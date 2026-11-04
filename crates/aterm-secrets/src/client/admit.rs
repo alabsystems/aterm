@@ -159,6 +159,16 @@ pub(super) fn kept_out_with_node(
     node: [u8; 32],
     restore: bool,
 ) -> Option<String> {
+    kept_out_with_node_at(log, binding, node, restore, true)
+}
+
+fn kept_out_with_node_at(
+    log: &Log,
+    binding: &crate::commons::binding::Binding,
+    node: [u8; 32],
+    restore: bool,
+    check_epoch_omission: bool,
+) -> Option<String> {
     let member = binding.actor();
     let recipient = binding.recipient();
     let membership = log.membership();
@@ -217,10 +227,12 @@ pub(super) fn kept_out_with_node(
                 && !log.recipient_is_removed(&m.binding.recipient())
                 && node_removal(log, node).is_none()
         });
-    if membership.members().iter().any(|(actor, m)| {
-        (*actor == member || (!active_node_holder && node != [0; 32] && m.node_key == Some(node)))
-            && log.audience_left_out(&EpochAudience::Everyone, actor)
-    }) || log.audience_left_out_recipient(&EpochAudience::Everyone, &recipient)
+    if check_epoch_omission
+        && (membership.members().iter().any(|(actor, m)| {
+            (*actor == member
+                || (!active_node_holder && node != [0; 32] && m.node_key == Some(node)))
+                && log.audience_left_out(&EpochAudience::Everyone, actor)
+        }) || log.audience_left_out_recipient(&EpochAudience::Everyone, &recipient))
     {
         return Some(
             "the vault's newest key leaves this Mac out on purpose, and an Allow does not let it \
@@ -321,14 +333,16 @@ pub(super) fn roster_keeps_out(
                 .is_some_and(|m| steward::member_is_denied_in_roster(r, m))
     };
     let roster = match lock {
-        Some(lock) => roster::swarm_roster_held(paths, lock),
-        None => swarm_roster(paths),
+        Some(lock) => roster::swarm_roster_for_denial_held(paths, lock),
+        None => roster::swarm_roster_for_denial(paths),
     }?;
-    let local_log = config(paths)?
-        .map(|cfg| log_entries::trusted_local_log(paths, &cfg))
-        .transpose()?
-        .flatten();
-    let denied = roster.as_ref().is_some_and(check_roster)
+    let local_log = exclusion_log(paths)?.map(|(log, _)| log);
+    let denied = local_log.as_ref().is_some_and(|log| {
+        removal_naming(log, binding).is_some()
+            || log.recipient_is_removed(&binding.recipient())
+            || node_removal(log, node).is_some()
+            || node_removal(log, *binding.writer()).is_some()
+    }) || roster.as_ref().is_some_and(check_roster)
         || log_entries::roster_from_doc_or_opened(None, opened, local_log.as_ref()).is_some_and(
             |mut r| {
                 if let Ok(Some(denied_nodes)) = swarm_denied_nodes(paths) {
@@ -343,6 +357,28 @@ pub(super) fn roster_keeps_out(
     }))
 }
 
+/// Epoch omissions need a current log; explicit signed removals remain evidence behind a cache.
+fn exclusion_log(paths: &Paths) -> crate::Result<Option<(Log, bool)>> {
+    let Some(config) = config(paths)? else {
+        return Ok(None);
+    };
+    let state = load_state(paths)?;
+    let Some((log, _)) = log_entries::authenticated_custody(paths, &config, &state)? else {
+        return Ok(None);
+    };
+    let current = match (
+        read_identity(paths)?,
+        read_verified_cached_envelope(paths, &config, &state)?,
+    ) {
+        (Some(identity), Some(bytes)) => {
+            log_entries::log_base(Some(&log), &envelope::parse(&bytes)?, &identity)?
+                != log_entries::LogBase::Behind
+        }
+        _ => true,
+    };
+    Ok(Some((log, current)))
+}
+
 fn trusted_log_keeps_out(
     paths: &Paths,
     binding: &crate::commons::binding::Binding,
@@ -350,21 +386,18 @@ fn trusted_log_keeps_out(
     restore: bool,
     lock: Option<&StateLock>,
 ) -> crate::Result<Option<String>> {
-    let log = match config(paths)? {
-        Some(config) => log_entries::trusted_local_log(paths, &config)?,
-        None => None,
-    };
-    if !log
+    let evidence = exclusion_log(paths)?;
+    if !evidence
         .as_ref()
-        .is_some_and(|log| restoring(log, binding, node, restore))
+        .is_some_and(|(log, _)| restoring(log, binding, node, restore))
         && let Some(why) = roster_keeps_out(paths, None, binding, node, lock)?
     {
         return Ok(Some(why));
     }
-    let Some(log) = log else {
+    let Some((log, current)) = evidence else {
         return Ok(None);
     };
-    Ok(kept_out_with_node(&log, binding, node, restore))
+    Ok(kept_out_with_node_at(&log, binding, node, restore, current))
 }
 
 /// The log, keys and opened entries the member at `paths` admits from: its vault's log where the
@@ -430,13 +463,17 @@ fn log_path(
     (reader, restore): (Option<Reader>, bool),
     held: Option<&super::HandoverHold>,
 ) -> crate::Result<ByLog> {
-    if reader.is_some_and(|reader| !reader.reads_log()) {
-        return Ok(
-            trusted_log_keeps_out(paths, request.binding(), node, restore, None)?
-                .map_or(ByLog::NotHere, ByLog::KeptOut),
-        );
-    }
     let held = held.filter(|held| held.holds(paths));
+    if reader.is_some_and(|reader| !reader.reads_log()) {
+        return Ok(trusted_log_keeps_out(
+            paths,
+            request.binding(),
+            node,
+            restore,
+            held.map(super::HandoverHold::state_lock),
+        )?
+        .map_or(ByLog::NotHere, ByLog::KeptOut));
+    }
     let owned_lock = match held {
         Some(_) => None,
         None => match StateLock::try_take_until(paths, Instant::now() + super::HANDOVER_LOCK_WAIT)?
@@ -456,10 +493,8 @@ fn log_path(
         );
     };
     let source = records_bound(paths, &store)?;
-    if reader.is_some_and(|reader| !reader.can_take(source)) {
-        return Err(Error::new(
-            "the joining device cannot receive this membership history",
-        ));
+    if let Some(reader) = reader.filter(|reader| !reader.can_take(source)) {
+        return Err(Error::new(reader.refusal(source)));
     }
     if let Some(why) = kept_out_with_node(&log, request.binding(), node, restore) {
         return Ok(ByLog::KeptOut(why));
@@ -566,10 +601,8 @@ fn log_path(
         }
     }
     let source = records_bound(paths, &store)?;
-    if reader.is_some_and(|reader| !reader.can_take(source)) {
-        return Err(Error::new(
-            "the admission exceeds the joining device's record capacity",
-        ));
+    if let Some(reader) = reader.filter(|reader| !reader.can_take(source)) {
+        return Err(Error::new(reader.refusal(source)));
     }
     if !signed.is_empty() {
         super::write_records(paths, &store)?;
@@ -771,9 +804,7 @@ pub(super) fn log_bundle(
     reader: Reader,
 ) -> crate::Result<Bundle> {
     if !reader.can_take(admission.source) {
-        return Err(Error::new(
-            "the joining device cannot receive this membership history",
-        ));
+        return Err(Error::new(reader.refusal(admission.source)));
     }
     let config = config(paths)?.ok_or_else(|| Error::new("no vault configured"))?;
     let signer = config
@@ -938,12 +969,8 @@ fn checked_log_bundle(paths: &Paths, bundle: &Bundle) -> crate::Result<CheckedLo
     };
     let previous = load_records(paths)?;
     let local = records_bound(paths, &previous)?;
-    if source.is_some_and(|source| !local.can_exchange(source))
-        || (source.is_none() && local.crossed)
-    {
-        return Err(Error::new(
-            "the member's join bundle has incompatible record capacity",
-        ));
+    if let Some(why) = crate::members::bundle::source_refusal(local, *source) {
+        return Err(Error::new(why));
     }
     let limit = source.map_or(crate::membership_log::LEGACY_RECORDS, |source| {
         (source.held as usize).min(if source.crossed {

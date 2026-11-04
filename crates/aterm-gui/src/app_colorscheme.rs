@@ -191,8 +191,8 @@ impl App {
         let installed = self.install_resolved_colors(ThemeChange::OsFlip);
         if !installed.theme_changed {
             for wid in self.appearance_redraw_targets() {
-                if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
-                    w.request_redraw();
+                if let Some(ws) = self.windows.get(&wid) {
+                    ws.request_redraw();
                 }
             }
         }
@@ -301,19 +301,51 @@ mod tests {
         );
     }
 
-    /// With the rendered theme unchanged, a flip nudges every window, not just the front one.
+    /// With the rendered theme unchanged, an OS appearance flip nudges every window, while an
+    /// equal-appearance reading nudges none (`NEGATIVE CONTROL:`).
     #[test]
     fn appearance_flip_nudges_every_window() {
         let mut app = crate::App::headless_for_test();
         let wid = crate::WindowId(9);
         app.install_window_state(wid, crate::stub_session(99), 38, 132);
         app.frontmost_window = Some(crate::WindowId(0));
-        let mut targets = app.appearance_redraw_targets();
-        targets.sort_unstable();
+        app.config = aterm_toml::from_str(r#"theme = "Dracula""#).expect("plain theme");
+        app.install_resolved_colors(super::ThemeChange::ConfigReload);
+        let before_theme = app.theme;
+        let baseline = (
+            app.windows[&crate::WindowId(0)]
+                .redraw_requests_for_test
+                .get(),
+            app.windows[&wid].redraw_requests_for_test.get(),
+        );
+
+        app.sync_app_theme_to_appearance(Appearance::Dark);
+        assert_eq!(app.os_appearance, Appearance::Dark);
         assert_eq!(
-            targets,
-            vec![crate::WindowId(0), wid],
-            "the appearance nudge fans out to every window, not just the front one"
+            (
+                app.windows[&crate::WindowId(0)]
+                    .redraw_requests_for_test
+                    .get(),
+                app.windows[&wid].redraw_requests_for_test.get(),
+            ),
+            baseline,
+            "negative control: an unchanged OS appearance requests no redraw"
+        );
+
+        app.sync_app_theme_to_appearance(Appearance::Light);
+        assert_eq!(app.os_appearance, Appearance::Light);
+        assert_eq!(app.theme, before_theme, "plain theme stays unchanged");
+        assert_eq!(
+            app.windows[&crate::WindowId(0)]
+                .redraw_requests_for_test
+                .get(),
+            baseline.0 + 1,
+            "front window nudged"
+        );
+        assert_eq!(
+            app.windows[&wid].redraw_requests_for_test.get(),
+            baseline.1 + 1,
+            "background window nudged"
         );
     }
 
@@ -440,11 +472,12 @@ pub(crate) mod install_resolved_colors {
         );
     }
 
-    fn scratch_dir(tag: &str) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("aterm-install-colors-{tag}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        dir
+    fn scratch_dir(tag: &str) -> aterm_tempfile::TempDir {
+        aterm_tempfile::Builder::new()
+            .prefix(&format!("aterm-install-colors-{tag}-"))
+            .suffix(".noindex")
+            .tempdir()
+            .expect("scratch dir")
     }
 
     /// The reply session 0 gives a program that asks `CSI ? 996 n`.
@@ -468,7 +501,7 @@ pub(crate) mod install_resolved_colors {
         let dir = scratch_dir("dsr");
         let mut app = App::headless_for_test();
         assert_eq!(app.os_appearance, Appearance::Dark);
-        apply_config_text(&mut app, &dir, "theme = \"GitHub Light\"\n");
+        apply_config_text(&mut app, dir.path(), "theme = \"GitHub Light\"\n");
         assert_eq!(
             app.theme.bg & 0x00FF_FFFF,
             0x00FF_FFFF,
@@ -476,7 +509,7 @@ pub(crate) mod install_resolved_colors {
         );
         assert_eq!(dsr_996(&app), b"\x1b[?997;2n", "GitHub Light reports light");
 
-        apply_config_text(&mut app, &dir, "theme = \"Dracula\"\n");
+        apply_config_text(&mut app, dir.path(), "theme = \"Dracula\"\n");
         assert_eq!(dsr_996(&app), b"\x1b[?997;1n", "Dracula reports dark");
 
         app.sync_app_theme_to_appearance(Appearance::Light);
@@ -485,7 +518,6 @@ pub(crate) mod install_resolved_colors {
             b"\x1b[?997;1n",
             "a light OS does not make Dracula light"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Read whatever the program side of `fd` holds, without blocking.
@@ -518,11 +550,11 @@ pub(crate) mod install_resolved_colors {
         );
         let sink = std::sync::Arc::new(aterm_session::sink::SinkWriter::new(fds[1]));
         let mut app = App::headless_for_test_with_sink(sink);
-        apply_config_text(&mut app, &dir, "theme = \"Dracula\"\n");
+        apply_config_text(&mut app, dir.path(), "theme = \"Dracula\"\n");
         crate::term_lock(&app.pool.get(0).expect("session 0").term).process(b"\x1b[?2031h");
         assert!(drain(fds[0]).is_empty(), "subscribing pushes nothing");
 
-        apply_config_text(&mut app, &dir, "theme = \"Solarized Light\"\n");
+        apply_config_text(&mut app, dir.path(), "theme = \"Solarized Light\"\n");
         assert_eq!(
             drain(fds[0]),
             b"\x1b[?997;2n",
@@ -549,7 +581,7 @@ pub(crate) mod install_resolved_colors {
 
         apply_config_text(
             &mut app,
-            &dir,
+            dir.path(),
             "theme = \"Solarized Light\"\ncopy_on_select = true\n",
         );
         assert!(
@@ -558,7 +590,6 @@ pub(crate) mod install_resolved_colors {
         );
         drop(app);
         unsafe { libc::close(fds[0]) };
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A program's own background outranks the theme in what its session
@@ -578,7 +609,7 @@ pub(crate) mod install_resolved_colors {
         let sink = std::sync::Arc::new(aterm_session::sink::SinkWriter::new(fds[1]));
         let mut app = App::headless_for_test_with_sink(sink);
         app.pool.insert(crate::stub_session(1));
-        apply_config_text(&mut app, &dir, "theme = \"Dracula\"\n");
+        apply_config_text(&mut app, dir.path(), "theme = \"Dracula\"\n");
         let field = |record: &str, key: &str| {
             record
                 .split_whitespace()
@@ -615,14 +646,14 @@ pub(crate) mod install_resolved_colors {
         );
         assert_eq!(field(&record, "bg_dark").as_deref(), Some("0"), "{record}");
 
-        apply_config_text(&mut app, &dir, "theme = \"Solarized Light\"\n");
+        apply_config_text(&mut app, dir.path(), "theme = \"Solarized Light\"\n");
         assert!(drain(fds[0]).is_empty(), "the program's view is unchanged");
         assert_eq!(
             dsr(&app, 1),
             b"\x1b[?997;2n",
             "negative control: a session without an override follows the theme"
         );
-        apply_config_text(&mut app, &dir, "theme = \"Dracula\"\n");
+        apply_config_text(&mut app, dir.path(), "theme = \"Dracula\"\n");
         assert!(drain(fds[0]).is_empty(), "nor back to a dark theme");
         assert_eq!(dsr(&app, 0), b"\x1b[?997;2n");
         assert_eq!(dsr(&app, 1), b"\x1b[?997;1n");
@@ -645,7 +676,6 @@ pub(crate) mod install_resolved_colors {
         );
         drop(app);
         unsafe { libc::close(fds[0]) };
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A theme file nothing draws changes no projection, so it costs no

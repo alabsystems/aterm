@@ -90,10 +90,12 @@ pub fn shim_root(home: &Path, path: &std::ffi::OsStr) -> PathBuf {
                 options.custom_flags(libc::O_NONBLOCK);
             }
             let file = options.open(shim).ok()?;
-            if !file.metadata().is_ok_and(|m| m.is_file()) {
+            let meta = file.metadata().ok()?;
+            if !meta.is_file() {
                 return None;
             }
-            let mut head = Vec::new();
+            let cap = usize::try_from(meta.len().min(64 << 10).saturating_add(1)).unwrap_or(0);
+            let mut head = Vec::with_capacity(cap);
             file.take(64 << 10).read_to_end(&mut head).ok()?;
             root_named_by_shim(home, std::str::from_utf8(&head).ok()?)
         })

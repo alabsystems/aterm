@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! The owner's yes, in a leaf module of its own (`native_settings::owner_yes`): [`OwnerYes`], the
-//! two doors that mint one, the test mint, and the alert's arm whose answer the first door reads
+//! door that mints one, the test mint, and the alert's arm whose answer the first door reads
 //! ([`ConfirmArm`]).
 //!
 //! The compiler holds the yes to its doors. `OwnerYes` is a braced struct whose one field is
@@ -15,29 +15,22 @@
 //! The aterm-census guard `devtools-door` holds this file to that shape: no `mod`, no macro
 //! defined here and none invoked but by an extern-prelude path (`::aterm_log::info!`), no alias,
 //! glob import, `unsafe`, trait impl for the yes, or attribute that could expand into code, and a
-//! `YesSeal` value only inside a door's body. Outside this file no line may name `YesSeal` (a
+//! `YesSeal` value only inside the door's body. Outside this file no line may name `YesSeal` (a
 //! macro body that did would expand here with this file's privacy), and the census flags the
 //! unsafe reads that could forge a yes, which no type can stop. No shipped line here holds a
 //! function type, and [`ConfirmArm`]'s stand-in exists only under `#[cfg(test)]`, so the alert's
 //! arm takes no answer from its caller outside a test build.
 
 use super::{ConsentGestures, OwnerAnswer, QuietStamp, SharedOwnerQuiet};
-use crate::workstation_setup::AdmittedAccess;
 
-/// The owner's yes to a macOS access change. Two doors in this file mint one:
-///
-/// * [`owner_confirms_with`], once its gestures' [`ConfirmArm`] raised aterm's alert and the owner
-///   chose its proceed button: the Security page's presses (`SettingsViewState::owner_confirms`).
-/// * [`Self::from_admitted`], from the window's own admission of the setup plan
-///   (`docs/DESIGN-system-state-2026-10-21.md` §6, "The standing yes"): System State's
-///   once-per-Mac debugger step (`DebuggerChangeLane::start_from_plan`) and a person's `Turn On…`
-///   press on its Debugger row (`App::turn_on_debugger_from_system_state`).
+/// The owner's yes to a macOS access change. One door in this file mints one:
+/// [`owner_confirms_with`], once its gestures' [`ConfirmArm`] raised aterm's alert and the owner
+/// chose its proceed button: the Security page's presses (`SettingsViewState::owner_confirms`).
 ///
 /// The debugger-access change is built on it all the way down: only `DebuggerChangeLane::begin`
 /// mints a `debugger_access::ChangeTicket`, and only from a yes; a `DevtoolsJob`, what the worker
 /// that runs `DevToolsSecurity` takes, is built only from a ticket. So nothing in this crate starts
-/// the change without the owner's yes in an alert or the window's own admission, which no control
-/// client's gesture makes. The containment runner beneath it,
+/// the change without the owner's yes in an alert, which no control client's gesture makes. The containment runner beneath it,
 /// `aterm_containment::consent::run_devtools_change`, is `pub` across the crate boundary; the
 /// census keeps it to its one caller, `debugger_access::spawn_devtools_worker`. One yes is spent by
 /// one change; the sudo preference writer likewise consumes one before changing its marker.
@@ -52,17 +45,6 @@ pub(crate) struct OwnerYes {
 struct YesSeal;
 
 impl OwnerYes {
-    /// The standing yes, spent: the window's own admission of a setup plan with its Permissions
-    /// group, which only `workstation_setup::PermissionGate::admitted` makes.
-    pub(crate) fn from_admitted(admitted: AdmittedAccess) -> Self {
-        ::aterm_log::info!(
-            "macOS access: the window's own admission of setup revision {} ({:?}) is the yes",
-            admitted.revision(),
-            admitted.by()
-        );
-        Self { _seal: YesSeal }
-    }
-
     /// A yes minted outside an alert (test-only).
     #[cfg(test)]
     pub(crate) const fn for_test() -> Self {

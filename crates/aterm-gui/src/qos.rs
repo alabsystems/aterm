@@ -26,9 +26,130 @@ const fn qos_class(role: Role) -> libc::qos_class_t {
     }
 }
 
-/// Declare the calling thread's role.
+/// How far `role` outranks the others: the order [`Role`] declares, highest first.
+const fn rank(role: Role) -> u8 {
+    match role {
+        Role::Interactive => 3,
+        Role::Responsive => 2,
+        Role::Background => 1,
+        Role::Housekeeping => 0,
+    }
+}
+
+/// `role`, or [`Role::Background`] where it ranks above it in a process [`held`]
+/// ([`hold_process_as_background_work`]).
+fn capped(role: Role, held: bool) -> Role {
+    if held && rank(role) > rank(Role::Background) {
+        Role::Background
+    } else {
+        role
+    }
+}
+
+/// Whether [`hold_process_as_background_work`] holds this process.
+fn held() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        hold::held()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+/// Hold this whole process as background work (the utility class), thread by thread, where a
+/// launchd job of `ProcessType` `Standard` clamped it: the calling thread at once, every thread
+/// the process starts from here on as it starts, each role a thread declares (`qos::set_self`)
+/// and each child started on a role's behalf (`qos::command`) capped there. Unlike the clamp, the hold
+/// leaves a lift ([`aterm_uds::qos::lift`]) its effect, so the one thread a waiter waits on (the
+/// fleet book's lock holder, a forking thread) runs at the default class while it holds what is
+/// waited on. `aterm node serve` calls it first, before it starts a thread: one started earlier
+/// keeps its class. A no-op off macOS.
+pub fn hold_process_as_background_work() {
+    #[cfg(target_os = "macos")]
+    hold::install();
+}
+
+/// Holding every thread of a process at [`Role::Background`]'s class as it starts.
+#[cfg(target_os = "macos")]
+mod hold {
+    use std::ffi::c_void;
+    use std::sync::{Once, OnceLock};
+
+    use super::{Role, qos_class};
+
+    /// `pthread_introspection_hook_t` (`<pthread/introspection.h>`).
+    type Hook = unsafe extern "C" fn(
+        event: libc::c_uint,
+        thread: libc::pthread_t,
+        addr: *mut c_void,
+        size: usize,
+    );
+
+    /// `PTHREAD_INTROSPECTION_THREAD_START` (`<pthread/introspection.h>`): the event a thread
+    /// gets on itself as it starts, before its start routine runs.
+    const THREAD_START: libc::c_uint = 2;
+
+    unsafe extern "C" {
+        fn pthread_introspection_hook_install(hook: Option<Hook>) -> Option<Hook>;
+    }
+
+    /// The hook that held this process's thread events before [`start_held`] (none in aterm, a
+    /// sanitizer's where one runs), set once [`start_held`] is installed: every event is handed
+    /// on to it, as `pthread_introspection_hook_install` keeps one hook alone.
+    static CHAINED: OnceLock<Option<Hook>> = OnceLock::new();
+
+    /// Whether [`install`] has run.
+    pub(super) fn held() -> bool {
+        CHAINED.get().is_some()
+    }
+
+    /// Install [`start_held`] once, and put the calling thread at the held class. Darwin's
+    /// `pthread_create` gives a new thread the default class whatever class its creator runs at
+    /// (measured on macOS 27.0: a thread started by one at background or utility read 0x15), so
+    /// the hook sets each one's class on that thread as it starts.
+    pub(super) fn install() {
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(|| {
+            // SAFETY: installs a plain function that lives as long as the process and takes
+            // nothing from this frame; it hands each event to the hook it replaced once
+            // `CHAINED` holds that hook (an event in the instant before is not handed on).
+            let chained = unsafe { pthread_introspection_hook_install(Some(start_held)) };
+            let _ = CHAINED.set(chained);
+        });
+        // SAFETY: sets this thread's own class; takes no pointers and mutates no shared state.
+        unsafe { libc::pthread_set_qos_class_self_np(qos_class(Role::Background), 0) };
+    }
+
+    /// [`install`]'s hook: a starting thread's class set to [`Role::Background`]'s on that
+    /// thread, then every event handed to the hook it replaced ([`CHAINED`]). It may run where a
+    /// thread's state is not whole (its end, its teardown), so it reads one atomic and makes one
+    /// call, for a start alone. A dispatch worker's item still runs at the class its queue gives
+    /// it, which libdispatch sets on that thread for each item.
+    unsafe extern "C" fn start_held(
+        event: libc::c_uint,
+        thread: libc::pthread_t,
+        addr: *mut c_void,
+        size: usize,
+    ) {
+        if event == THREAD_START {
+            // SAFETY: a start's event runs on the starting thread itself, whose own class this
+            // sets; it takes no pointers and mutates no shared state.
+            unsafe { libc::pthread_set_qos_class_self_np(qos_class(Role::Background), 0) };
+        }
+        if let Some(Some(chained)) = CHAINED.get() {
+            // SAFETY: `chained` is the hook the install returned, a function of this signature
+            // that lives as long as the process, given this event's own arguments.
+            unsafe { chained(event, thread, addr, size) };
+        }
+    }
+}
+
+/// Declare the calling thread's role, [`capped`] in a process held as background work.
 #[inline]
 pub(crate) fn set_self(role: Role) {
+    let role = capped(role, held());
     #[cfg(target_os = "macos")]
     {
         fork_at_default::install();
@@ -66,8 +187,10 @@ pub(crate) struct RoleObservation {
     pub(crate) read_errno: Option<i32>,
 }
 
-/// Set and immediately read this thread's native role, retaining native errors.
+/// Set and immediately read this thread's native role, retaining native errors: `role`
+/// [`capped`] as [`set_self`] caps it, which is the role it reports requested.
 pub(crate) fn set_self_observed(role: Role) -> RoleObservation {
+    let role = capped(role, held());
     #[cfg(target_os = "macos")]
     {
         fork_at_default::install();
@@ -339,12 +462,16 @@ const fn child_clamp(role: Role) -> Option<&'static str> {
     }
 }
 
-/// A `Command` for `program`, run on behalf of `role`'s work: behind `taskpolicy -c <clamp>` whenever that work ranks below the inherited default, so the child and everything it launches yield to the program being typed into (under `taskpolicy -c utility` a child and its own child both read pri 20, against 31 bare).
+/// A `Command` for `program`, run on behalf of `role`'s work ([`capped`] in a process held as background work): behind `taskpolicy -c <clamp>` whenever that work ranks below the inherited default, so the child and everything it launches yield to the program being typed into (under `taskpolicy -c utility` a child and its own child both read pri 20, against 31 bare).
 pub(crate) fn command(
     role: Role,
     program: impl AsRef<std::path::Path>,
 ) -> aterm_uds::spawnfd::Command {
-    command_with(role, program.as_ref(), std::path::Path::new(TASKPOLICY))
+    command_with(
+        capped(role, held()),
+        program.as_ref(),
+        std::path::Path::new(TASKPOLICY),
+    )
 }
 
 /// THE way the GUI starts the co-located `atpkg`: a [`Role::Background`] [`command`], so a package pass — parsing, verifying, unpacking — never runs in the band of the program being typed into.
@@ -481,14 +608,10 @@ pub(crate) fn class_of_self() -> u32 {
     unsafe { qos_class_self() }
 }
 
-/// The class another thread is actually running at, named by its pthread handle (`std::os::unix::thread::JoinHandleExt::as_pthread_t`), or `None` if the platform declined to report one.
+/// The class another thread has requested, named by its handle, or `None` if the platform declined to report one.
 #[cfg(all(test, target_os = "macos"))]
-pub(crate) fn class_of(thread: libc::pthread_t) -> Option<u32> {
-    let mut class: libc::c_uint = 0;
-    let mut relative: libc::c_int = 0;
-    // SAFETY: both out-parameters are live, correctly typed locals, and the caller's `JoinHandle` keeps `thread` alive across the call.
-    let rc = unsafe { pthread_get_qos_class_np(thread, &mut class, &mut relative) };
-    (rc == 0).then_some(class)
+pub(crate) fn class_of<T>(thread: &std::thread::JoinHandle<T>) -> Option<u32> {
+    aterm_uds::qos::requested_class_of(thread).map(|(class, _)| class)
 }
 
 /// The class [`set_self`] puts a thread at, to compare against one read back off the running thread.
@@ -636,7 +759,7 @@ mod tests {
             aterm_spec::wait::MUST_HAPPEN,
             "the worker blocked in its read at its declared role",
             || {
-                (class_of(thread) == Some(class_for(Role::Background))
+                (class_of(&worker) == Some(class_for(Role::Background))
                     && record_of(thread).run_state == TH_STATE_WAITING)
                     .then_some(())
             },
@@ -927,6 +1050,123 @@ mod tests {
             ["/bin/sh"],
             "no launcher, no wrapper"
         );
+    }
+
+    /// In a process held as background work (`aterm node serve`,
+    /// [`hold_process_as_background_work`]), each thread it starts from then on starts at
+    /// utility, a thread that declares any role stays at or below utility, and a child started on
+    /// any role's behalf starts behind a clamp at or below utility, as the `Standard` launchd job
+    /// the node job ran in clamped every thread and child; and a lift
+    /// ([`aterm_uds::qos::lift`]) still raises the thread that asks for it to the default class,
+    /// which that clamp held at utility. The hold is the process's own, so the body runs alone in
+    /// a child of this test binary. Each class is read from outside the thread that has it, by a
+    /// thread at the default class.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_process_held_as_background_work_holds_each_thread_at_utility_and_a_lift_still_lifts() {
+        use std::sync::mpsc::{Receiver, Sender, channel};
+
+        /// A thread started now that runs each step it is told, on itself, saying when it has.
+        struct Stepped {
+            tell: Sender<Box<dyn FnOnce() + Send>>,
+            hear: Receiver<()>,
+            thread: std::thread::JoinHandle<()>,
+        }
+        impl Stepped {
+            /// Started, once it says so.
+            fn start() -> Self {
+                let (tell, told) = channel::<Box<dyn FnOnce() + Send>>();
+                let (said, hear) = channel();
+                let thread = std::thread::spawn(move || {
+                    let _ = said.send(());
+                    while let Ok(step) = told.recv() {
+                        step();
+                        let _ = said.send(());
+                    }
+                });
+                hear.recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                    .expect("the thread started");
+                Self { tell, hear, thread }
+            }
+            /// `step` run on the thread, once it says so.
+            fn step(&self, step: impl FnOnce() + Send + 'static) {
+                self.tell.send(Box::new(step)).expect("the thread waits");
+                self.hear
+                    .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                    .expect("the thread ran its step");
+            }
+            /// The thread's class, read from this one.
+            fn class(&self) -> u32 {
+                class_of(&self.thread).expect("its class reads")
+            }
+        }
+        thread_local! {
+            /// What a held thread's lift raised it from, for its put back.
+            static LIFTED: std::cell::Cell<Option<aterm_uds::qos::Lifted>> =
+                const { std::cell::Cell::new(None) };
+        }
+        if !crate::test_alone::alone() {
+            return;
+        }
+        let utility = class_for(Role::Background);
+
+        let unheld = Stepped::start().class();
+        assert_eq!(
+            unheld, UNDECLARED_CLASS,
+            "an unheld process's new thread read 0x{unheld:x}"
+        );
+        let declarers = [
+            Role::Interactive,
+            Role::Responsive,
+            Role::Background,
+            Role::Housekeeping,
+        ]
+        .map(|role| (role, Stepped::start()));
+
+        std::thread::spawn(hold_process_as_background_work)
+            .join()
+            .expect("the hold");
+        assert!(held());
+
+        let thread = Stepped::start();
+        let started = thread.class();
+        assert_eq!(
+            started, utility,
+            "a held process's new thread read 0x{started:x}"
+        );
+        thread.step(|| LIFTED.set(aterm_uds::qos::lift()));
+        let lifted = thread.class();
+        assert_eq!(
+            lifted, UNDECLARED_CLASS,
+            "a lift in a held process left its thread at 0x{lifted:x}"
+        );
+        thread.step(|| {
+            if let Some(lifted) = LIFTED.take() {
+                aterm_uds::qos::restore(lifted);
+            }
+        });
+        assert_eq!(thread.class(), utility, "the lifted thread put back");
+
+        for (role, declarer) in declarers {
+            declarer.step(move || set_self(role));
+            let declared = declarer.class();
+            assert_eq!(
+                declared,
+                class_for(capped(role, true)),
+                "a {role:?} thread of a held process declared 0x{declared:x}"
+            );
+            assert!(declared <= utility, "{role:?}: 0x{declared:x}");
+            let clamp = if role == Role::Housekeeping {
+                "background"
+            } else {
+                "utility"
+            };
+            assert_eq!(
+                argv(&command(role, "/bin/sh")),
+                [TASKPOLICY, "-c", clamp, "/bin/sh"],
+                "a child of a held process's {role:?} work"
+            );
+        }
     }
 
     /// A `Background` child really starts below the inherited band (pri 31).

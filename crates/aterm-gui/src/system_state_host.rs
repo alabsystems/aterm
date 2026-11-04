@@ -14,7 +14,7 @@ use crate::native_app::{AppKind, NativeApp};
 use crate::system_state::{
     Admission, PasswordAcceptance, SetupOperation, SetupStatus, SetupStatusRow, SystemStateAction,
 };
-use crate::workstation_setup::{OfferKind, Request, WorkstationSetupDecision};
+use crate::workstation_setup::{Request, WorkstationSetupDecision};
 use crate::{App, Wake};
 
 /// Provisioning callbacks installed by the shipped binary.
@@ -70,7 +70,7 @@ pub struct InitialSetupHandlers {
     /// A person pressed for macOS's grants: save that durably and read the Access rows again.
     /// Returns whether it was saved.
     pub ask_access: fn() -> bool,
-    /// Apple's Command Line Tools are installed (design §3.3): the Command Line Tools tab said so,
+    /// Apple's Command Line Tools are installed (design §3.3): the Mac Setup tab said so,
     /// or the window found them, however they came (`clt_install`'s `read_repositories_again`).
     /// Read the GitHub repositories row again at once and wake the run waiting on them, so the
     /// page moves on without waiting for its next look.
@@ -781,7 +781,7 @@ impl App {
         self.system_state_host
             .pending
             .as_ref()
-            .is_some_and(|request| matches!(request.kind(), OfferKind::Launch) && request.pending())
+            .is_some_and(Request::pending)
     }
 
     /// Queued setup and Restore still belong to this worker; a live installer also
@@ -887,15 +887,10 @@ impl App {
     }
 
     pub(crate) fn offer_system_state(&mut self, request: Request) {
-        if self.resume_offer_moot(&request) {
-            return;
-        }
-        let quiet =
-            self.system_state_host.review_shown || matches!(request.kind(), OfferKind::Resume);
         if !request.pending()
             || self.headless
-            || !self.can_offer_system_state(request.kind())
-            || !(if quiet {
+            || !self.can_offer_system_state()
+            || !(if self.system_state_host.review_shown {
                 self.open_system_state_tab_quietly()
             } else {
                 self.open_system_state_tab()
@@ -907,19 +902,13 @@ impl App {
         self.attach_system_state_offer(request);
     }
 
-    fn can_offer_system_state(&self, kind: &OfferKind) -> bool {
+    fn can_offer_system_state(&self) -> bool {
         // The host keeps accepted work and admissions after their final view
         // closes. A queued startup offer must yield before opening a new
         // review, just as it does while a busy controller survives (§3.3).
-        // The offer of a plan an earlier process admitted yields to the same
-        // work, but not to that plan's own run going (§3.3, §6), and to a
-        // Stop or a choice the window holds setup for, which no answer of it
-        // may take the place of.
-        let resume = matches!(kind, OfferKind::Resume);
         self.system_state_host.operation.is_none()
-            && (!resume || self.workstation_setup.setup_unheld())
             && !self.system_state_host.awaiting_run
-            && (resume || !self.system_state_host.latest_status.busy)
+            && !self.system_state_host.latest_status.busy
             && self.system_state_host.pending.is_none()
             && self.system_state_host.pending_apply.is_none()
             && self
@@ -927,27 +916,12 @@ impl App {
                 .instance_by_kind(AppKind::SystemState)
                 .is_none_or(|instance| {
                     matches!(self.native_runtime.app(instance), Some(NativeApp::SystemState(state))
-                        if if resume { state.can_offer_resume() } else { state.can_offer() })
+                        if state.can_offer())
                 })
     }
 
-    /// The offer of a plan an earlier process admitted is moot while this window holds its own
-    /// admission of the plan in force (a press's, or an answer to an earlier offer): it is let go
-    /// with no receipt ([`Request::let_go`]), and nothing answers it for that admission (§6).
-    /// Whether `request` was that offer, now finished.
-    fn resume_offer_moot(&self, request: &Request) -> bool {
-        let moot = matches!(request.kind(), OfferKind::Resume) && self.own_admission_stands();
-        if moot {
-            request.let_go();
-        }
-        moot
-    }
-
     fn attach_system_state_offer(&mut self, request: Request) {
-        if self.resume_offer_moot(&request) {
-            return;
-        }
-        if !request.pending() || !self.can_offer_system_state(request.kind()) {
+        if !request.pending() || !self.can_offer_system_state() {
             request.finish(WorkstationSetupDecision::Unavailable);
             return;
         }
@@ -955,24 +929,9 @@ impl App {
             request.finish(WorkstationSetupDecision::Unavailable);
             return;
         }
-        // The review of the groups the ALab signal adds holds none of aterm's own permissions:
-        // they are in the plan in force, whose run carries them (design §3.5). Nor does the offer
-        // of a plan an earlier process admitted: its run goes on, its access steps with it, and
-        // the page reads as it did; nor does its answer (§3.3, §6).
-        let launch = matches!(request.kind(), OfferKind::Launch);
-        let resume = matches!(request.kind(), OfferKind::Resume);
         self.system_state_host.pending = Some(request);
-        if resume {
-            self.system_state_host.action_refusal = None;
-            self.system_state_host.next_tick = None;
-            self.system_state_host.next_status = Some(Instant::now());
-            self.request_redraw_all_windows();
-            return;
-        }
         self.system_state_host.review_shown = true;
-        if launch {
-            self.hold_initial_setup_permissions();
-        }
+        self.hold_initial_setup_permissions();
         self.refresh_system_state_tab_indicators();
         self.system_state_host.action_refusal = None;
         // The page answers the offer on its first tick: tick now.
@@ -1421,16 +1380,8 @@ impl App {
         {
             return;
         }
-        // The offer of a plan an earlier process admitted held nothing, so its going releases
-        // nothing either.
-        if !self
-            .system_state_host
-            .pending
-            .take()
-            .is_some_and(|request| matches!(request.kind(), OfferKind::Resume))
-        {
-            self.recheck_initial_setup_permissions();
-        }
+        self.system_state_host.pending = None;
+        self.recheck_initial_setup_permissions();
         self.system_state_host.generation = self.system_state_host.generation.wrapping_add(1);
         self.system_state_host.status_in_flight = false;
         self.system_state_host.next_status = Some(now);
@@ -1452,7 +1403,7 @@ impl App {
     /// again right before each sign-out's clicks.
     pub(crate) fn publish_system_state_front(&mut self) {
         let frontmost = self.system_state_frontmost();
-        let front = frontmost && self.person_at_this_screen();
+        let front = self.system_state_front_with_a_person();
         *PRESENCE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(self.presence());
@@ -1465,8 +1416,8 @@ impl App {
     /// Whether a person stage may put its gesture on screen now (init-on-by-default design §6.4):
     /// System State is in front ([`Self::system_state_frontmost`]) and a person is at this Mac's
     /// screen ([`Self::person_at_this_screen`], SAFE-1's fence, moved from the admission onto the
-    /// person stages: the Messages and FaceTime sign-outs, the debugger step's macOS dialog and
-    /// the Command Line Tools' authorization). The background stages never ask it. The input
+    /// person stages: the Messages and FaceTime sign-outs and the Command Line Tools'
+    /// authorization). The background stages never ask it. The input
     /// and screen readings (an IOKit and a window server read on this thread) are made only
     /// once the page is in front.
     pub(crate) fn system_state_front_with_a_person(&self) -> bool {
@@ -1475,7 +1426,7 @@ impl App {
 
     /// Whether a System State view is the visible, active view of a focused,
     /// on-screen window with no overlay: the only time a setup run's access
-    /// steps, the sign-outs and the debugger step may put a macOS gesture on
+    /// steps and the sign-outs may put a macOS gesture on
     /// screen (design §6). A focused window macOS reports occluded (the screen
     /// locked or asleep, a screen saver up) stays key but shows nothing.
     pub(crate) fn system_state_frontmost(&self) -> bool {
@@ -1790,18 +1741,6 @@ impl App {
                 if let Some(handlers) = handlers {
                     (handlers.stop)();
                 }
-                // A stopped run has nothing to go on with: the offer of its plan goes, once the
-                // worker's Stop is raised, so the offer's thread wakes to a run already stopped,
-                // and the window, stopped, takes no offer of it again.
-                if self
-                    .system_state_host
-                    .pending
-                    .as_ref()
-                    .is_some_and(|request| matches!(request.kind(), OfferKind::Resume))
-                    && let Some(request) = self.system_state_host.pending.take()
-                {
-                    request.finish(WorkstationSetupDecision::Unavailable);
-                }
             }
             SystemStateAction::OpenAccess { access, by_person } => {
                 let press = self.take_system_state_press();
@@ -1849,13 +1788,13 @@ impl App {
                     return;
                 }
                 if !self.press_developer_tools_install() {
-                    aterm_log::info!("system state: Install… opened no Command Line Tools tab");
+                    aterm_log::info!("system state: Install… opened no Mac Setup tab");
                 }
             }
             SystemStateAction::GoToToolsTab => {
                 let _ = self.take_system_state_press();
                 if !self.go_to_developer_tools_tab() {
-                    aterm_log::info!("system state: Go to tab found no Command Line Tools tab");
+                    aterm_log::info!("system state: Go to tab found no Mac Setup tab");
                 }
             }
             SystemStateAction::CopyCommand { command, by_person } => {
@@ -1904,40 +1843,11 @@ impl App {
                 if admission != Admission::Automatic && answer.changed.is_some() {
                     self.resolve_withdrawn_system_state_offer(Instant::now());
                 }
-                // The page's own answer to the offer of a plan an earlier process admitted holds
-                // nothing (§3.3, §6): it admits nothing new, so it neither withdraws the window's
-                // own admission nor turns a Stop a person's row press may go past into one it may
-                // not. It is moot while the window holds its own admission already.
-                let resume_answer = admission == Admission::Automatic
-                    && self
-                        .system_state_host
-                        .pending
-                        .as_ref()
-                        .is_some_and(|request| matches!(request.kind(), OfferKind::Resume));
-                if resume_answer
-                    && self.own_admission_stands()
-                    && let Some(request) = self.system_state_host.pending.take()
-                {
-                    request.let_go();
-                    return;
-                }
-                // A press answers for itself, never for the offer of a plan an earlier process
-                // admitted (§6): that offer goes, and the press is the manual choice it is.
-                if admission != Admission::Automatic
-                    && self
-                        .system_state_host
-                        .pending
-                        .as_ref()
-                        .is_some_and(|request| matches!(request.kind(), OfferKind::Resume))
-                    && let Some(request) = self.system_state_host.pending.take()
-                {
-                    request.finish(WorkstationSetupDecision::Unavailable);
-                }
                 // A run going now, or a plan still being admitted, stops for
                 // this one at its next step (§3.3): the worker does that as it
                 // takes the plan, so the window never sends a Stop that could
                 // reach this plan's own run.
-                self.begin_system_state_action(true, !resume_answer);
+                self.begin_system_state_action(true, true);
                 self.note_system_state_apply(admission);
                 // A person turning the Permissions group on asks for macOS's grants, as the offer's
                 // press does. Any other Apply (the page's automatic answer, Set up now, a Join, a

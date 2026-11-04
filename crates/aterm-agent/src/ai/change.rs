@@ -320,7 +320,8 @@ fn new_file_hunk(root: &Path, rel: &str) -> Option<String> {
     if path_of_open(&file)? != own {
         return None;
     }
-    let mut bytes = Vec::new();
+    let cap = usize::try_from(meta.len().min(UNTRACKED_FILE_MAX).saturating_add(1)).unwrap_or(0);
+    let mut bytes = Vec::with_capacity(cap);
     file.take(UNTRACKED_FILE_MAX + 1)
         .read_to_end(&mut bytes)
         .ok()?;

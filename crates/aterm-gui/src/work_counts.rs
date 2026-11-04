@@ -218,6 +218,7 @@ pub(crate) fn last_tooltips_pushed(window: crate::WindowId) -> Option<Vec<Option
 thread_local! {
     static COUNTING: Cell<bool> = const { Cell::new(false) };
     static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+    static FREED: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Threads inside [`allocations_in`] now: while none is, an allocation
@@ -235,6 +236,18 @@ impl CountingAlloc {
         let _ = COUNTING.try_with(|on| {
             if on.get() {
                 let _ = ALLOCATIONS.try_with(|n| n.set(n.get() + 1));
+            }
+        });
+    }
+
+    /// Count `bytes` handed back to the allocator on a counting thread ([`bytes_freed_in`]).
+    fn note_freed(bytes: usize) {
+        if COUNTING_THREADS.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            return;
+        }
+        let _ = COUNTING.try_with(|on| {
+            if on.get() {
+                let _ = FREED.try_with(|n| n.set(n.get().saturating_add(bytes)));
             }
         });
     }
@@ -257,11 +270,13 @@ unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
         Self::note();
+        Self::note_freed(layout.size().saturating_sub(size));
         // SAFETY: forwarded with the caller's pointer, layout and size.
         unsafe { std::alloc::System.realloc(ptr, layout, size) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        Self::note_freed(layout.size());
         // SAFETY: forwarded with the caller's pointer and layout.
         unsafe { std::alloc::System.dealloc(ptr, layout) }
     }
@@ -287,6 +302,15 @@ pub(crate) fn allocations_in<R>(f: impl FnOnce() -> R) -> (R, usize) {
     let out = f();
     drop(counting);
     (out, ALLOCATIONS.with(|n| n.replace(0)))
+}
+
+/// Run `f` and say how many heap bytes it handed back on this thread: each
+/// freed block's requested size, and what a shrinking reallocation gave up
+/// (a growing one frees nothing net).
+pub(crate) fn bytes_freed_in<R>(f: impl FnOnce() -> R) -> (R, usize) {
+    FREED.with(|n| n.set(0));
+    let (out, _) = allocations_in(f);
+    (out, FREED.with(|n| n.replace(0)))
 }
 
 thread_local! {

@@ -15,7 +15,7 @@ use std::{
     collections::{BTreeMap, VecDeque},
     io,
     os::{fd::AsFd as _, unix::net::UnixDatagram},
-    sync::{Arc, Mutex, PoisonError, atomic::AtomicUsize},
+    sync::{Arc, Condvar, Mutex, PoisonError, atomic::AtomicUsize},
     time::Instant,
 };
 
@@ -108,9 +108,27 @@ struct Publication {
 /// A read-only local subscription. Cloning/dropping it owns no native job lifetime.
 /// No subscriber callback or I/O runs inside the execution owner's tick.
 #[derive(Clone)]
-pub struct Observer(Arc<Mutex<Publication>>);
+pub struct Observer(Arc<Mutex<Publication>>, Arc<Condvar>);
 
 impl Observer {
+    // The predicate and wait share the publication mutex, so a revision between
+    // capture and park cannot be lost. This runs only on an independent reader.
+    fn wait_revision(&self, revision: u64, until: Instant) {
+        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        while !state.exhausted && !state.snapshot.closed && state.snapshot.revision == revision {
+            let remaining = until.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            state = self
+                .1
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+    }
+
+    #[cfg(test)]
     fn latest(&self) -> io::Result<(Arc<Snapshot>, Instant)> {
         let state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         if state.exhausted {
@@ -277,18 +295,21 @@ impl Owner {
             process,
             sender: Arc::new(sender),
         };
-        let observer = Observer(Arc::new(Mutex::new(Publication {
-            snapshot: Arc::new(Snapshot {
-                generation,
-                revision: 0,
-                closed: false,
-                jobs: Vec::new(),
-            }),
-            at: Instant::now(),
-            events: VecDeque::with_capacity(history),
-            limit: history,
-            exhausted: false,
-        })));
+        let observer = Observer(
+            Arc::new(Mutex::new(Publication {
+                snapshot: Arc::new(Snapshot {
+                    generation,
+                    revision: 0,
+                    closed: false,
+                    jobs: Vec::new(),
+                }),
+                at: Instant::now(),
+                events: VecDeque::with_capacity(history),
+                limit: history,
+                exhausted: false,
+            })),
+            Arc::new(Condvar::new()),
+        );
         Ok(Self {
             jobs,
             tickets: BTreeMap::new(),
@@ -495,6 +516,8 @@ impl Owner {
         }
         let Some(revision) = state.snapshot.revision.checked_add(events.len() as u64) else {
             state.exhausted = true;
+            drop(state);
+            self.observer.1.notify_all();
             return Ok(());
         };
         for (at, (attempt, event)) in (state.snapshot.revision + 1..=revision).zip(events) {
@@ -514,6 +537,8 @@ impl Owner {
             jobs,
         });
         state.at = Instant::now();
+        drop(state);
+        self.observer.1.notify_all();
         Ok(())
     }
 
@@ -557,6 +582,8 @@ impl Drop for Owner {
         }
         // Preserve the actual row observation time, not the client's read time.
         state.snapshot = Arc::new(snapshot);
+        drop(state);
+        self.observer.1.notify_all();
     }
 }
 
@@ -565,24 +592,27 @@ mod tests {
     use super::*;
 
     fn publication(revision: u64, first: u64, count: usize) -> Observer {
-        Observer(Arc::new(Mutex::new(Publication {
-            snapshot: Arc::new(Snapshot {
-                generation: Generation([8; 16]),
-                revision,
-                closed: false,
-                jobs: Vec::new(),
-            }),
-            at: Instant::now(),
-            events: (0..count)
-                .map(|index| Record {
-                    revision: first + index as u64,
-                    attempt: None,
-                    event: Event::StateChanged,
-                })
-                .collect(),
-            limit: 1024,
-            exhausted: false,
-        })))
+        Observer(
+            Arc::new(Mutex::new(Publication {
+                snapshot: Arc::new(Snapshot {
+                    generation: Generation([8; 16]),
+                    revision,
+                    closed: false,
+                    jobs: Vec::new(),
+                }),
+                at: Instant::now(),
+                events: (0..count)
+                    .map(|index| Record {
+                        revision: first + index as u64,
+                        attempt: None,
+                        event: Event::StateChanged,
+                    })
+                    .collect(),
+                limit: 1024,
+                exhausted: false,
+            })),
+            Arc::new(Condvar::new()),
+        )
     }
 
     #[test]

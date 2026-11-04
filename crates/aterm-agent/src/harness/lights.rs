@@ -561,9 +561,12 @@ mod tests {
                 "{}: {got:?}",
                 path.display()
             );
+            // The prompt-history search (Ctrl-R) heads the mode row with its words and query
+            // (measured on 2.1.318): no mode row is read there, so the glass leaves the row whole.
             if rows
                 .iter()
                 .any(|r| r.contains("\u{23F5}\u{23F5} auto mode on"))
+                && !aterm_phase::phase::history_search(&rows)
             {
                 assert_eq!(s.mode, Some(Mode::Auto), "{}", path.display());
             }

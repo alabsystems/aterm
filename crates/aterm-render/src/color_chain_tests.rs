@@ -103,7 +103,7 @@ fn repair_checksums(font: &mut [u8]) {
 }
 
 struct Faces {
-    dir: std::path::PathBuf,
+    _dir: aterm_tempfile::TempDir,
     head: String,
     next: String,
     next_bytes: Vec<u8>,
@@ -111,20 +111,14 @@ struct Faces {
 
 impl Faces {
     fn new(name: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-color-chain-{name}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch font directory");
+        let dir = crate::test_scratch_dir(&format!("color-chain-{name}"));
         let next_bytes = next_face();
-        let head = dir.join("head-emoji.ttf");
-        let next = dir.join("next-emoji.ttf");
+        let head = dir.path().join("head-emoji.ttf");
+        let next = dir.path().join("next-emoji.ttf");
         std::fs::write(&head, COLR).expect("head face written");
         std::fs::write(&next, &next_bytes).expect("next face written");
         Faces {
-            dir,
+            _dir: dir,
             head: head.to_string_lossy().into_owned(),
             next: next.to_string_lossy().into_owned(),
             next_bytes,
@@ -135,12 +129,6 @@ impl Faces {
         let mut r = renderer();
         r.color_font_paths = vec![self.head.clone(), self.next.clone()];
         r
-    }
-}
-
-impl Drop for Faces {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 

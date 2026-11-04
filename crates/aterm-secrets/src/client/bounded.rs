@@ -30,15 +30,18 @@ pub(super) fn take(paths: &Paths, deadline: Option<Instant>) -> crate::Result<St
     }
 }
 
-/// Fetch verified membership records and the best available envelope, then materialize them.
+/// Apply already-received log changes or repair local files from the authenticated cache if
+/// possible; otherwise fetch verified membership records and the best available envelope,
+/// then materialize them.
 /// Discovery, network requests and state-lock waits share one absolute `deadline`. This member
 /// pass does not mirror, repost records or put an envelope back on a server; the standing
 /// subscriber owns that upkeep. It uses the same admission, pin, floor and materialization
 /// checks as [`sync`].
 ///
 /// # Errors
-/// Configuration, verification or materialization fails, no source answers, or the deadline
-/// elapses before a required request or state lock completes.
+/// Configuration, verification or materialization fails, neither a source nor an admitted
+/// cache supplies recovery, or the deadline elapses before a required request or state lock
+/// completes.
 pub fn sync_reader_until(paths: &Paths, deadline: Instant) -> crate::Result<SyncOutcome> {
     sync_reader_with_candidates_until(paths, deadline, &[])
 }
@@ -49,6 +52,25 @@ pub(super) fn sync_reader_with_candidates_until(
     candidates: &[String],
 ) -> crate::Result<SyncOutcome> {
     budget(Some(deadline), Duration::MAX)?;
+    let config = configured(paths)?;
+    let before = load_state(paths)?;
+    // Network discovery and stalled peers can consume the whole deadline.
+    // Local recovery gets its chance first, under that same hard deadline,
+    // without inventing a network attempt or renewing its receipts.
+    let local = apply_until(
+        paths,
+        config.clone(),
+        before.clone(),
+        ApplyInput::Cached,
+        None,
+        Some(deadline),
+        true,
+    )?;
+    match local {
+        SyncOutcome::Unchanged { .. } => {}
+        SyncOutcome::Applied { ref report, .. } if apply_failed(report) => {}
+        complete => return Ok(complete),
+    }
     let config = configured(paths)?;
     let before = load_state(paths)?;
     let subscriber = subscriber_recipient(paths);
@@ -81,7 +103,7 @@ pub(super) fn sync_reader_with_candidates_until(
             Source::Url(url) => transport::fetch_within_as_observed(
                 url,
                 None,
-                budget(Some(deadline), PROBE_DEADLINE)?,
+                budget(Some(deadline), servers_within(PROBE_DEADLINE))?,
                 subscriber.as_deref(),
             ),
             Source::Path(_) => {
@@ -106,70 +128,47 @@ pub(super) fn sync_reader_with_candidates_until(
         let primary_advanced = match (&fetched, config.signer.as_ref()) {
             (Ok(Fetched::Body(bytes)), Some(pin)) => {
                 envelope::verify_for_reader(bytes, &config.name, pin, &config.followed, None)
-                    .is_ok_and(|(envelope, _, _)| envelope.seq > before.seq)
+                    .is_ok_and(|(envelope, pinned, _)| {
+                        peer_selection::primary_advances(&before, &envelope, pinned)
+                    })
             }
             _ => false,
         };
         if !primary_advanced && let Some(pin) = config.signer.as_ref() {
-            let found: Vec<SyncPeerHead> = match budget(Some(deadline), PROBE_DEADLINE) {
+            let peers_within = budget(Some(deadline), servers_within(PROBE_DEADLINE));
+            let found: Vec<SyncPeerHead> = match peers_within {
                 Ok(left) => {
                     probe_peers_for_sync(paths, &peers, &config, pin, left, subscriber.as_deref())
                 }
                 Err(_) => Vec::new(),
             };
-            let exact = before.digest.and_then(|digest| {
-                found
-                    .iter()
-                    .find(|p| p.seq == before.seq && p.digest == digest)
-                    .map(|p| (p.envelope.clone(), p.network_body))
-            });
-            if let Some(peer) = found.into_iter().max_by_key(|p| (p.seq, p.digest)) {
-                let take_peer = match &fetched {
-                    Err(_) => {
-                        peer.seq > before.seq
-                            || (peer.seq == before.seq
-                                && before.digest.is_none_or(|digest| digest == peer.digest))
-                    }
-                    Ok(Fetched::Missing) => peer.seq > before.seq || before.seq == 0,
-                    Ok(Fetched::NoNewer(_) | Fetched::Body(_)) => {
-                        peer.seq > before.seq && peer_subsumes_held(paths, &config, &before, &peer)
-                    }
-                };
-                if take_peer {
-                    network_body = peer.network_body;
-                    fetched = Ok(Fetched::Body(peer.envelope));
-                } else if let Some((exact, exact_body)) = exact {
-                    // The exact head already held is also safe when the primary is missing,
-                    // stale or invalid. Reapplying it lets newly fetched membership records
-                    // take effect without requiring this reader to heal the primary first.
-                    network_body = exact_body;
-                    fetched = Ok(Fetched::Body(exact));
-                }
+            if let Some(peer) = peer_selection::select(
+                paths,
+                &config,
+                &before,
+                &fetched,
+                found,
+                false,
+                Some(deadline),
+            )? {
+                network_body = peer.network_body;
+                fetched = Ok(Fetched::Body(peer.envelope));
             }
         }
         if network_body.is_some() {
             refresh.peer_response();
         }
-        let fetched = fetched.or_else(|error| {
-            if log_entries::current_records_digest(paths, &config, &before) != before.records_digest
-                && let Some(copy) = verified_cached_envelope(paths, &config, &before)
-            {
-                network_body = None;
-                Ok(Fetched::Body(copy))
-            } else {
-                Err(error)
-            }
-        })?;
-        apply_fetched_until(
+        apply_response_until(
             paths,
             config.clone(),
             before,
-            network_observation::Received {
+            fetched.map(|fetched| network_observation::Received {
                 fetched,
                 body: network_body,
-            },
+            }),
             None,
             Some(deadline),
+            true,
         )
     })
 }
@@ -243,7 +242,7 @@ pub fn join_if_unchanged_until(
         resolved.as_ref().unwrap_or(options),
         ExpectedConfig::Read(expected),
         |source| {
-            let left = budget(Some(deadline), PROBE_DEADLINE)?;
+            let left = budget(Some(deadline), servers_within(PROBE_DEADLINE))?;
             match source {
                 Source::Url(url) => transport::fetch_within(url, None, left),
                 Source::Path(_) => transport::fetch(source, None, Duration::ZERO),

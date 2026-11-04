@@ -1317,7 +1317,7 @@ fn the_row_stays_calm_after_the_tab_installed_them_until_it_is_read_again() {
     );
 }
 
-/// The page says "Enter your password in the Command Line Tools tab", and its Go to tab brings
+/// The page says "Enter your password in the Mac Setup tab", and its Go to tab brings
 /// that tab to the front: the tab is named so, whatever its program titles it.
 #[test]
 fn the_tab_the_page_names_carries_that_name() {
@@ -2450,7 +2450,7 @@ fn the_tab_closes_itself_once_it_installed_them_but_never_ends_its_window() {
     );
 }
 
-/// A package pass that says `c-toolchain: missing` while aterm's own Command Line Tools tab
+/// A package pass that says `c-toolchain: missing` while aterm's own Mac Setup tab
 /// installs them files no only-you entry telling the person to run that install (nux round 9's
 /// sixth exception): the verdict waits for the tab. A tab the person stopped leaves the tools to
 /// them, so the entry is filed then; a tab that installed them files none.

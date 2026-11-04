@@ -1340,10 +1340,11 @@ pub fn serve_fleet_mail_code<S: std::io::Read + std::io::Write>(
 fn read_regular_nofollow_bounded(path: &Path, max: u64) -> Option<String> {
     use std::io::Read as _;
     let file = astream_sys::open_nonblocking(path, astream_sys::Links::Refuse).ok()?;
-    if !file.metadata().ok()?.is_file() {
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.len() > max {
         return None;
     }
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0).saturating_add(1));
     file.take(max.saturating_add(1))
         .read_to_end(&mut bytes)
         .ok()?;

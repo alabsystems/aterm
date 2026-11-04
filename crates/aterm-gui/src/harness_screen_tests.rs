@@ -251,6 +251,66 @@ fn machines_toml_names_and_hosts_read_as_written() {
     assert!(configured_hosts_in("not = [toml", &names).is_empty());
 }
 
+/// This Mac's own name is its Bonjour `LocalHostName` before its `ComputerName` (the name a LAN
+/// probe asks for as `<name>.local`), then `$HOSTNAME`, then its host name short of a trailing
+/// dot, `.local` or `.localdomain`, then "this Mac": each trimmed, a blank one passed over, and
+/// none read past the first that names it.
+#[test]
+fn this_macs_name_is_its_bonjour_name_before_its_computer_name() {
+    fn scutil<'a>(keys: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |key| {
+            keys.iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| (*v).to_owned())
+        }
+    }
+    let host = |name: &'static str| move || Some(name.to_owned());
+    assert_eq!(
+        local_host_name_from(
+            |key: &str| match key {
+                "LocalHostName" => Some("m15-MacBook-Pro\n".to_owned()),
+                other => panic!("no {other} read past LocalHostName"),
+            },
+            || panic!("no $HOSTNAME read"),
+            || panic!("no host name read")
+        ),
+        "m15-MacBook-Pro"
+    );
+    assert_eq!(
+        local_host_name_from(scutil(&[("ComputerName", " Studio ")]), || None, host("h")),
+        "Studio"
+    );
+    assert_eq!(
+        local_host_name_from(
+            scutil(&[("LocalHostName", " "), ("ComputerName", "Studio")]),
+            || panic!("no $HOSTNAME read"),
+            || panic!("no host name read")
+        ),
+        "Studio",
+        "a blank LocalHostName passed over for the ComputerName"
+    );
+    assert_eq!(
+        local_host_name_from(
+            scutil(&[]),
+            || Some(" box ".into()),
+            || panic!("no host name read past $HOSTNAME")
+        ),
+        "box"
+    );
+    assert_eq!(
+        local_host_name_from(scutil(&[]), || Some(" ".into()), host(" m3.local. ")),
+        "m3"
+    );
+    assert_eq!(
+        local_host_name_from(scutil(&[]), || None, host("x.localdomain")),
+        "x"
+    );
+    assert_eq!(
+        local_host_name_from(scutil(&[]), || None, host("")),
+        "this Mac"
+    );
+}
+
 #[test]
 fn durations_and_shares_read_as_the_page_says_them() {
     assert_eq!(duration_words(0), "0m");
@@ -1733,6 +1793,91 @@ fn a_rows_day_line_names_a_self_claims_holder_after_aterms_counts() {
         ..Tally::default()
     };
     assert_eq!(day_line(&nothing, Some(0)), None, "no count, no part");
+}
+
+/// THE FACTS A SELF-CLAIM'S ACTS CARRIED ARE SAID AFTER ITS ACTS (gap 23): in its day line and its
+/// WHAT THE HARNESS DID row, never in aterm's own `Facts told (<kind>)` rows. NEGATIVE CONTROL: the
+/// same holder with no fact told reads as before.
+#[test]
+fn a_self_claims_facts_told_follow_its_acts_and_never_aterms_facts() {
+    use aterm_agent::harness::stats::{SelfClaimed, Tally};
+    let did = |facts_told: u64| SelfClaimed {
+        continued: 3,
+        acts: 3,
+        facts_told,
+        ..SelfClaimed::default()
+    };
+    let tally = |facts_told: u64| Tally {
+        self_claimed: [("codex-alab".to_string(), did(facts_told))].into(),
+        ..Tally::default()
+    };
+    assert_eq!(
+        day_line(&tally(1), Some(0)).as_deref(),
+        Some("today: codex-alab did 3 kept going, 1 fact told")
+    );
+    assert_eq!(
+        day_line(&tally(0), Some(0)).as_deref(),
+        Some("today: codex-alab did 3 kept going"),
+        "NEGATIVE CONTROL"
+    );
+    let only = Tally {
+        self_claimed: [(
+            "codex-alab".to_string(),
+            SelfClaimed {
+                facts_told: 2,
+                ..SelfClaimed::default()
+            },
+        )]
+        .into(),
+        ..Tally::default()
+    };
+    assert_eq!(
+        day_line(&only, Some(0)).as_deref(),
+        Some("today: codex-alab did 2 facts told")
+    );
+    // The page's WHAT THE HARNESS DID rows for a week in which aterm acted too, so its own
+    // `Facts told (<kind>)` rows render wherever its week holds one: the holder's two facts told
+    // are its row's alone.
+    let today = HarnessStats::new(0);
+    let mut week = HarnessStats::new(0);
+    week.approved = 5;
+    week.rows = 5;
+    week.self_claimed.insert("codex-alab".to_string(), did(2));
+    let mut state = HarnessState::unobserved();
+    state.observed = true;
+    let report = |week: &HarnessStats| {
+        Some(std::sync::Arc::new(HarnessStatsReport::new(
+            today.clone(),
+            week.clone(),
+            1_000_000_000,
+            Some(0),
+            &|_| Some(0),
+        )))
+    };
+    state.stats.report = report(&week);
+    let rows = state.projection().did_rows;
+    assert!(
+        rows.contains(&(
+            "codex-alab did".to_string(),
+            "none today \u{b7} 3 kept going, 2 facts told in 7 days".to_string()
+        )),
+        "{rows:?}"
+    );
+    assert!(
+        rows.iter().all(|(label, _)| !label.starts_with("Facts ")),
+        "none of aterm's own facts told: {rows:?}"
+    );
+    // CONTROL: aterm's own told fact renders its row, counting only aterm's.
+    week.facts_told.insert("no-progress".to_string(), 1);
+    state.stats.report = report(&week);
+    let rows = state.projection().did_rows;
+    assert!(
+        rows.contains(&(
+            "Facts told (no-progress)".to_string(),
+            "0 today \u{b7} 1 in 7 days".to_string()
+        )),
+        "{rows:?}"
+    );
 }
 
 #[test]

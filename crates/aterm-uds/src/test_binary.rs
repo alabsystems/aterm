@@ -29,9 +29,14 @@ pub fn scratch_root() -> Option<&'static Path> {
     }
 }
 
-/// Whether `exe` is a Cargo test binary. Linux names a running image that a later build unlinked
-/// `<path> (deleted)` (its `/proc/self/exe`, which `current_exe` reads), and that image is still the
-/// test binary it was.
+/// Whether `exe` is a Cargo test binary: an executable with the name Cargo gives one,
+/// `<name>-<16 hex digits>`, in any folder, so that a copy kept aside to compare two builds stays
+/// out of the person's folders as the original does. Under any other name it cannot be told from a
+/// development program, and it runs on the person's real state, sockets and fleet port. Cargo names
+/// an example and a build script the same way, and each of those is a program.
+///
+/// Linux names a running image that a later build unlinked `<path> (deleted)` (its
+/// `/proc/self/exe`, which `current_exe` reads), and that image is still the test binary it was.
 #[must_use]
 pub fn is_test_binary(exe: &Path) -> bool {
     #[cfg(unix)]
@@ -42,38 +47,24 @@ pub fn is_test_binary(exe: &Path) -> bool {
             .strip_suffix(b" (deleted)")
             .map_or(exe, |path| Path::new(OsStr::from_bytes(path)))
     };
-    let in_deps = exe
-        .parent()
-        .and_then(Path::file_name)
-        .is_some_and(|dir| dir == "deps");
     let executable = exe.extension().is_none_or(|ext| ext == "exe");
     let named = exe
         .file_stem()
         .and_then(OsStr::to_str)
         .and_then(|stem| stem.rsplit_once('-'))
-        .filter(|(name, hash)| {
+        .is_some_and(|(name, hash)| {
             !name.is_empty()
+                && !name.starts_with("build_script_")
                 && hash.len() == 16
                 && hash
                     .bytes()
                     .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         });
-    let Some((_, hash)) = named else {
-        return false;
-    };
-    // Native Targo's separated build directory retains test executables at
-    // build/<package>/<unit-hash>/out/<target>-<same-unit-hash>. This is the
-    // same debug-only isolation heuristic as deps/, not executable authority.
-    let native_out = exe
+    let example = exe
         .parent()
-        .filter(|out| out.file_name().is_some_and(|n| n == "out"))
-        .and_then(Path::parent)
-        .filter(|unit| unit.file_name().is_some_and(|name| name == hash))
-        .and_then(Path::parent)
-        .filter(|package| package.file_name().is_some_and(|name| !name.is_empty()))
-        .and_then(Path::parent)
-        .is_some_and(|build| build.file_name().is_some_and(|name| name == "build"));
-    executable && (in_deps || native_out)
+        .and_then(Path::file_name)
+        .is_some_and(|dir| dir == "examples");
+    executable && named && !example
 }
 
 /// Whether `dir` is the login session's runtime directory (`/run/user/<uid>`).
@@ -229,6 +220,9 @@ mod tests {
             "/t/debug/build/aterm-types/0123456789abcdef/out/aterm_types-0123456789abcdef",
             "/t/opt-test/build/package/0123456789abcdef/out/contract-0123456789abcdef",
             r"C:\t\debug\build\aterm-uds\0123456789abcdef\out\aterm_uds-0123456789abcdef.exe",
+            // A copy kept aside to compare two builds is as isolated as the original.
+            "/scratch/base/aterm_gui-ed1c215a8f696a87",
+            r"C:\scratch\base\aterm_gui-ed1c215a8f696a87.exe",
         ] {
             let exe = exe.replace('\\', std::path::MAIN_SEPARATOR_STR);
             assert!(is_test_binary(Path::new(&exe)), "{exe}");
@@ -238,16 +232,16 @@ mod tests {
             "/t/debug/aterm (deleted)",
             "/t/debug/examples/demo-ed1c215a8f696a87",
             "/t/debug/build/aterm-gui-ed1c215a8f696a87/build-script-build",
+            "/t/debug/build/aterm-gui-ed1c215a8f696a87/build_script_build-ed1c215a8f696a87",
             "/t/debug/deps/aterm_gui-ED1C215A8F696A87",
             "/t/debug/deps/aterm_gui-ed1c215a8f696a8",
             "/t/debug/deps/-ed1c215a8f696a87",
             "/t/debug/deps/libaterm_uds-ed1c215a8f696a87.rlib",
             "/Applications/aterm.app/Contents/MacOS/aterm",
-            "/t/debug/build/pkg/fedcba9876543210/out/unit-0123456789abcdef",
             "/t/debug/build/pkg/0123456789abcdef/out/unit-0123456789abcdef.rlib",
             "/t/debug/build/pkg/0123456789abcdef/out/build-script-build",
-            "/t/debug/build/0123456789abcdef/out/unit-0123456789abcdef",
-            "/t/debug/other/pkg/0123456789abcdef/out/unit-0123456789abcdef",
+            // The gap this name leaves: a copy renamed without its hash reads as a program.
+            "/scratch/base/aterm_gui",
         ] {
             assert!(!is_test_binary(Path::new(exe)), "{exe}");
         }

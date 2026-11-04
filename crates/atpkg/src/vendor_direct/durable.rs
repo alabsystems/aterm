@@ -215,12 +215,25 @@ mod tests {
         assert_eq!(std::fs::read(tmp).unwrap(), b"a = 1\n");
     }
 
+    /// A raw Darwin refusal that no std names by a refusal kind, `ENODEV` (what a full flush
+    /// of `/dev/null` answers), is accepted too: staging reads astream's rule, not a list of
+    /// kinds. Darwin's `ENOTSUP` (45) would not show that: the Trust std reads it as
+    /// `Unsupported`, the kind the test above feeds. CONTROL: `ENODEV`'s kind alone is no
+    /// refusal.
     #[cfg(target_vendor = "apple")]
     #[test]
     fn a_staged_file_accepts_a_darwin_raw_flush_refusal() {
+        let enodev = io::Error::from_raw_os_error(libc::ENODEV);
+        assert!(
+            aterm_durable::refusal_accepted(Err(io::Error::from(enodev.kind()))).is_err(),
+            "CONTROL: std names ENODEV by kind ({enodev:?}); the errno half is untested"
+        );
         let d = dir("raw-refused-flush");
         let tmp = d.join("stage");
-        stage_with(&tmp, b"a = 1\n", |_| Err(io::Error::from_raw_os_error(45))).unwrap();
+        stage_with(&tmp, b"a = 1\n", |_| {
+            Err(io::Error::from_raw_os_error(libc::ENODEV))
+        })
+        .unwrap();
         assert_eq!(std::fs::read(tmp).unwrap(), b"a = 1\n");
     }
 

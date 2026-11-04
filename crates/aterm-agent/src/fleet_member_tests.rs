@@ -9137,6 +9137,26 @@ struct Racing {
     a: (World, String, Listener),
     b: (World, String, Listener),
     c: (World, String, Listener),
+    // The race's fixture as the product's verbs made it, and the issuers' books as they left them.
+    template: RefCell<Option<(World, [Vec<Peer>; 3])>>,
+}
+
+/// The files and directories under `from` again under `to`, each with its mode. A fixture holds no
+/// symlink, which a copy would follow.
+fn copy_tree(from: &Path, to: &Path) {
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let meta = entry.metadata().unwrap();
+        let target = to.join(entry.file_name());
+        if meta.is_dir() {
+            std::fs::create_dir(&target).unwrap();
+            std::fs::set_permissions(&target, meta.permissions()).unwrap();
+            copy_tree(&entry.path(), &target);
+        } else {
+            assert!(meta.is_file(), "{:?} in a fixture", entry.path());
+            std::fs::copy(entry.path(), &target).unwrap();
+        }
+    }
 }
 
 impl Racing {
@@ -9144,14 +9164,40 @@ impl Racing {
         member::node_id(&self.a.0.places.state).unwrap()
     }
 
+    fn issuers(&self) -> [&World; 3] {
+        [&self.a.0, &self.b.0, &self.c.0]
+    }
+
+    /// A world this race's run starts from: its fixture as [`Self::fixture_fresh`] made it once,
+    /// copied, with the issuers' books back as that left them, so every run meets what a fresh
+    /// fixture would, a book's row for this member included. The fixture's closed ports now last
+    /// the race, not one run; a listener that took one in that time proves no key, so it can only
+    /// delay a read.
     fn fixture(&self, fixture: Fixture) -> (World, Option<FleetSecret>) {
-        for issuer in [&self.a.0, &self.b.0, &self.c.0] {
-            member::update_peers(&issuer.places.state, |book| {
-                book.retain(|peer| peer.via != Via::Joined);
+        let mut template = self.template.borrow_mut();
+        let (made, books) = template.get_or_insert_with(|| {
+            let made = self.fixture_fresh(fixture);
+            let books = self
+                .issuers()
+                .map(|issuer| read_peers(&issuer.places.state).unwrap());
+            (made, books)
+        });
+        for (issuer, book) in self.issuers().into_iter().zip(books.iter()) {
+            member::update_peers(&issuer.places.state, |now| {
+                now.clone_from(book);
                 Ok(())
             })
             .unwrap();
         }
+        let world = World::new("race");
+        copy_tree(made._tmp.path(), world._tmp.path());
+        let own = read_key_file(&world.places.state)
+            .ok()
+            .filter(|_| matches!(fixture, Fixture::Issuer | Fixture::Unlistened));
+        (world, own)
+    }
+
+    fn fixture_fresh(&self, fixture: Fixture) -> World {
         let world = World::new("race");
         let places = &world.places;
         match fixture {
@@ -9182,10 +9228,7 @@ impl Racing {
                 ok(syncing(places, false, &self.b.1));
             }
         }
-        let own = read_key_file(&places.state)
-            .ok()
-            .filter(|_| matches!(fixture, Fixture::Issuer | Fixture::Unlistened));
-        (world, own)
+        world
     }
 
     fn end(&self, world: &World, own: Option<&FleetSecret>) -> End {
@@ -9439,7 +9482,8 @@ fn every_fleet_writer_ends_as_some_serial_order_would() {
         aterm_spec::check::each_on(aterm_spec::fs_lane::PLACES, &races, |&(at, one)| {
             aterm_spec::check::attempt(|| {
                 let [a, b, c] = ["a", "b", "c"].map(|name| issuing(&format!("race{at}-{name}")));
-                race(&Racing { a, b, c }, one)
+                let template = RefCell::default();
+                race(&Racing { a, b, c, template }, one)
             })
             .unwrap_or_else(|why| vec![format!("race {at} ({}) panicked: {why}", one.verb)])
         })
@@ -9984,6 +10028,8 @@ fn an_admitted_member_receives_the_signed_fleet_code_and_joins_with_default_driv
     use aterm_secrets::server;
     use aterm_secrets::text::Audience;
 
+    // The vault server this thread reads is the test's own on loopback, which answers.
+    let _answering = client::ServersAnswering::within(aterm_spec::wait::MUST_HAPPEN);
     let (issuer, code, _serving) = issuing("automatic-lan");
     let member = World::new("automatic-lan-newcomer");
     let root = aterm_tempfile::tempdir().unwrap();
@@ -11522,6 +11568,59 @@ fn fleet_leave_stops_and_removes_installed_node_job_without_recording_node_off()
         again.starts_with("aterm fleet leave: this machine is in no fleet;"),
         "again={again}"
     );
+}
+
+/// `fleet leave` in a process under a private state root whose `HOME` is still the account's
+/// own (an isolated instance set up for a real Claude Code), with the account's node job
+/// installed: the file-only supervisor `supervisor_here` hands it keeps the account's unit file,
+/// and the report says it was kept and its job not stopped, never that it was removed. The
+/// leave itself, its `fleet-off`, still goes through.
+/// NEGATIVE CONTROL: the same leave through a file-only supervisor whose account home is
+/// elsewhere removes the unit and says so, as every file-only leave did on `main`.
+#[test]
+fn a_private_fleet_leave_keeps_the_accounts_own_node_unit_and_says_so() {
+    use crate::node_service::{self, FileOnlySupervisor, ServiceSupervisor as _};
+
+    let world = World::new("leave-keeps-account-unit");
+    let home = world.places.state.parent().unwrap().join("home");
+    let exe = home.join("aterm");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(&exe, b"bin").unwrap();
+    let elsewhere = FileOnlySupervisor::guarding(Some(home.with_file_name("account-home")));
+    let unit =
+        node_service::install_with(&exe, &home, &world.places.state, false, &elsewhere).unwrap();
+    let before = std::fs::read(&unit).unwrap();
+    let own = FileOnlySupervisor::guarding(Some(home.clone()));
+
+    let report = ok(leave_within_node(
+        &world.places,
+        Some(&home),
+        Some(&own),
+        Duration::from_millis(20),
+    ));
+    assert!(
+        report.contains(&format!(
+            "  kept       {} (the node job, not stopped): it is this account's own",
+            unit.display()
+        )),
+        "report={report}"
+    );
+    assert!(!report.contains("  removed    "), "report={report}");
+    assert_eq!(std::fs::read(&unit).unwrap(), before);
+    assert!(in_state(&world.places, member::OFF_FILE).unwrap());
+
+    let report = ok(leave_within_node(
+        &world.places,
+        Some(&home),
+        Some(&elsewhere),
+        Duration::from_millis(20),
+    ));
+    assert!(
+        report.contains(&format!("  removed    {} (the node job)\n", unit.display())),
+        "report={report}"
+    );
+    assert!(!unit.exists());
+    assert_eq!(own.unit_file(&home), unit);
 }
 
 #[cfg(unix)]

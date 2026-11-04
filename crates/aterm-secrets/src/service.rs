@@ -356,6 +356,34 @@ pub fn plist_text_in(
     domain: Domain,
     bundle_id: Option<&str>,
 ) -> String {
+    plist_text_with_path(
+        label,
+        program,
+        args,
+        log,
+        domain,
+        bundle_id,
+        LaunchdPath::Managed,
+    )
+}
+
+/// A service either inherits launchd's PATH or explicitly names the managed tools.
+/// Replacing its executable preserves that choice; new installations use the managed path.
+#[derive(Clone, Copy)]
+enum LaunchdPath {
+    Inherited,
+    Managed,
+}
+
+fn plist_text_with_path(
+    label: &str,
+    program: &Path,
+    args: &[String],
+    log: &Path,
+    domain: Domain,
+    bundle_id: Option<&str>,
+    path_setting: LaunchdPath,
+) -> String {
     let string = |s: &str| format!("<string>{}</string>", aterm_codec::xml::escape(s));
     let mut argv = String::new();
     for arg in
@@ -364,21 +392,25 @@ pub fn plist_text_in(
         argv.push_str(&format!("\t\t{}\n", string(arg)));
     }
     let environment = home_of_log(log).map_or_else(String::new, |home| {
-        let pkg_bin = home.join("Library/Application Support/aterm/pkg/bin");
-        let path = format!(
-            "{}:/usr/bin:/bin:/usr/sbin:/sbin",
-            pkg_bin.to_string_lossy()
-        );
+        let path = match path_setting {
+            LaunchdPath::Inherited => String::new(),
+            LaunchdPath::Managed => {
+                let pkg_bin = home.join("Library/Application Support/aterm/pkg/bin");
+                let value = format!(
+                    "{}:/usr/bin:/bin:/usr/sbin:/sbin",
+                    pkg_bin.to_string_lossy()
+                );
+                format!("\t\t<key>PATH</key>\n\t\t{}\n", string(&value))
+            }
+        };
         format!(
             "\t<key>EnvironmentVariables</key>\n\
              \t<dict>\n\
              \t\t<key>HOME</key>\n\
              \t\t{}\n\
-             \t\t<key>PATH</key>\n\
-             \t\t{}\n\
+             {path}\
              \t</dict>\n",
             string(&home.to_string_lossy()),
-            string(&path),
         )
     });
     let session = domain.session().map_or_else(String::new, |session| {
@@ -1521,7 +1553,12 @@ fn recoverable_subscriber_unit(home: &Path, program: &Path) -> crate::Result<Opt
     {
         return Ok(Some(false));
     }
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.len())
+            .unwrap_or(0)
+            .min(UNIT_FILE_MOST)
+            .saturating_add(1),
+    );
     file.take(UNIT_FILE_MOST as u64 + 1)
         .read_to_end(&mut bytes)?;
     let args = ["secrets".to_owned(), "watch".to_owned()];
@@ -2552,7 +2589,53 @@ fn repair_argv(definition: &str) -> Option<Vec<String>> {
     }
 }
 
-/// Produce a replacement of a supported unit, retaining its arguments and launchd domain.
+/// The complete supported launchd shape, shared by inspection and replacement.
+/// Exact rendering rejects additional manager directives or a custom environment.
+struct RepairPlistShape {
+    domain: Domain,
+    attributed: bool,
+    path: LaunchdPath,
+}
+
+fn repair_plist_shape(
+    home: &Path,
+    job: Job,
+    unit: &crate::service_repair::Unit,
+) -> Option<RepairPlistShape> {
+    let program = Path::new(&unit.program);
+    let log = log_path(home, job);
+    let bundle = bundle_id_of(program);
+    for domain in [Domain::Gui, Domain::User] {
+        for (id, attributed) in [(None, false), (bundle.as_deref(), true)] {
+            if attributed && id.is_none() {
+                continue;
+            }
+            for path in [LaunchdPath::Managed, LaunchdPath::Inherited] {
+                if unit.definition
+                    == plist_text_with_path(
+                        job.label(),
+                        program,
+                        &unit.args,
+                        &log,
+                        domain,
+                        id,
+                        path,
+                    )
+                {
+                    return Some(RepairPlistShape {
+                        domain,
+                        attributed,
+                        path,
+                    });
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Produce a replacement of a supported unit, retaining its arguments, launchd domain,
+/// bundle attribution policy and inherited or managed PATH.
 /// # Errors
 /// The old definition is unsupported or the new executable cannot be used by a service.
 pub fn repair_unit(
@@ -2572,37 +2655,21 @@ pub fn repair_unit(
         .ok_or_else(|| Error::new("non-UTF-8 executable"))?;
     let definition = if cfg!(target_os = "macos") {
         let log = log_path(home, job);
-        let old_program = Path::new(&old.program);
-        let old_bundle = bundle_id_of(old_program);
-        let (domain, had_bundle) = [Domain::Gui, Domain::User]
-            .into_iter()
-            .find_map(|d| {
-                if old.definition
-                    == plist_text_in(job.label(), old_program, &old.args, &log, d, None)
-                {
-                    Some((d, false))
-                } else if old_bundle.as_deref().is_some_and(|id| {
-                    old.definition
-                        == plist_text_in(job.label(), old_program, &old.args, &log, d, Some(id))
-                }) {
-                    Some((d, true))
-                } else {
-                    None
-                }
-            })
+        let shape = repair_plist_shape(home, job, old)
             .ok_or_else(|| Error::new("service definition has unsupported manager directives"))?;
         let new_bundle = bundle_id_of(program);
-        plist_text_in(
+        plist_text_with_path(
             job.label(),
             program,
             &old.args,
             &log,
-            domain,
-            if had_bundle {
+            shape.domain,
+            if shape.attributed {
                 new_bundle.as_deref()
             } else {
                 None
             },
+            shape.path,
         )
     } else {
         systemd_unit(job.description(), program, &old.args)
@@ -2643,13 +2710,7 @@ fn repair_check_unit(
     // Additional manager directives can override argv or add executable hooks. Only complete
     // definitions produced by this service writer are candidates for independent activation.
     let supported = if cfg!(target_os = "macos") {
-        let log = log_path(home, job);
-        let bundle = bundle_id_of(program);
-        [Domain::Gui, Domain::User].into_iter().any(|domain| {
-            [None, bundle.as_deref()].into_iter().any(|id| {
-                unit.definition == plist_text_in(job.label(), program, &unit.args, &log, domain, id)
-            })
-        })
+        repair_plist_shape(home, job, unit).is_some()
     } else {
         unit.definition == systemd_unit(job.description(), program, &unit.args)
     };
@@ -2943,6 +3004,84 @@ pub fn daemon_state_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn signed_repair_preserves_an_existing_inherited_path_and_exact_rollback() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let home = root.path();
+        let old_program = home.join("old-aterm");
+        let new_program = home.join("new-aterm");
+        std::fs::write(&old_program, b"old image").unwrap();
+        std::fs::write(&new_program, b"new image").unwrap();
+        let args = vec!["secrets".to_owned(), "watch".to_owned()];
+        let generated = plist_text_in(
+            Job::Subscriber.label(),
+            &old_program,
+            &args,
+            &log_path(home, Job::Subscriber),
+            Domain::Gui,
+            None,
+        );
+        // The installed subscriber inherited launchd's PATH: its owned definition sets
+        // HOME alone. Remove only the explicit PATH field to reproduce that input.
+        let path_at = generated.find("\t\t<key>PATH</key>\n").unwrap();
+        let path_end =
+            path_at + generated[path_at..].find("</string>\n").unwrap() + "</string>\n".len();
+        let mut definition = generated.clone();
+        definition.replace_range(path_at..path_end, "");
+        write_unit_file(&unit_file(home, Job::Subscriber), &definition).unwrap();
+
+        let observed = repair_observe_at(home, Job::Subscriber)
+            .expect("an owned subscriber can inherit launchd's PATH");
+        assert!(!observed.off);
+        assert!(observed.pin.is_none());
+        let old = observed.unit.unwrap();
+        assert_eq!(old.definition, definition);
+        let next = repair_unit(home, Job::Subscriber, &old, &new_program, &"a".repeat(64)).unwrap();
+        assert_eq!(next.args, args);
+        assert!(!next.definition.contains("<key>PATH</key>"));
+        repair_check_unit(home, Job::Subscriber, &next).unwrap();
+
+        let mut changed_path = old.clone();
+        changed_path.definition = generated.replace(
+            &aterm_codec::xml::escape(
+                &home
+                    .join("Library/Application Support/aterm/pkg/bin")
+                    .to_string_lossy(),
+            ),
+            "/untrusted/bin",
+        );
+        assert!(repair_check_unit(home, Job::Subscriber, &changed_path).is_err());
+        let mut changed_home = old.clone();
+        changed_home.definition = definition.replace(
+            &format!(
+                "<string>{}</string>",
+                aterm_codec::xml::escape(&home.to_string_lossy())
+            ),
+            "<string>/another-home</string>",
+        );
+        assert!(repair_check_unit(home, Job::Subscriber, &changed_home).is_err());
+
+        let mut manager = FakeLaunchd {
+            loaded: Some(Domain::Gui),
+            no_gui: false,
+            calls: Vec::new(),
+        };
+        for unit in [&next, &old] {
+            repair_restart_launchd(home, Job::Subscriber, unit, &mut |call| {
+                manager.answer(call)
+            })
+            .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(plist_path(home, Job::Subscriber)).unwrap(),
+                unit.definition
+            );
+        }
+        assert_eq!(manager.loaded, Some(Domain::Gui));
+        assert!(!subscriber_off_path(home).exists());
+        assert!(!pin_path(home, Job::Subscriber).exists());
+    }
 
     #[test]
     fn signed_repair_observes_exact_unit_and_preserves_persons_records() {

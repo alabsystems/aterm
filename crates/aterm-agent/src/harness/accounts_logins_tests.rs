@@ -40,6 +40,31 @@ fn roster() -> Roster {
     Roster::parse(&roster_text()).expect("admits")
 }
 
+fn admitted_observation(
+    logins: &mut Logins,
+    label: &str,
+    at: i64,
+    observe: impl FnOnce(&mut Logins) -> Vec<Event>,
+) -> Vec<Event> {
+    let home = tmp("admitted-observation");
+    let store = Store::at(home.path());
+    let path = home.path().join("accounts.toml");
+    std::fs::write(&path, roster_text()).unwrap();
+    store.save_logins(logins).unwrap();
+    let mut observed = Vec::new();
+    store
+        .transact_pool_logins_within(&[], &path, at, &mut None, |raw, _, logins| {
+            assert_eq!(raw, &roster());
+            admit_workflow(logins, label)?;
+            observed = observe(logins);
+            Ok(observed.clone())
+        })
+        .unwrap();
+    *logins = store.load_logins(at).unwrap().0;
+    assert!(current_workflow(roster().row(label).unwrap(), logins).is_some());
+    observed
+}
+
 fn every(roster: &Roster) -> BTreeSet<String> {
     roster.rows.iter().map(|r| r.label.clone()).collect()
 }
@@ -244,12 +269,20 @@ fn logins_round_trip_past_the_roster_limit_and_beside_an_untouched_state() {
 #[test]
 fn a_sign_in_task_survives_restart_and_old_login_use_until_a_new_login_is_bound() {
     let tmp = tmp("sign-in-task");
-    let store = Store::at_for(tmp.path(), Cli::Kimi, tmp.path());
+    let store = Store::at(tmp.path());
     let (mut state, mut logins) = renewed(NOW - DAY);
     let dir = logins.labels["main"].dir.clone();
     note_sign_in_task(&mut logins, "main", SignInAction::Browser, NOW - HOUR);
+    assert!(
+        sign_in_tasks(&roster(), &logins).is_empty(),
+        "unadmitted history is not a current step"
+    );
+    admitted_observation(&mut logins, "main", NOW - HOUR, |logins| {
+        note_sign_in_task(logins, "main", SignInAction::Browser, NOW - HOUR);
+        Vec::new()
+    });
     store.save_logins(&logins).expect("save");
-    let reopened = Store::at_for(tmp.path(), Cli::Kimi, tmp.path());
+    let reopened = Store::at(tmp.path());
     let (mut logins, _) = reopened.load_logins(NOW).expect("reload");
     assert_eq!(
         sign_in_tasks(&roster(), &logins),
@@ -1071,21 +1104,48 @@ fn an_automatic_sign_in_is_written_once_per_finding_and_a_new_login_ends_its_fai
     let routes = "profile(none) mailbox(none configured) vault(not a member) \
                   headless-browser(none installed) hosts(none configured)";
     let mut logins = Logins::default();
-    let events = note_sign_in_attempt(&mut logins, "work-2", AttemptOutcome::NoRoute, routes, NOW);
+    logins.labels.insert(
+        "work-2".into(),
+        Binding {
+            dir: r.row("work-2").unwrap().dir.clone(),
+            ..Binding::default()
+        },
+    );
+    let events = admitted_observation(&mut logins, "work-2", NOW, |logins| {
+        note_sign_in_attempt(logins, "work-2", AttemptOutcome::NoRoute, routes, NOW)
+    });
     assert_eq!(events.len(), 1);
     assert_eq!(
         (events[0].kind, events[0].account.as_str()),
         (Kind::SignIn, "work-2")
     );
     assert_eq!(events[0].why, format!("{AUTO_SIGN_IN} no-route: {routes}"));
+    let mut unadmitted = logins.clone();
     assert!(
         note_sign_in_attempt(
-            &mut logins,
+            &mut unadmitted,
             "work-2",
             AttemptOutcome::NoRoute,
             routes,
             NOW + HOUR
         )
+        .is_empty()
+    );
+    assert!(unadmitted.get("work-2").unwrap().sign_in_attempt.is_some());
+    assert!(
+        current_sign_in_attempt(r.row("work-2").unwrap(), &unadmitted).is_none(),
+        "an unadmitted duplicate retains history but cannot retain current authority"
+    );
+    assert!(
+        admitted_observation(&mut logins, "work-2", NOW + HOUR, |logins| {
+            note_sign_in_attempt(
+                logins,
+                "work-2",
+                AttemptOutcome::NoRoute,
+                routes,
+                NOW + HOUR,
+            )
+        })
         .is_empty(),
         "the same finding is not written again"
     );
@@ -1100,7 +1160,10 @@ fn an_automatic_sign_in_is_written_once_per_finding_and_a_new_login_ends_its_fai
     );
     let long = "mailbox(none configured) ".repeat(20);
     assert_eq!(
-        note_sign_in_attempt(&mut logins, "main", AttemptOutcome::Failed, &long, NOW).len(),
+        admitted_observation(&mut logins, "main", NOW, |logins| {
+            note_sign_in_attempt(logins, "main", AttemptOutcome::Failed, &long, NOW)
+        })
+        .len(),
         1
     );
     let bounded = &logins
@@ -1126,7 +1189,7 @@ fn an_automatic_sign_in_is_written_once_per_finding_and_a_new_login_ends_its_fai
     let mut signed_out = state();
     note_auth(&mut signed_out, "main", Auth::SignedOut, NOW - HOUR);
     assert_eq!(
-        failing_sign_ins(&r, &signed_out, &logins, NOW)
+        failing_sign_ins(&r, &r, &signed_out, &logins, NOW)
             .into_iter()
             .map(|(label, attempt)| (label, attempt.outcome))
             .collect::<Vec<_>>(),
@@ -1137,7 +1200,7 @@ fn an_automatic_sign_in_is_written_once_per_finding_and_a_new_login_ends_its_fai
         "a signed-out row and a row never enrolled, in roster order"
     );
     assert_eq!(
-        failing_sign_ins(&r, &state(), &logins, NOW)
+        failing_sign_ins(&r, &r, &state(), &logins, NOW)
             .into_iter()
             .map(|(label, _)| label)
             .collect::<Vec<_>>(),
@@ -1150,7 +1213,7 @@ fn an_automatic_sign_in_is_written_once_per_finding_and_a_new_login_ends_its_fai
         .expect("main's binding")
         .notice_end = Some(NOW + DAY);
     assert_eq!(
-        failing_sign_ins(&r, &state(), &due, NOW)
+        failing_sign_ins(&r, &r, &state(), &due, NOW)
             .into_iter()
             .map(|(label, _)| label)
             .collect::<Vec<_>>(),
@@ -1170,13 +1233,15 @@ fn an_automatic_sign_in_is_written_once_per_finding_and_a_new_login_ends_its_fai
     );
     assert_eq!(logins.get("main").unwrap().sign_in_attempt, None);
     assert_eq!(
-        note_sign_in_attempt(
-            &mut logins,
-            "main",
-            AttemptOutcome::SignedIn,
-            "mailbox",
-            NOW + HOUR
-        )
+        admitted_observation(&mut logins, "main", NOW + HOUR, |logins| {
+            note_sign_in_attempt(
+                logins,
+                "main",
+                AttemptOutcome::SignedIn,
+                "mailbox",
+                NOW + HOUR,
+            )
+        })
         .len(),
         1
     );
@@ -1198,7 +1263,7 @@ fn an_automatic_sign_in_is_written_once_per_finding_and_a_new_login_ends_its_fai
         "the route that made the login stays named"
     );
     assert_eq!(
-        failing_sign_ins(&r, &state, &logins, NOW + 2 * HOUR)
+        failing_sign_ins(&r, &r, &state, &logins, NOW + 2 * HOUR)
             .into_iter()
             .map(|(label, _)| label)
             .collect::<Vec<_>>(),
@@ -1217,9 +1282,11 @@ fn a_login_signed_back_in_ends_its_rows_old_sign_in_failure() {
     let mut logins = Logins::default();
     let mut state = state();
     note_auth(&mut state, "main", Auth::SignedOut, NOW - HOUR);
-    note_sign_in_attempt(&mut logins, "main", AttemptOutcome::NoRoute, routes, NOW);
+    admitted_observation(&mut logins, "main", NOW, |logins| {
+        note_sign_in_attempt(logins, "main", AttemptOutcome::NoRoute, routes, NOW)
+    });
     let failing = |state: &State, logins: &Logins, at: i64| {
-        failing_sign_ins(&r, state, logins, at)
+        failing_sign_ins(&r, &r, state, logins, at)
             .into_iter()
             .filter(|(label, _)| label == "main")
             .map(|(_, attempt)| attempt.since)
@@ -1246,7 +1313,9 @@ fn a_login_signed_back_in_ends_its_rows_old_sign_in_failure() {
         failing(&state, &logins, at).is_empty(),
         "no failure from before the login is told of it"
     );
-    note_sign_in_attempt(&mut logins, "main", AttemptOutcome::NoRoute, routes, at);
+    admitted_observation(&mut logins, "main", at, |logins| {
+        note_sign_in_attempt(logins, "main", AttemptOutcome::NoRoute, routes, at)
+    });
     assert_eq!(
         failing(&state, &logins, at),
         [at],

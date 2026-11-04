@@ -359,7 +359,8 @@ pub(crate) fn read_tape(path: &Path) -> Result<(tape::TapeHeader, Vec<EffectReco
     };
     #[cfg(not(unix))]
     let file = std::fs::File::open(path).map_err(|e| not_read(path, &e))?;
-    let kind = file.metadata().map_err(|e| not_read(path, &e))?.file_type();
+    let meta = file.metadata().map_err(|e| not_read(path, &e))?;
+    let kind = meta.file_type();
     #[cfg(unix)]
     let pipe = {
         use std::os::unix::fs::FileTypeExt as _;
@@ -382,6 +383,9 @@ pub(crate) fn read_tape(path: &Path) -> Result<(tape::TapeHeader, Vec<EffectReco
         bytes = read_pipe(&file, TAPE_STREAM_BUDGET).map_err(|e| not_read(path, &e))?;
     }
     if !pipe {
+        bytes.reserve(
+            usize::try_from(meta.len().min(tape::TAPE_MAX).saturating_add(1)).unwrap_or(0),
+        );
         file.take(tape::TAPE_MAX.saturating_add(1))
             .read_to_end(&mut bytes)
             .map_err(|e| not_read(path, &e))?;
@@ -1471,10 +1475,7 @@ mod tests {
     }
 
     fn scratch() -> aterm_tempfile::TempDir {
-        aterm_tempfile::Builder::new()
-            .prefix("agh-fx-")
-            .tempdir()
-            .expect("a scratch directory")
+        crate::test_fixtures::scratch_dir("fx")
     }
 
     /// A streamed asset's GET, as `dev`: the request the streamed-body tests tape.

@@ -612,6 +612,24 @@ pub(super) fn claim_state(
 }
 
 impl Laid {
+    pub(crate) fn check_retained_description(&self) -> io::Result<()> {
+        self.check_custody()?;
+        let custody = self
+            .custody
+            .as_ref()
+            .ok_or_else(|| refused("retained CPU binding requires original cohort custody"))?;
+        if self.granted.is_none()
+            || !custody.journal.description()
+            || custody.actual_birth.is_some()
+            || custody.unused.is_some()
+        {
+            return Err(refused(
+                "retained CPU binding requires an unused admitted description",
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn check_cohort_namespace(&self, expected: &Namespace) -> io::Result<()> {
         expected.validate()?;
         let custody = self
@@ -793,6 +811,12 @@ impl Laid {
         next: Journal,
     ) -> io::Result<()> {
         self.check_locked(transaction)?;
+        #[cfg(test)]
+        if FAIL_EVENT_BEFORE_WRITE.with(|failure| failure.replace(false)) {
+            return Err(io::Error::other(
+                "injected custody failure before write or pending capture",
+            ));
+        }
         let prefix = snapshot(
             &self
                 .custody
@@ -990,6 +1014,17 @@ impl Laid {
         Ok(cohort)
     }
 
+    pub(crate) fn check_cohort_cancel(&self, proof: &NotSpawned) -> io::Result<()> {
+        let custody = self
+            .custody
+            .as_ref()
+            .ok_or_else(|| refused("legacy claim cannot cancel a cohort"))?;
+        if custody.unused.is_some() {
+            return Err(refused("the original no-child receipt is already retained"));
+        }
+        custody.journal.cancel(proof.key()).map(|_| ())
+    }
+
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -999,15 +1034,18 @@ impl Laid {
         )
     )]
     pub(crate) fn cancel_cohort(&mut self, proof: NotSpawned) -> io::Result<()> {
+        // Match actual receipt custody before transaction I/O, then keep it even
+        // when transaction creation, validation or the durable event fails. The
+        // existing finish path can retry this exact proof without inventing one.
+        self.check_cohort_cancel(&proof)?;
+        self.custody
+            .as_mut()
+            .expect("validated cohort claim")
+            .unused = Some(proof);
         let mut transaction = self.transaction()?;
         self.retry_event(&mut transaction)?;
-        self.check_locked(&transaction)?;
-        let custody = self
-            .custody
-            .as_ref()
-            .ok_or_else(|| refused("legacy claim cannot cancel a cohort"))?;
-        let (line, next) = custody.journal.cancel(proof.key())?;
-        self.event(&mut transaction, line, next)
+        self.finish_unused(&mut transaction)?;
+        self.check_locked(&transaction)
     }
 
     #[cfg_attr(
@@ -1098,9 +1136,9 @@ impl Laid {
         }
     }
 
-    /// Cancel the ARM with the `NotSpawned` receipt `arm_cohort` kept as `unused` when its ARM
-    /// event failed with a write pending, through the same `Journal::cancel` match as
-    /// `cancel_cohort`; a journal already back at its description only drops the receipt.
+    /// Cancel the ARM with its retained `NotSpawned` receipt, from explicit cancellation
+    /// or an ARM event that failed with a write pending. Both use the same actual
+    /// `Journal::cancel` match; an already committed description only drops the receipt.
     ///
     /// # Errors
     /// The claim has no cohort custody, the receipt belongs to another process or scope, it
@@ -1137,6 +1175,7 @@ impl Laid {
 
 #[cfg(test)]
 thread_local! {
+    static FAIL_EVENT_BEFORE_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_EVENT_AFTER_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_EVENT_PARTIAL_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -1181,6 +1220,14 @@ pub(super) mod tests {
                 Polled::Admitted(claim) => claim,
                 other => panic!("claim was not admitted: {other:?}"),
             }
+        }
+
+        pub(crate) fn fail_next_event_after_write(&self) {
+            FAIL_EVENT_AFTER_WRITE.with(|failure| failure.set(true));
+        }
+
+        pub(crate) fn fail_next_event_before_write(&self) {
+            FAIL_EVENT_BEFORE_WRITE.with(|failure| failure.set(true));
         }
     }
 

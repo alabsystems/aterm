@@ -10,6 +10,8 @@ pub(crate) fn shared_checkpoint_observation(cli: Cli) -> (bool, bool) {
     shared_checkpoint_case(cli, 0)
 }
 
+/// For shared adoption's recovery model alone, which runs only on Unix.
+#[cfg(unix)]
 pub(crate) fn shared_checkpoint_alias_observation(principal: bool) -> (bool, bool) {
     shared_checkpoint_case(Cli::Codex, if principal { 2 } else { 1 })
 }

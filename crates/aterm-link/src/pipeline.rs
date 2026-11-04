@@ -73,19 +73,39 @@ pub(crate) struct Unsent<T> {
 pub(crate) struct Link<T> {
     client: Conn,
     unacked: VecDeque<Unacked<T>>,
+    /// A write of this connection was refused since its GAP FENCES were last lifted, on a
+    /// broker that keeps them ([`Link::gap_fences`]): until the producer lifts them
+    /// ([`Link::lift_gap_fences`]), a write at or under the refused sequence lands, or the
+    /// connection closes, every later write above it is refused `gap-fenced=`.
+    fenced: bool,
+    /// This connection asked its broker to gap-fence its writes ([`Link::ask_gap_fences`]).
+    asked: bool,
     /// The most acks this connection has had unread at once: what a test reads
     /// to know a burst went out without waiting on each answer.
     #[cfg(test)]
     peak: usize,
+    /// Told each write's frames, in the write's order, as it goes out ([`Link::tap_writes`]):
+    /// what a test reads to know which frames shared a write.
+    #[cfg(test)]
+    tap: Option<WriteTap<T>>,
 }
+
+/// What [`Link::tap_writes`] is told: one write's frames in order, each its tag and, for a
+/// publish, its subject (`None`: a commit).
+#[cfg(test)]
+type WriteTap<T> = Box<dyn FnMut(&[(&T, Option<&str>)]) + Send>;
 
 impl<T> From<Conn> for Link<T> {
     fn from(client: Conn) -> Self {
         Link {
             client,
             unacked: VecDeque::new(),
+            fenced: false,
+            asked: false,
             #[cfg(test)]
             peak: 0,
+            #[cfg(test)]
+            tap: None,
         }
     }
 }
@@ -103,6 +123,86 @@ impl<T> Link<T> {
     /// The client, for a request that reads its own reply — ONLY while no pipelined ack is unread, so that reply is the next frame.
     pub fn ready(&mut self) -> Option<&mut Conn> {
         self.unacked.is_empty().then_some(&mut self.client)
+    }
+
+    /// Whether this connection's broker GAP-FENCES each producer's writes on a connection that
+    /// asks, as its `Hello` said (astream's `Client::supports_gap_fences`,
+    /// `OpenOptions::sticky_batch_refusal`), and this one asked ([`Link::ask_gap_fences`]): once
+    /// one is refused, no later one above its sequence lands until the producer lifts the
+    /// fence. Only then may one sender keep several posts in flight (`Bridge::pipelines_posts`):
+    /// against any other broker, and on a connection that did not ask, a refused batch is
+    /// rolled back and the next write lands ahead of the refused one's retry
+    /// (`a_refused_batch_lands_the_publish_sent_after_it`).
+    pub fn gap_fences(&self) -> bool {
+        self.asked && self.client.supports_gap_fences()
+    }
+
+    /// ASK THE BROKER TO GAP-FENCE this connection's writes (astream's `Client::fence_gaps`),
+    /// where its `Hello` said it offers that, before anything is written on it: a broker fences
+    /// only a connection that asks, so a link of an older build, which never lifts a fence, is
+    /// not held behind a refusal it does not retry next. A broker that announced the fence
+    /// and predates the ask refuses it, and fences every connection anyway (astream
+    /// `8a15cdb`..`ea8bab7`), so the link is fenced either way once its `Hello` said so. Against
+    /// a broker that did not say so nothing is asked.
+    /// # Errors
+    /// The request's transport failure.
+    pub fn ask_gap_fences(&mut self) -> io::Result<()> {
+        if !self.client.supports_gap_fences() {
+            return Ok(());
+        }
+        self.client.fence_gaps()?;
+        self.asked = true;
+        Ok(())
+    }
+
+    /// Take the broker's offer as asked for without asking: the bridge that pipelines on the
+    /// `Hello` alone (`Mutant::NeverAskForTheFence`).
+    #[cfg(test)]
+    pub fn assume_asked(&mut self) {
+        self.asked = true;
+    }
+
+    /// A write of this connection was refused: on a broker that gap-fences, the connection
+    /// now holds a fence ([`Link::fenced`]).
+    pub fn note_refused(&mut self) {
+        self.fenced |= self.gap_fences();
+    }
+
+    /// Whether a write was refused since the fences were last lifted ([`Link::note_refused`]).
+    pub fn fenced(&self) -> bool {
+        self.fenced
+    }
+
+    /// Whether an owed publish was sent at a sequence above `seq`. On a broker that
+    /// gap-fences, a write at or under a fence lands and lifts it, so a publish sent below
+    /// one still owed could let a write sent after it land ahead of an earlier refused one's
+    /// retry: the caller reads those answers first (`Bridge::settle_above`).
+    pub fn owes_above(&self, seq: u64) -> bool {
+        self.unacked.iter().any(|owed| owed.seq > seq)
+    }
+
+    /// LIFT THE GAP FENCES this connection's refused writes set (astream's
+    /// `Client::clear_gap_fences`): only with no ack owed, every answer read, so the caller
+    /// knows each refused write and holds back what must follow it; `None` while one is
+    /// owed. The broker answers it after every write sent before it, so it reaches none of
+    /// them.
+    /// # Errors
+    /// The request's: a transport failure, or a refusal from a broker that predates it.
+    pub fn lift_gap_fences(&mut self) -> Option<io::Result<()>> {
+        if !self.unacked.is_empty() {
+            return None;
+        }
+        let lifted = match self.client.clear_gap_fences() {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(io::Error::other(
+                "the broker said it gap-fences, and refused to lift its fences",
+            )),
+            Err(e) => Err(e),
+        };
+        if lifted.is_ok() {
+            self.fenced = false;
+        }
+        Some(lifted)
     }
 
     /// Write one publish WITHOUT waiting for its ack, and queue `tag` for the answer: a burst
@@ -151,6 +251,10 @@ impl<T> Link<T> {
     ) -> Result<(), (io::Error, T)> {
         match self.client.send_commit(group, upto) {
             Ok(()) => {
+                #[cfg(test)]
+                if let Some(tap) = self.tap.as_mut() {
+                    tap(&[(&tag, None)]);
+                }
                 self.owe(Unacked {
                     seq: 0,
                     first: false,
@@ -204,6 +308,15 @@ impl<T> Link<T> {
                 commit: commit.map(|c| c.tag),
                 tags: publishes.into_iter().map(|p| p.tag).collect(),
             });
+        }
+        #[cfg(test)]
+        if let Some(tap) = self.tap.as_mut() {
+            let frames: Vec<(&T, Option<&str>)> = commit
+                .iter()
+                .map(|c| (&c.tag, None))
+                .chain(publishes.iter().map(|p| (&p.tag, Some(p.subject))))
+                .collect();
+            tap(&frames);
         }
         if let Some(c) = commit {
             self.owe(Unacked {
@@ -288,6 +401,13 @@ impl<T> Link<T> {
     #[cfg(test)]
     pub fn peak(&self) -> usize {
         self.peak
+    }
+
+    /// Tell `tap` each later write's frames, in the write's order: a commit and the publishes
+    /// of one [`Link::send_burst`] in one call, a [`Link::send_commit`] in one of its own.
+    #[cfg(test)]
+    pub fn tap_writes(&mut self, tap: impl FnMut(&[(&T, Option<&str>)]) + Send + 'static) {
+        self.tap = Some(Box::new(tap));
     }
 }
 
@@ -674,10 +794,10 @@ mod tests {
         assert!(link.ride(12, |tag| tag % 2 == 0));
     }
 
-    /// **A REFUSED BATCH LANDS THE PUBLISH SENT AFTER IT** — the hazard that
-    /// makes a caller whose records must land in its own order keep one of
-    /// them in flight at a time (`Bridge::settle_sender`), shown on a REAL
-    /// Strict broker rather than a scripted one.
+    /// **A REFUSED BATCH LANDS THE PUBLISH SENT AFTER IT** on a broker that does not gap-fence —
+    /// the hazard that makes a caller whose records must land in its own order keep one of
+    /// them in flight at a time there (`Bridge::settle_sender`), shown on a REAL Strict broker
+    /// rather than a scripted one. Its `Hello` does not say it gap-fences.
     #[test]
     fn a_refused_batch_lands_the_publish_sent_after_it() {
         let dir = aterm_tempfile::Builder::new()
@@ -693,6 +813,11 @@ mod tests {
         )
         .expect("dial");
         let mut link: Link<char> = Link::from(conn);
+        link.ready()
+            .expect("nothing owed")
+            .hello()
+            .expect("a Hello");
+        assert!(!link.gap_fences(), "its Hello says nothing of a fence");
         let (a, b) = ("/f/f/order/a", "/f/f/order/b");
 
         broker.inject_faults(astream_broker::InjectedFaults {
@@ -730,5 +855,86 @@ mod tests {
             a_at > b_at,
             "A was sent first and is on the log after B (@{a_at} > @{b_at})"
         );
+    }
+
+    /// **A GAP-FENCED BROKER REFUSES THE PUBLISH SENT AFTER A REFUSED BATCH**, and its producer
+    /// lifts the fence once it has read both answers: then the refused one's retry lands first
+    /// and the later one's after it, in send order. The broker offers it in its `Hello` and the
+    /// link asks for it ([`Link::gap_fences`]), which is what lets the bridge keep several of a
+    /// sender's posts in flight; the control is [`a_refused_batch_lands_the_publish_sent_after_it`]'s broker,
+    /// opened without the fence, whose `Hello` says nothing.
+    #[test]
+    fn a_gap_fenced_broker_holds_the_publish_sent_after_a_refused_batch() {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("al-g")
+            .tempdir_in("/tmp")
+            .expect("a scratch dir");
+        let socket = dir.path().join("b.sock");
+        let broker = astream_broker::Broker::open_opts(
+            dir.path().join("b.log"),
+            astream_broker::OpenOptions::new(astream_broker::Durability::Strict)
+                .with_sticky_batch_refusal(true),
+            || Ok(astream_broker::Prepared::Nothing),
+        )
+        .expect("a broker");
+        let _server = broker.serve(&socket).expect("serve");
+        let (conn, _) = crate::transport::connect(
+            &socket.to_string_lossy(),
+            std::time::Duration::from_secs(60),
+        )
+        .expect("dial");
+        let mut link: Link<char> = Link::from(conn);
+        link.ready()
+            .expect("nothing owed")
+            .hello()
+            .expect("a Hello");
+        assert!(
+            !link.gap_fences(),
+            "its Hello offers the fence, and the link has not asked"
+        );
+        link.ask_gap_fences().expect("the link asks for the fence");
+        assert!(link.gap_fences(), "it asked where the Hello offered it");
+        let (a, b) = ("/f/f/order/a", "/f/f/order/b");
+
+        broker.inject_faults(astream_broker::InjectedFaults {
+            sync: true,
+            truncate: false,
+        });
+        let held = broker.pause_next_acks();
+        link.send(7, 1, true, a, b"a", 'a', Instant::now())
+            .map_err(|(e, _)| e)
+            .expect("A written");
+        assert!(held.wait(), "A's batch was tried and is held unanswered");
+        broker.inject_faults(astream_broker::InjectedFaults::default());
+        link.send(7, 2, true, b, b"b", 'b', Instant::now())
+            .map_err(|(e, _)| e)
+            .expect("B written while A's answer is held");
+        held.resume();
+
+        let (owed, answer) = link.recv().expect("A's ack is owed");
+        assert_eq!(owed.tag, 'a');
+        answer.expect_err("A's batch failed its fsync");
+        link.note_refused();
+        assert!(link.fenced());
+        let (owed, answer) = link.recv().expect("B's ack is owed");
+        assert_eq!(owed.tag, 'b');
+        let fenced = answer.expect_err("B is held behind A's refusal");
+        assert_eq!(
+            astream_broker::broker_refusal(&fenced)
+                .and_then(|r| astream_broker::sticky_fence::parse_gap_fenced_seq(&r.msg)),
+            Some(1),
+            "refused behind A's sequence: {fenced}"
+        );
+
+        link.lift_gap_fences()
+            .expect("nothing owed")
+            .expect("the broker lifts the fence");
+        assert!(!link.fenced());
+        let conn = link.ready().expect("nothing owed");
+        let (a_at, deduped) = conn.publish(7, 1, a, b"a").expect("A's retry lands");
+        assert!(!deduped, "A never landed: its retry appends");
+        let (b_at, deduped) = conn.publish(7, 2, b, b"b").expect("B's retry lands");
+        assert!(!deduped, "B never landed: its retry appends");
+        assert!(a_at < b_at, "A is on the log before B (@{a_at} < @{b_at})");
     }
 }

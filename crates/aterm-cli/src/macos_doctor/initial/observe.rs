@@ -786,7 +786,7 @@ fn held_at_login(root: &Path) -> Selection {
 }
 
 fn held_at_login_in(root: &Path, session: &str) -> Selection {
-    std::fs::read(root.join(AT_LOGIN))
+    crate::macos_doctor::read_record_bytes(&root.join(AT_LOGIN))
         .ok()
         .and_then(|bytes| aterm_json::from_slice::<Value>(&bytes).ok())
         .filter(|value| {

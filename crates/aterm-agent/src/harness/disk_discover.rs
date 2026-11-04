@@ -1085,7 +1085,7 @@ pub(crate) fn small_bytes(p: &Path) -> Option<Vec<u8>> {
     if !meta.is_file() || meta.len() > 4096 {
         return None;
     }
-    let mut buf = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
+    let mut buf = Vec::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
     file.take(4097).read_to_end(&mut buf).ok()?;
     (buf.len() <= 4096).then_some(buf)
 }

@@ -425,16 +425,6 @@ pub(crate) fn card_items(app: &SystemStateApp, rows: &[RowView]) -> Vec<CardItem
             continue;
         }
         let item = match subject {
-            // macOS's administrator dialog is up for it: nothing here moves it.
-            Subject::Access(Access::Debugger) if status.access_step == Some(Access::Debugger) => {
-                CardItem::new(
-                    slug,
-                    Mark::NeedsYou,
-                    format!("Enter your password for {}", Access::Debugger.name()),
-                )
-                .reason(row.note.clone())
-                .for_row(subject)
-            }
             // The walk is one card item, at its current page (§4.8): the grants it reaches next
             // wait on their line, named under the page's button.
             Subject::Access(access)
@@ -463,15 +453,11 @@ pub(crate) fn card_items(app: &SystemStateApp, rows: &[RowView]) -> Vec<CardItem
                 item = item.for_row(subject);
                 if row.open.is_some() {
                     let key = format!("system-state/row/{slug}/open");
-                    item = if access == Access::Debugger {
-                        item.button(&key, format!("Turn On {}…", access.name()), "Turn On…")
-                    } else {
-                        item.button(
-                            &key,
-                            format!("{OPEN_SETTINGS} for {}", access.name()),
-                            OPEN_SETTINGS,
-                        )
-                    };
+                    item = item.button(
+                        &key,
+                        format!("{OPEN_SETTINGS} for {}", access.name()),
+                        OPEN_SETTINGS,
+                    );
                 }
                 item
             }
@@ -612,8 +598,8 @@ pub(crate) fn card_items(app: &SystemStateApp, rows: &[RowView]) -> Vec<CardItem
 pub(crate) const TRIES_BY_ITSELF: &str = "aterm tries it again by itself.";
 
 /// Whether the permission walk shows a page for `access`: a grant the person turns on in System
-/// Settings, which the walk visits in turn. The debugger's password and macOS's Local Network
-/// question are dialogs of their own, never a walk page.
+/// Settings, which the walk visits in turn. Debugger access, which setup's one early elevation
+/// turns on, and macOS's Local Network question, a dialog of its own, are never a walk page.
 const fn walks_to(access: Access) -> bool {
     !matches!(access, Access::Debugger | Access::LocalNetwork)
 }

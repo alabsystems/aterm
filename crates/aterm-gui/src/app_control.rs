@@ -586,7 +586,8 @@ impl App {
         let current = self
             .native_ui_compile_stamp_for(wid, native.instance, view, viewport)
             .ok()?;
-        let retained = window.leaf_render_cache.get(&view)?.native.as_ref()?;
+        let cache = window.leaf_render_cache.get(&view)?;
+        let retained = cache.native.as_ref()?;
         (retained.stamp.view == view
             && retained.stamp.instance == native.instance
             && retained.width == width
@@ -596,7 +597,9 @@ impl App {
                 (
                     retained.compiled.clone(),
                     retained.stamp,
-                    retained.stamp == current,
+                    // An invalidation keeps the raster glass shows, stamp and all, though what the
+                    // view draws may have moved where the stamp does not look.
+                    cache.native_tree_current(retained) && retained.stamp == current,
                 )
             })
     }
@@ -1064,15 +1067,14 @@ fn markdown_view_inspection_lines(compiled: &CompiledUi) -> Vec<String> {
         .semantic(&UiKey::new("markdown/status"))
         .map_or("Unavailable", |node| node.label.as_str());
     let paging = |key: &str| {
-        compiled.semantic(&UiKey::new(key)).map_or_else(
-            || (false, "-"),
-            |node| {
+        compiled
+            .semantic(&UiKey::new(key))
+            .map_or((false, "-"), |node| {
                 (
                     node.state.is_none_or(|state| state.enabled),
                     node.action.as_ref().map_or("-", ActionId::as_str),
                 )
-            },
-        )
+            })
     };
     let (previous_enabled, previous_action) = paging("markdown/previous-page-button");
     let (next_enabled, next_action) = paging("markdown/next-page-button");
@@ -2616,6 +2618,71 @@ mod tests {
             .unwrap();
         assert!(stale_wire[1].contains("source=retained"));
         assert!(stale_wire[1].contains("model-current=false"));
+    }
+
+    #[test]
+    fn an_invalidated_retained_sibling_inspects_as_shown_not_current() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        let (_, native_view) = app.active_native_view(wid).unwrap();
+        app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Horizontal);
+        app.prepare_heterogeneous_input_scratch(wid)
+            .expect("mixed frame is retained");
+        let raster = app
+            .windows
+            .get_mut(&wid)
+            .and_then(|window| window.leaf_render_cache.get_mut(&native_view))
+            .and_then(|cache| cache.native.as_mut())
+            .unwrap();
+        raster.presented = true;
+        let retained = raster.compiled.clone();
+        let stamp = raster.stamp;
+        assert!(app.compile_view(native_view).unwrap().model_current);
+
+        // Hover, pressed and focus marks owe pixels, not a different tree.
+        app.invalidate_native_pointer_style(wid, native_view);
+        let feedback = app.compile_view(native_view).unwrap();
+        assert_eq!(feedback.source, InspectionCompileSource::Retained);
+        assert!(
+            feedback.model_current,
+            "pointer feedback is no model change"
+        );
+        assert!(
+            app.retained_native_pointer_artifact(wid, native_view)
+                .is_some()
+        );
+        assert!(
+            app.retained_native_leaf_artifact(wid, native_view, true)
+                .is_none()
+        );
+
+        // The invalidation leaves the stamp as it was and glass still shows the raster, but what
+        // the view draws may have moved where the stamp does not look: the feedback still owed
+        // on it cannot carry the pointer through.
+        app.invalidate_native_ui_cache(wid);
+        assert!(
+            app.retained_native_pointer_artifact(wid, native_view)
+                .is_none()
+        );
+        let invalidated = app.compile_view(native_view).unwrap();
+        let cache = &app.windows[&wid].leaf_render_cache[&native_view];
+        assert_eq!(cache.native.as_ref().unwrap().stamp, stamp);
+        assert_eq!(invalidated.source, InspectionCompileSource::Retained);
+        assert_eq!(invalidated.compiled, retained);
+        assert!(!invalidated.model_current);
+        let wire = app
+            .inspect_app(InspectRequest::View {
+                view: native_view,
+                projection: InspectionProjection::Audit,
+            })
+            .unwrap();
+        assert!(wire[1].contains("source=retained"), "{wire:#?}");
+        assert!(wire[1].contains("model-current=false"), "{wire:#?}");
+
+        app.prepare_heterogeneous_input_scratch(wid)
+            .expect("mixed frame is retained again");
+        assert!(app.compile_view(native_view).unwrap().model_current);
     }
 
     #[test]

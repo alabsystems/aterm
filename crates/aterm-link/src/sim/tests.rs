@@ -2,6 +2,11 @@
 // Copyright 2026 Andrew Yates
 
 //! THE SIMULATION'S SEEDS, its negative controls and its replay.
+//!
+//! Normal checks run pinned witnesses without searching. To discover replacements, run
+//! `ATERM_SIM_DISCOVER_WITNESSES=1 targo --unverified test --profile opt-test -p aterm-link
+//! --lib sim::tests:: -- --nocapture`. Discovery retains each original search bound and
+//! fails stale pins even when it finds replacements, so the new witnesses must be recorded.
 
 use super::bus::{self, ArmMutant, Escalation, Stop, Tier};
 use super::device::Device;
@@ -78,6 +83,8 @@ fn every_seed_holds_every_law() {
         total.seen_before_ack += s.seen_before_ack;
         total.commits_corked += s.commits_corked;
         total.commits_alone += s.commits_alone;
+        total.gap_fenced += s.gap_fenced;
+        total.fences_lifted += s.fences_lifted;
         total.kills_holding += s.kills_holding;
         total.writes_failed += s.writes_failed;
         total.renamed_unflushed += s.renamed_unflushed;
@@ -147,6 +154,11 @@ fn every_seed_holds_every_law() {
             total.commits_corked,
         ),
         ("inbox commits written alone", total.commits_alone),
+        (
+            "publishes a gap fence refused behind a refused one",
+            total.gap_fenced,
+        ),
+        ("gap fences the bridge lifted", total.fences_lifted),
         ("kills while an inbox commit was held", total.kills_holding),
         ("state-dir writes failed", total.writes_failed),
         (
@@ -180,6 +192,43 @@ fn every_seed_holds_every_law() {
     ] {
         assert!(n > 0, "the seeds exercised no {what}: {total:?}");
     }
+}
+
+/// THE COMMITTED SEEDS AGAINST A BROKER THAT DOES NOT GAP-FENCE ([`Opts::gap_fences`] off): the
+/// world of a broker an older build opened, where a sender keeps one post in flight
+/// (`Bridge::settle_sender`) and the bridge lifts nothing. Every seed of the committed sweep
+/// fences, so without this run a regression on that path would pass all of them (C12s1's
+/// review).
+#[test]
+fn every_seed_holds_every_law_against_a_broker_that_does_not_gap_fence() {
+    let unfenced = |s: u64| {
+        let mut o = Opts::seed(s);
+        o.gap_fences = false;
+        o
+    };
+    let outs = run_all(&unfenced, 1..=SEEDS);
+    let failures: Vec<String> = outs
+        .iter()
+        .filter(|out| !out.violations.is_empty())
+        .map(report)
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "{} of {} seeds break a law against a broker that does not gap-fence:\n{}",
+        failures.len(),
+        outs.len(),
+        failures.join("\n")
+    );
+    let posts: u64 = outs.iter().map(|out| out.stats.posts).sum();
+    let fenced: u64 = outs
+        .iter()
+        .map(|out| out.stats.gap_fenced + out.stats.fences_lifted)
+        .sum();
+    assert!(posts > 0, "the seeds sent no post");
+    assert_eq!(
+        fenced, 0,
+        "a broker that does not gap-fence fenced or lifted"
+    );
 }
 
 #[test]
@@ -271,16 +320,31 @@ fn first_within(
     .next()
 }
 
-/// What the pinned `witness` seed shows: its outcome, where `hit` takes it; else the first seed
-/// within `limit` that `hit` takes, with a note naming that seed. A change to the world's schedule
-/// moves which seed shows a rule, and the search past a stale witness runs every seed up to the
-/// one that does: thousands of worlds where one would do, unseen while the test passes. So a
-/// stale witness fails its test ([`witnessed`]), and the note says what to pin.
+const WITNESS_DISCOVERY: &str = "ATERM_SIM_DISCOVER_WITNESSES";
+const DISCOVER_WITNESSES: &str = "ATERM_SIM_DISCOVER_WITNESSES=1 targo --unverified test --profile opt-test -p aterm-link --lib sim::tests:: -- --nocapture";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WitnessMode {
+    Pinned,
+    Discover,
+}
+
+fn witness_mode() -> WitnessMode {
+    if std::env::var_os(WITNESS_DISCOVERY).as_deref() == Some(std::ffi::OsStr::new("1")) {
+        WitnessMode::Discover
+    } else {
+        WitnessMode::Pinned
+    }
+}
+
+/// Run the pinned world once. Only explicit discovery searches beyond a stale witness;
+/// both modes reject a stale pin and explain how to refresh it within the original bound.
 fn witness_of(
     opts: &(dyn Fn(u64) -> Opts + Sync),
     witness: u64,
     limit: u64,
     hit: &(dyn Fn(&Outcome) -> bool + Sync),
+    mode: WitnessMode,
 ) -> (Option<Outcome>, Option<String>) {
     assert!(
         (1..=limit).contains(&witness),
@@ -290,6 +354,16 @@ fn witness_of(
     if hit(&out) {
         return (Some(out), None);
     }
+    if mode == WitnessMode::Pinned {
+        return (
+            None,
+            Some(format!(
+                "witness seed {witness} no longer shows it; no search ran. Discover within \
+                 1..={limit} with `{DISCOVER_WITNESSES}`"
+            )),
+        );
+    }
+    eprintln!("STALE WITNESS: seed {witness}; explicitly searching 1..={limit}");
     let found = first_within(opts, limit, hit);
     let stale = found.as_ref().map(|o| {
         format!(
@@ -301,6 +375,42 @@ fn witness_of(
     (found, stale)
 }
 
+#[test]
+fn a_stale_witness_searches_only_in_explicit_discovery_mode() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    for (mode, witness, expected_seed, stale) in [
+        (WitnessMode::Pinned, 2, Some(2), false),
+        (WitnessMode::Pinned, 1, None, true),
+        (WitnessMode::Discover, 1, Some(2), true),
+    ] {
+        let calls = AtomicUsize::new(0);
+        let opts = |seed| {
+            assert!((1..=3).contains(&seed), "discovery widened its bound");
+            calls.fetch_add(1, Ordering::Relaxed);
+            Opts {
+                steps: 0,
+                ..Opts::seed(seed)
+            }
+        };
+        let (out, note) = witness_of(&opts, witness, 3, &|out| out.seed == 2, mode);
+        assert_eq!(out.as_ref().map(|out| out.seed), expected_seed);
+        assert_eq!(note.is_some(), stale);
+        let calls = calls.load(Ordering::Relaxed);
+        if mode == WitnessMode::Pinned {
+            assert_eq!(calls, 1, "a normal check ran an unpinned world");
+            if stale {
+                assert!(note.unwrap().contains(DISCOVER_WITNESSES));
+            }
+        } else {
+            assert!(
+                (2..=4).contains(&calls),
+                "one pin plus at most three searched worlds"
+            );
+        }
+    }
+}
+
 /// [`witness_of`], failing on a stale witness.
 fn witnessed(
     opts: &(dyn Fn(u64) -> Opts + Sync),
@@ -308,7 +418,7 @@ fn witnessed(
     limit: u64,
     hit: &(dyn Fn(&Outcome) -> bool + Sync),
 ) -> Option<Outcome> {
-    let (out, stale) = witness_of(opts, witness, limit, hit);
+    let (out, stale) = witness_of(opts, witness, limit, hit, witness_mode());
     if let Some(stale) = stale {
         panic!("STALE WITNESS: {stale}");
     }
@@ -375,7 +485,7 @@ fn each_rule_switched_off_is_caught() {
                 o
             }),
             "model:",
-            78,
+            122,
         ),
         (
             "the endpoint forgets the offsets a move took (no loss)",
@@ -447,13 +557,49 @@ fn each_rule_switched_off_is_caught() {
             16,
         ),
         (
-            "one post in flight per sender",
-            Box::new(|s| Opts::seed(s).with(Mutant::PipelineSender)),
+            "a sender keeps one post in flight against a broker that does not gap-fence",
+            Box::new(|s| {
+                let mut o = Opts::seed(s).with(Mutant::PipelineSender);
+                o.gap_fences = false;
+                o
+            }),
+            "order:",
+            18,
+        ),
+        (
+            "the bridge asks the broker for the gap fence it pipelines behind",
+            Box::new(|s| {
+                let mut o = Opts::seed(s).with(Mutant::NeverAskForTheFence);
+                o.gap_fences = true;
+                o
+            }),
+            "order:",
+            18,
+        ),
+        (
+            "a post is not sent past an answer that held its sender since its drain reached it",
+            Box::new(|s| Opts::seed(s).with(Mutant::SendPastAHeldSender)),
             "order:",
             5,
         ),
         (
-            "the outbox is peeked only once every post in flight is answered",
+            "a pipelining drain skips the posts owed at its peek, not those owed as it goes",
+            Box::new(|s| {
+                let mut o = Opts::seed(s).with(Mutant::LiveOwedSkip);
+                o.refused_batches = false;
+                o
+            }),
+            "dup post",
+            6,
+        ),
+        (
+            "the bridge lifts the gap fences its refused writes set",
+            Box::new(|s| Opts::seed(s).with(Mutant::KeepGapFences)),
+            "liveness",
+            8,
+        ),
+        (
+            "a drain sends no listed post that was in flight at its peek",
             Box::new(|s| {
                 let mut o = Opts::seed(s).with(Mutant::PeekPastOwedPost);
                 o.hold_acks = true;
@@ -482,7 +628,7 @@ fn each_rule_switched_off_is_caught() {
                 )
             }),
             "cap-compromised",
-            84750,
+            46058,
         ),
         (
             "a move of the log drops the mirror's pinned batch",
@@ -508,7 +654,7 @@ fn each_rule_switched_off_is_caught() {
                 o
             }),
             "mirror:",
-            24,
+            26,
         ),
         (
             "a relaunched bridge republishes the mirror's pinned batch at its sequences",
@@ -604,25 +750,25 @@ fn each_rule_switched_off_is_caught() {
             "a mirror floor covers a batch only once this open made it durable",
             Box::new(|s| Opts::seed(s).with(Mutant::TrustTheFloorThatReads)),
             "mirror total",
-            443,
+            2315,
         ),
         (
             "an attach delivers on a new log only once its witness is written",
             Box::new(|s| both_ways(s).with(Mutant::AttachPastAnUnwrittenWitness)),
             "dup delivery",
-            713,
+            158,
         ),
         (
             "a run whose recovery is owed makes no clean stop",
             Box::new(|s| erring_quitting(s).with(Mutant::CleanStopOverAnOwedRecovery)),
             "mirror",
-            7479,
+            19155,
         ),
         (
             "a recovery tried again moves each file once",
             Box::new(|s| both_ways_erring(s).with(Mutant::CopyOnEveryTry)),
             "quarantine copies:",
-            1,
+            3,
         ),
         (
             "the broker escalates aterm's table (the oracle keeps it)",
@@ -696,7 +842,7 @@ fn each_rule_switched_off_is_caught() {
             "the inbox's gap notice is told to aterm",
             Box::new(|s| scaled(s).with(Mutant::TellNoGap)),
             "given up untold",
-            230,
+            114,
         ),
         (
             "the mirror's window takes the broker's oldest=",
@@ -738,7 +884,7 @@ fn each_rule_switched_off_is_caught() {
             "a topic catch-up tells the uncounted notice below the first broadcast it delivers (F4)",
             Box::new(|s| asking(s).with(Mutant::TopicReplayDropsAnUncountedNotice)),
             "silent skip",
-            105,
+            443,
         ),
         (
             "the broadcast face's gap notice hands its cursors to the catch-up (F4)",
@@ -762,13 +908,13 @@ fn each_rule_switched_off_is_caught() {
             "an answer is delivered only once the deadline it settles is off the disk (F4)",
             Box::new(|s| asking_erring(s).with(Mutant::DeliverOverAnUnwrittenSettle)),
             "was handed",
-            348,
+            1170,
         ),
         (
             "an attach takes a hand-off's files before its incarnation (F4)",
             Box::new(|s| asking_erring(s).with(Mutant::AdoptAfterTheAttach)),
             "dup post|answered 2 times| expired 2 times",
-            106,
+            2212,
         ),
         (
             "an adoption names the attach of the hand-off it takes (F4)",
@@ -780,7 +926,7 @@ fn each_rule_switched_off_is_caught() {
             "a post retires only once its deadline is on disk (F4)",
             Box::new(|s| asking_erring(s).with(Mutant::RetireOverAnUnwrittenDeadline)),
             "neither answered nor expired",
-            12,
+            45,
         ),
     ];
     // The replay's drain rule (a record the attach published again is delivered once its
@@ -829,6 +975,7 @@ fn each_rule_switched_off_is_caught() {
             "a rare rule names no rule: {rare}"
         );
     }
+    let mode = witness_mode();
     let shown = aterm_spec::check::each(&rules, |(rule, opts, law, witness)| {
         let limit = if RAREST.contains(rule) {
             RAREST_SEEDS
@@ -837,7 +984,13 @@ fn each_rule_switched_off_is_caught() {
         } else {
             CONTROL_SEEDS
         };
-        let (off, stale) = witness_of(opts.as_ref(), *witness, limit, &|out| breaks_law(out, law));
+        let (off, stale) = witness_of(
+            opts.as_ref(),
+            *witness,
+            limit,
+            &|out| breaks_law(out, law),
+            mode,
+        );
         let on = off
             .as_ref()
             .map(|out| run(&with_every_rule(opts(out.seed))));
@@ -865,18 +1018,16 @@ fn each_rule_switched_off_is_caught() {
                     report(committed)
                 );
             }
-            _ => missed.push(format!("{rule} (expected `{law}` within {limit} seeds)")),
+            _ => missed.push(format!(
+                "{rule} (pin did not show `{law}`; discovery bound {limit})"
+            )),
         }
     }
     assert!(
-        missed.is_empty(),
-        "no seed caught these rules switched off:\n  {}",
+        stale.is_empty() && missed.is_empty(),
+        "control witnesses need updating:\n  stale:\n  {}\n  missing:\n  {}",
+        stale.join("\n  "),
         missed.join("\n  ")
-    );
-    assert!(
-        stale.is_empty(),
-        "STALE WITNESSES, each caught by another seed:\n  {}",
-        stale.join("\n  ")
     );
 }
 
@@ -1179,6 +1330,14 @@ const FOUND_BOTH_WAYS_ERRING: &[(u64, usize, &str)] = &[
         400,
         "a move an `auto` mirror met before its hello left its pinned batch to recover",
     ),
+    // Critic item E04's hold of a take nothing would carry moved 6751's, 7755's, 735's, 2270's
+    // and 3018's trajectories off this bug (each holds every law still); the first seed of this
+    // world to 60,000 that reaches it with its rule off.
+    (
+        6371,
+        400,
+        "a move an `auto` mirror met before its hello left its pinned batch to recover",
+    ),
     (
         4067,
         400,
@@ -1214,6 +1373,15 @@ const FOUND_RETAINED: &[FoundIn] = &[
     (
         windowed,
         3834,
+        400,
+        "a hello's judge that said the mirror runs kept the wait it no longer showed",
+    ),
+    // Critic item E04's hold of a take nothing would carry moved 3924's and 3834's trajectories
+    // off this bug (each holds every law still); the first windowed seed to 60,000 that reaches
+    // it with its rule off.
+    (
+        windowed,
+        7617,
         400,
         "a hello's judge that said the mirror runs kept the wait it no longer showed",
     ),
@@ -3538,7 +3706,7 @@ fn a_post_the_log_lost_stays_lost_after_a_later_power_cut() {
         o
     };
     let republishing = move |s: u64| world(s).with(Mutant::RepublishInFlightOfAnEarlierBoot);
-    let out = breaking_at(&republishing, "order:", 1746, RARE_SEEDS)
+    let out = breaking_at(&republishing, "order:", 85, RARE_SEEDS)
         .expect("NEGATIVE CONTROL: the old republish puts some post out of its sender's order");
     eprintln!(
         "the old republish at seed {}: {}",

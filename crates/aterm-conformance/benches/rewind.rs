@@ -19,7 +19,7 @@ mod measuring {
     use aterm_conformance::measure::instance::CouldNotRun;
     use aterm_conformance::measure::rewind::{RewindRow, RewindScene, measure};
     use aterm_conformance::measure::rewind_cost::{self, CostRow};
-    use aterm_conformance::measure::starvation::{Disposition, ShapeVerdict};
+    use aterm_conformance::measure::starvation::Disposition;
 
     /// A full chain: the recorder re-keyframes at a quarter of its 8 MiB budget, so 2 MiB of output is the longest a step folds through.
     const CHAIN: usize = 2_000_000;
@@ -51,12 +51,12 @@ mod measuring {
                 chain_bytes: CHAIN,
             }),
         ),
-        // Design §14.5 R4 exit rows, declared before the candidate was measured: parse throughput with recording on at least 0.97x off, ABBA over fresh instances, the arms' medians.
+        // Design §14.5 R4 exit rows, declared before the candidate was measured: parse throughput with recording on at least 0.97x off, ABBA over fresh instances. Judged on the adjacent takes' off/on ratios: their median's 95% sign interval at or above 0.97 passes, wholly below fails, and one holding 0.97 is unproved (`rewind_cost::throughput_disposition`), since a load that comes and goes slows whole takes (ATERM-KI-1102-7) and the arms' pooled medians followed it. Ten blocks give twenty ratios, so the interval is their 6th to 15th (95.9%).
         (
             "recording_keeps_parse_throughput_at_or_above_0_97x",
             Row::Cost(CostRow::Throughput {
                 bytes: 64 << 20,
-                pairs: 5,
+                pairs: 10,
                 min_milli: 970,
             }),
         ),
@@ -88,12 +88,20 @@ mod measuring {
 
     fn cost(rig: &Rig, row: &CostRow) -> Outcome {
         match rewind_cost::measure(rig, row) {
-            Ok(report) if report.verdict == ShapeVerdict::Pass => Outcome::Pass(report.line),
-            Ok(report) => Outcome::Fail(format!(
-                "REWIND COST FAILED: recording lost input or exceeded its cost bound, or a bundle \
-                 that records by default is past the idle target.\n  {}",
-                report.line
-            )),
+            Ok(report) => match report.disposition {
+                Disposition::Pass => Outcome::Pass(report.line),
+                Disposition::Fail => Outcome::Fail(format!(
+                    "REWIND COST FAILED: recording lost input or exceeded its cost bound, or a \
+                     bundle that records by default is past the idle target.\n  {}",
+                    report.line
+                )),
+                Disposition::Unproved => Outcome::CouldNotRun(format!(
+                    "REWIND COST UNPROVED: the adjacent takes' off/on ratios spread past the bound \
+                     the row judges, so their median's 95% interval holds it and the takes are no \
+                     evidence either way; take it on an unloaded machine.\n  {}",
+                    report.line
+                )),
+            },
             Err(CouldNotRun::Unanswered(why)) => Outcome::Unanswered(why),
             Err(why) => Outcome::CouldNotRun(format!(
                 "REWIND COST COULD NOT RUN: the probe decided nothing: {why}"

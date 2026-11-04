@@ -620,8 +620,8 @@ pub trait System: Sync {
     }
 
     /// [`System::ask`] with echo off that keeps what was typed before it: a line another program
-    /// typed into the terminal ahead of the read (System State's go line for the Command Line
-    /// Tools tab, typed once the tab landed) is read, never discarded.
+    /// typed into the terminal ahead of the read (System State's go line for the Mac Setup
+    /// tab, typed once the tab landed) is read, never discarded.
     fn ask_kept(&self, prompt: &str) -> io::Result<Option<Secret>> {
         self.ask(prompt, true)
     }
@@ -1263,8 +1263,13 @@ fn kept_tail(path: &Path) -> io::Result<Vec<u8>> {
     }
     let keep = aterm_uds::deadline::OUTPUT_KEEP as u64;
     let len = meta.len();
-    file.seek(io::SeekFrom::Start(len.saturating_sub(keep)))?;
-    let mut bytes = Vec::new();
+    let start = len.saturating_sub(keep);
+    file.seek(io::SeekFrom::Start(start))?;
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(len.saturating_sub(start).min(keep))
+            .unwrap_or(0)
+            .saturating_add(1),
+    );
     file.take(keep).read_to_end(&mut bytes)?;
     Ok(bytes)
 }
@@ -1640,7 +1645,8 @@ impl System for Live {
                 "file exceeds 64 MiB read limit",
             ));
         }
-        let mut bytes = Vec::new();
+        let mut bytes =
+            Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0).saturating_add(1));
         file.take(MAX_READ_FILE_BYTES + 1).read_to_end(&mut bytes)?;
         if bytes.len() as u64 > MAX_READ_FILE_BYTES {
             return Err(io::Error::new(

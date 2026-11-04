@@ -61,10 +61,7 @@ impl FileEvents for Scripted {
 }
 
 fn scratch(name: &str) -> aterm_tempfile::TempDir {
-    aterm_tempfile::Builder::new()
-        .prefix(name)
-        .tempdir()
-        .unwrap()
+    crate::test_scratch_dir(name)
 }
 
 /// Any arm, counting its arms so a test knows the watch took its baseline.

@@ -141,6 +141,8 @@ fn this_macs_preferred_accounts_come_first_and_a_preference_limits_nothing() {
 
 /// Negative controls: taking the first window rather than the most used reads 5h's 62% left;
 /// skipping the wall leaves the cell a heat; letting a workspace's window bind makes it 1% left.
+/// Reusing the sign-in words or projection clock leaves their ages unchanged or labels the
+/// future record as one made in the past.
 #[test]
 fn quota_left_is_the_binding_windows_with_its_readings_age() {
     let lab = Lab {
@@ -162,19 +164,31 @@ fn quota_left_is_the_binding_windows_with_its_readings_age() {
         "ac-01".into(),
         AccountSeen {
             windows: vec![window("5h", 380, 720), window("7d", 615, 1_800), workspace],
-            signed_in: vec![SignedIn {
-                on: "m3".into(),
-                state: "in".into(),
-                t: NOW - 60,
-            }],
+            signed_in: vec![
+                SignedIn {
+                    on: "m3".into(),
+                    state: "in".into(),
+                    t: NOW - 60,
+                },
+                SignedIn {
+                    on: "m4".into(),
+                    state: "out".into(),
+                    t: NOW + 60,
+                },
+            ],
             ..AccountSeen::default()
         },
     );
     let mut wall = window("5h", 1000, 120);
+    wall.read = Some((NOW + 120, "m3".into(), "statusline".into()));
     wall.wall_until = Some(Some(NOW + 3_600));
     seen.accounts.insert(
         "ac-02".into(),
         AccountSeen {
+            last_use: Some(LastUse {
+                by: "m3".into(),
+                t: NOW + 300,
+            }),
             windows: vec![window("7d", 200, 60), wall],
             ..AccountSeen::default()
         },
@@ -188,21 +202,58 @@ fn quota_left_is_the_binding_windows_with_its_readings_age() {
             ..AccountSeen::default()
         },
     );
+    let original = seen.clone();
     let deck = project(Some(&lab), Some(&seen), NOW);
     let two = &deck.rows[0];
     assert_eq!(two.cell, Cell::Used(615));
     assert_eq!(
         fact(two, "Quota left"),
-        "38.5% of 7d left, read 30 min ago on m3 (statusline)"
+        "38.5% of 7d left, read on m3, about 30 min ago (its clock) (statusline)"
     );
-    assert_eq!(fact(two, "Signed in on"), "m3 (in)");
+    let sign_ins = "m3 (in), about 1 min ago (its clock); m4 (out), 1 min ahead (its clock)";
+    assert_eq!(fact(two, "Sign-in records"), sign_ins);
+    assert!(
+        two.summary
+            .contains(&format!("sign-in records: {sign_ins}"))
+    );
     assert!(two.summary.contains("38.5% of 7d left"), "{}", two.summary);
     let walled = &deck.rows[1];
     assert_eq!(walled.cell, Cell::AtLimit);
     assert!(fact(walled, "Quota left").starts_with("5h at its limit until "));
+    assert!(
+        fact(walled, "Quota left").contains("read on m3, 2 min ahead (its clock) (statusline)")
+    );
+    assert_eq!(fact(walled, "Last used by"), "m3, 5 min ahead (its clock)");
+    assert!(
+        walled
+            .summary
+            .contains("last used by m3, 5 min ahead (its clock)")
+    );
     let unread = &deck.rows[2];
     assert_eq!(unread.cell, Cell::Unknown, "absent, never zero");
     assert!(fact(unread, "Quota left").starts_with("Unknown"));
+    let later = project(Some(&lab), Some(&seen), NOW + 3_600);
+    let sign_ins = "m3 (in), about 1 h ago (its clock); m4 (out), about 59 min ago (its clock)";
+    assert_eq!(fact(&later.rows[0], "Sign-in records"), sign_ins);
+    assert!(
+        later.rows[0]
+            .summary
+            .contains(&format!("sign-in records: {sign_ins}"))
+    );
+    assert!(
+        fact(&later.rows[1], "5h window")
+            .contains("read on m3, about 58 min ago (its clock) (statusline)")
+    );
+    assert_eq!(
+        fact(&later.rows[1], "Last used by"),
+        "m3, about 55 min ago (its clock)"
+    );
+    assert!(
+        later.rows[1]
+            .summary
+            .contains("last used by m3, about 55 min ago (its clock)")
+    );
+    assert_eq!(seen, original);
 }
 
 /// Negative control: a `latest` that locks rather than tries waits on the held guard and hangs
@@ -338,6 +389,14 @@ fn the_lens_steps_from_secrets_onto_the_accounts_and_shows_their_rows() {
     use crate::network_deck::{Target, details_lab, step};
     let snapshot = aterm_types::network_state::NetworkStateSnapshot::default();
     let deck = fixture(NOW);
+    assert!(
+        fact(&deck.rows[1], "Quota left")
+            .contains("read on m2, 2 min ahead (its clock) (statusline)")
+    );
+    assert_eq!(
+        fact(&deck.rows[1], "Last used by"),
+        "m2, 5 min ahead (its clock)"
+    );
     let first = Target::LabAccount(deck.rows[0].id);
     assert_eq!(step(&snapshot, &deck, Target::Secrets, true), first);
     let rows = details_lab(&snapshot, &deck, first);
@@ -372,7 +431,10 @@ fn an_unread_journal_is_not_read_as_an_empty_one() {
         fact(row, "Quota left"),
         "Unknown; the lab journal is not read yet"
     );
-    assert_eq!(fact(row, "Signed in on"), "The lab journal is not read yet");
+    assert_eq!(
+        fact(row, "Sign-in records"),
+        "The lab journal is not read yet"
+    );
     let (_, line) = unread.overview().expect("a row");
     assert!(line.contains("not read yet"), "{line}");
     let read = project(
@@ -386,6 +448,10 @@ fn an_unread_journal_is_not_read_as_an_empty_one() {
     assert_eq!(
         fact(&read.rows[0], "Last used by"),
         "No use in the lab journal"
+    );
+    assert_eq!(
+        fact(&read.rows[0], "Sign-in records"),
+        "No sign-in record in the lab journal"
     );
     assert!(!read.overview().expect("a row").1.contains("not read yet"));
 }

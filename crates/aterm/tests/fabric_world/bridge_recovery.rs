@@ -114,10 +114,35 @@ fn the_fleet_face_resumes_from_its_last_record_and_does_not_re_answer_history() 
     );
 }
 
-/// §6.2's refill runs for a session that already existed when the bridge started.
+/// §6.2's refill runs for a session that already existed when the bridge started. NEGATIVE
+/// CONTROL for the cold refill below: this small log fits inside aterm's residency budget
+/// (`RESIDENT_BUDGET`, set here so the dev seam cannot change it), so the restart reads none of
+/// it back from the file.
 #[test]
 fn a_session_that_existed_when_the_bridge_started_is_still_refilled() {
-    let w = World::boot("r3refill", &[]);
+    let mut opts = harness::broker_opts(aterm_link::durability::Durability::Strict);
+    opts.resident_budget = Some(aterm_link::durability::RESIDENT_BUDGET);
+    let w = World::boot_opts("r3refill", opts);
+    let cold = refilled(&w);
+    assert_eq!(cold, 0, "every record resident, none read cold");
+}
+
+/// THE SAME REFILL, READ COLD (D10d): a broker held to a residency budget of 0 keeps only its
+/// newest record decoded, so the restarted bridge's refill (`Bridge::refill_together`) reads
+/// the session's rows back from the log file, and offers exactly what the resident refill does.
+#[test]
+fn a_refill_below_the_residency_window_offers_what_a_resident_one_does() {
+    let mut opts = harness::broker_opts(aterm_link::durability::Durability::Strict);
+    opts.resident_budget = Some(0);
+    let w = World::boot_opts("r3refillcold", opts);
+    let cold = refilled(&w);
+    assert!(cold > 0, "the restart read records back from the file");
+}
+
+/// Fills a session's ring to its sender's quota, marks half of it seen, restarts the bridge and
+/// checks its refill offers each row once, the one the quota refused included. Returns the
+/// records `w`'s broker read back cold from the restart to that check (`Broker::cold_reads`).
+fn refilled(w: &World) -> u64 {
     w.wait_ready();
     let (a, _b) = w.two_sessions();
 
@@ -130,7 +155,7 @@ fn a_session_that_existed_when_the_bridge_started_is_still_refilled() {
         .collect();
     harness::publish_pipelined(&mut w.god(), &rows_65);
     until("the ring to fill to the sender's quota", || {
-        (rows(&w, &a).len() >= 64).then_some(())
+        (rows(w, &a).len() >= 64).then_some(())
     });
     let refused = until("the 65th to be refused for quota", || {
         w.ev()
@@ -138,12 +163,12 @@ fn a_session_that_existed_when_the_bridge_started_is_still_refilled() {
             .find(|e| e.starts_with("undeliverable ") && e.contains("reason=quota"))
     });
     assert!(
-        !rows(&w, &a).iter().any(|r| r.ends_with("text=row65")),
+        !rows(w, &a).iter().any(|r| r.ends_with("text=row65")),
         "the quota refusal means the endpoint never took the row: {refused}"
     );
 
     assert!(w.verb(&format!("@{a} inbox")).ok(), "list the ring");
-    let mid_id = rows(&w, &a)
+    let mid_id = rows(w, &a)
         .iter()
         .find(|r| r.ends_with("text=row32"))
         .and_then(|r| r.split_whitespace().nth(1).map(str::to_string))
@@ -155,15 +180,17 @@ fn a_session_that_existed_when_the_bridge_started_is_still_refilled() {
             .map(|_| ())
     });
 
+    let broker = w.broker.as_ref().expect("the world's own broker");
+    let cold_before = broker.cold_reads();
     w.restart_bridge();
 
     until("the refill to re-offer the row the quota refused", || {
-        rows(&w, &a)
+        rows(w, &a)
             .iter()
             .any(|r| r.ends_with("text=row65"))
             .then_some(())
     });
-    let held = rows(&w, &a);
+    let held = rows(w, &a);
     for n in [1u64, 32, 33, 48, 64, 65] {
         assert_eq!(
             held.iter()
@@ -173,6 +200,7 @@ fn a_session_that_existed_when_the_bridge_started_is_still_refilled() {
             "row{n} must appear exactly once: {held:#?}"
         );
     }
+    broker.cold_reads().saturating_sub(cold_before)
 }
 
 /// A post that becomes unroutable takes its durable reservation with it, and an

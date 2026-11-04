@@ -538,11 +538,9 @@ fn a_fresh_row_starts_with_no_read() {
     assert_eq!(reads.homes.lock().unwrap().len(), 1);
 }
 
-/// A pool whose every pick turns out spent stops at [`LAUNCH_READS`], so a launch never sweeps the
-/// pool. CONTROL: `LAUNCH_READS` rows are read, so the cap is what stopped it.
-#[test]
-fn a_launch_reads_no_more_than_its_cap() {
-    let world = World::new("launch-cap");
+/// A Codex pool of six on `main`: `main`, `work`, and `w2` to `w5`, each with a login of its own.
+fn six(tag: &str) -> World {
+    let world = World::new(tag);
     world.two(Cli::Codex);
     let mut text =
         std::fs::read_to_string(world.cfg.join(Cli::Codex.accounts().roster_file)).expect("roster");
@@ -557,6 +555,14 @@ fn a_launch_reads_no_more_than_its_cap() {
     }
     std::fs::write(world.cfg.join(Cli::Codex.accounts().roster_file), text).expect("roster");
     world.on_main(Cli::Codex, &[]);
+    world
+}
+
+/// A pool whose every pick turns out spent stops at [`LAUNCH_READS`], so a launch never sweeps the
+/// pool. CONTROL: `LAUNCH_READS` rows are read, so the cap is what stopped it.
+#[test]
+fn a_launch_reads_no_more_than_its_cap() {
+    let world = six("launch-cap");
     let answer = |_: &Path| spent_usage();
     let reads = Reads {
         user_home: &world.home,
@@ -568,6 +574,36 @@ fn a_launch_reads_no_more_than_its_cap() {
         reads.homes.lock().unwrap().len(),
         crate::harness::accounts_pool::LAUNCH_READS
     );
+}
+
+/// A cold relaunch's read of the row it ran on counts against the same cap: where every row reads
+/// spent, the row it ran on and the serving row's picks are read [`LAUNCH_READS`] times in all.
+/// CONTROL: the row it ran on was read first, so the cap, not a skipped read, stopped it.
+#[test]
+fn a_cold_relaunch_reads_no_more_than_a_launchs_cap() {
+    let world = six("cold-cap");
+    let ran = world.root.join("logins").join("codex").join("w2");
+    let auth = ran.join("auth.json").display().to_string();
+    let answer = |_: &Path| spent_usage();
+    let reads = Reads {
+        user_home: &world.home,
+        homes: std::sync::Mutex::default(),
+        answer: &answer,
+    };
+    let _ = cold_launch_env(
+        &world.seat(),
+        Cli::Codex,
+        &[("CODEX_AUTH_PATH", auth.as_str())],
+        &reads,
+        None,
+    );
+    let homes = reads.homes.lock().unwrap();
+    assert_eq!(
+        homes.len(),
+        crate::harness::accounts_pool::LAUNCH_READS,
+        "{homes:?}"
+    );
+    assert_eq!(homes[0], ran, "CONTROL: the row it ran on is read first");
 }
 
 /// A login signed in again by hand comes back when nothing on record serves, the one row left to

@@ -44,7 +44,14 @@ impl Poster for Inert {
 }
 
 /// How long [`ToInstance`] gives the instance to take every line of one pass.
+#[cfg(not(test))]
 pub const POST_BOUND: Duration = Duration::from_secs(2);
+
+/// Under test, the one-minute hang detector: a unit test's stand-in instance answers from a
+/// thread of the test binary, which a loaded machine can keep from running for longer than 2 s,
+/// and no test's property is how fast an instance answers.
+#[cfg(test)]
+pub const POST_BOUND: Duration = aterm_spec::wait::MUST_HAPPEN;
 
 /// The most bytes of one line's text an `appnotice` carries: within the 512 the instance takes.
 const NOTICE_TEXT_BYTES: usize = 400;

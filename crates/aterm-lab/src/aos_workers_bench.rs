@@ -1687,6 +1687,13 @@ pub struct LabFacts {
     pub unchanged: Option<bool>,
 }
 
+/// [`LabFacts::debug`]: this runner's own profile (`runner_debug`) where `--lab` is byte-identical
+/// to it (`runner_is_lab`), else unknown. Pure, so a test reaches a release runner's answer.
+#[must_use]
+pub fn lab_debug(runner_is_lab: Option<bool>, runner_debug: bool) -> Option<bool> {
+    runner_is_lab.and_then(|same| same.then_some(runner_debug))
+}
+
 /// Gate 0, one clean commit and one debug lab binary: what breaks it. Pure.
 #[must_use]
 pub fn gate0(build: Option<&str>, lab: LabFacts, done: bool) -> Vec<String> {
@@ -1781,7 +1788,7 @@ fn reasons(v: &[(Gate, String)], gate: Gate) -> Vec<String> {
 #[must_use]
 pub fn span_ratio(walls: &[f64]) -> Option<f64> {
     let (lo, hi) = span(walls)?;
-    (lo > 0.0).then(|| hi / lo)
+    (lo > 0.0).then_some(hi / lo)
 }
 
 /// The clean session's gates 0–6 over its runs so far. Pure.
@@ -2881,7 +2888,7 @@ fn reported(o: &mut String, runs: &[Run], ev: &CleanEval) {
             .filter_map(|n| {
                 let x = arm_runs(runs, &[*n], a).first()?.m.wall_ms;
                 let y = arm_runs(runs, &[*n], b).first()?.m.wall_ms;
-                (y > 0.0).then(|| x / y)
+                (y > 0.0).then_some(x / y)
             })
             .collect()
     };
@@ -3599,7 +3606,7 @@ pub fn cmd_aos_workers_bench(args: &[String]) -> Res {
         runner_is_lab,
         profile: env!("ATERM_LAB_PROFILE").to_owned(),
         lab_facts: LabFacts {
-            debug: runner_is_lab.and_then(|same| same.then_some(cfg!(debug_assertions))),
+            debug: lab_debug(runner_is_lab, cfg!(debug_assertions)),
             unchanged: None,
         },
         plans: plans.display().to_string(),

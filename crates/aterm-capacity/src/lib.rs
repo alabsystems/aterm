@@ -63,9 +63,17 @@ use std::time::Duration;
 pub mod admit;
 pub mod book;
 pub mod cpu_observation;
+#[cfg(unix)]
+pub mod epoch_controller;
+#[cfg(unix)]
+mod epoch_endpoint;
+#[cfg(unix)]
+mod epoch_wire;
 pub mod host_protocol;
 #[cfg(unix)]
 pub mod leadership;
+#[cfg(unix)]
+pub mod retained_cohort;
 pub use cpu_observation::{CpuHolder, CpuObservation};
 mod timing;
 pub use timing::{CpuPoint, CpuWindow, QuietPolicy, TimingCause, TimingEvidence, TimingIssue};
@@ -94,6 +102,11 @@ pub mod tree_meter;
 /// Core Trust's native CPU lease pool, shared with toolchain schedulers.
 #[cfg(unix)]
 pub use trust_build_cpu as build_cpu;
+
+#[cfg(all(test, unix))]
+mod epoch_controller_tests;
+#[cfg(all(test, unix))]
+mod retained_cohort_tests;
 
 pub use admit::{
     Alone, CREDIT_MAX, Claim, Error, Forced, Holder, Pace, Polled, QuietStart, Relief, Reserve,
@@ -124,18 +137,23 @@ pub(crate) const fn account_home() -> Option<PathBuf> {
     None
 }
 
-/// Open a regular file for reading without following a symlink at `path` or blocking on a FIFO.
-pub(crate) fn open_regular_reader(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+/// Open a regular file for reading without following a symlink at `path` or blocking on a FIFO,
+/// returning both the descriptor and its `fstat` metadata.
+pub(crate) fn open_regular_reader_with_meta(
+    path: &std::path::Path,
+) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
     #[cfg(unix)]
-    let file = {
+    let (file, meta) = {
         use std::os::unix::fs::OpenOptionsExt as _;
-        std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-            .open(path)?
+            .open(path)?;
+        let meta = file.metadata()?;
+        (file, meta)
     };
     #[cfg(windows)]
-    let file = {
+    let (file, meta) = {
         use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
@@ -143,16 +161,17 @@ pub(crate) fn open_regular_reader(path: &std::path::Path) -> std::io::Result<std
             .read(true)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)?;
-        if file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        let meta = file.metadata()?;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "refusing symlink",
             ));
         }
-        file
+        (file, meta)
     };
     #[cfg(not(any(unix, windows)))]
-    let file = {
+    let (file, meta) = {
         let link = std::fs::symlink_metadata(path)?;
         if link.file_type().is_symlink() {
             return Err(std::io::Error::new(
@@ -160,22 +179,35 @@ pub(crate) fn open_regular_reader(path: &std::path::Path) -> std::io::Result<std
                 "refusing symlink",
             ));
         }
-        std::fs::File::open(path)?
+        let file = std::fs::File::open(path)?;
+        let meta = file.metadata()?;
+        (file, meta)
     };
-    if !file.metadata()?.is_file() {
+    if !meta.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "not a regular file",
         ));
     }
-    Ok(file)
+    Ok((file, meta))
+}
+
+/// Open a regular file for reading without following a symlink at `path` or blocking on a FIFO.
+pub(crate) fn open_regular_reader(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    open_regular_reader_with_meta(path).map(|(file, _)| file)
 }
 
 /// Read up to `max` bytes of UTF-8 text from a regular file at `path` ([`open_regular_reader`]).
 pub(crate) fn read_regular_text(path: &std::path::Path, max: u64) -> std::io::Result<String> {
     use std::io::Read as _;
-    let file = open_regular_reader(path)?;
-    let cap = usize::try_from(max.min(64 * 1024)).unwrap_or(64 * 1024);
+    let (file, meta) = open_regular_reader_with_meta(path)?;
+    if meta.len() > max {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            "file exceeds bound",
+        ));
+    }
+    let cap = usize::try_from(meta.len().min(64 * 1024).saturating_add(1)).unwrap_or(64 * 1024 + 1);
     let mut buf = Vec::with_capacity(cap);
     file.take(max.saturating_add(1)).read_to_end(&mut buf)?;
     if u64::try_from(buf.len()).unwrap_or(u64::MAX) > max {

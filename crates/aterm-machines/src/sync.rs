@@ -97,7 +97,7 @@ pub const ACCOUNTS: &str = "sync.accounts";
 pub const RELEASE: &str = "sync.release";
 /// `sync.fabric`: the message bus (fabric), on by default, and its broker renewed on a new build.
 pub const FABRIC: &str = "sync.fabric";
-/// `sync.awake`: aCaffiene keeping this Mac awake, with no window open too.
+/// `sync.awake`: aCaffeine keeping this Mac awake, with no window open too.
 pub const AWAKE: &str = "sync.awake";
 
 /// What every sync row says when `[swarm] enabled = false` turns swarm participation off.
@@ -521,7 +521,7 @@ pub enum FabricRead {
     Unset(String),
 }
 
-/// What aCaffiene's keeping this Mac awake reads as (`sync.awake`).
+/// What aCaffeine's keeping this Mac awake reads as (`sync.awake`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AwakeRead {
     /// Nothing of it is this pass's: why (not macOS, no installed app, or the person turned
@@ -829,7 +829,7 @@ pub trait Ports: Sync {
     /// # Errors
     /// The mug did not start.
     fn keep_awake(&self) -> Result<String, String>;
-    /// Whether the person turned the installed app's aCaffiene Enable at Startup off: they chose
+    /// Whether the person turned the installed app's aCaffeine Enable at Startup off: they chose
     /// no mug at login, so the subscriber's pass, which runs at login with no window, leaves it
     /// to a window.
     fn awake_startup_off(&self) -> bool;
@@ -915,7 +915,7 @@ enum Kind {
 impl Kind {
     /// Whether this kind rides the vault, so System State's hold on the vault holds it too
     /// ([`Ports::vault_held`]): every kind but the fabric, a message bus provisioned on this Mac
-    /// alone (design §8.5), and aCaffiene's keeping this Mac awake, which an aterm window keeps
+    /// alone (design §8.5), and aCaffeine's keeping this Mac awake, which an aterm window keeps
     /// whatever the vault does, so the subscriber's pass keeps it alike.
     const fn rides_the_vault(self) -> bool {
         !matches!(self, Self::Fabric | Self::Awake)
@@ -1022,7 +1022,7 @@ fn not_applicable(why: impl Into<String>) -> Probe {
     Probe::NotApplicable { why: why.into() }
 }
 
-const AWAKE_STARTUP_OFF_WHY: &str = "aCaffiene's Enable at Startup is off by your choice, so an \
+const AWAKE_STARTUP_OFF_WHY: &str = "aCaffeine's Enable at Startup is off by your choice, so an \
      aterm window starts the mug, not this pass";
 
 fn old_awake_jobs_due(retired: &[String], context: &str) -> Probe {
@@ -1164,7 +1164,7 @@ impl Item for Synced<'_> {
             Kind::Accounts => "the AI accounts roster",
             Kind::Release => "shared release signing",
             Kind::Fabric => "the message bus (fabric)",
-            Kind::Awake => "aCaffiene keeping this Mac awake",
+            Kind::Awake => "aCaffeine keeping this Mac awake",
         }
         .to_owned()
     }
@@ -1580,7 +1580,7 @@ impl Item for Synced<'_> {
             },
             Kind::Release => Remedy::None,
             Kind::Fabric => Remedy::Command("aterm fabric on".to_owned()),
-            Kind::Awake => Remedy::Command("aterm acaffiene start".to_owned()),
+            Kind::Awake => Remedy::Command("aterm acaffeine start".to_owned()),
         };
         Explain { why, remedy }
     }

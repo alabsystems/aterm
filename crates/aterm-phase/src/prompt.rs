@@ -3182,6 +3182,50 @@ pub mod fixtures {
     pub const AT_MENU_NO_DOWN_CELLS_2_1_268: &str =
         include_str!("fixtures/claude-2.1.268-at-menu-no-down-cells.txt");
     pub const AT_MENU_ONE_2_1_268: &str = include_str!("fixtures/claude-2.1.268-at-menu-one.txt");
+    /// Claude Code 2.1.318's prompt-history search (Ctrl-R) open after a turn
+    /// (`crate::phase::history_search`): its match in the composer row, in typed ink; nothing there,
+    /// its query matching nothing; and the grey suggestion it opened over, its query empty. The
+    /// cursor stands on the footer row.
+    pub const HISTORY_SEARCH_2_1_318: &str =
+        include_str!("fixtures/claude-2.1.318-history-search.txt");
+    pub const HISTORY_SEARCH_NO_MATCH_2_1_318: &str =
+        include_str!("fixtures/claude-2.1.318-history-search-no-match.txt");
+    pub const HISTORY_SEARCH_OVER_SUGGESTION_2_1_318: &str =
+        include_str!("fixtures/claude-2.1.318-history-search-over-suggestion.txt");
+    pub const HISTORY_SEARCH_UNDER_STATUSLINE_2_1_318: &str =
+        include_str!("fixtures/claude-2.1.318-history-search-under-statusline.txt");
+    pub const HISTORY_SEARCH_UNDER_STATUSLINE_CELLS_2_1_318: &str =
+        include_str!("fixtures/claude-2.1.318-history-search-under-statusline-cells.txt");
+    pub const HISTORY_SEARCH_CELLS_2_1_318: &str =
+        include_str!("fixtures/claude-2.1.318-history-search-cells.txt");
+    pub const HISTORY_SEARCH_OVER_SUGGESTION_CELLS_2_1_318: &str =
+        include_str!("fixtures/claude-2.1.318-history-search-over-suggestion-cells.txt");
+    /// The same search in narrow windows: its label wraps in its own column beside the query, by
+    /// whole words at 60, 44 and 34 columns and within its words at 26 and 22; over its match
+    /// (its ink in the cells files at 60, 44 and 26; at 22 the match wraps the composer onto two
+    /// rows), or its query matching nothing over an empty composer.
+    pub const HISTORY_SEARCH_60COL_2_1_318: &str =
+        include_str!("fixtures/claude-2.1.318-history-search-60col.txt");
+    pub const HISTORY_SEARCH_60COL_CELLS_2_1_318: &str =
+        include_str!("fixtures/claude-2.1.318-history-search-60col-cells.txt");
+    pub const HISTORY_SEARCH_NO_MATCH_60COL_2_1_318: &str =
+        include_str!("fixtures/claude-2.1.318-history-search-no-match-60col.txt");
+    pub const HISTORY_SEARCH_44COL_2_1_318: &str =
+        include_str!("fixtures/claude-2.1.318-history-search-44col.txt");
+    pub const HISTORY_SEARCH_44COL_CELLS_2_1_318: &str =
+        include_str!("fixtures/claude-2.1.318-history-search-44col-cells.txt");
+    pub const HISTORY_SEARCH_NO_MATCH_44COL_2_1_318: &str =
+        include_str!("fixtures/claude-2.1.318-history-search-no-match-44col.txt");
+    pub const HISTORY_SEARCH_NO_MATCH_34COL_2_1_318: &str =
+        include_str!("fixtures/claude-2.1.318-history-search-no-match-34col.txt");
+    pub const HISTORY_SEARCH_26COL_2_1_318: &str =
+        include_str!("fixtures/claude-2.1.318-history-search-26col.txt");
+    pub const HISTORY_SEARCH_26COL_CELLS_2_1_318: &str =
+        include_str!("fixtures/claude-2.1.318-history-search-26col-cells.txt");
+    pub const HISTORY_SEARCH_NO_MATCH_26COL_2_1_318: &str =
+        include_str!("fixtures/claude-2.1.318-history-search-no-match-26col.txt");
+    pub const HISTORY_SEARCH_22COL_2_1_318: &str =
+        include_str!("fixtures/claude-2.1.318-history-search-22col.txt");
     pub const SLASH_MENU_CONFIG_2_1_268: &str =
         include_str!("fixtures/claude-2.1.268-slash-menu-config.txt");
     pub const SLASH_MENU_CONFIG_CELLS_2_1_268: &str =

@@ -151,8 +151,7 @@ pub fn read_install_policy(store: &OsStr) -> Verdict<Policy> {
         meta.file_type().is_file() && meta.uid() == me && meta.mode() & 0o077 == 0,
         "unsafe update-state file",
     )?;
-    let state_file = open_file(&real)?;
-    let state_opened = state_file.metadata().map_err(|e| os_error(&e, &real))?;
+    let (state_file, state_opened) = open_file(&real)?;
     require(
         state_opened.file_type().is_file()
             && state_opened.uid() == me
@@ -161,7 +160,10 @@ pub fn read_install_policy(store: &OsStr) -> Verdict<Policy> {
             && state_opened.ino() == meta.ino(),
         "unsafe update-state file",
     )?;
-    let state = parse_toml(&read_bounded_file(state_file, &path, 262_144)?, &path)?;
+    let state = parse_toml(
+        &read_bounded_file((state_file, state_opened), &path, 262_144)?,
+        &path,
+    )?;
     require(
         equals_int(state.get("schema"), 1),
         "unsupported update-state schema",
@@ -226,10 +228,7 @@ pub fn read_install_policy(store: &OsStr) -> Verdict<Policy> {
             && target_meta.len() <= MAX_BINARY,
         "unsafe installed executable",
     )?;
-    let target_file = open_file(&target_path)?;
-    let target_opened = target_file
-        .metadata()
-        .map_err(|e| os_error(&e, &target_path))?;
+    let (target_file, target_opened) = open_file(&target_path)?;
     require(
         target_opened.file_type().is_file()
             && target_opened.uid() == me

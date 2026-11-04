@@ -52,7 +52,8 @@ fn read(path: &Path, maximum: u64) -> Result<Option<Vec<u8>>, String> {
         }
     }
     let modified = before.modified().map_err(|error| error.to_string())?;
-    let mut bytes = Vec::new();
+    let mut bytes =
+        Vec::with_capacity(usize::try_from(before.len()).unwrap_or(0).saturating_add(1));
     std::io::Read::by_ref(&mut file)
         .take(maximum + 1)
         .read_to_end(&mut bytes)

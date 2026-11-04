@@ -662,6 +662,31 @@ fn execution_fixture(sid: &str) -> (Arc<Accts>, WorkerIdle, HostHandle, u64) {
     (a, idle, host, born)
 }
 
+pub(in crate::harness_host) struct ProgressExecutionFixture {
+    accounts: Arc<Accts>,
+    pub(in crate::harness_host) seat: AccountSeat,
+    pub(in crate::harness_host) idle: WorkerIdle,
+    pub(in crate::harness_host) host: HostHandle,
+    pub(in crate::harness_host) born: u64,
+}
+
+impl ProgressExecutionFixture {
+    pub(in crate::harness_host) fn account_calls(&self) -> [usize; 3] {
+        ["env:", "restart:", "made:"].map(|call| self.accounts.asked(call))
+    }
+}
+
+pub(in crate::harness_host) fn progress_execution_fixture(sid: &str) -> ProgressExecutionFixture {
+    let (accounts, idle, host, born) = execution_fixture(sid);
+    ProgressExecutionFixture {
+        seat: accounts.seat(),
+        accounts,
+        idle,
+        host,
+        born,
+    }
+}
+
 // The actual gate/deadline stay real; observations pin both clocks without a scheduling budget.
 fn execution_clock(host: &HostHandle, sid: &str, elapsed: bool) -> (Instant, Option<i64>) {
     let kept = host.shared.kept.lock().unwrap().get(sid).cloned();
@@ -1078,6 +1103,253 @@ fn execution_case_at(
     ]
 }
 
+fn execution_activity_transition(
+    before: &aterm_spec::interp::State,
+    legacy: u8,
+) -> aterm_spec::interp::State {
+    let mut observed = None;
+    for off in [false, true] {
+        let values = progress::expired_activity_tests::expired_activity_observation(
+            before["elapsed"] == 1 || legacy == 2,
+            before["activity_rows_changed"] == 1 && legacy != 3,
+            legacy != 1,
+            1,
+            off,
+        );
+        let mut after = before.clone();
+        after.insert("stage", 2);
+        for (field, value) in [
+            ("view", values[0]),
+            ("deadline", values[1]),
+            ("current", values[2]),
+            ("historical", values[3]),
+            ("counts_unknown", values[4]),
+            ("authority", values[6]),
+            ("retained", values[6]),
+            ("retry", values[8]),
+            ("wake", values[9]),
+            ("visible", i64::from(values[2] == 1 || values[3] == 1)),
+        ] {
+            after.insert(field, value);
+        }
+        assert_eq!(values[7], 0, "active work acquired a historical diagnostic");
+        if let Some(expected) = &observed {
+            assert_eq!(expected, &after, "Off changed the execution observation");
+        } else {
+            observed = Some(after);
+        }
+    }
+    observed.unwrap()
+}
+
+fn retained_normal_execution_transition(
+    before: &aterm_spec::interp::State,
+    legacy: u8,
+) -> aterm_spec::interp::State {
+    let mut observed = None;
+    for resumed in [false, true] {
+        let activity_kinds: &[i64] = if before["activity"] == 0 {
+            &[0, 3] // Empty and inactive B must project the same retained A history.
+        } else {
+            std::slice::from_ref(&before["activity"])
+        };
+        for &activity_kind in activity_kinds {
+            let context_present = before["context"] == 1 && before["context_record"] == 1;
+            let values = progress::retired_activity_tests::retired_activity_observation(
+                if legacy == 4 { 1 } else { before["normal"] },
+                context_present && legacy != 3,
+                activity_kind,
+                resumed,
+            );
+            let mut after = before.clone();
+            after.insert("stage", 2);
+            for (field, value) in [
+                ("view", values[0]),
+                ("counts_unknown", values[6]),
+                ("deadline", values[2]),
+                ("generic_safe", values[7]),
+                ("retry", i64::from(values[0] == 7 || values[6] == 1)),
+                ("wake", i64::from(values[0] == 7 || values[6] == 1)),
+                ("forecasts", i64::from(values[1] == 1 || values[2] == 1)),
+                ("paused", values[3]),
+                ("retained", values[4]),
+                ("activity_history", i64::from(values[5] > 0)),
+            ] {
+                after.insert(field, value);
+            }
+            if let Some(expected) = &observed {
+                assert_eq!(
+                    expected, &after,
+                    "Off/resumed and empty/inactive projections differ"
+                );
+            } else {
+                observed = Some(after);
+            }
+        }
+    }
+    observed.unwrap()
+}
+
+fn independent_execution_transition(
+    before: &aterm_spec::interp::State,
+    action: &str,
+    legacy: u8,
+) -> aterm_spec::interp::State {
+    use aterm_agent::harness::account_progress::ProgressPhase;
+    use progress::activity::ActivityCapture;
+
+    let sid = "s-independent-execution-model";
+    let (a, idle, host, born) = execution_fixture(sid);
+    let seat = a.seat();
+    let initial_generation = Arc::clone(&idle.kept.lock().unwrap().account.landing);
+    let authority = || {
+        [
+            a.store().state_file(),
+            a.store().logins_file(),
+            a.store().ledger_path(),
+            a.store().machine_file(),
+            a.roster_path(),
+        ]
+        .map(|path| std::fs::read(path).ok())
+    };
+    let images = authority();
+    let capture = if before["context"] > 0 || action == "CaptureContext" {
+        Some(ActivityCapture::capture(&idle.kept.lock().unwrap()).unwrap())
+    } else {
+        None
+    };
+    let replace = || idle.kept.lock().unwrap().account.landing = Arc::default();
+    if before["context"] == 2 {
+        replace();
+    }
+    if before["stage"] == 1 {
+        if let Some(capture) = capture.as_ref() {
+            let read = capture.read_for_test(&seat, born);
+            capture.publish_for_test(&idle.kept, &idle.hooks, &seat, read, Some(born));
+        }
+        if before["context"] == 3 {
+            replace();
+        }
+    }
+    let mut after = before.clone();
+    match action {
+        "CaptureContext" => {
+            // Capturing metadata does not publish a judgment or activity observation.
+            assert!(capture.is_some());
+            after.insert("context", 1);
+        }
+        "ReplaceContext" => {
+            replace();
+            after.insert("context", if before["stage"] == 0 { 2 } else { 3 });
+        }
+        "WorkStarts" | "ActivityBusy" => {
+            after.insert("activity", if action == "WorkStarts" { 1 } else { 2 });
+        }
+        "PublishContext" => {
+            if let Some(capture) = capture.as_ref() {
+                let read = capture.read_for_test(&seat, born);
+                capture.publish_for_test(&idle.kept, &idle.hooks, &seat, read, Some(born));
+            }
+            after.insert("stage", 1);
+            after.insert(
+                "context_record",
+                i64::from(idle.kept.lock().unwrap().account.activity_context.is_some()),
+            );
+        }
+        "Project" => {
+            if legacy == 1 {
+                // The former reader had no independent metadata source at all.
+                idle.kept.lock().unwrap().account.activity_context = None;
+            } else if legacy == 2 {
+                // Counterfactual reuse of the captured fence authorizes the retired row.
+                idle.kept.lock().unwrap().account.landing = initial_generation;
+            }
+            let roster = a.roster();
+            let clock = Instant::now();
+            let read = host.account_progress_read_with_activity(
+                sid,
+                std::process::id().try_into().unwrap(),
+                Some(born),
+                Some(ACCT_TALK_A),
+                || (clock, Some(ACCT_NOW)),
+                |store, cli, now| {
+                    assert_eq!(store.dir, a.store().dir);
+                    assert_eq!(cli, accounts::Cli::Claude);
+                    match before["activity"] {
+                        0 => Some(Vec::new()),
+                        1 => Some(vec![aterm_agent::harness::accounts_sync::LoginActivity {
+                            label: "work-2".into(),
+                            route: Some("fixture-browser".into()),
+                            active: true,
+                            observed_at: now,
+                            // Context-only views must not inherit a scheduling judgment.
+                            next_at: Some(now + 900),
+                            diagnostic: None,
+                            identity: roster
+                                .row("work-2")
+                                .map(aterm_agent::harness::accounts_sync::LoginIdentity::for_test),
+                        }]),
+                        2 => None,
+                        _ => unreachable!(),
+                    }
+                },
+            );
+            let (view, retry, wake) = match read {
+                Ok(read) => {
+                    let retry = read.retry();
+                    let wake = read.next_poll(clock).is_some();
+                    (read.progress, retry, wake)
+                }
+                Err(()) => (None, true, true),
+            };
+            after.insert("stage", 2);
+            after.insert(
+                "view",
+                view.as_ref().map_or(0, |value| {
+                    if matches!(value.phase, ProgressPhase::SigningIn { .. }) {
+                        7
+                    } else {
+                        8
+                    }
+                }),
+            );
+            after.insert(
+                "counts_unknown",
+                i64::from(
+                    view.as_ref()
+                        .is_none_or(|value| value.known.is_none() && value.eligible.is_none()),
+                ),
+            );
+            after.insert(
+                "generic_safe",
+                i64::from(view.as_ref().is_none_or(|value| {
+                    value.account.is_none()
+                        && value.wall.is_none()
+                        && !matches!(value.phase, ProgressPhase::Ready)
+                })),
+            );
+            after.insert(
+                "deadline",
+                i64::from(view.as_ref().is_some_and(|value| value.next_at.is_some())),
+            );
+            after.insert("retry", i64::from(retry));
+            after.insert("wake", i64::from(wake));
+        }
+        _ => panic!("unknown independent activity action {action}"),
+    }
+    let kept = idle.kept.lock().unwrap();
+    assert!(kept.account.progress.is_none());
+    assert!(kept.account.execution_progress.is_none());
+    assert_eq!(
+        authority(),
+        images,
+        "metadata observation changed account records"
+    );
+    assert_eq!(a.asked("restart:"), 0);
+    assert_eq!(a.asked("made:"), 0);
+    after
+}
+
 pub(crate) fn execution_transition(
     before: &aterm_spec::interp::State,
     action: &str,
@@ -1087,9 +1359,29 @@ pub(crate) fn execution_transition(
         after.insert("case", before["case"] + 1);
         return after;
     }
+    if before["case"] == 22 {
+        if action == "RetainNormal" || action == "RetireNormal" {
+            // These fixture inputs reuse the real policy publication paths in the
+            // retained-normal projection adapter; this machine does not decide policy.
+            after.insert("normal", if action == "RetainNormal" { 1 } else { 2 });
+            return after;
+        }
+        if action == "Project" && before["normal"] > 0 {
+            return retained_normal_execution_transition(before, 0);
+        }
+        return independent_execution_transition(before, action, 0);
+    }
     if action == "Elapse" {
         after.insert("elapsed", 1);
         return after;
+    }
+    if action == "ReplaceActivityRows" {
+        // This input is replayed as an admitted Store replacement by the native projection.
+        after.insert("activity_rows_changed", 1);
+        return after;
+    }
+    if before["case"] == 20 && action == "Project" {
+        return execution_activity_transition(before, 0);
     }
     let values = execution_case_at(
         before["case"],
@@ -1126,12 +1418,14 @@ pub(crate) fn execution_transition(
 fn execution_visibility_conforms_to_the_actual_gate_and_rejects_hidden_off_control() {
     use aterm_spec::verify;
     let model = aterm_models_harness::account_execution_visibility_model();
+    assert_eq!(model.mutant_dials(), (1..=38).collect::<Vec<_>>());
     let coverage = verify::prove_and_catch_scalar(&model, "account execution visibility");
     if verify::checkers_required() {
         assert_eq!(coverage, verify::Covered::InterpreterAndTy);
     }
     assert!(verify::sweep_faults(std::slice::from_ref(&model)).is_empty());
     let mut transitions = 0;
+    let mut independent_transitions = 0;
     for before in aterm_spec::interp::reachable_states(&model) {
         for action in &model.actions {
             if model.action_enabled(action.name, &before) {
@@ -1150,10 +1444,75 @@ fn execution_visibility_conforms_to_the_actual_gate_and_rejects_hidden_off_contr
                 );
                 assert!(accepted, "{before:?} -> {after:?}");
                 transitions += 1;
+                independent_transitions += usize::from(before["case"] == 22);
             }
         }
     }
-    assert_eq!(transitions, 109);
+    assert!(independent_transitions > 0);
+    eprintln!(
+        "{transitions} actual transitions, {independent_transitions} independent-context transitions"
+    );
+    let independent = aterm_spec::interp::reachable_states(&model);
+    for (elapsed, legacy, law) in [
+        (1, 1, "CurrentWorkVisible"),
+        (0, 2, "CurrentWorkVisible"),
+        (1, 3, "ActualRecheckShown"),
+    ] {
+        let before = independent
+            .iter()
+            .find(|state| {
+                state["case"] == 20
+                    && state["stage"] == 1
+                    && state["activity_rows_changed"] == 1
+                    && state["elapsed"] == elapsed
+            })
+            .unwrap();
+        // Actual native projections distinguish missing B metadata, premature expiry,
+        // and the unchanged-row retry forecast that must not cross a changed context.
+        let old = execution_activity_transition(before, legacy);
+        assert!(!model.check_invariant(law, &old));
+        assert!(!model.successors("Project", before).contains(&old));
+    }
+    for (context, legacy, law) in [
+        (1, 1, "IndependentWorkVisible"),
+        (3, 2, "ContextScopeRespected"),
+    ] {
+        let before = independent
+            .iter()
+            .find(|state| {
+                state["case"] == 22
+                    && state["stage"] == 1
+                    && state["normal"] == 0
+                    && state["context"] == context
+                    && state["context_record"] == 1
+                    && state["activity"] == 1
+            })
+            .unwrap();
+        let old = independent_execution_transition(before, "Project", legacy);
+        assert!(!model.check_invariant(law, &old));
+        assert!(!model.successors("Project", before).contains(&old));
+    }
+    for (activity, legacy, law) in [
+        (1, 3, "IndependentWorkVisible"),
+        (0, 4, "RetiredNormalWithdrawsForecasts"),
+    ] {
+        let before = independent
+            .iter()
+            .find(|state| {
+                state["case"] == 22
+                    && state["stage"] == 1
+                    && state["normal"] == 2
+                    && state["context"] == 1
+                    && state["context_record"] == 1
+                    && state["activity"] == activity
+            })
+            .unwrap();
+        // Removing current B metadata reproduces old-context priority; replaying the
+        // current-policy projection reproduces a retired receipt keeping its forecasts.
+        let old = retained_normal_execution_transition(before, legacy);
+        assert!(!model.check_invariant(law, &old));
+        assert!(!model.successors("Project", before).contains(&old));
+    }
     let mut before = model.init_state();
     before = execution_transition(&before, "Observe");
     let mut hidden = before.clone();

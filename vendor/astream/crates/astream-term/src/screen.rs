@@ -11,9 +11,9 @@
 //! VT/FF as line feeds), index (IND/NEL/RI), CSI cursor motion
 //! (CUU/CUD/CUF/CUB/CNL/CPL/CHA/VPA/CUP), erase (ED/EL/ECH), insert and delete
 //! (ICH/DCH/IL/DL), SGR (the 16- and 256-colour palettes plus 24-bit truecolour
-//! in both the `;` and the `:` sub-parameter form; bold, underline, reverse,
-//! italic, blink (5 and 6 alike, as xterm), crossed-out and concealed, each with
-//! its reset; a double underline, 21 or `4:2`, is an underline; faint is not
+//! in both the `;` and the `:` sub-parameter form; bold, reverse, italic, blink
+//! (5 and 6 alike, as xterm), crossed-out and concealed, each with its reset;
+//! the underline's style ([`Underline`]) and colour (below); faint is not
 //! modelled), East Asian wide glyphs, zero-width Unicode combining marks (up to
 //! [`MAX_COMBINING`] per cell), the alternate screen (`?1049`/`?47`/`?1047`),
 //! cursor visibility (`?25`), save/restore cursor (DECSC/DECRC and `CSI s`/`u`,
@@ -33,8 +33,8 @@
 //! sequences outside it (any with an intermediate byte, or a private marker
 //! other than `?`) are skipped whole;
 //! CMY/CMYK SGR (`38;3;…`, `38;4;…`, `38:3:…`, `38;3:…`) and truncated extended-colour
-//! forms are consumed *with* their values and leave the pen unchanged, and so is the underline
-//! colour (58) in every spelling; DEL, and C1 controls arriving
+//! forms, on 38, 48 and 58 alike, are consumed *with* their values and leave the pen
+//! unchanged; DEL, and C1 controls arriving
 //! as UTF-8 (U+0080..U+009F), are ignored; malformed UTF-8 (overlong,
 //! surrogate, truncated, a stray continuation or 8-bit byte) yields one U+FFFD
 //! per maximal subpart (Unicode 3.9) — a control character never lands in a
@@ -81,6 +81,17 @@
 //!   `DeleteLine`/`ClearRight`: each resets a pending wrap where it acts,
 //!   IL/DL act only on a cursor inside the scrolling region and move it to
 //!   the left margin, and every vacated cell takes the bce blank.
+//! * **The underline** has a style and a colour, on [`Cell::underline`] and
+//!   [`Cell::ul`] / [`Cell::ul_rgb`], as kitty, VTE and aterm keep them (xterm
+//!   has no colour: its `CASE_SGR` has no 58). 4 is a single underline and 21 a
+//!   double one; `4:0` to `4:5` name none, single, double, curly, dotted and
+//!   dashed, and `4:n` past 5 is a single one, as aterm draws it; 24 takes it
+//!   off. 58 sets the colour in every spelling 38 takes (`58;5;n`, `58;2;r;g;b`,
+//!   and the colon groups with and without a colour-space id, under the one
+//!   rule of `Screen::sgr`), 59 takes it off, and SGR 0 resets both. A glyph
+//!   takes both from the pen, whether or not it is underlined, as it takes the
+//!   foreground; DECSC saves them with the rest of the pen, and a bce blank
+//!   carries neither.
 //! * **Left/right margins** follow xterm's `LEFT_RIGHT` flag. Under DECLRMM
 //!   `CSI Pl ; Pr s` is DECSLRM, not a cursor save: a pair with `left <
 //!   right` (a left of 0 is 1; a right absent, 0 or past the screen is the
@@ -233,12 +244,79 @@ pub enum Color {
     Indexed(u8),
 }
 
-/// Cell attribute bits (a bitset in [`Cell::attrs`]).
+/// The style of a cell's underline (SGR 4, 21 and `4:0`..`4:5`; off with 24).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Underline {
+    /// No underline (24, `4:0`, SGR 0).
+    #[default]
+    None,
+    /// One straight line (4, `4:1`, and `4:n` past 5).
+    Single,
+    /// Two straight lines (21, `4:2`).
+    Double,
+    /// A wavy line (`4:3`), the squiggle editors draw under a diagnostic.
+    Curly,
+    /// A dotted line (`4:4`).
+    Dotted,
+    /// A dashed line (`4:5`).
+    Dashed,
+}
+
+impl Underline {
+    /// The style `4:n` names: `0` is none, `1` to `5` the styles in order, and
+    /// any higher a single line, as aterm draws it.
+    #[must_use]
+    pub const fn from_sgr(n: u16) -> Underline {
+        match n {
+            0 => Underline::None,
+            2 => Underline::Double,
+            3 => Underline::Curly,
+            4 => Underline::Dotted,
+            5 => Underline::Dashed,
+            _ => Underline::Single,
+        }
+    }
+
+    /// The style's `4:n` number, `0..=5`.
+    #[must_use]
+    pub const fn code(self) -> u8 {
+        match self {
+            Underline::None => 0,
+            Underline::Single => 1,
+            Underline::Double => 2,
+            Underline::Curly => 3,
+            Underline::Dotted => 4,
+            Underline::Dashed => 5,
+        }
+    }
+
+    /// The style numbered `code` by [`Self::code`]; `None` for any other byte.
+    #[must_use]
+    pub const fn from_code(code: u8) -> Option<Underline> {
+        match code {
+            0 => Some(Underline::None),
+            1 => Some(Underline::Single),
+            2 => Some(Underline::Double),
+            3 => Some(Underline::Curly),
+            4 => Some(Underline::Dotted),
+            5 => Some(Underline::Dashed),
+            _ => None,
+        }
+    }
+}
+
+/// The attribute bit the encodings ([`Screen::serialize`], [`encode_cell_bytes`],
+/// [`crate::ops::ScreenOp::SetSgr`]) set for an underlined cell or pen, whatever its
+/// style: bit 1, where the fold kept its one underline bit before the underline had a
+/// style, so a screen or op stream that has no other underline keeps its bytes. A
+/// style other than single, and a colour, ride in extensions of their own.
+pub const WIRE_UNDERLINE: u8 = 1 << 1;
+
+/// Cell attribute bits (a bitset in [`Cell::attrs`]). Bit 1 is no attribute: the
+/// underline is [`Cell::underline`].
 pub mod attr {
     /// Bold / increased intensity.
     pub const BOLD: u8 = 1 << 0;
-    /// Underline.
-    pub const UNDERLINE: u8 = 1 << 1;
     /// Reverse video (swap fg/bg).
     pub const REVERSE: u8 = 1 << 2;
     /// Faint / dim — used to render an unconfirmed speculative echo.
@@ -1055,6 +1133,13 @@ pub struct Cell {
     pub bg_rgb: Option<(u8, u8, u8)>,
     /// Attribute bits (see [`attr`]).
     pub attrs: u8,
+    /// The underline's style.
+    pub underline: Underline,
+    /// The underline's palette/default colour (`Color::Default` when `ul_rgb` is `Some`);
+    /// the default is the foreground's.
+    pub ul: Color,
+    /// The underline's resolved 24-bit colour `(r, g, b)`, when 58 set one.
+    pub ul_rgb: Option<(u8, u8, u8)>,
     /// Up to [`MAX_COMBINING`] zero-width combining / ZWJ continuation codepoints attached
     /// to [`Self::ch`], in arrival order (`'\0'` in unused trailing slots).
     pub combining: [char; MAX_COMBINING],
@@ -1067,7 +1152,7 @@ pub struct Cell {
 
 impl Cell {
     /// An empty cell: a single-width space with default colours, no RGB overrides,
-    /// no attributes, and no combining marks.
+    /// no attributes, no underline, and no combining marks.
     pub const BLANK: Cell = Cell {
         ch: ' ',
         fg: Color::Default,
@@ -1075,6 +1160,9 @@ impl Cell {
         fg_rgb: None,
         bg_rgb: None,
         attrs: 0,
+        underline: Underline::None,
+        ul: Color::Default,
+        ul_rgb: None,
         combining: ['\0'; MAX_COMBINING],
         combining_len: 0,
         width: 1,
@@ -1200,6 +1288,9 @@ struct Pen {
     fg_rgb: Option<(u8, u8, u8)>,
     bg_rgb: Option<(u8, u8, u8)>,
     attrs: u8,
+    underline: Underline,
+    ul: Color,
+    ul_rgb: Option<(u8, u8, u8)>,
 }
 
 /// What DECSC saves (xterm `CursorSave2`, within this fold's state): the
@@ -1225,7 +1316,57 @@ impl Pen {
             fg_rgb: None,
             bg_rgb: None,
             attrs: 0,
+            underline: Underline::None,
+            ul: Color::Default,
+            ul_rgb: None,
         }
+    }
+
+    /// The pen a [`crate::ops::ScreenOp::SetSgr`]-shaped op names: its colours, and
+    /// `attrs` with [`WIRE_UNDERLINE`] read as a single underline. The underline
+    /// takes no colour; a [`crate::ops::ScreenOp::SetUnderline`] after it sets the rest.
+    const fn from_wire(
+        fg: Color,
+        fg_rgb: Option<(u8, u8, u8)>,
+        bg: Color,
+        bg_rgb: Option<(u8, u8, u8)>,
+        attrs: u8,
+    ) -> Pen {
+        Pen {
+            fg,
+            bg,
+            fg_rgb,
+            bg_rgb,
+            attrs: attrs & !WIRE_UNDERLINE,
+            underline: if attrs & WIRE_UNDERLINE != 0 {
+                Underline::Single
+            } else {
+                Underline::None
+            },
+            ul: Color::Default,
+            ul_rgb: None,
+        }
+    }
+
+    /// The attribute byte the encodings write for this pen ([`WIRE_UNDERLINE`]).
+    const fn wire_attrs(&self) -> u8 {
+        wire_attrs(self.attrs, self.underline)
+    }
+
+    /// The underline is more than [`Self::wire_attrs`] says: a style other than
+    /// none or single, a colour, or an `attrs` that holds [`WIRE_UNDERLINE`] itself.
+    const fn underline_ext(&self) -> bool {
+        underline_ext(self.attrs, self.underline, self.ul, self.ul_rgb)
+    }
+
+    const fn set_ul_color(&mut self, c: Color) {
+        self.ul = c;
+        self.ul_rgb = None;
+    }
+
+    const fn set_ul_rgb(&mut self, r: u8, g: u8, b: u8) {
+        self.ul = Color::Default;
+        self.ul_rgb = Some((r, g, b));
     }
 
     const fn set_fg_color(&mut self, c: Color) {
@@ -1757,14 +1898,18 @@ impl Screen {
         // not — without these, two unequal screens could serialize identically
         // (e.g. a pending SGR pen with nothing yet printed). The grid length is
         // fixed by cols*rows above, so what follows is self-delimiting.
-        out.extend_from_slice(&encode_pen_bytes(self.pen.fg, self.pen.bg, self.pen.attrs));
+        out.extend_from_slice(&encode_pen_bytes(
+            self.pen.fg,
+            self.pen.bg,
+            self.pen.wire_attrs(),
+        ));
         match self.saved_cursor {
             Some(saved) => out.extend_from_slice(&encode_saved_cursor_bytes(
                 saved.row,
                 saved.col,
                 saved.pen.fg,
                 saved.pen.bg,
-                saved.pen.attrs,
+                saved.pen.wire_attrs(),
             )),
             None => out.extend_from_slice(&[0]),
         }
@@ -1774,7 +1919,7 @@ impl Screen {
                 saved.col,
                 saved.pen.fg,
                 saved.pen.bg,
-                saved.pen.attrs,
+                saved.pen.wire_attrs(),
             )),
             None => out.extend_from_slice(&[0]),
         }
@@ -1910,6 +2055,37 @@ impl Screen {
                 emit_deep_combining_cells(out, cells);
             }
         }
+        // Tag-6 extension trailer for the underline beyond the attribute byte's
+        // [`WIRE_UNDERLINE`] (a style other than none or single, an underline colour):
+        // emitted ONLY when the pen, a saved pen or some cell has one, so every screen
+        // whose underlines are single and uncoloured keeps the bytes it had when the
+        // fold knew one underline, and `Eq <=> serialize()` stays strict. It names the
+        // pen and each saved pen in full, then the cells that need it by index.
+        let saved_ul = self.saved_cursor.is_some_and(|s| s.pen.underline_ext());
+        let alt_saved_ul = self.alt_saved_cursor.is_some_and(|s| s.pen.underline_ext());
+        let inactive_ul = self
+            .inactive
+            .as_deref()
+            .is_some_and(slice_has_underline_ext);
+        if self.pen.underline_ext()
+            || saved_ul
+            || alt_saved_ul
+            || slice_has_underline_ext(&self.grid)
+            || inactive_ul
+        {
+            out.extend_from_slice(&[6]);
+            emit_underline_pen(out, self.pen);
+            if let Some(s) = self.saved_cursor {
+                emit_underline_pen(out, s.pen);
+            }
+            if let Some(s) = self.alt_saved_cursor {
+                emit_underline_pen(out, s.pen);
+            }
+            emit_underline_cells(out, &self.grid);
+            if let Some(cells) = &self.inactive {
+                emit_underline_cells(out, cells);
+            }
+        }
     }
 
     // --- internal mutators ------------------------------------------------
@@ -2041,6 +2217,9 @@ impl Screen {
             fg_rgb: self.pen.fg_rgb,
             bg_rgb: self.pen.bg_rgb,
             attrs: self.pen.attrs,
+            underline: self.pen.underline,
+            ul: self.pen.ul,
+            ul_rgb: self.pen.ul_rgb,
             combining: ['\0'; MAX_COMBINING],
             combining_len: 0,
             width,
@@ -2082,6 +2261,9 @@ impl Screen {
             fg_rgb: base_copy.fg_rgb,
             bg_rgb: base_copy.bg_rgb,
             attrs: base_copy.attrs,
+            underline: base_copy.underline,
+            ul: base_copy.ul,
+            ul_rgb: base_copy.ul_rgb,
             combining: ['\0'; MAX_COMBINING],
             combining_len: 0,
             width: 0,
@@ -2796,7 +2978,8 @@ impl Screen {
     /// An erased cell under background-colour-erase (`bce`): a space carrying the
     /// **current SGR background** (including 24-bit `bg_rgb`), so `ED`/`EL` after
     /// `\x1b[44m` or `\x1b[48;2;r;g;bm` paints that background, not a hardcoded
-    /// default blank. (Reverse-video bce is out of scope.)
+    /// default blank. It carries no attribute and no underline, colour included.
+    /// (Reverse-video bce is out of scope.)
     const fn bce_blank(&self) -> Cell {
         Cell {
             ch: ' ',
@@ -2805,6 +2988,9 @@ impl Screen {
             fg_rgb: None,
             bg_rgb: self.pen.bg_rgb,
             attrs: 0,
+            underline: Underline::None,
+            ul: Color::Default,
+            ul_rgb: None,
             combining: ['\0'; MAX_COMBINING],
             combining_len: 0,
             width: 1,
@@ -2855,17 +3041,17 @@ impl Screen {
                 0 => self.pen = Pen::reset(),
                 1 => self.pen.attrs |= attr::BOLD,
                 3 => self.pen.attrs |= attr::ITALIC,
-                4 => self.pen.attrs |= attr::UNDERLINE,
+                4 => self.pen.underline = Underline::Single,
                 // xterm's CASE_SGR: 5 (slow) and 6 (rapid) both set BLINK.
                 5 | 6 => self.pen.attrs |= attr::BLINK,
                 7 => self.pen.attrs |= attr::REVERSE,
                 8 => self.pen.attrs |= attr::CONCEAL,
                 9 => self.pen.attrs |= attr::STRIKE,
-                // Double underline (xterm `ATR_DBL_UNDER`), modelled as underline.
-                21 => self.pen.attrs |= attr::UNDERLINE,
+                // The double underline (xterm `ATR_DBL_UNDER`).
+                21 => self.pen.underline = Underline::Double,
                 22 => self.pen.attrs &= !attr::BOLD,
                 23 => self.pen.attrs &= !attr::ITALIC,
-                24 => self.pen.attrs &= !attr::UNDERLINE,
+                24 => self.pen.underline = Underline::None,
                 25 => self.pen.attrs &= !attr::BLINK,
                 27 => self.pen.attrs &= !attr::REVERSE,
                 28 => self.pen.attrs &= !attr::CONCEAL,
@@ -2886,10 +3072,12 @@ impl Screen {
                     Some(ExtendedColor::Rgb(r, g, b)) => self.pen.set_bg_rgb(r, g, b),
                     None => {}
                 },
-                // The underline colour is not modelled; its arguments are still its own.
-                58 => {
-                    let _ = parse_extended(params, sub, &mut i);
-                }
+                58 => match parse_extended(params, sub, &mut i) {
+                    Some(ExtendedColor::Palette(idx)) => self.pen.set_ul_color(Color::Indexed(idx)),
+                    Some(ExtendedColor::Rgb(r, g, b)) => self.pen.set_ul_rgb(r, g, b),
+                    None => {}
+                },
+                59 => self.pen.set_ul_color(Color::Default),
                 _ => {}
             }
             i = i.saturating_add(1);
@@ -2902,12 +3090,10 @@ impl Screen {
             return;
         };
         match code {
-            // `4:0` is underline off; `4:n` a styled underline (modelled as plain).
+            // `4:n`: the style `n` names (`4:0` none); what follows `n` is nothing.
             4 => {
-                if matches!(tail, &[0, ..]) {
-                    self.pen.attrs &= !attr::UNDERLINE;
-                } else {
-                    self.pen.attrs |= attr::UNDERLINE;
+                if let &[n, ..] = tail {
+                    self.pen.underline = Underline::from_sgr(n);
                 }
             }
             38 => match parse_colon_colour(tail) {
@@ -2920,7 +3106,12 @@ impl Screen {
                 Some(ExtendedColor::Rgb(r, g, b)) => self.pen.set_bg_rgb(r, g, b),
                 None => {}
             },
-            _ => {} // 58 (underline colour) and any other sub-parameterised code
+            58 => match parse_colon_colour(tail) {
+                Some(ExtendedColor::Palette(idx)) => self.pen.set_ul_color(Color::Indexed(idx)),
+                Some(ExtendedColor::Rgb(r, g, b)) => self.pen.set_ul_rgb(r, g, b),
+                None => {}
+            },
+            _ => {} // any other sub-parameterised code
         }
     }
 
@@ -3222,7 +3413,8 @@ pub const fn decode_screen_header(raw: &[u8; 10]) -> (u16, u16, u16, u16, bool, 
     (cols, rows, row, col, cursor_visible, altscreen)
 }
 
-/// Encode one [`Cell`] into its 9-byte canonical screen serialization.
+/// Encode one [`Cell`] into its 9-byte canonical screen serialization: its last byte
+/// is the attribute byte with [`WIRE_UNDERLINE`] set for an underline of any style.
 #[must_use]
 pub const fn encode_cell_bytes(cell: &Cell) -> [u8; 9] {
     let cp = cell.ch as u32;
@@ -3243,7 +3435,7 @@ pub const fn encode_cell_bytes(cell: &Cell) -> [u8; 9] {
         fv,
         bt,
         bv,
-        cell.attrs,
+        wire_attrs(cell.attrs, cell.underline),
     ]
 }
 
@@ -3401,6 +3593,76 @@ pub const fn decode_u32_le_bytes(raw: &[u8; 4]) -> u32 {
 
 const fn pen_has_rgb(pen: Pen) -> bool {
     pen.fg_rgb.is_some() || pen.bg_rgb.is_some()
+}
+
+/// The attribute byte the encodings write: `attrs` with [`WIRE_UNDERLINE`] set
+/// when `underline` is any style.
+const fn wire_attrs(attrs: u8, underline: Underline) -> u8 {
+    if matches!(underline, Underline::None) {
+        attrs
+    } else {
+        attrs | WIRE_UNDERLINE
+    }
+}
+
+/// [`wire_attrs`] does not say all of this underline: its style is neither none
+/// nor single, it has a colour, or `attrs` itself holds [`WIRE_UNDERLINE`] (which
+/// no fold sets, but a caller's [`Cell`] can), so the byte would read the same as
+/// for another cell.
+const fn underline_ext(
+    attrs: u8,
+    underline: Underline,
+    ul: Color,
+    ul_rgb: Option<(u8, u8, u8)>,
+) -> bool {
+    !matches!(underline, Underline::None | Underline::Single)
+        || !matches!(ul, Color::Default)
+        || ul_rgb.is_some()
+        || attrs & WIRE_UNDERLINE != 0
+}
+
+const fn cell_underline_ext(c: &Cell) -> bool {
+    underline_ext(c.attrs, c.underline, c.ul, c.ul_rgb)
+}
+
+/// One underline in full, for the Tag-6 trailer: a byte holding the style's
+/// [`Underline::code`] and, in bit 3, whether `attrs` holds [`WIRE_UNDERLINE`];
+/// the palette colour as a tag and a value; the 24-bit colour.
+fn emit_underline<S: ByteSink>(
+    out: &mut S,
+    attrs: u8,
+    underline: Underline,
+    ul: Color,
+    ul_rgb: Option<(u8, u8, u8)>,
+) {
+    let raw_bit = ((attrs & WIRE_UNDERLINE != 0) as u8) << 3;
+    let (ut, uv) = match ul {
+        Color::Default => (0u8, 0u8),
+        Color::Indexed(n) => (1u8, n),
+    };
+    out.extend_from_slice(&[underline.code() | raw_bit, ut, uv]);
+    emit_opt_rgb(out, ul_rgb);
+}
+
+fn emit_underline_pen<S: ByteSink>(out: &mut S, pen: Pen) {
+    emit_underline(out, pen.attrs, pen.underline, pen.ul, pen.ul_rgb);
+}
+
+fn slice_has_underline_ext(cells: &[Cell]) -> bool {
+    cells.iter().any(cell_underline_ext)
+}
+
+/// Every cell [`cell_underline_ext`] holds for: their count, then each one's index
+/// and [`emit_underline`].
+fn emit_underline_cells<S: ByteSink>(out: &mut S, cells: &[Cell]) {
+    let count = cells.iter().filter(|c| cell_underline_ext(c)).count();
+    out.extend_from_slice(&encode_u32_le_bytes(count as u32));
+    for (idx, c) in cells.iter().enumerate() {
+        if cell_underline_ext(c) {
+            out.extend_from_slice(&encode_u32_le_bytes(idx as u32));
+            emit_underline(out, c.attrs, c.underline, c.ul, c.ul_rgb);
+        }
+    }
 }
 
 const fn cell_has_ext(c: &Cell) -> bool {
@@ -4458,19 +4720,29 @@ impl Parser {
                 screen.sgr(vals, sub);
                 // Record the RESOLVED pen (after sgr ran), not the raw params —
                 // this is what kills the two-party terminfo-disagreement class.
-                if screen.pen.fg_rgb.is_none() && screen.pen.bg_rgb.is_none() {
+                // The attribute byte says whether the pen underlines; a style past
+                // single, or a colour, follows as a `SetUnderline`.
+                let pen = screen.pen;
+                if pen.fg_rgb.is_none() && pen.bg_rgb.is_none() {
                     self.rec(ScreenOp::SetSgr {
-                        fg: screen.pen.fg,
-                        bg: screen.pen.bg,
-                        attrs: screen.pen.attrs,
+                        fg: pen.fg,
+                        bg: pen.bg,
+                        attrs: pen.wire_attrs(),
                     });
                 } else {
                     self.rec(ScreenOp::SetSgrRgb {
-                        fg: screen.pen.fg,
-                        fg_rgb: screen.pen.fg_rgb,
-                        bg: screen.pen.bg,
-                        bg_rgb: screen.pen.bg_rgb,
-                        attrs: screen.pen.attrs,
+                        fg: pen.fg,
+                        fg_rgb: pen.fg_rgb,
+                        bg: pen.bg,
+                        bg_rgb: pen.bg_rgb,
+                        attrs: pen.wire_attrs(),
+                    });
+                }
+                if pen.underline_ext() {
+                    self.rec(ScreenOp::SetUnderline {
+                        style: pen.underline,
+                        ul: pen.ul,
+                        ul_rgb: pen.ul_rgb,
                     });
                 }
             }
@@ -4595,6 +4867,7 @@ const fn screen_op_group(op: &ScreenOp) -> u8 {
         | ScreenOp::ScrollDown(_) => 1,
         ScreenOp::SetSgr { .. }
         | ScreenOp::SetSgrRgb { .. }
+        | ScreenOp::SetUnderline { .. }
         | ScreenOp::SetMode { .. }
         | ScreenOp::SaveCursor
         | ScreenOp::RestoreCursor
@@ -4644,13 +4917,7 @@ fn apply_op_edit(screen: &mut Screen, op: &ScreenOp) {
 fn apply_op_style_or_mode(screen: &mut Screen, op: &ScreenOp) {
     match op {
         ScreenOp::SetSgr { fg, bg, attrs } => {
-            screen.pen = Pen {
-                fg: *fg,
-                bg: *bg,
-                fg_rgb: None,
-                bg_rgb: None,
-                attrs: *attrs,
-            };
+            screen.pen = Pen::from_wire(*fg, None, *bg, None, *attrs);
         }
         ScreenOp::SetSgrRgb {
             fg,
@@ -4659,13 +4926,12 @@ fn apply_op_style_or_mode(screen: &mut Screen, op: &ScreenOp) {
             bg_rgb,
             attrs,
         } => {
-            screen.pen = Pen {
-                fg: *fg,
-                bg: *bg,
-                fg_rgb: *fg_rgb,
-                bg_rgb: *bg_rgb,
-                attrs: *attrs,
-            };
+            screen.pen = Pen::from_wire(*fg, *fg_rgb, *bg, *bg_rgb, *attrs);
+        }
+        ScreenOp::SetUnderline { style, ul, ul_rgb } => {
+            screen.pen.underline = *style;
+            screen.pen.ul = *ul;
+            screen.pen.ul_rgb = *ul_rgb;
         }
         ScreenOp::SetMode { params, set } => screen.set_mode(params, *set),
         ScreenOp::SaveCursor => screen.save_cursor(),

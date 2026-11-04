@@ -927,7 +927,13 @@ fn run(cmd: &str, args: &[&str]) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
+/// The paths the stamp is of: every producer that probes a work tree for a stamp's `-dirty`
+/// mounts this one file.
+#[path = "stamp_paths.rs"]
+mod stamp_paths;
+
 mod build_stamp {
+    use super::stamp_paths::PATHSPEC;
     use super::{GIT, rfc3339_utc, run};
     use std::path::PathBuf;
 
@@ -951,7 +957,8 @@ mod build_stamp {
             None => {
                 let commit = run(GIT, &["rev-parse", "--short=12", "HEAD"])
                     .unwrap_or_else(|| "unknown".into());
-                let dirty = run(GIT, &["status", "--porcelain"]).is_some_and(|s| !s.is_empty());
+                let dirty = run(GIT, &[&["status", "--porcelain"][..], &PATHSPEC].concat())
+                    .is_some_and(|s| !s.is_empty());
                 if commit != "unknown" && dirty {
                     format!("{commit}-dirty")
                 } else {
@@ -1060,7 +1067,10 @@ mod build_stamp {
         paths
     }
 
-    /// Every file git tracks in this checkout and its submodules that exists as a file and has no newline in its name, absolute, so an edit to any of them reruns the script and no build after an edit keeps the clean stamp of the build before it.
+    /// Every file git tracks in this checkout and its submodules that exists as a file and has
+    /// no newline in its name, absolute, so an edit to any of them reruns the script and no
+    /// build after an edit keeps the clean stamp of the build before it. The measured ledger's
+    /// files are left out: the stamp is not of them ([`PATHSPEC`]), so no edit there changes it.
     fn tracked_files() -> Vec<PathBuf> {
         let Some(top) = run(GIT, &["rev-parse", "--show-toplevel"]).map(PathBuf::from) else {
             return Vec::new();
@@ -1069,6 +1079,7 @@ mod build_stamp {
             .arg("-C")
             .arg(&top)
             .args(["ls-files", "-z", "--recurse-submodules"])
+            .args(PATHSPEC)
             .output()
         else {
             return Vec::new();

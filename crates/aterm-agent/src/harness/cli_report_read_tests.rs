@@ -329,6 +329,8 @@ fn combined_reports_age_cached_journal_quota_at_the_command_clock() {
         "",
         &[accounts::Row {
             label: "main".into(),
+            email: Some("alias@example.test".into()),
+            identity_email: Some("owner@example.test".into()),
             dir: Some(f.old.clone()),
             ..Default::default()
         }],
@@ -374,12 +376,19 @@ fn combined_reports_age_cached_journal_quota_at_the_command_clock() {
             env.now = now;
             for json in [false, true] {
                 let (mut out, mut err) = (Vec::new(), Vec::new());
-                let report = write_accounts_report(
-                    (Cli::Claude, Launch::default()),
-                    &env,
-                    json,
-                    &mut out,
-                    &mut err,
+                let report = crate::harness::journal::with_keyer(
+                    |realm, email| {
+                        (realm == "claude" && email == "owner@example.test").then(|| KEY.into())
+                    },
+                    || {
+                        write_accounts_report(
+                            (Cli::Claude, Launch::default()),
+                            &env,
+                            json,
+                            &mut out,
+                            &mut err,
+                        )
+                    },
                 );
                 assert!(report.local.is_some(), "{}", String::from_utf8_lossy(&err));
                 let lines = if json {

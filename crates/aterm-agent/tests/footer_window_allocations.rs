@@ -113,9 +113,12 @@ fn resumed_conversation(root: &Path) -> (std::path::PathBuf, u64) {
 
 #[test]
 fn each_window_the_footer_walks_back_is_allocated_once() {
-    let root = std::env::temp_dir().join(format!("aterm-footer-windows-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    let (claude, len) = resumed_conversation(&root);
+    let root = aterm_tempfile::Builder::new()
+        .prefix("aterm-footer-windows-")
+        .suffix(".noindex")
+        .tempdir()
+        .unwrap();
+    let (claude, len) = resumed_conversation(root.path());
     let windows = len.div_ceil(footer::TAIL_BYTES) as usize;
     assert_eq!(windows, 4, "the transcript spans four windows");
     assert!(
@@ -153,5 +156,4 @@ fn each_window_the_footer_walks_back_is_allocated_once() {
     assert_eq!(facts.model.as_deref(), Some("Opus 5.5"), "{facts:?}");
     assert_eq!(fresh, 2 * windows, "one block per window per walk");
     assert_eq!(grown, 0, "no window's buffer grown after its read");
-    std::fs::remove_dir_all(&root).unwrap();
 }

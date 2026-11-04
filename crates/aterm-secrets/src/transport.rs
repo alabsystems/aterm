@@ -143,6 +143,19 @@ pub const FETCH_MARGIN: Duration = Duration::from_secs(5);
 /// that ends at its total never waits it.
 #[cfg(test)]
 pub const FETCH_MARGIN: Duration = aterm_spec::wait::MUST_HAPPEN.saturating_mul(2);
+
+/// [`FETCH_MARGIN`], or a test's hang detector where longer: the bound a test holds on this
+/// thread for the vault servers it started (`client::ServersAnswering`), which answer.
+fn fetch_margin() -> Duration {
+    #[cfg(unix)]
+    {
+        FETCH_MARGIN.max(crate::client::servers_within(FETCH_MARGIN))
+    }
+    #[cfg(not(unix))]
+    {
+        FETCH_MARGIN
+    }
+}
 /// The DNS lookup, connect and TLS handshake of each of a look's tries ([`look_bounded`]):
 /// a vault's name answers in milliseconds once macOS lets it, and mDNS says a `.local` name
 /// nobody has is not there after about five seconds, which this outlasts so that answer is
@@ -724,7 +737,7 @@ pub(crate) fn fetch_as_observed_hearing(
 ) -> (crate::Result<ObservedFetch>, Option<LocalNetworkHeard>) {
     match source {
         Source::Url(url) => {
-            let client = client(wait.saturating_add(FETCH_MARGIN));
+            let client = client(wait.saturating_add(fetch_margin()));
             let (sent, heard) = with_local_network_heard(source, || {
                 get_request(&client, url, after, None, subscriber, false, false)
                     .limit(MAX_ENVELOPE)
@@ -1002,7 +1015,7 @@ pub fn get_bounded(
     connect: Option<Duration>,
 ) -> Result<Answer, Unheard> {
     get_via(
-        &client(wait.saturating_add(FETCH_MARGIN)),
+        &client(wait.saturating_add(fetch_margin())),
         url,
         after,
         connect,
@@ -1018,7 +1031,7 @@ pub fn look_bounded(
     connect: Option<Duration>,
 ) -> Result<Answer, Unheard> {
     get_via_purpose(
-        &client(wait.saturating_add(FETCH_MARGIN)),
+        &client(wait.saturating_add(fetch_margin())),
         url,
         None,
         connect,
@@ -1447,7 +1460,7 @@ fn records_exchange(
     pull: Pull<'_>,
 ) -> Result<aterm_http::Exchange, aterm_http::SendError> {
     let deadline = pull.wait.map_or(pull.total, |wait| {
-        wait.saturating_add(FETCH_MARGIN).max(pull.total)
+        wait.saturating_add(fetch_margin()).max(pull.total)
     });
     let http = client(deadline);
     records_request(&http, url, pull).exchange(aterm_http::Body::Empty)
@@ -2220,7 +2233,11 @@ fn remove_dead(lock: &std::path::Path) -> bool {
     let Ok(judged) = file.metadata() else {
         return false;
     };
-    let mut line = String::new();
+    let mut line = String::with_capacity(
+        usize::try_from(judged.len().min(256))
+            .unwrap_or(0)
+            .saturating_add(1),
+    );
     if !judged.is_file() || (&file).take(256).read_to_string(&mut line).is_err() {
         return false;
     }
@@ -2461,7 +2478,7 @@ pub fn wait_joins_from(
     after: Option<u64>,
     wait: Duration,
 ) -> crate::Result<(Joins, Option<IpAddr>)> {
-    wait_joins_from_within(url, after, wait.saturating_add(FETCH_MARGIN))
+    wait_joins_from_within(url, after, wait.saturating_add(fetch_margin()))
 }
 
 /// Read a join queue within the remaining shared deadline, including connection and response.

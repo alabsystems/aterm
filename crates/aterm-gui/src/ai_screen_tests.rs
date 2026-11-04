@@ -460,6 +460,7 @@ fn a_claude_row_whose_sign_in_starts_nothing_offers_no_sign_in() {
     let (local, notes) = config::read("[ai]\npreferred = \"claude\"\n");
     let settings = config::resolve(&local, None, None, notes);
     let view = |refused: Option<&str>| ClaudeAccounts {
+        pool_picks: false,
         store: None,
         roster: None,
         label: "main".to_string(),

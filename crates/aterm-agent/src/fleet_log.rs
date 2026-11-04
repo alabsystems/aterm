@@ -310,8 +310,27 @@ impl LocalLog {
             file,
             Vec::new(),
             Box::new(move || {
-                let bytes = std::fs::read(&from)
+                use std::io::Read as _;
+                const MAX_STORE_BYTES: u64 = 16 * 1024 * 1024;
+                let (file, meta) = aterm_uds::regular_file::open(&from)
                     .map_err(|e| aterm_secrets::Error::new(format!("the record store: {e}")))?;
+                if meta.len() > MAX_STORE_BYTES {
+                    return Err(aterm_secrets::Error::new(
+                        "the record store: file exceeds size limit",
+                    ));
+                }
+                let cap = usize::try_from(meta.len().min(MAX_STORE_BYTES))
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                let mut bytes = Vec::with_capacity(cap);
+                file.take(MAX_STORE_BYTES + 1)
+                    .read_to_end(&mut bytes)
+                    .map_err(|e| aterm_secrets::Error::new(format!("the record store: {e}")))?;
+                if bytes.len() as u64 > MAX_STORE_BYTES {
+                    return Err(aterm_secrets::Error::new(
+                        "the record store: file exceeds size limit",
+                    ));
+                }
                 let mut store = aterm_secrets::membership_log::Store::with_compiled(Some(network));
                 store.ingest(&bytes)?;
                 Ok(store.log().map(log_member_keys))

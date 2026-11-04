@@ -560,17 +560,16 @@ fn path_word(path: &Path) -> String {
 
 fn in_the_way(path: &Path) -> String {
     let magic = format!("{MAGIC}\n");
-    let mut head = Vec::new();
-    let tape = std::fs::metadata(path).is_ok_and(|meta| meta.is_file())
-        && crate::download::open_nonblocking(path)
-            .and_then(|file| {
-                if !file.metadata()?.is_file() {
-                    return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
-                }
-                file.take(u64::try_from(magic.len()).unwrap_or(u64::MAX))
-                    .read_to_end(&mut head)
-            })
-            .is_ok()
+    let mut head = Vec::with_capacity(magic.len().saturating_add(1));
+    let tape = crate::download::open_nonblocking(path)
+        .and_then(|file| {
+            if !file.metadata()?.is_file() {
+                return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+            }
+            file.take(u64::try_from(magic.len()).unwrap_or(u64::MAX))
+                .read_to_end(&mut head)
+        })
+        .is_ok()
         && head == magic.as_bytes();
     if tape {
         format!(
@@ -1298,10 +1297,7 @@ mod tests {
 
     #[test]
     fn a_tape_cut_short_by_a_write_error_takes_its_bodies_with_it() {
-        let dir = aterm_tempfile::Builder::new()
-            .prefix("agh-tape-")
-            .tempdir()
-            .expect("a scratch directory");
+        let dir = crate::test_fixtures::scratch_dir("tape");
         let path = dir.path().join("t.atape");
         let argv = ["release".to_string(), "download".to_string()];
         let header = TapeHeader::for_run(&argv, &crate::wire::Endpoints::github_com());

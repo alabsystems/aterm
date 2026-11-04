@@ -17,7 +17,7 @@ use aterm_agent::harness::alab_seen::{
     self, AccountSeen, Figure, HISTORY_MAX, LastUse, Line, SignedIn, WindowSeen,
 };
 use aterm_db::alab::{
-    LabRead, Registry,
+    Inventory, LabRead, Registry,
     journal::{
         Spool,
         seen::{self, Usage},
@@ -165,33 +165,67 @@ pub(crate) fn harness_seen(view: &LabView, seen: &seen::Seen) -> alab_seen::Seen
     }
 }
 
+/// The view a journal read names Macs by, given what the registry read gave and the `last`
+/// projection held: a projection replaces `last`, a partial history (whose rows are not all here
+/// yet) and an unmoved inventory read with it, and no lab drops it.
+fn journal_view(
+    read: Option<LabRead>,
+    last: &mut Option<(Arc<LabView>, Inventory)>,
+) -> Arc<LabView> {
+    match read {
+        Some(LabRead::Projected(view, inventory)) => {
+            let view = Arc::new(*view);
+            *last = Some((Arc::clone(&view), inventory));
+            view
+        }
+        Some(LabRead::Partial | LabRead::Unchanged) => last
+            .as_ref()
+            .map_or_else(Arc::default, |(view, _)| Arc::clone(view)),
+        None => {
+            *last = None;
+            Arc::default()
+        }
+    }
+}
+
 struct Cache {
     paths: Paths,
     config: PathBuf,
     held: Mutex<Option<Arc<alab_seen::Seen>>>,
+    /// The last view of the registry projected here, and the inventory it was projected from.
+    lab: Mutex<Option<(Arc<LabView>, Inventory)>>,
     reader: OnceLock<()>,
 }
 
 impl Cache {
-    /// One read of the registry and the journal window; a failed or unheld read keeps what was
-    /// held.
+    /// One read of the registry and the journal window ([`journal_view`] names the Macs); a
+    /// failed or unheld read keeps what was held.
     fn read(&self) {
         if crate::alab_view::turned_off(&self.config) {
             *self
                 .held
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            *self
+                .lab
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
             return;
         }
         let now = aterm_time::unix_millis().unwrap_or(0) / 1000;
-        let view = match Registry::at(self.paths.clone()).lab(&self.config, None) {
-            Ok(Some(LabRead::Projected(view, _))) => *view,
-            Ok(_) => LabView::default(),
+        let mut last = self
+            .lab
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let held = last.as_ref().map(|(_, inventory)| *inventory);
+        let view = match Registry::at(self.paths.clone()).lab(&self.config, held) {
+            Ok(read) => journal_view(read, &mut last),
             Err(why) => {
                 aterm_log::debug!("journal view: {why}");
                 return;
             }
         };
+        drop(last);
         let spool = Spool::local();
         let heard = spool
             .as_ref()
@@ -263,6 +297,7 @@ pub(crate) fn install() {
         paths: Paths::for_home(&home),
         config,
         held: Mutex::new(None),
+        lab: Mutex::new(None),
         reader: OnceLock::new(),
     });
     let _ = alab_seen::install(Box::new(cache));
@@ -287,6 +322,45 @@ mod tests {
         let empty = harness_seen(&view, &Seen::empty(5));
         assert!(empty.accounts.is_empty());
         assert_eq!(empty.at, 5);
+    }
+
+    /// The journal names Macs by the last projection through a partial history and an unmoved
+    /// inventory, and by none once there is no lab; a first partial history has none to keep.
+    /// NEGATIVE CONTROL: with a partial history read as no view (the journal left unread, as
+    /// `Partial => return` once did, or named by an empty view), `` a partial history keeps the
+    /// last projection `` fails.
+    #[test]
+    fn the_journal_names_macs_by_the_last_projection_until_there_is_no_lab() {
+        let mut named = LabView::default();
+        named.me = Some("pk-me".into());
+        let first = Inventory([1; 32]);
+        let mut last = None;
+        assert_eq!(
+            *journal_view(Some(LabRead::Partial), &mut last),
+            LabView::default(),
+            "a first partial history has no projection to keep"
+        );
+        assert!(last.is_none());
+        let view = journal_view(
+            Some(LabRead::Projected(Box::new(named.clone()), first)),
+            &mut last,
+        );
+        assert_eq!(*view, named, "a projection names the Macs");
+        assert_eq!(last.as_ref().map(|(_, i)| *i), Some(first), "and is held");
+        for read in [LabRead::Partial, LabRead::Unchanged] {
+            let kept = journal_view(Some(read.clone()), &mut last);
+            assert_eq!(
+                *kept, named,
+                "a partial history keeps the last projection ({read:?})"
+            );
+            assert_eq!(last.as_ref().map(|(_, i)| *i), Some(first), "{read:?}");
+        }
+        assert_eq!(
+            *journal_view(None, &mut last),
+            LabView::default(),
+            "no lab names no Mac"
+        );
+        assert!(last.is_none(), "no lab drops the projection");
     }
 
     /// A test process installs no journal source.

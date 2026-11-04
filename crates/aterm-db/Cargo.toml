@@ -44,6 +44,8 @@ aterm-netplace.workspace = true
 [dev-dependencies]
 aterm-spec.workspace = true
 aterm-models-db.workspace = true
+# SwarmRecordsCapacity's legacy database fence (control::tests::crossing_tests).
+aterm-models-swarm.workspace = true
 # FleetMachineAssignment's mail area: the alias chain the harness is handed (alab::view).
 aterm-models-harness.workspace = true
 

@@ -576,13 +576,21 @@ mod live {
             Err(e) if e.kind() == ErrorKind::PermissionDenied => return Got::Refused,
             Err(_) => return kept(file, Sight::Unproven),
         };
-        let same = f
-            .metadata()
-            .is_ok_and(|m| m.file_type().is_file() && identity(&m) == file);
-        if !same {
+        let Ok(opened_meta) = f.metadata() else {
+            return kept(file, Sight::Unproven);
+        };
+        if !opened_meta.file_type().is_file() || identity(&opened_meta) != file {
             return kept(file, Sight::Unproven);
         }
-        let mut bytes = Vec::new();
+        let mut bytes = Vec::with_capacity(
+            usize::try_from(
+                opened_meta
+                    .len()
+                    .min(RECORD_CAP as u64 + 1)
+                    .saturating_add(1),
+            )
+            .unwrap_or(0),
+        );
         let read = (&mut f).take(RECORD_CAP as u64 + 1).read_to_end(&mut bytes);
         let lock = locked(&f);
         while_open(path);

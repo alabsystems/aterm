@@ -140,9 +140,13 @@ fn author<T>(
 
 #[test]
 fn final_ingress_cannot_publish_only_the_epoch_of_an_authored_batch() {
+    crate::crossing::fixture::LEGACY.within(final_ingress_at_a_full_held_store);
+}
+
+fn final_ingress_at_a_full_held_store() {
     let root = aterm_tempfile::tempdir().unwrap();
     let (mut store, writer) = rooted();
-    while store.len() < crate::membership_log::MAX_HELD_RECORDS - 5 {
+    while store.len() < crate::crossing::fixture::LEGACY.held - 5 {
         let record = writer.name(
             store.log().unwrap(),
             1_001 + u64::try_from(store.len()).unwrap(),

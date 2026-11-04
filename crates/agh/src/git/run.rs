@@ -549,9 +549,10 @@ mod unix {
     }
 
     /// The run's one scratch directory, canonical, with `home/` and `work/` made.
-    fn scratch() -> Result<(aterm_tempfile::TempDir, PathBuf)> {
+    pub(super) fn scratch() -> Result<(aterm_tempfile::TempDir, PathBuf)> {
         let dir = aterm_tempfile::Builder::new()
             .prefix("agh-git-")
+            .suffix(".noindex")
             .tempdir()
             .map_err(|e| Error::local(format!("the git run's scratch directory: {e}")))?;
         let root = std::fs::canonicalize(dir.path())
@@ -1334,5 +1335,22 @@ mod tests {
         let tail = format!("{}\u{e9}", "z".repeat(64 * 1024));
         let kept = super::unix::kept(tail.as_bytes(), &redactor);
         assert!(kept.ends_with('\u{e9}'), "the cut kept the last char whole");
+    }
+
+    /// NEGATIVE CONTROL: transient git scratch directories must carry `.noindex` so Spotlight
+    /// never indexes cloned worktrees or credential-helper homes under `$TMPDIR`.
+    #[test]
+    fn git_run_scratch_directory_carries_noindex_suffix() {
+        let (dir, root) = super::unix::scratch().expect("create git scratch");
+        let name = dir
+            .path()
+            .file_name()
+            .and_then(|os| os.to_str())
+            .expect("scratch dir name is UTF-8");
+        assert!(name.starts_with("agh-git-"), "{name}");
+        assert!(name.ends_with(".noindex"), "{name}");
+        assert!(root.ends_with(name), "{}", root.display());
+        assert!(root.join("home").is_dir());
+        assert!(root.join("work").is_dir());
     }
 }

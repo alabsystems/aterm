@@ -9,7 +9,7 @@ use super::Rig;
 use super::instance::{
     Budget, CouldNotRun, Instance, Scratch, World, could_not_run, field, unanswered,
 };
-use super::starvation::ShapeVerdict;
+use super::starvation::{Disposition, ShapeVerdict};
 
 #[path = "rewind_cost_diagnostic.rs"]
 mod diagnostic;
@@ -25,7 +25,7 @@ pub const APP_IDLE_TARGET_BYTES: u64 = 25_000_000;
 /// What a cost row measures.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CostRow {
-    /// `pairs` ABBA pairs (off, on, on, off) of one pane draining `bytes`, each take a fresh instance: passes when the off arm's median drain time is at least `min_milli` thousandths of the on arm's and no recording input was dropped.
+    /// `pairs` ABBA blocks (off, on, on, off) of one pane draining `bytes`, each take a fresh instance, judged on the adjacent takes' off/on drain ratios ([`pair_ratios_milli`]) by [`throughput_disposition`]: passes when their median's interval ([`median_interval`]) lies at or above `min_milli` thousandths and no recording input was dropped, fails when it lies below or input was dropped, and is unproved between.
     Throughput {
         bytes: usize,
         pairs: u32,
@@ -41,11 +41,19 @@ pub enum CostRow {
     },
 }
 
-/// One row's outcome: its report line and verdict.
+/// One row's outcome: its report line and disposition.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CostReport {
     pub line: String,
-    pub verdict: ShapeVerdict,
+    pub disposition: Disposition,
+}
+
+/// A row judged pass or fail, never unproved.
+const fn judged(verdict: ShapeVerdict) -> Disposition {
+    match verdict {
+        ShapeVerdict::Pass => Disposition::Pass,
+        ShapeVerdict::Fail => Disposition::Fail,
+    }
 }
 
 /// An instance in its own scratch world, recording or not.
@@ -246,14 +254,72 @@ pub fn median(v: &[u64]) -> u64 {
     s.get((s.len().saturating_sub(1)) / 2).copied().unwrap_or(0)
 }
 
-/// The off arm's median over the on arm's, in thousandths (1000: recording costs nothing).
+/// The off take's drain time over the on take's, in thousandths (1000: recording cost nothing),
+/// for each pair of adjacent takes in an ABBA block: its arms 0 and 1, then its arms 3 and 2.
+/// `off` and `on` hold each arm's takes in take order, so block `p`'s arms 0 and 3 are `off`'s
+/// entries `2p` and `2p + 1`, and its arms 1 and 2 are `on`'s. Adjacent takes, a couple of seconds
+/// apart, share the machine's state: a load that comes and goes between them is in both sides of
+/// a pair, where pooling each arm's takes would put it in one arm's median and not the other's.
+/// A pair with an on take of 0 µs (none was measured) gives no ratio.
 #[must_use]
-pub fn ratio_milli(off: &[u64], on: &[u64]) -> u64 {
-    let on = median(on);
-    if on == 0 {
-        return 0;
+pub fn pair_ratios_milli(off: &[u64], on: &[u64]) -> Vec<u64> {
+    off.iter()
+        .zip(on)
+        .filter(|(_, on)| **on != 0)
+        .map(|(off, on)| off.saturating_mul(1000) / on)
+        .collect()
+}
+
+/// An interval holding the median of the population `values` were drawn from with at least
+/// [`MedianInterval::coverage_ppm`] probability, from the sign test (distribution-free: it
+/// assumes only independent draws).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MedianInterval {
+    /// The sample median (the lower of the middle two).
+    pub median: u64,
+    /// The interval's ends: the sorted values' `k`th and `n + 1 - k`th.
+    pub lo: u64,
+    pub hi: u64,
+    /// The least probability, in millionths rounded down, that the interval holds the population's
+    /// median.
+    pub coverage_ppm: u64,
+}
+
+/// The most values [`median_interval`] takes: its binomial sums are exact in `u128` up to here.
+const MAX_INTERVAL_VALUES: usize = 64;
+
+/// `values`' median and its sign-test interval at 95% or more: with `n` values, `k` is the largest
+/// with `P(Binomial(n, 1/2) <= k - 1) <= 2.5%`, so the median lies below the `k`th smallest or
+/// above the `k`th largest with at most 2.5% probability each. `None` for fewer than 6 values (no
+/// such `k`) or more than [`MAX_INTERVAL_VALUES`].
+#[must_use]
+pub fn median_interval(values: &[u64]) -> Option<MedianInterval> {
+    let n = values.len();
+    if n > MAX_INTERVAL_VALUES {
+        return None;
     }
-    median(off).saturating_mul(1000) / on
+    let whole = 1_u128 << n;
+    let choose =
+        |i: usize| -> u128 { (0..i).fold(1_u128, |c, j| c * (n - j) as u128 / (j + 1) as u128) };
+    // `tail` is P(B <= k - 1) * 2^n for the current `k`; the last `k` whose tail is at most 2.5%.
+    let (mut k, mut tail, mut kept) = (0, 0_u128, None);
+    while k < n / 2 {
+        tail += choose(k);
+        k += 1;
+        if tail * 40 > whole {
+            break;
+        }
+        kept = Some((k, tail));
+    }
+    let (k, tail) = kept?;
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    Some(MedianInterval {
+        median: median(&sorted),
+        lo: sorted[k - 1],
+        hi: sorted[n - k],
+        coverage_ppm: u64::try_from(1_000_000 - (tail * 2_000_000).div_ceil(whole)).unwrap_or(0),
+    })
 }
 
 /// What recording adds to an idle instance's resident size: the on arm's median less the off arm's, 0 when the on arm is the smaller.
@@ -338,16 +404,36 @@ pub fn measure(rig: &Rig, row: &CostRow) -> Result<CostReport, CouldNotRun> {
                     if record { &mut on } else { &mut off }.push(us);
                 }
             }
-            let milli = ratio_milli(&off, &on);
+            let ratios = pair_ratios_milli(&off, &on);
+            let interval = median_interval(&ratios);
+            let (median_milli, lo, hi, coverage) = interval.map_or_else(
+                || {
+                    (
+                        "-".to_owned(),
+                        "-".to_owned(),
+                        "-".to_owned(),
+                        "-".to_owned(),
+                    )
+                },
+                |i| {
+                    (
+                        i.median.to_string(),
+                        i.lo.to_string(),
+                        i.hi.to_string(),
+                        i.coverage_ppm.to_string(),
+                    )
+                },
+            );
             Ok(CostReport {
                 line: format!(
                     "COST throughput bytes={bytes} pairs={pairs} off_us={off:?} on_us={on:?} \
-                     off_median_us={} on_median_us={} ratio_milli={milli} min_milli={min_milli} \
-                     dropped_input={dropped_input}",
+                     off_median_us={} on_median_us={} pair_ratios_milli={ratios:?} \
+                     ratio_milli={median_milli} interval_milli={lo}..{hi} \
+                     coverage_ppm={coverage} min_milli={min_milli} dropped_input={dropped_input}",
                     median(&off),
                     median(&on)
                 ),
-                verdict: throughput_verdict(milli, min_milli, dropped_input),
+                disposition: throughput_disposition(interval, min_milli, dropped_input),
             })
         }
         CostRow::IdleRss {
@@ -380,7 +466,13 @@ pub fn measure(rig: &Rig, row: &CostRow) -> Result<CostReport, CouldNotRun> {
                     on_app_median,
                     on_app_median <= APP_IDLE_TARGET_BYTES,
                 ),
-                verdict: idle_verdict(&off, &on, &on_app, max_extra_bytes, by_default),
+                disposition: judged(idle_verdict(
+                    &off,
+                    &on,
+                    &on_app,
+                    max_extra_bytes,
+                    by_default,
+                )),
             })
         }
         CostRow::BusyRss {
@@ -398,7 +490,7 @@ pub fn measure(rig: &Rig, row: &CostRow) -> Result<CostReport, CouldNotRun> {
                      extra_bytes={extra} max_extra_bytes={max_extra_bytes} pool_used={used} \
                      pool_limit={limit}"
                 ),
-                verdict: verdict(extra <= max_extra_bytes && used <= limit),
+                disposition: judged(verdict(extra <= max_extra_bytes && used <= limit)),
             })
         }
     }
@@ -433,8 +525,24 @@ fn writer_finished(status: &str) -> Result<bool, CouldNotRun> {
     Ok(number("writer_in_flight")? == 0 && number("writer_queued_bytes")? == 0)
 }
 
-const fn throughput_verdict(milli: u64, min_milli: u64, dropped_input: u64) -> ShapeVerdict {
-    verdict(milli >= min_milli && dropped_input == 0)
+/// The throughput row's disposition from the adjacent takes' ratios' [`MedianInterval`]: a
+/// recording that dropped input fails, whatever its speed; an interval at or above `min_milli`
+/// passes, and one wholly below it fails (recording cost more than the bound, under whatever load
+/// the takes ran in: ATERM-KI-1102-7's cost is real). An interval that holds `min_milli`, or none
+/// (too few pairs), is unproved: the takes varied more than the bound the row judges, so they
+/// are no evidence either way.
+#[must_use]
+pub const fn throughput_disposition(
+    interval: Option<MedianInterval>,
+    min_milli: u64,
+    dropped_input: u64,
+) -> Disposition {
+    match interval {
+        _ if dropped_input != 0 => Disposition::Fail,
+        Some(MedianInterval { lo, .. }) if lo >= min_milli => Disposition::Pass,
+        Some(MedianInterval { hi, .. }) if hi < min_milli => Disposition::Fail,
+        _ => Disposition::Unproved,
+    }
 }
 
 /// `panes` panes of one instance each draining `bytes` at once: its settled resident size and the pool's `(used, limit)`.
@@ -503,18 +611,105 @@ mod tests {
     }
 
     #[test]
-    fn the_ratio_is_the_off_median_over_the_on_median() {
+    fn the_ratios_pair_adjacent_takes_and_their_interval_is_the_sign_tests() {
         assert_eq!(median(&[5, 1, 3]), 3);
         assert_eq!(median(&[4, 1, 3, 2]), 2);
-        assert_eq!(ratio_milli(&[970, 1000, 990], &[1000, 1000, 1010]), 990);
-        assert_eq!(ratio_milli(&[1], &[]), 0, "no on arm passes nothing");
+        assert_eq!(
+            pair_ratios_milli(&[970, 1000, 5], &[1000, 1010, 0]),
+            [970, 990],
+            "an unmeasured on take gives no ratio"
+        );
+        let ten: Vec<u64> = (1..=10).rev().collect();
+        assert_eq!(
+            median_interval(&ten),
+            Some(MedianInterval {
+                median: 5,
+                lo: 2,
+                hi: 9,
+                coverage_ppm: 978_515,
+            }),
+            "P(B(10, 1/2) <= 1) = 11/1024"
+        );
+        let twenty: Vec<u64> = (1..=20).collect();
+        let i = median_interval(&twenty).expect("twenty values");
+        assert_eq!(
+            (i.lo, i.hi, i.coverage_ppm),
+            (6, 15, 958_610),
+            "P(B(20, 1/2) <= 5) = 21700/2^20"
+        );
+        assert_eq!(median_interval(&[1, 2, 3, 4, 5]), None, "too few for 95%");
+        assert!(median_interval(&[1; 6]).is_some());
+        assert_eq!(median_interval(&[1; 65]), None, "past the exact sums");
+    }
+
+    /// Retained takes (`off_us`, `on_us` in take order) of three five-block runs.
+    const LOADED_POOLED_955: ([u64; 10], [u64; 10]) = (
+        [
+            1_808_126, 1_844_560, 2_086_444, 1_879_753, 2_001_503, 1_938_782, 1_887_837, 2_636_332,
+            2_758_945, 2_782_664,
+        ],
+        [
+            1_934_805, 1_824_336, 1_952_736, 1_888_877, 2_029_006, 2_081_219, 2_499_644, 2_511_547,
+            2_948_381, 2_884_309,
+        ],
+    );
+    const LOADED_POOLED_1025: ([u64; 10], [u64; 10]) = (
+        [
+            304_384, 291_178, 311_930, 307_422, 309_872, 292_797, 293_213, 786_952, 861_320,
+            726_545,
+        ],
+        [
+            299_894, 291_672, 297_713, 297_672, 305_655, 298_078, 771_557, 821_118, 725_792,
+            813_669,
+        ],
+    );
+    const QUIET_POOLED_999: ([u64; 10], [u64; 10]) = (
+        [
+            1_605_535, 1_614_247, 1_609_860, 1_607_189, 1_596_909, 1_609_144, 1_586_673, 1_607_772,
+            1_593_787, 1_616_058,
+        ],
+        [
+            1_596_980, 1_597_657, 1_655_941, 1_618_460, 1_604_724, 1_642_396, 1_608_202, 1_613_086,
+            1_602_880, 1_610_144,
+        ],
+    );
+
+    fn disposition_of((off, on): ([u64; 10], [u64; 10])) -> Disposition {
+        throughput_disposition(median_interval(&pair_ratios_milli(&off, &on)), 970, 0)
+    }
+
+    /// A take drains for 0.2 to 3 s in a fresh instance (these runs' takes), so a load that
+    /// comes and goes slows whole takes (ATERM-KI-1102-7) and the arms' pooled medians follow
+    /// the Mac: retained loaded runs pooled 955, a fail, and 1025, a pass that had one block run
+    /// 2.5 times slow in both arms. Judged on the adjacent takes' ratios, each reads unproved:
+    /// their intervals, 931..1049 and 892..1047, hold the bound. A quiet run's, 979..1005, clears
+    /// it, and takes that cost recording 6% in every pair fail however they spread.
+    /// NEGATIVE CONTROL: a verdict on the ratios' median alone (`median >= min_milli`) fails the
+    /// 955 run (median 964) and passes the 1025 one (998).
+    #[test]
+    fn the_row_judges_the_takes_not_the_load_they_ran_in() {
+        assert_eq!(disposition_of(LOADED_POOLED_955), Disposition::Unproved);
+        assert_eq!(disposition_of(LOADED_POOLED_1025), Disposition::Unproved);
+        assert_eq!(disposition_of(QUIET_POOLED_999), Disposition::Pass);
+        let on: [u64; 10] = [
+            300_000, 320_000, 900_000, 310_000, 305_000, 700_000, 301_000, 330_000, 299_000,
+            480_000,
+        ];
+        let off = on.map(|us| us * 94 / 100);
+        assert_eq!(disposition_of((off, on)), Disposition::Fail);
+        assert_eq!(
+            throughput_disposition(None, 970, 0),
+            Disposition::Unproved,
+            "too few pairs prove nothing"
+        );
     }
 
     #[test]
     fn a_fast_recording_cannot_pass_by_losing_input() {
-        assert_eq!(throughput_verdict(1000, 970, 0), ShapeVerdict::Pass);
-        assert_eq!(throughput_verdict(1000, 970, 1), ShapeVerdict::Fail);
-        assert_eq!(throughput_verdict(969, 970, 0), ShapeVerdict::Fail);
+        let fast = median_interval(&[1000; 10]);
+        assert_eq!(throughput_disposition(fast, 970, 0), Disposition::Pass);
+        assert_eq!(throughput_disposition(fast, 970, 1), Disposition::Fail);
+        assert_eq!(throughput_disposition(None, 970, 1), Disposition::Fail);
         assert_eq!(recording_drops("OK dropped_input=0").unwrap(), 0);
         assert_eq!(recording_drops("OK dropped_input=2").unwrap(), 2);
         for status in ["OK", "OK dropped_input=-", "OK dropped_input=bad"] {
@@ -534,8 +729,12 @@ mod tests {
         assert!(!writer_finished(receipt).unwrap());
         assert!(writer_finished(completed).unwrap());
         assert_eq!(
-            throughput_verdict(1000, 970, recording_drops(completed).unwrap()),
-            ShapeVerdict::Fail
+            throughput_disposition(
+                median_interval(&[1000; 10]),
+                970,
+                recording_drops(completed).unwrap()
+            ),
+            Disposition::Fail
         );
         assert!(
             writer_finished("OK writer_gone=false writer_in_flight=0 writer_queued_bytes=0")

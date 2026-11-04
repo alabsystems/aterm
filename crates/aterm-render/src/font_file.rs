@@ -35,11 +35,11 @@ fn not_regular() -> io::Error {
 }
 
 /// Open once and prove that the handle which will be read is a regular file,
-/// returning it with the path that was actually opened.
+/// returning it with its metadata and the path that was actually opened.
 #[cfg(unix)]
-fn open_regular(path: &Path) -> io::Result<(std::fs::File, Cow<'_, Path>)> {
+fn open_regular(path: &Path) -> io::Result<(std::fs::File, std::fs::Metadata, Cow<'_, Path>)> {
     match open_regular_no_follow(path) {
-        Ok(file) => Ok((file, Cow::Borrowed(path))),
+        Ok((file, metadata)) => Ok((file, metadata, Cow::Borrowed(path))),
         Err(error) => {
             // Only a final-component LINK is retried; every other refusal
             // (absent, FIFO, device, oversize) keeps its own error.
@@ -47,8 +47,8 @@ fn open_regular(path: &Path) -> io::Result<(std::fs::File, Cow<'_, Path>)> {
                 return Err(error);
             }
             let target = std::fs::canonicalize(path)?;
-            let file = open_regular_no_follow(&target)?;
-            Ok((file, Cow::Owned(target)))
+            let (file, metadata) = open_regular_no_follow(&target)?;
+            Ok((file, metadata, Cow::Owned(target)))
         }
     }
 }
@@ -56,33 +56,34 @@ fn open_regular(path: &Path) -> io::Result<(std::fs::File, Cow<'_, Path>)> {
 /// The one `open` [`open_regular`] performs per path: never through a
 /// final-component link, never blocking, and only a regular file is kept.
 #[cfg(unix)]
-fn open_regular_no_follow(path: &Path) -> io::Result<std::fs::File> {
+fn open_regular_no_follow(path: &Path) -> io::Result<(std::fs::File, std::fs::Metadata)> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
     let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW)
         .open(path)?;
-    if !file.metadata()?.file_type().is_file() {
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
         return Err(not_regular());
     }
-    Ok(file)
+    Ok((file, metadata))
 }
 
 /// Windows' reparse-point flag is the closest equivalent of `O_NOFOLLOW`.
 #[cfg(windows)]
-fn open_regular(path: &Path) -> io::Result<(std::fs::File, Cow<'_, Path>)> {
-    let file = open_regular_shared(
+fn open_regular(path: &Path) -> io::Result<(std::fs::File, std::fs::Metadata, Cow<'_, Path>)> {
+    let (file, metadata) = open_regular_shared(
         path,
         win::FILE_SHARE_READ | win::FILE_SHARE_WRITE | win::FILE_SHARE_DELETE,
     )?;
-    Ok((file, Cow::Borrowed(path)))
+    Ok((file, metadata, Cow::Borrowed(path)))
 }
 
 /// [`open_regular`] with an explicit share mode: the copy path shares everything (std's
 /// default); the mapping path ([`open_for_admission`]) refuses write sharing.
 #[cfg(windows)]
-fn open_regular_shared(path: &Path, share: u32) -> io::Result<std::fs::File> {
+fn open_regular_shared(path: &Path, share: u32) -> io::Result<(std::fs::File, std::fs::Metadata)> {
     use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
 
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
@@ -99,24 +100,25 @@ fn open_regular_shared(path: &Path, share: u32) -> io::Result<std::fs::File> {
     {
         return Err(not_regular());
     }
-    Ok(file)
+    Ok((file, metadata))
 }
 
 /// Portable fallback for targets without a non-blocking filesystem-open flag.
 #[cfg(not(any(unix, windows)))]
-fn open_regular(path: &Path) -> io::Result<(std::fs::File, Cow<'_, Path>)> {
+fn open_regular(path: &Path) -> io::Result<(std::fs::File, std::fs::Metadata, Cow<'_, Path>)> {
     if !std::fs::symlink_metadata(path)?.file_type().is_file() {
         return Err(not_regular());
     }
     let file = std::fs::File::open(path)?;
-    if !file.metadata()?.file_type().is_file() {
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
         return Err(not_regular());
     }
-    Ok((file, Cow::Borrowed(path)))
+    Ok((file, metadata, Cow::Borrowed(path)))
 }
 
-fn check_observed_size(file: &std::fs::File, max_bytes: usize) -> io::Result<u64> {
-    let length = file.metadata()?.len();
+fn check_observed_size(metadata: &std::fs::Metadata, max_bytes: usize) -> io::Result<u64> {
+    let length = metadata.len();
     if length > u64::try_from(max_bytes).unwrap_or(u64::MAX) {
         return Err(too_large(max_bytes));
     }
@@ -125,8 +127,8 @@ fn check_observed_size(file: &std::fs::File, max_bytes: usize) -> io::Result<u64
 
 /// Validate an explicit path without reading or parsing its bytes, under the same open/handle/type/size rules as [`read_bounded_font_file`].
 pub fn validate_bounded_font_file(path: &Path, max_bytes: usize) -> io::Result<()> {
-    let (file, _) = open_regular(path)?;
-    let _ = check_observed_size(&file, max_bytes)?;
+    let (_, metadata, _) = open_regular(path)?;
+    let _ = check_observed_size(&metadata, max_bytes)?;
     Ok(())
 }
 
@@ -144,8 +146,8 @@ pub fn read_bounded_font_file_into(
     buf: &mut Vec<u8>,
 ) -> io::Result<()> {
     buf.clear();
-    let (file, _) = open_regular(path)?;
-    let length = check_observed_size(&file, max_bytes)?;
+    let (file, metadata, _) = open_regular(path)?;
+    let length = check_observed_size(&metadata, max_bytes)?;
     read_admitted_handle(file, length, max_bytes, buf)
 }
 
@@ -210,7 +212,7 @@ unsafe impl Sync for MappedFontFile {}
 
 #[cfg(unix)]
 impl MappedFontFile {
-    fn map(file: &std::fs::File, len: u64) -> io::Result<Self> {
+    fn map(file: &std::fs::File, metadata: &std::fs::Metadata, len: u64) -> io::Result<Self> {
         use std::os::unix::fs::MetadataExt as _;
         use std::os::unix::io::AsRawFd as _;
 
@@ -223,7 +225,6 @@ impl MappedFontFile {
                 "font file is empty",
             ));
         }
-        let metadata = file.metadata()?;
         let identity = (metadata.dev(), metadata.ino());
         // SAFETY: `fd` is the caller's open, admitted handle; a NULL hint with
         // PROT_READ|MAP_PRIVATE asks the kernel for a fresh read-only private
@@ -256,7 +257,7 @@ impl MappedFontFile {
 
 #[cfg(windows)]
 impl MappedFontFile {
-    fn map(file: &std::fs::File, len: u64) -> io::Result<Self> {
+    fn map(file: &std::fs::File, _metadata: &std::fs::Metadata, len: u64) -> io::Result<Self> {
         use std::os::windows::io::AsRawHandle as _;
 
         let Ok(len_usize) = usize::try_from(len) else {
@@ -318,7 +319,7 @@ impl MappedFontFile {
 
 #[cfg(not(any(unix, windows)))]
 impl MappedFontFile {
-    fn map(_file: &std::fs::File, _len: u64) -> io::Result<Self> {
+    fn map(_file: &std::fs::File, _metadata: &std::fs::Metadata, _len: u64) -> io::Result<Self> {
         Err(io::Error::from(io::ErrorKind::Unsupported))
     }
 
@@ -420,9 +421,9 @@ fn lies_under(path: &Path, root: &Path) -> bool {
 
 /// Admit one font file under the production budget.
 pub fn admit_font_file(path: &Path) -> io::Result<crate::font::FaceBytes> {
-    let (file, may_map) = open_for_admission(path, maps_in_place)?;
-    let length = check_observed_size(&file, MAX_FONT_FILE_BYTES)?;
-    if may_map && let Ok(mapped) = MappedFontFile::map(&file, length) {
+    let (file, metadata, may_map) = open_for_admission(path, maps_in_place)?;
+    let length = check_observed_size(&metadata, MAX_FONT_FILE_BYTES)?;
+    if may_map && let Ok(mapped) = MappedFontFile::map(&file, &metadata, length) {
         return Ok(crate::font::FaceBytes::Mapped(Arc::new(mapped)));
     }
     let mut bytes = Vec::new();
@@ -452,8 +453,8 @@ pub fn read_face_tables(
     use std::io::{Seek as _, SeekFrom};
 
     let malformed = |what: &str| io::Error::new(io::ErrorKind::InvalidData, what.to_string());
-    let (mut file, _) = open_regular(path)?;
-    let length = check_observed_size(&file, MAX_FONT_FILE_BYTES)?;
+    let (mut file, metadata, _) = open_regular(path)?;
+    let length = check_observed_size(&metadata, MAX_FONT_FILE_BYTES)?;
     let mut read_at = |offset: u64, len: usize| -> io::Result<Vec<u8>> {
         if offset
             .checked_add(len as u64)
@@ -513,10 +514,10 @@ pub fn read_face_tables(
 fn open_for_admission(
     path: &Path,
     mappable: fn(&Path) -> bool,
-) -> io::Result<(std::fs::File, bool)> {
-    let (file, opened) = open_regular(path)?;
+) -> io::Result<(std::fs::File, std::fs::Metadata, bool)> {
+    let (file, metadata, opened) = open_regular(path)?;
     let may_map = mappable(&opened);
-    Ok((file, may_map))
+    Ok((file, metadata, may_map))
 }
 
 /// Windows: a file [`maps_in_place`] would map is opened without write sharing, which the
@@ -526,18 +527,19 @@ fn open_for_admission(
 fn open_for_admission(
     path: &Path,
     mappable: fn(&Path) -> bool,
-) -> io::Result<(std::fs::File, bool)> {
+) -> io::Result<(std::fs::File, std::fs::Metadata, bool)> {
     const ERROR_SHARING_VIOLATION: i32 = 32;
     if mappable(path) {
         match open_regular_shared(path, win::FILE_SHARE_READ | win::FILE_SHARE_DELETE) {
-            Ok(file) => return Ok((file, true)),
+            Ok((file, metadata)) => return Ok((file, metadata, true)),
             Err(error) if error.raw_os_error() != Some(ERROR_SHARING_VIOLATION) => {
                 return Err(error);
             }
             Err(_) => {}
         }
     }
-    Ok((open_regular(path)?.0, false))
+    let (file, metadata, _) = open_regular(path)?;
+    Ok((file, metadata, false))
 }
 
 /// No mapping on this target: every admission is a copy.
@@ -545,8 +547,9 @@ fn open_for_admission(
 fn open_for_admission(
     path: &Path,
     _mappable: fn(&Path) -> bool,
-) -> io::Result<(std::fs::File, bool)> {
-    Ok((open_regular(path)?.0, false))
+) -> io::Result<(std::fs::File, std::fs::Metadata, bool)> {
+    let (file, metadata, _) = open_regular(path)?;
+    Ok((file, metadata, false))
 }
 
 /// The kernel32 calls the Windows mapping arm makes, declared directly.
@@ -631,28 +634,21 @@ pub fn validate_font_file(path: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
 
-    fn fixture_dir(label: &str) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "aterm-font-file-{label}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).expect("create font-file fixture directory");
-        root
+    fn fixture_dir(label: &str) -> aterm_tempfile::TempDir {
+        crate::test_scratch_dir(&format!("font-file-{label}"))
     }
 
     #[test]
     fn exact_limit_is_accepted_and_one_byte_over_is_rejected() {
         let root = fixture_dir("limit");
-        let exact = root.join("exact.ttf");
-        let over = root.join("over.ttf");
+        let exact = root.path().join("exact.ttf");
+        let over = root.path().join("over.ttf");
         std::fs::write(&exact, [0x5a; 64]).expect("write exact-limit fixture");
         std::fs::write(&over, [0x5a; 65]).expect("write over-limit fixture");
         assert_eq!(read_bounded_font_file(&exact, 64).unwrap(), [0x5a; 64]);
         let error = read_bounded_font_file(&over, 64).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        std::fs::remove_dir_all(root).expect("remove font-file fixtures");
+        std::fs::remove_dir_all(root.path()).expect("remove font-file fixtures");
     }
 
     #[test]
@@ -663,7 +659,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, &n)| {
-                let path = root.join(format!("face{i}.ttf"));
+                let path = root.path().join(format!("face{i}.ttf"));
                 std::fs::write(&path, vec![u8::try_from(i).unwrap(); n]).expect("write fixture");
                 path
             })
@@ -675,15 +671,15 @@ mod tests {
             assert_eq!(buf, read_font_file(path).expect("fresh read"));
         }
         assert!(buf.capacity() >= *sizes.iter().max().unwrap());
-        std::fs::remove_dir_all(root).expect("remove font-file fixtures");
+        std::fs::remove_dir_all(root.path()).expect("remove font-file fixtures");
     }
 
     #[test]
     fn a_refused_path_leaves_no_stale_font_in_a_reused_buffer() {
         let root = fixture_dir("stale");
-        let previous = root.join("previous.ttf");
-        let over = root.join("over.ttf");
-        let absent = root.join("absent.ttf");
+        let previous = root.path().join("previous.ttf");
+        let over = root.path().join("over.ttf");
+        let absent = root.path().join("absent.ttf");
         std::fs::write(&previous, [0xa5; 512]).expect("write previous-face fixture");
         std::fs::write(&over, [0x11; 4096]).expect("write over-limit fixture");
 
@@ -705,28 +701,28 @@ mod tests {
                 buf.len()
             );
         }
-        std::fs::remove_dir_all(root).expect("remove font-file fixtures");
+        std::fs::remove_dir_all(root.path()).expect("remove font-file fixtures");
     }
 
     #[test]
     fn a_fresh_read_allocates_no_slack() {
         let root = fixture_dir("exact-capacity");
-        let path = root.join("face.ttf");
+        let path = root.path().join("face.ttf");
         std::fs::write(&path, vec![0x5a; 100_003]).expect("write fixture");
         let bytes = read_font_file(&path).expect("fresh read");
         assert_eq!(bytes.len(), 100_003);
         assert_eq!(bytes.capacity(), bytes.len());
-        std::fs::remove_dir_all(root).expect("remove font-file fixtures");
+        std::fs::remove_dir_all(root.path()).expect("remove font-file fixtures");
     }
 
     #[test]
     fn same_open_handle_supplies_bytes_after_path_replacement() {
         let root = fixture_dir("same-handle");
-        let path = root.join("face.ttf");
-        let moved = root.join("opened.ttf");
+        let path = root.path().join("face.ttf");
+        let moved = root.path().join("opened.ttf");
         std::fs::write(&path, b"original-font-bytes").expect("write original fixture");
 
-        let (mut opened, _) = open_regular(&path).expect("open admitted handle");
+        let (mut opened, _, _) = open_regular(&path).expect("open admitted handle");
         std::fs::rename(&path, &moved).expect("retain opened inode under another name");
         std::fs::write(&path, b"replacement-font").expect("replace logical path");
 
@@ -736,7 +732,7 @@ mod tests {
             .expect("read admitted handle");
         assert_eq!(bytes, b"original-font-bytes");
         assert_eq!(std::fs::read(&path).unwrap(), b"replacement-font");
-        std::fs::remove_dir_all(root).expect("remove font-file fixtures");
+        std::fs::remove_dir_all(root.path()).expect("remove font-file fixtures");
     }
 
     #[test]
@@ -795,7 +791,7 @@ mod tests {
     #[test]
     fn admit_font_file_copies_a_file_off_the_system_font_volume() {
         let root = fixture_dir("admit-policy");
-        let outside = root.join("outside.ttf");
+        let outside = root.path().join("outside.ttf");
         std::fs::write(&outside, [0x42; 4099]).expect("write outside fixture");
         assert!(!maps_in_place(&outside));
         let admitted = admit_font_file(&outside).expect("a regular file admits");
@@ -805,7 +801,7 @@ mod tests {
         );
         assert_eq!(&admitted[..], &read_font_file(&outside).unwrap()[..]);
 
-        let empty = root.join("empty.ttf");
+        let empty = root.path().join("empty.ttf");
         std::fs::write(&empty, []).expect("write empty fixture");
         let admitted = admit_font_file(&empty).expect("an empty regular file still admits");
         assert!(
@@ -813,7 +809,7 @@ mod tests {
             "the copy arm carries the empty file as-is"
         );
 
-        std::fs::remove_dir_all(root).expect("remove font-file fixtures");
+        std::fs::remove_dir_all(root.path()).expect("remove font-file fixtures");
     }
 
     /// The mapping arm answers the SAME bytes the copy arm does: a file on the
@@ -869,13 +865,14 @@ mod tests {
     fn a_mapped_font_refuses_writers_until_it_is_dropped() {
         const ERROR_SHARING_VIOLATION: i32 = 32;
         let root = fixture_dir("win-map-share");
-        let path = root.join("face.ttf");
+        let path = root.path().join("face.ttf");
         std::fs::write(&path, b"mapped-font-bytes").expect("write fixture");
 
-        let file = open_regular_shared(&path, win::FILE_SHARE_READ | win::FILE_SHARE_DELETE)
-            .expect("the mapping open succeeds with no writer present");
-        let length = check_observed_size(&file, MAX_FONT_FILE_BYTES).expect("size");
-        let mapped = MappedFontFile::map(&file, length).expect("map the fixture");
+        let (file, metadata) =
+            open_regular_shared(&path, win::FILE_SHARE_READ | win::FILE_SHARE_DELETE)
+                .expect("the mapping open succeeds with no writer present");
+        let length = check_observed_size(&metadata, MAX_FONT_FILE_BYTES).expect("size");
+        let mapped = MappedFontFile::map(&file, &metadata, length).expect("map the fixture");
         drop(file);
         assert_eq!(&mapped[..], b"mapped-font-bytes");
 
@@ -895,7 +892,7 @@ mod tests {
             .write(true)
             .open(&path)
             .expect("the write refusal must lift with the mapping");
-        std::fs::remove_dir_all(root).expect("remove font-file fixtures");
+        std::fs::remove_dir_all(root.path()).expect("remove font-file fixtures");
     }
 
     /// The servicing path the mapping keeps open, checked against the OS: the
@@ -907,14 +904,15 @@ mod tests {
     #[test]
     fn a_mapped_font_can_be_renamed_and_replaced_and_its_view_keeps_the_original() {
         let root = fixture_dir("win-map-rename");
-        let path = root.join("face.ttf");
-        let renamed = root.join("face-old.ttf");
+        let path = root.path().join("face.ttf");
+        let renamed = root.path().join("face-old.ttf");
         std::fs::write(&path, b"original-font-bytes").expect("write fixture");
 
-        let file = open_regular_shared(&path, win::FILE_SHARE_READ | win::FILE_SHARE_DELETE)
-            .expect("the mapping open succeeds with no writer present");
-        let length = check_observed_size(&file, MAX_FONT_FILE_BYTES).expect("size");
-        let mapped = MappedFontFile::map(&file, length).expect("map the fixture");
+        let (file, metadata) =
+            open_regular_shared(&path, win::FILE_SHARE_READ | win::FILE_SHARE_DELETE)
+                .expect("the mapping open succeeds with no writer present");
+        let length = check_observed_size(&metadata, MAX_FONT_FILE_BYTES).expect("size");
+        let mapped = MappedFontFile::map(&file, &metadata, length).expect("map the fixture");
         drop(file);
 
         std::fs::rename(&path, &renamed).expect("a mapped font must still be renameable");
@@ -930,7 +928,7 @@ mod tests {
         );
 
         drop(mapped);
-        std::fs::remove_dir_all(root).expect("remove font-file fixtures");
+        std::fs::remove_dir_all(root.path()).expect("remove font-file fixtures");
     }
 
     /// A mappable file a writer already holds is not mapped (its bytes could change under the
@@ -939,25 +937,25 @@ mod tests {
     #[test]
     fn a_mappable_font_a_writer_holds_is_copied_not_refused() {
         let root = fixture_dir("win-map-writer");
-        let path = root.join("face.ttf");
+        let path = root.path().join("face.ttf");
         std::fs::write(&path, b"held-by-a-writer").expect("write fixture");
         let writer = std::fs::OpenOptions::new()
             .write(true)
             .open(&path)
             .expect("open the writer");
 
-        let (file, may_map) =
+        let (file, metadata, may_map) =
             open_for_admission(&path, |_| true).expect("a held file still admits");
         assert!(!may_map, "a file a writer holds must not be mapped");
-        let length = check_observed_size(&file, MAX_FONT_FILE_BYTES).expect("size");
+        let length = check_observed_size(&metadata, MAX_FONT_FILE_BYTES).expect("size");
         let mut bytes = Vec::new();
         read_admitted_handle(file, length, MAX_FONT_FILE_BYTES, &mut bytes).expect("copy");
         assert_eq!(bytes, b"held-by-a-writer");
 
         drop(writer);
-        let (_, may_map) = open_for_admission(&path, |_| true).expect("admits once released");
+        let (_, _, may_map) = open_for_admission(&path, |_| true).expect("admits once released");
         assert!(may_map, "with no writer the same file is mappable again");
-        std::fs::remove_dir_all(root).expect("remove font-file fixtures");
+        std::fs::remove_dir_all(root.path()).expect("remove font-file fixtures");
     }
 
     /// A writable view keeps its section alive even after both handles close.
@@ -978,7 +976,7 @@ mod tests {
         const PAGE_READWRITE: u32 = 0x04;
         const FILE_MAP_WRITE: u32 = 0x0002;
         let root = fixture_dir("win-map-prior-view");
-        let path = root.join("face.ttf");
+        let path = root.path().join("face.ttf");
         let expected = b"held-by-a-writable-view";
         std::fs::write(&path, expected).expect("write fixture");
         let file = std::fs::OpenOptions::new()
@@ -1017,28 +1015,30 @@ mod tests {
         drop(section);
         drop(file);
 
-        let (file, may_map) =
+        let (file, metadata, may_map) =
             open_for_admission(&path, |_| true).expect("a live view still admits");
         assert!(
             !may_map,
             "a writable view without handles must prevent mapping"
         );
-        let length = check_observed_size(&file, MAX_FONT_FILE_BYTES).expect("size");
+        let length = check_observed_size(&metadata, MAX_FONT_FILE_BYTES).expect("size");
         let mut bytes = Vec::new();
         read_admitted_handle(file, length, MAX_FONT_FILE_BYTES, &mut bytes).expect("copy");
         assert_eq!(bytes, expected);
 
         drop(view);
-        let (file, may_map) = open_for_admission(&path, |_| true).expect("admits after unmapping");
+        let (file, metadata, may_map) =
+            open_for_admission(&path, |_| true).expect("admits after unmapping");
         assert!(
             may_map,
             "the same file is mappable after its writable view closes"
         );
-        let mapped = MappedFontFile::map(&file, length).expect("map the released fixture");
+        let mapped =
+            MappedFontFile::map(&file, &metadata, length).expect("map the released fixture");
         assert_eq!(&mapped[..], expected);
         drop(mapped);
         drop(file);
-        std::fs::remove_dir_all(root).expect("remove font-file fixtures");
+        std::fs::remove_dir_all(root.path()).expect("remove font-file fixtures");
     }
 
     #[cfg(unix)]
@@ -1047,7 +1047,7 @@ mod tests {
         use std::os::unix::ffi::OsStrExt as _;
 
         let root = fixture_dir("special");
-        let fifo = root.join("face.fifo");
+        let fifo = root.path().join("face.fifo");
         let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("FIFO path");
         // SAFETY: `fifo_c` is a live NUL-terminated pathname and mkfifo retains no pointer.
         assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
@@ -1055,17 +1055,17 @@ mod tests {
             .expect_err("writerless FIFO must fail without blocking");
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
 
-        let to_fifo = root.join("fifo-link.ttf");
+        let to_fifo = root.path().join("fifo-link.ttf");
         std::os::unix::fs::symlink(&fifo, &to_fifo).expect("create link to FIFO");
         let error = read_bounded_font_file(&to_fifo, 64)
             .expect_err("a link to a writerless FIFO must fail without blocking");
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-        let to_device = root.join("zero-link.ttf");
+        let to_device = root.path().join("zero-link.ttf");
         std::os::unix::fs::symlink("/dev/zero", &to_device).expect("create link to device");
         let error = read_bounded_font_file(&to_device, 64)
             .expect_err("a link to a device must not be read");
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-        std::fs::remove_dir_all(root).expect("remove font-file fixtures");
+        std::fs::remove_dir_all(root.path()).expect("remove font-file fixtures");
     }
 
     /// A font installed as a LINK (Ubuntu's `UbuntuMono-R.ttf`, a stow or
@@ -1076,13 +1076,13 @@ mod tests {
     #[test]
     fn a_link_to_a_regular_font_admits_as_its_target() {
         let root = fixture_dir("links");
-        let store = root.join("store");
+        let store = root.path().join("store");
         std::fs::create_dir_all(&store).expect("create link-target directory");
         let regular = store.join("Face[wght].ttf");
         std::fs::write(&regular, b"font-bytes").expect("write link target");
-        let linked = root.join("Face-R.ttf");
+        let linked = root.path().join("Face-R.ttf");
         std::os::unix::fs::symlink(&regular, &linked).expect("create final link");
-        let chained = root.join("Face-B.ttf");
+        let chained = root.path().join("Face-B.ttf");
         std::os::unix::fs::symlink("Face-R.ttf", &chained).expect("create chained link");
 
         for path in [&linked, &chained] {
@@ -1096,18 +1096,18 @@ mod tests {
             assert!(matches!(admitted, crate::font::FaceBytes::Vec(_)));
         }
 
-        let a = root.join("loop-a.ttf");
-        let b = root.join("loop-b.ttf");
+        let a = root.path().join("loop-a.ttf");
+        let b = root.path().join("loop-b.ttf");
         std::os::unix::fs::symlink(&b, &a).expect("create loop link a");
         std::os::unix::fs::symlink(&a, &b).expect("create loop link b");
         assert!(read_font_file(&a).is_err(), "a link loop must stay refused");
-        let dangling = root.join("dangling.ttf");
-        std::os::unix::fs::symlink(root.join("absent.ttf"), &dangling)
+        let dangling = root.path().join("dangling.ttf");
+        std::os::unix::fs::symlink(root.path().join("absent.ttf"), &dangling)
             .expect("create dangling link");
         assert_eq!(
             read_font_file(&dangling).unwrap_err().kind(),
             io::ErrorKind::NotFound
         );
-        std::fs::remove_dir_all(root).expect("remove font-file fixtures");
+        std::fs::remove_dir_all(root.path()).expect("remove font-file fixtures");
     }
 }

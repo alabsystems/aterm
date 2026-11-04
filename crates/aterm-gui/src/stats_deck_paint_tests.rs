@@ -711,6 +711,42 @@ fn sweep_widths() -> impl Iterator<Item = f64> {
     (160..=5120).map(f64::from)
 }
 
+/// Where [`sweep`] stops laying every point at 1×: above it no word a deck draws changes (the last
+/// change is at 3171 pt in any job), a premise [`sweep`] holds at the 64ths it lays there.
+const EVERY_POINT_TO: i32 = 3200;
+
+/// The widths [`sweep`] lays above [`EVERY_POINT_TO`], at either scale.
+fn widths_above() -> impl Iterator<Item = i32> {
+    (EVERY_POINT_TO + 64..=5120).step_by(64)
+}
+
+/// The widths [`sweep`] lays at 2×: every seventh point, odd and even widths alike, each width
+/// where the words change at 1× (`words_change`), and [`widths_above`].
+fn widths_at_2x(words_change: &[i32]) -> Vec<i32> {
+    let mut widths: Vec<i32> = (160..=EVERY_POINT_TO)
+        .step_by(7)
+        .chain(words_change.iter().copied())
+        .chain(widths_above())
+        .collect();
+    widths.sort_unstable();
+    widths.dedup();
+    widths
+}
+
+/// What a layout draws in words, in any order: each box's kind and text, hashed and summed.
+fn drawn_words(laid: &Laid) -> u64 {
+    use std::hash::{Hash, Hasher};
+    laid.boxes
+        .iter()
+        .map(|b| {
+            let mut h = std::hash::DefaultHasher::new();
+            (b.kind as u8).hash(&mut h);
+            b.text.hash(&mut h);
+            h.finish()
+        })
+        .fold(0, u64::wrapping_add)
+}
+
 struct Swept<'a> {
     sc: Scene,
     face: &'static str,
@@ -736,8 +772,9 @@ enum Check {
     Bars,
 }
 
-/// What each check found over the T-G4 sweep: one pass lays every scene out at every width, and
-/// each test reads its own check's findings (the key and the cells on the worst scene only).
+/// What each check found over the T-G4 sweep: one pass lays every scene out at the widths
+/// [`sweep`] says, and each test reads its own check's findings (the key and the cells on the
+/// worst scene only).
 fn swept(check: Check) -> Vec<&'static str> {
     static FOUND: std::sync::OnceLock<Vec<(Check, String)>> = std::sync::OnceLock::new();
     let scenes = [
@@ -769,6 +806,22 @@ fn swept(check: Check) -> Vec<&'static str> {
         .collect()
 }
 
+/// One pass of the T-G4 sweep over every scene, face and form. At 1× it lays every whole point
+/// from 160 pt to [`EVERY_POINT_TO`]; at 2× it lays every seventh point, each width where the words
+/// drawn at 1× change ([`drawn_words`]), and at both, every 64th point above that to 5120 pt. The
+/// stride of seven reaches odd and even widths alike: `lay_folded` floors a halved width, so odd
+/// widths have their own slack.
+///
+/// Why those stand for every width. The plans floor to whole points and draw the same words at
+/// both scales at a width, so 1× sees every plan a point at a time and those lays draw every word
+/// layout at 2× too, a two-point island among them; what 2× adds is device-pixel rounding, whose
+/// faults run for hundreds of widths. Above [`EVERY_POINT_TO`] the words do not change; the
+/// positions of what is not a bar still do, every 2 pt, from the same arithmetic 1× sweeps below
+/// it. Both premises are held here, as [`Check::Whole`] findings: 2× draws 1×'s words at each width
+/// it lays, and no 64th above [`EVERY_POINT_TO`] draws other words than that width. What is not
+/// implied, and would be missed: a 2×-only fault at a width none of these lays and narrower than
+/// seven points where the words do not change, and any fault between the 64ths above
+/// [`EVERY_POINT_TO`], a change of words included.
 fn sweep(
     scenes: &[Scene],
     check: impl Fn(&Swept<'_>) -> Vec<(Check, String)> + Sync,
@@ -781,10 +834,8 @@ fn sweep(
     let mut jobs = Vec::new();
     for (sc, snap) in &snaps {
         for (face, m) in &faces {
-            for s in [1.0, 2.0] {
-                for form in [DeckForm::Full, DeckForm::Folded] {
-                    jobs.push((*sc, snap, *face, m, s, form));
-                }
+            for form in [DeckForm::Full, DeckForm::Folded] {
+                jobs.push((*sc, snap, *face, m, form));
             }
         }
     }
@@ -792,13 +843,27 @@ fn sweep(
     std::thread::scope(|scope| {
         let running: Vec<_> = jobs
             .into_iter()
-            .map(|(sc, snap, face, m, s, form)| {
+            .map(|(sc, snap, face, m, form)| {
                 scope.spawn(move || {
                     let input = scene_input(snap, form);
                     let words = DeckWords::new(&input, m);
                     let mut failed: Vec<(Check, String)> = Vec::new();
-                    for w in sweep_widths() {
+                    let note = |failed: &mut Vec<(Check, String)>,
+                                c: Check,
+                                s: f64,
+                                w: f64,
+                                why: String| {
+                        if failed.iter().filter(|(f, _)| *f == c).count() <= 20 {
+                            failed.push((
+                                c,
+                                format!("{sc:?}, {face}, {s}×, {form:?}, {w} pt: {why}"),
+                            ));
+                        }
+                    };
+                    let laid_at = |failed: &mut Vec<(Check, String)>, s: f64, w: i32| {
+                        let w = f64::from(w);
                         let laid = lay(&geom(w, s, form), &input, &words, m, false);
+                        let drawn = drawn_words(&laid);
                         let swept = Swept {
                             sc,
                             face,
@@ -809,12 +874,32 @@ fn sweep(
                             laid,
                         };
                         for (c, why) in check(&swept) {
-                            if failed.iter().filter(|(f, _)| *f == c).count() <= 20 {
-                                failed.push((
-                                    c,
-                                    format!("{sc:?}, {face}, {s}×, {form:?}, {w} pt: {why}"),
-                                ));
-                            }
+                            note(failed, c, s, w, why);
+                        }
+                        drawn
+                    };
+                    let mut at_1x = std::collections::BTreeMap::new();
+                    let mut words_change = Vec::new();
+                    let mut last = None;
+                    for w in (160..=EVERY_POINT_TO).chain(widths_above()) {
+                        let drawn = laid_at(&mut failed, 1.0, w);
+                        if last != Some(drawn) {
+                            words_change.push(w);
+                        }
+                        last = Some(drawn);
+                        at_1x.insert(w, drawn);
+                    }
+                    for (&w, drawn) in at_1x.range(EVERY_POINT_TO + 1..) {
+                        if Some(drawn) != at_1x.get(&EVERY_POINT_TO) {
+                            let why = format!("other words than at {EVERY_POINT_TO} pt");
+                            note(&mut failed, Check::Whole, 1.0, f64::from(w), why);
+                        }
+                    }
+                    for w in widths_at_2x(&words_change) {
+                        let drawn = laid_at(&mut failed, 2.0, w);
+                        if at_1x.get(&w) != Some(&drawn) {
+                            let why = "other words than at 1×".to_string();
+                            note(&mut failed, Check::Whole, 2.0, f64::from(w), why);
                         }
                     }
                     failed
@@ -996,9 +1081,11 @@ fn bar_faults(d: &Swept<'_>) -> Vec<String> {
     why
 }
 
-/// Every row that prints a % draws its scope bar, in every form, at every width, on both faces
-/// at 1× and 2×: in its column right of the strip where it has one, else under the figure, inside
-/// the row's pitch (`docs/DESIGN-stats-deck-meter-2026-10-26.md` §2).
+/// Every row that prints a % draws its scope bar, in every form, on both faces at 1× and 2×: in
+/// its column right of the strip where it has one, else under the figure, inside the row's pitch
+/// (`docs/DESIGN-stats-deck-meter-2026-10-26.md` §2). The widths are [`sweep`]'s: every point at
+/// 1× and every seventh at 2× to [`EVERY_POINT_TO`], with 2× also at each width where the words
+/// change, and above it every 64th point, the only stride at which positions are guarded there.
 #[test]
 fn every_row_with_a_percent_draws_its_bar() {
     let failed = swept(Check::Bars);
@@ -1261,8 +1348,9 @@ fn beat_faults(boxes: &[Boxed], reach: f64) -> Vec<String> {
     why
 }
 
-/// The now dot's beat, widest, meets no words and no mark at any width, in either form or face,
-/// at 1× or 2× (the % column ends `PCT_TO_STRIP` before the strip, past the ring's reach).
+/// The now dot's beat, widest, meets no words and no mark at the widths [`sweep`] lays, in either
+/// form or face, at 1× or 2× (the % column ends `PCT_TO_STRIP` before the strip, past the ring's
+/// reach).
 #[test]
 fn the_beat_ring_meets_no_words() {
     let failed = swept(Check::Beat);

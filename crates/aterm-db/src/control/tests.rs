@@ -1776,6 +1776,22 @@ fn commons_control_repairs_membership_records_and_tolerates_legacy_peers() {
     assert_eq!(ra_leg.membership(), None);
 }
 
+/// Part 1, the v1 negative control: independent admissions fork `Journal` into `State::Conflict`
+/// and brick sessions. Part 2, the log-backed path: two partitioned islands admit and remove with
+/// no authority-seed signature, m4 refuses removed m3 and a sybil at the `ACX2` handshake, an
+/// exchange signs no records, a ranked vault pass closes m5's `Wrap` gap and every active member
+/// converges after the heal. Once a pair has met, its repairs name the Proposals table as a push
+/// does, and m1-m4 and the m4-m5 first contact go by named table too. m1-m2, m1-m3, m3-m4 and m2-m5
+/// at first sight, and one checked m4-m5 scan after the rotation, scan regularly so the catalog is
+/// still selected and its `application_error` still checked. m5 therefore gets its `ACHG1`
+/// handoff in the keys phase of the m2-m5 push after its island write, not in a catalog exchange
+/// before it, and `cells.len() == 6` pins that it arrives. The regular scan across later Proposals
+/// repairs is left to
+/// `runtime::auto_sync_tests::two_loopback_islands_write_admit_and_remove_then_join_and_match_inventories`,
+/// which covers the proposals table's convergence only; no further idle pass runs once the `Wrap`
+/// has moved. NEGATIVE CONTROLS: with `verify_peer_against_local_log`
+/// returning early, `responder m4 must refuse removed m3` fails; with `sync_acx2_membership`
+/// returning an empty report, a checked pair reports `application probe closed before agreement`.
 #[test]
 fn two_islands_admit_and_remove_then_tables_continue_after_the_heal() {
     use crate::{accounts::proposals::Proposals, database::Change};
@@ -1836,6 +1852,8 @@ fn two_islands_admit_and_remove_then_tables_continue_after_the_heal() {
         key: key.into(),
         value: Some(aterm_json::json!({ "provider": "claude", "method": "oauth" })),
     };
+    // The table the next exchanges name as a push does; none, and they scan regularly.
+    let first = std::cell::Cell::new(None::<[u8; 32]>);
     // Commons exchanges between `a` and `b`, `rounds` of them; where `checked`, neither side's
     // table repair reports an application error.
     let exchange_commons =
@@ -1844,11 +1862,14 @@ fn two_islands_admit_and_remove_then_tables_continue_after_the_heal() {
             for _ in 0..rounds {
                 let ba = Bootstrap::required(a).expect("bootstrap a");
                 let bb = Bootstrap::required(b).expect("bootstrap b");
-                let ea = Endpoint::from_bootstrap(&ba)
+                let mut ea = Endpoint::from_bootstrap(&ba)
                     .expect("endpoint a")
                     .expect("witness a")
                     .with_commons(a.clone(), cfg_a.to_path_buf())
                     .expect("commons a");
+                if first.get().is_some() {
+                    ea.prefer(std::sync::Arc::new(std::sync::Mutex::new(first.get())));
+                }
                 let eb = Endpoint::from_bootstrap(&bb)
                     .expect("endpoint b")
                     .expect("witness b")
@@ -1940,7 +1961,7 @@ fn two_islands_admit_and_remove_then_tables_continue_after_the_heal() {
     enroll_v1(&v1_a, &v1_b);
     let cfg_v1_a = neg_root.path().join("cfg-v1-a.toml");
     let cfg_v1_b = neg_root.path().join("cfg-v1-b.toml");
-    pair_commons(&v1_a, &cfg_v1_a, &v1_b, &cfg_v1_b, 2);
+    pair_commons(&v1_a, &cfg_v1_a, &v1_b, &cfg_v1_b, 1);
 
     // Split: `v1_a` enrolls `v1_left`, while `v1_b` independently enrolls `v1_right`.
     enroll_v1(&v1_a, &v1_left);
@@ -2053,10 +2074,15 @@ fn two_islands_admit_and_remove_then_tables_continue_after_the_heal() {
     // a log `Commons` epoch and read pre-Genesis v2 rows even when `Journal` later enters
     // `State::Conflict`.
     let p1 = Proposals::at(m1.clone());
-    p1.initialize().unwrap();
+    let table = p1.initialize().unwrap().digest();
     p1.write([9; 16], vec![prop("pre-genesis-v1-from-m1")])
         .unwrap();
     pair_commons(&m1, &cfg1, &m2, &cfg2, 2);
+    let push = |a: &Paths, cfg_a: &Path, b: &Paths, cfg_b: &Path| {
+        first.set(Some(table));
+        pair_commons(a, cfg_a, b, cfg_b, 1);
+        first.set(None);
+    };
 
     let genesis_out = root.path().join("f18.genesis");
     test_sign_genesis(&m1, &genesis_out, &created.signer).expect("sign genesis");
@@ -2067,17 +2093,17 @@ fn two_islands_admit_and_remove_then_tables_continue_after_the_heal() {
 
     // Pre-cut table causal chain: `m3` writes a row, and `m4` writes a row causally parenting on
     // `m3`'s row; sync all 4 founders before the partition.
-    pair_commons(&m1, &cfg1, &m3, &cfg3, 3);
+    pair_commons(&m1, &cfg1, &m3, &cfg3, 2);
     Proposals::at(m3.clone())
         .write([10; 16], vec![prop("pre-cut-from-m3")])
         .unwrap();
-    pair_commons(&m3, &cfg3, &m4, &cfg4, 3);
+    pair_commons(&m3, &cfg3, &m4, &cfg4, 2);
     Proposals::at(m4.clone())
         .write([11; 16], vec![prop("pre-cut-from-m4-after-m3")])
         .unwrap();
-    pair_commons(&m4, &cfg4, &m1, &cfg1, 2);
-    pair_commons(&m1, &cfg1, &m2, &cfg2, 3);
-    pair_commons(&m1, &cfg1, &m3, &cfg3, 2);
+    push(&m4, &cfg4, &m1, &cfg1);
+    push(&m1, &cfg1, &m2, &cfg2);
+    push(&m1, &cfg1, &m3, &cfg3);
     for p in [&m1, &m2, &m3, &m4] {
         assert_eq!(Proposals::at(p.clone()).snapshot().unwrap().cells.len(), 3);
     }
@@ -2110,16 +2136,16 @@ fn two_islands_admit_and_remove_then_tables_continue_after_the_heal() {
     };
     admit_member_in_log(&m2, entrant5, Evidence::Phrase).expect("non-admin m2 admits m5");
     save_records(&m5, &load_records(&m2).unwrap().encode()).unwrap();
-    pair_commons(&m2, &cfg2, &m5, &cfg5, 3);
-    pair_commons(&m2, &cfg2, &m1, &cfg1, 2);
+    pair_commons(&m2, &cfg2, &m5, &cfg5, 2);
+    push(&m2, &cfg2, &m1, &cfg1);
 
     p1.write([21; 16], vec![prop("island-a-from-m1")]).unwrap();
     Proposals::at(m5.clone())
         .write([25; 16], vec![prop("island-a-from-newcomer-m5")])
         .unwrap();
-    pair_commons(&m1, &cfg1, &m2, &cfg2, 2);
-    pair_commons(&m2, &cfg2, &m5, &cfg5, 2);
-    pair_commons(&m1, &cfg1, &m2, &cfg2, 2);
+    push(&m1, &cfg1, &m2, &cfg2);
+    push(&m2, &cfg2, &m5, &cfg5);
+    push(&m1, &cfg1, &m2, &cfg2);
 
     // Island B (`{m3, m4}`): non-admin `m4` removes `m3` via `remove_member_in_log`!
     let actor_m3 = Bootstrap::required(&m3)
@@ -2249,10 +2275,12 @@ fn two_islands_admit_and_remove_then_tables_continue_after_the_heal() {
     // records closes that gap, its holders one gap step apart by rank (at first sight, then a
     // hundred steps on), and the next exchanges carry the `Wrap` before table repair.
     let heal_pairs = || {
-        exchange_commons(&m1, &cfg1, &m4, &cfg4, 2, false);
-        exchange_commons(&m1, &cfg1, &m2, &cfg2, 2, false);
-        exchange_commons(&m2, &cfg2, &m5, &cfg5, 2, false);
-        exchange_commons(&m4, &cfg4, &m5, &cfg5, 2, false);
+        first.set(Some(table));
+        exchange_commons(&m1, &cfg1, &m4, &cfg4, 1, false);
+        exchange_commons(&m1, &cfg1, &m2, &cfg2, 1, false);
+        exchange_commons(&m2, &cfg2, &m5, &cfg5, 1, false);
+        exchange_commons(&m4, &cfg4, &m5, &cfg5, 1, false);
+        first.set(None);
     };
     let held = || -> BTreeSet<[u8; 32]> {
         [&m1, &m2, &m3, &m4, &m5]
@@ -2282,7 +2310,15 @@ fn two_islands_admit_and_remove_then_tables_continue_after_the_heal() {
                 aterm_secrets::client::vault_pass_at(p, at).expect("the vault pass's closer looks"),
             );
         }
-        heal_pairs();
+        if at == healed_at {
+            heal_pairs();
+        } else {
+            // The last pass is the checked one: table repair reports no error once the gaps close.
+            push(&m1, &cfg1, &m4, &cfg4);
+            push(&m1, &cfg1, &m2, &cfg2);
+            push(&m2, &cfg2, &m5, &cfg5);
+            push(&m4, &cfg4, &m5, &cfg5);
+        }
     }
     let to_m5: Vec<[u8; 32]> = closed
         .iter()
@@ -2298,10 +2334,6 @@ fn two_islands_admit_and_remove_then_tables_continue_after_the_heal() {
         "CONTROL: the heal left m5's Wrap gaps, which the exchange's repair once closed at once; \
          one ranked holder's vault pass closes each: {to_m5:?}"
     );
-    pair_commons(&m1, &cfg1, &m4, &cfg4, 2);
-    pair_commons(&m1, &cfg1, &m2, &cfg2, 2);
-    pair_commons(&m2, &cfg2, &m5, &cfg5, 2);
-    pair_commons(&m4, &cfg4, &m5, &cfg5, 2);
 
     for p in [&m1, &m2, &m4, &m5] {
         assert_eq!(
@@ -2320,11 +2352,13 @@ fn two_islands_admit_and_remove_then_tables_continue_after_the_heal() {
         .write([34; 16], vec![prop("post-heal-from-m4")])
         .expect("m4 writes after heal");
 
-    pair_commons(&m5, &cfg5, &m2, &cfg2, 2);
-    pair_commons(&m2, &cfg2, &m1, &cfg1, 2);
-    pair_commons(&m1, &cfg1, &m4, &cfg4, 2);
+    push(&m5, &cfg5, &m2, &cfg2);
+    push(&m2, &cfg2, &m1, &cfg1);
+    push(&m1, &cfg1, &m4, &cfg4);
+    // A pair that never met before the heal scans regularly, so the catalog is selected after the
+    // rotation and its repair's application error is checked.
     pair_commons(&m4, &cfg4, &m5, &cfg5, 2);
-    pair_commons(&m2, &cfg2, &m5, &cfg5, 2);
+    push(&m2, &cfg2, &m5, &cfg5);
 
     let expected = Proposals::at(m1.clone()).snapshot().unwrap();
     assert_eq!(expected.cells.len(), 8);
@@ -2665,8 +2699,8 @@ fn a_converged_membership_exchange_reads_the_records_file_once_per_side() {
     }
 }
 
-/// Two Macs whose complete records each fill `MAX_HELD_RECORDS`, on branches the other lacks, refuse
-/// every record the other offers: a store at its bound takes no complete record. Each pass still
+/// Two Macs whose complete records each fill the legacy held bound, on branches the other lacks,
+/// refuse every record the other offers: a store at its bound takes no complete record. Each pass still
 /// offered 16 of them a round, in each of up to three rounds (the refusals moved the second
 /// pass), so 48 refused records crossed each way every pass, every few seconds, forever. A peer
 /// at the bound that took none of a round's records is now offered none while both inventories
@@ -2677,11 +2711,21 @@ fn a_converged_membership_exchange_reads_the_records_file_once_per_side() {
 /// each way, not one round's 16" (`[48, 48]` against `[16, 16]`).
 #[test]
 fn full_stores_on_different_branches_stop_offering_records_the_other_refused() {
+    use aterm_secrets::membership_log::{LEGACY_RECORDS, RecordBudgets};
+
+    let budgets = RecordBudgets {
+        held: LEGACY_RECORDS,
+        ..RecordBudgets::PRODUCTION
+    };
+    budgets.within(|| full_stores_at_legacy_bound(budgets));
+}
+
+fn full_stores_at_legacy_bound(budgets: aterm_secrets::membership_log::RecordBudgets) {
     use aterm_secrets::{
         age::Identity,
         client::{Paths, load_records, save_records},
         commons::binding::Request as BindRequest,
-        membership_log::{Body, Founder, Log, MAX_HELD_RECORDS, Record, Root, encode_records},
+        membership_log::{Body, Founder, LEGACY_RECORDS, Log, Record, Root, encode_records},
     };
     use std::os::unix::net::UnixStream;
     use std::sync::atomic::Ordering;
@@ -2726,7 +2770,7 @@ fn full_stores_on_different_branches_stop_offering_records_the_other_refused() {
         [(&a, "a", m1, w1, inc1), (&b, "b", m2, w2, inc2)]
     {
         let mut log = Log::new(genesis.clone()).unwrap();
-        for n in 1..MAX_HELD_RECORDS {
+        for n in 1..LEGACY_RECORDS {
             let name = format!("{tag}-{n}");
             let record = log
                 .draft(&actor, 10_000 + n as u64, Body::Name { name })
@@ -2738,7 +2782,7 @@ fn full_stores_on_different_branches_stop_offering_records_the_other_refused() {
         save_records(paths, &encode_records(&records)).unwrap();
         assert_eq!(
             load_records(paths).unwrap().complete_inventory().len(),
-            MAX_HELD_RECORDS
+            LEGACY_RECORDS
         );
     }
 
@@ -2759,7 +2803,8 @@ fn full_stores_on_different_branches_stop_offering_records_the_other_refused() {
         };
         let (mut sa, mut sb) = UnixStream::pair().unwrap();
         thread::scope(|s| {
-            let responder = s.spawn(|| side(&mut sb, &b, Side::Responder, hint_b));
+            let responder =
+                s.spawn(|| budgets.within(|| side(&mut sb, &b, Side::Responder, hint_b)));
             let initiator = side(&mut sa, &a, Side::Initiator, hint_a);
             [initiator, responder.join().unwrap()]
         })
@@ -2784,7 +2829,7 @@ fn full_stores_on_different_branches_stop_offering_records_the_other_refused() {
     for paths in [&a, &b] {
         assert_eq!(
             load_records(paths).unwrap().complete_inventory().len(),
-            MAX_HELD_RECORDS
+            LEGACY_RECORDS
         );
     }
 }

@@ -216,7 +216,7 @@ fn either_form_reads_and_damage_is_refused_unless_salvaged() {
     assert!(read.items.len() < items.len());
 
     let mut damaged = bytes.clone();
-    let at = super::super::frame::MAGIC.len() + super::super::frame::HEAD + 2;
+    let at = super::super::frame::MAGIC.len() + super::super::frame::OVERHEAD + 2;
     damaged[at] ^= 0x01;
     let err = open(&damaged, false).expect_err("refused");
     assert!(err.contains("--salvage"), "{err}");

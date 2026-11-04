@@ -134,10 +134,7 @@ mod tests {
 
     #[test]
     fn sha256_matches_known_vector() {
-        let dir = aterm_tempfile::Builder::new()
-            .prefix("aterm-sha-")
-            .tempdir()
-            .unwrap();
+        let dir = crate::test_scratch_dir("sha-vec");
         let f = dir.path().join("v.txt");
         std::fs::write(&f, b"abc").unwrap();
         let got = sha256_file(&f).unwrap();
@@ -249,9 +246,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn native_hash_handles_multiple_buffers_empty_input_and_unusual_names() {
-        let dir = std::env::temp_dir().join(format!("aterm-sha-edge-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("- input\nfile");
+        let dir = crate::test_scratch_dir("sha-edge");
+        let file = dir.path().join("- input\nfile");
         std::fs::write(&file, []).unwrap();
         assert_eq!(
             sha256_file(&file).unwrap(),
@@ -263,9 +259,9 @@ mod tests {
             sha256_file(&file).unwrap(),
             "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
         );
-        assert!(sha256_file(&dir.join("absent")).is_err());
-        assert!(sha256_file(&dir).is_err());
-        let fifo = dir.join("input.fifo");
+        assert!(sha256_file(&dir.path().join("absent")).is_err());
+        assert!(sha256_file(dir.path()).is_err());
+        let fifo = dir.path().join("input.fifo");
         let c_fifo = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
         // SAFETY: `c_fifo` is a valid NUL-terminated path inside the private temp directory.
         assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
@@ -274,6 +270,5 @@ mod tests {
             fifo_err.contains("not a regular file"),
             "a FIFO at the SHA-256 input path must be refused without blocking: {fifo_err}"
         );
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

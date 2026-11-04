@@ -82,10 +82,7 @@ struct Host {
 
 impl Host {
     fn new(refuse: bool) -> Self {
-        let dir = aterm_tempfile::Builder::new()
-            .prefix("at-resource-")
-            .tempdir_in("/tmp")
-            .unwrap();
+        let dir = crate::test_scratch_dir("resource");
         let sock = dir.path().join("s");
         let listener = aterm_uds::CtlListener::bind(&sock).unwrap();
         let (tx, peer) = mpsc::channel();
@@ -129,10 +126,13 @@ impl Host {
         }
     }
 
+    /// The fixture's command. A libtest that runs one test at a time writes `test <name> ... ` to
+    /// stdout before the test runs, with no newline, so the fixture's first line starts after it.
+    /// The fixture runs that way whatever `RUST_TEST_THREADS` this run inherited.
     fn command(&self, mode: &str) -> aterm_uds::spawnfd::Command {
         let mut command = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
         command
-            .args(["--exact", TEST, "--nocapture"])
+            .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
             .env(FIXTURE, format!("{}\n{mode}", self.sock.display()))
             .env("ATERM_PARENT_SESSION_ID", "s-a")
             .env("ATERM_SESSION_ID", "s-dead")
@@ -212,7 +212,7 @@ fn group_stops_wait_for_the_actual_commands_delayed_exit() {
             }
         });
         loop {
-            if lines.recv_timeout(HANG).unwrap().starts_with("READY pid=") {
+            if lines.recv_timeout(HANG).unwrap().contains("READY pid=") {
                 break;
             }
         }

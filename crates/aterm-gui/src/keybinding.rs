@@ -612,6 +612,73 @@ pub(crate) fn chord_layout_twin(
     aterm_winit_keymap::layout_letter_twin_for(logical, physical)
 }
 
+#[cfg(any(not(target_os = "macos"), test))]
+macro_rules! non_macos_default_pairs {
+    (@build [$($paste:expr),+ $(,)?], $zoom:expr, [$($pre_tab:expr),* $(,)?], [$($post_tab:expr),* $(,)?]) => {
+        &[
+            ("ctrl+shift+c", "copy"),
+            ("ctrl+shift+v", "paste"),
+            $($paste,)+
+            ("ctrl+insert", "copy"),
+            ("ctrl+shift+t", "new_tab"),
+            ("ctrl+shift+w", "close_tab"),
+            ("ctrl+shift+n", "new_window"),
+            ("ctrl+shift+f", "find"),
+            ("ctrl+shift+d", "split_vertical"),
+            ("ctrl+shift+e", "split_horizontal"),
+            $zoom,
+            ("alt+left", "focus_pane_left"),
+            ("alt+right", "focus_pane_right"),
+            ("alt+up", "focus_pane_up"),
+            ("alt+down", "focus_pane_down"),
+            $($pre_tab,)*
+            ("ctrl+pagedown", "next_tab"),
+            ("ctrl+pageup", "prev_tab"),
+            $($post_tab,)*
+            ("ctrl+shift+up", "jump_prev_prompt"),
+            ("ctrl+shift+down", "jump_next_prompt"),
+            ("ctrl+=", "font_increase"),
+            ("ctrl+shift+=", "font_increase"),
+            ("ctrl+plus", "font_increase"),
+            ("ctrl+-", "font_decrease"),
+            ("ctrl+0", "font_reset"),
+            ("ctrl+shift+s", "toggle_settings"),
+            ("ctrl+,", "toggle_settings"),
+            ("ctrl+shift+a", "select_all"),
+            ("ctrl+shift+p", "open_palette"),
+            ("ctrl+shift+l", "open_ledger"),
+            ("f11", "toggle_fullscreen"),
+        ]
+    };
+    (windows) => {
+        non_macos_default_pairs!(
+            @build
+            [("ctrl+v", "paste"), ("shift+insert", "paste")],
+            ("ctrl+shift+z", "toggle_pane_zoom"),
+            [("ctrl+tab", "next_tab"), ("ctrl+shift+tab", "prev_tab")],
+            []
+        )
+    };
+    (linux) => {
+        non_macos_default_pairs!(
+            @build
+            [("shift+insert", "paste_selection"), ("ctrl+shift+insert", "paste")],
+            ("ctrl+shift+return", "toggle_pane_zoom"),
+            [("ctrl+shift+right", "next_tab"), ("ctrl+shift+left", "prev_tab")],
+            [("ctrl+tab", "next_tab"), ("ctrl+shift+tab", "prev_tab")]
+        )
+    };
+    (other) => {
+        non_macos_default_pairs!(
+            @build
+            [("shift+insert", "paste")],
+            ("ctrl+shift+return", "toggle_pane_zoom"),
+            [("ctrl+shift+right", "next_tab"), ("ctrl+shift+left", "prev_tab")],
+            [("ctrl+tab", "next_tab"), ("ctrl+shift+tab", "prev_tab")]
+        )
+    };
+}
+
 /// Chord-to-action map combining platform defaults and `[keybindings]` overrides.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Keybindings {
@@ -676,67 +743,19 @@ impl Keybindings {
     /// The (chord, action-name) seed table behind [`Self::platform_defaults`], parsed by the same machinery as user config; empty on macOS.
     #[cfg(target_os = "macos")]
     pub(crate) const PLATFORM_DEFAULT_PAIRS: &'static [(&'static str, &'static str)] = &[];
-    #[cfg(not(target_os = "macos"))]
-    pub(crate) const PLATFORM_DEFAULT_PAIRS: &'static [(&'static str, &'static str)] = &[
-        ("ctrl+shift+c", "copy"),
-        ("ctrl+shift+v", "paste"),
-        #[cfg(windows)]
-        ("ctrl+v", "paste"),
-        #[cfg(target_os = "linux")]
-        ("shift+insert", "paste_selection"),
-        #[cfg(target_os = "linux")]
-        ("ctrl+shift+insert", "paste"),
-        #[cfg(not(target_os = "linux"))]
-        ("shift+insert", "paste"),
-        ("ctrl+insert", "copy"),
-        ("ctrl+shift+t", "new_tab"),
-        ("ctrl+shift+w", "close_tab"),
-        ("ctrl+shift+n", "new_window"),
-        ("ctrl+shift+f", "find"),
-        ("ctrl+shift+d", "split_vertical"),
-        ("ctrl+shift+e", "split_horizontal"),
-        #[cfg(not(windows))]
-        ("ctrl+shift+return", "toggle_pane_zoom"),
-        #[cfg(windows)]
-        ("ctrl+shift+z", "toggle_pane_zoom"),
-        ("alt+left", "focus_pane_left"),
-        ("alt+right", "focus_pane_right"),
-        ("alt+up", "focus_pane_up"),
-        ("alt+down", "focus_pane_down"),
-        #[cfg(not(windows))]
-        ("ctrl+shift+right", "next_tab"),
-        #[cfg(not(windows))]
-        ("ctrl+shift+left", "prev_tab"),
-        #[cfg(windows)]
-        ("ctrl+tab", "next_tab"),
-        #[cfg(windows)]
-        ("ctrl+shift+tab", "prev_tab"),
-        ("ctrl+pagedown", "next_tab"),
-        ("ctrl+pageup", "prev_tab"),
-        #[cfg(not(windows))]
-        ("ctrl+tab", "next_tab"),
-        #[cfg(not(windows))]
-        ("ctrl+shift+tab", "prev_tab"),
-        ("ctrl+shift+up", "jump_prev_prompt"),
-        ("ctrl+shift+down", "jump_next_prompt"),
-        ("ctrl+=", "font_increase"),
-        ("ctrl+shift+=", "font_increase"),
-        ("ctrl+plus", "font_increase"),
-        ("ctrl+-", "font_decrease"),
-        ("ctrl+0", "font_reset"),
-        ("ctrl+shift+s", "toggle_settings"),
-        ("ctrl+,", "toggle_settings"),
-        ("ctrl+shift+a", "select_all"),
-        ("ctrl+shift+p", "open_palette"),
-        ("ctrl+shift+l", "open_ledger"),
-        ("f11", "toggle_fullscreen"),
-    ];
+    #[cfg(windows)]
+    pub(crate) const PLATFORM_DEFAULT_PAIRS: &'static [(&'static str, &'static str)] =
+        non_macos_default_pairs!(windows);
+    #[cfg(target_os = "linux")]
+    pub(crate) const PLATFORM_DEFAULT_PAIRS: &'static [(&'static str, &'static str)] =
+        non_macos_default_pairs!(linux);
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    pub(crate) const PLATFORM_DEFAULT_PAIRS: &'static [(&'static str, &'static str)] =
+        non_macos_default_pairs!(other);
 
-    /// The platform's built-in keybindings. macOS has none: the hardcoded Cmd chords in `on_key` are the convention there.
-    #[must_use]
-    pub(crate) fn platform_defaults() -> Keybindings {
+    fn from_pairs(pairs: &[(&str, &str)]) -> Keybindings {
         let mut map = HashMap::new();
-        for (chord_str, action_str) in Self::PLATFORM_DEFAULT_PAIRS {
+        for &(chord_str, action_str) in pairs {
             match (Chord::parse(chord_str), Action::parse(action_str)) {
                 (Ok(c), Some(a)) => {
                     map.insert(c, a);
@@ -748,6 +767,30 @@ impl Keybindings {
             }
         }
         Keybindings { map }
+    }
+
+    /// The platform's built-in keybindings. macOS has none: the hardcoded Cmd chords in `on_key` are the convention there.
+    #[must_use]
+    pub(crate) fn platform_defaults() -> Keybindings {
+        Self::from_pairs(Self::PLATFORM_DEFAULT_PAIRS)
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn macos_defaults_for_test() -> Keybindings {
+        Self::from_pairs(&[])
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn linux_defaults_for_test() -> Keybindings {
+        Self::from_pairs(non_macos_default_pairs!(linux))
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn windows_defaults_for_test() -> Keybindings {
+        Self::from_pairs(non_macos_default_pairs!(windows))
     }
 
     /// The effective keybindings: [`Self::platform_defaults`] with `[keybindings]` overlaid (a user entry wins).

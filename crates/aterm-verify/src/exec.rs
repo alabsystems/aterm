@@ -426,6 +426,23 @@ pub const TASKPOLICY: &str = aterm_uds::os_path!("taskpolicy");
 /// Spawn, wait, and collect.
 #[must_use]
 pub fn run(cmd: &Cmd, env: ExecEnv<'_>) -> Run {
+    run_captured(cmd, env, None)
+}
+
+/// One compiler invocation's machine stdout, separate from its diagnostic stderr.
+pub(crate) struct MachineRun {
+    pub run: Run,
+    pub stdout: Result<String, String>,
+}
+
+/// Capture compiler stdout without allowing diagnostic text to become machine evidence.
+pub(crate) fn run_machine(cmd: &Cmd, env: ExecEnv<'_>) -> MachineRun {
+    let mut stdout = Err("compiler stdout was not captured".to_owned());
+    let run = run_captured(cmd, env, Some(&mut stdout));
+    MachineRun { run, stdout }
+}
+
+fn run_captured(cmd: &Cmd, env: ExecEnv<'_>, machine: Option<&mut Result<String, String>>) -> Run {
     let mut c = spawn_command(cmd, env, Path::new(TASKPOLICY));
     c.current_dir(cmd.cwd.as_deref().unwrap_or(env.cwd));
     if cmd.exact_env {
@@ -487,14 +504,43 @@ pub fn run(cmd: &Cmd, env: ExecEnv<'_>) -> Run {
             {
                 return spawn_failure(cmd, &e.to_string());
             }
-            let file2 = match file.try_clone() {
-                Ok(f) => f,
-                Err(e) => return spawn_failure(cmd, &e.to_string()),
+            let stdout_log = machine.as_ref().map(|_| log.with_extension("stdout"));
+            let file2 = match &stdout_log {
+                Some(path) => File::create(path),
+                None => file.try_clone(),
             };
-            c.stdout(file).stderr(file2);
+            let file2 = match file2 {
+                Ok(f) => f,
+                Err(e) => {
+                    std::fs::remove_file(&log).ok();
+                    return spawn_failure(cmd, &e.to_string());
+                }
+            };
+            if machine.is_some() {
+                c.stdout(file2).stderr(file);
+            } else {
+                c.stdout(file).stderr(file2);
+            }
             let (mut r, logged) = finish(c, cmd, env, Some(&log), &label, marks);
             r.output
                 .insert_str(0, logged.as_deref().unwrap_or_default());
+            if let Some(stdout) = machine {
+                let path = stdout_log.expect("machine capture has a stdout file");
+                *stdout = match crate::read_captured(&path) {
+                    Ok(bytes) => match String::from_utf8(bytes) {
+                        Ok(text) => Ok(text),
+                        Err(error) => {
+                            r.output
+                                .push_str("\n--- invalid UTF-8 compiler stdout ---\n");
+                            r.output
+                                .push_str(&String::from_utf8_lossy(error.as_bytes()));
+                            Err("compiler stdout was not UTF-8".to_owned())
+                        }
+                    },
+                    Err(error) => Err(format!("could not read compiler stdout: {error}")),
+                };
+                std::fs::remove_file(path).ok();
+            }
             std::fs::remove_file(&log).ok();
             r
         }
@@ -2167,11 +2213,46 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    #[cfg(not(unix))]
-    fn cmd_exe() -> OsString {
-        std::env::var_os("ComSpec")
-            .unwrap_or_else(|| OsString::from(r"C:\Windows\System32\cmd.exe"))
+    /// The host shell's argv for a script: `unix` under `/bin/sh -c`, or off Unix `windows` under
+    /// `cmd.exe /d /s /c`, which strips the quotes std puts round an argument with a space and
+    /// leaves a variable it does not have as its literal `%NAME%`.
+    fn shell_argv(unix: &str, windows: &str) -> Vec<OsString> {
+        if cfg!(unix) {
+            vec!["/bin/sh".into(), "-c".into(), unix.into()]
+        } else {
+            let cmd = std::env::var_os("ComSpec")
+                .unwrap_or_else(|| OsString::from(r"C:\Windows\System32\cmd.exe"));
+            vec![cmd, "/d".into(), "/s".into(), "/c".into(), windows.into()]
+        }
     }
+
+    fn shell(unix: &str, windows: &str) -> Cmd {
+        let argv = shell_argv(unix, windows);
+        Cmd::new(&argv[0]).args(&argv[1..])
+    }
+
+    /// What a child said, its line ends LF as `/bin/sh`'s are (cmd.exe ends each with CRLF).
+    fn said(r: &Run) -> String {
+        let text = if cfg!(windows) {
+            r.output.replace("\r\n", "\n")
+        } else {
+            r.output.clone()
+        };
+        text.trim_end_matches('\n').to_owned()
+    }
+
+    /// What the host shell's script reads for a variable the child does not have: the script's
+    /// `${NAME-unset}`, or cmd.exe's untouched `%NAME%`.
+    fn unset(name: &str) -> String {
+        if cfg!(unix) {
+            "unset".to_owned()
+        } else {
+            format!("%{name}%")
+        }
+    }
+
+    /// A variable every test run inherits, which a child that keeps only its record must not.
+    const INHERITED: &str = if cfg!(unix) { "HOME" } else { "USERPROFILE" };
 
     #[test]
     fn a_child_runs_in_the_root_with_the_runs_variables_and_its_own_win() {
@@ -2182,24 +2263,16 @@ mod tests {
             add_env: &added,
             ..env_in(&tmp)
         };
-        #[cfg(unix)]
-        let ask = Cmd::new("/bin/sh").args([
-            "-c",
+        let ask = shell(
             "cat marker; printf ' %s %s' \"${ATV_ADDED_PROBE-unset}\" \"$PATH\"",
-        ]);
-        #[cfg(not(unix))]
-        let ask = Cmd::new(cmd_exe()).args([
-            "/d",
-            "/v:on",
-            "/c",
-            "set /p m=<marker& if defined ATV_ADDED_PROBE (echo !m! !ATV_ADDED_PROBE! !PATH!) else (echo !m! unset !PATH!)",
-        ]);
-        assert_eq!(run(&ask, env).trimmed_output(), "x 0 /usr/bin:/bin");
+            "type marker& echo  %ATV_ADDED_PROBE% %PATH%",
+        );
+        assert_eq!(said(&run(&ask, env)), "x 0 /usr/bin:/bin");
         let stage_says = ask.clone().env("ATV_ADDED_PROBE", "1");
-        assert_eq!(run(&stage_says, env).trimmed_output(), "x 1 /usr/bin:/bin");
+        assert_eq!(said(&run(&stage_says, env)), "x 1 /usr/bin:/bin");
         assert_eq!(
-            run(&ask, env_in(&tmp)).trimmed_output(),
-            "x unset /usr/bin:/bin"
+            said(&run(&ask, env_in(&tmp))),
+            format!("x {} /usr/bin:/bin", unset("ATV_ADDED_PROBE"))
         );
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -2218,19 +2291,18 @@ mod tests {
             add_env: &added,
             ..env_in(&tmp)
         };
-        #[cfg(unix)]
-        let ask = Cmd::new("/bin/sh").args(["-c", "printf %s \"$ATERM_CAPACITY_COVER\""]);
-        #[cfg(not(unix))]
-        let ask = Cmd::new(cmd_exe()).args(["/d", "/c", "echo %ATERM_CAPACITY_COVER%"]);
-        assert_eq!(run(&ask, env).trimmed_output(), aterm_capacity::NO_COVER);
+        let ask = shell(
+            "printf %s \"$ATERM_CAPACITY_COVER\"",
+            "echo %ATERM_CAPACITY_COVER%",
+        );
+        assert_eq!(said(&run(&ask, env)), aterm_capacity::NO_COVER);
         {
             let _covering = crate::memory::covering(Some("0000000000001-7-0".into()));
-            assert_eq!(run(&ask, env).trimmed_output(), "0000000000001-7-0");
-            let pooled =
-                crate::testrun::pool(1, &[0], 1, |_| run(&ask, env).trimmed_output().to_owned());
+            assert_eq!(said(&run(&ask, env)), "0000000000001-7-0");
+            let pooled = crate::testrun::pool(1, &[0], 1, |_| said(&run(&ask, env)));
             assert_eq!(pooled, [Some("0000000000001-7-0".to_string())]);
         }
-        assert_eq!(run(&ask, env).trimmed_output(), aterm_capacity::NO_COVER);
+        assert_eq!(said(&run(&ask, env)), aterm_capacity::NO_COVER);
         std::fs::remove_dir_all(&tmp).ok();
     }
 
@@ -2286,20 +2358,21 @@ mod tests {
     #[test]
     fn output_is_captured_with_stderr_merged_and_a_nonzero_exit_keeps_its_code() {
         let tmp = crate::mktemp_dir("atv-exec").expect("mktemp");
-        #[cfg(unix)]
-        let ok_cmd = Cmd::new("/bin/sh").args(["-c", "echo out; echo err >&2; echo out2"]);
-        #[cfg(not(unix))]
-        let ok_cmd = Cmd::new(cmd_exe()).args(["/d", "/c", "echo out& echo err 1>&2& echo out2"]);
-        let r = run(&ok_cmd, env_in(&tmp));
-        assert!(r.ok);
-        assert_eq!(r.trimmed_output().replace("\r\n", "\n"), "out\nerr\nout2");
-        #[cfg(unix)]
-        let err_cmd = Cmd::new("/bin/sh").args(["-c", "echo why >&2; exit 3"]);
-        #[cfg(not(unix))]
-        let err_cmd = Cmd::new(cmd_exe()).args(["/d", "/c", "echo why 1>&2& exit /b 3"]);
-        let r = run(&err_cmd, env_in(&tmp));
+        let r = run(
+            &shell(
+                "echo out; echo err >&2; echo out2",
+                "echo out& (echo err)1>&2& echo out2",
+            ),
+            env_in(&tmp),
+        );
+        assert!(r.ok, "{r:?}");
+        assert_eq!(said(&r), "out\nerr\nout2");
+        let r = run(
+            &shell("echo why >&2; exit 3", "(echo why)1>&2& exit 3"),
+            env_in(&tmp),
+        );
         assert!(!r.ok);
-        assert_eq!(r.trimmed_output(), "why");
+        assert_eq!(said(&r), "why");
         assert_eq!(r.code, Some(3));
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -2315,50 +2388,35 @@ mod tests {
             add_env: &added,
             ..env_in(&tmp)
         };
-        #[cfg(unix)]
-        let argv = vec![
-            OsString::from("/bin/sh"),
-            OsString::from("-c"),
-            OsString::from(
-                "cat marker; printf ' %s %s %s' \"${RECORDED-unset}\" \"${GATE_ADDED-unset}\" \
-                 \"${HOME-unset}\"",
+        assert!(
+            std::env::var_os(INHERITED).is_some(),
+            "the probe needs {INHERITED} where the replay could inherit it"
+        );
+        let argv = shell_argv(
+            &format!(
+                "cat marker; printf ' %s %s %s' \"${{RECORDED-unset}}\" \"${{GATE_ADDED-unset}}\" \
+                 \"${{{INHERITED}-unset}}\""
             ),
-        ];
-        #[cfg(not(unix))]
-        let argv = vec![
-            cmd_exe(),
-            OsString::from("/d"),
-            OsString::from("/v:on"),
-            OsString::from("/c"),
-            OsString::from(
-                "set /p m=<marker& set r=unset& if defined RECORDED set r=!RECORDED!& \
-                 set g=unset& if defined GATE_ADDED set g=!GATE_ADDED!& \
-                 set h=unset& if defined HOME set h=!HOME!& echo !m! !r! !g! !h!",
-            ),
-        ];
-        #[cfg(unix)]
-        let recorded_env = vec![
-            (OsString::from("RECORDED"), OsString::from("yes")),
-            (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
-        ];
-        #[cfg(not(unix))]
-        let recorded_env = {
-            let mut v = vec![
+            &format!("type marker& echo  %RECORDED% %GATE_ADDED% %{INHERITED}%"),
+        );
+        let cmd = Cmd::replayed(
+            &argv,
+            &pkg,
+            vec![
                 (OsString::from("RECORDED"), OsString::from("yes")),
                 (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
-            ];
-            if let Some(sysroot) = std::env::var_os("SystemRoot") {
-                v.push((OsString::from("SystemRoot"), sysroot));
-            }
-            v
-        };
-        let cmd = Cmd::replayed(&argv, &pkg, recorded_env)
-            .preamble("     Running tests/x.rs (target/debug/deps/x-1)\n");
+            ],
+        )
+        .preamble("     Running tests/x.rs (target/debug/deps/x-1)\n");
         let r = run(&cmd, env);
         assert!(r.ok, "{}", r.output);
         assert_eq!(
-            r.trimmed_output().replace("\r\n", "\n"),
-            "     Running tests/x.rs (target/debug/deps/x-1)\nin-pkg yes unset unset",
+            said(&r),
+            format!(
+                "     Running tests/x.rs (target/debug/deps/x-1)\nin-pkg yes {} {}",
+                unset("GATE_ADDED"),
+                unset(INHERITED)
+            ),
             "the preamble first, then the child — in its own directory, with only what \
              was recorded"
         );

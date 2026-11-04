@@ -31,7 +31,7 @@ pub(super) fn lookup(
             incomplete: false,
         });
     };
-    let until = deadline.min(Instant::now() + QUEUES_WITHIN);
+    let until = deadline.min(Instant::now() + servers_within(QUEUES_WITHIN));
     let urls = peer_candidates::policy_queues(config, primary, policy);
     let answers = fan_out::each_at_once("join-lookup", &urls, |url| {
         if url != primary {
@@ -96,7 +96,7 @@ fn hear_bounded(
     } else {
         Vec::new()
     };
-    let ordinary = Instant::now() + QUEUES_WITHIN;
+    let ordinary = Instant::now() + servers_within(QUEUES_WITHIN);
     let until = deadline.map_or(ordinary, |end| end.min(ordinary));
     let discovery = PeerDiscovery::direct(Some(until));
     // The explicit pool excludes discovery hints: a queue an approver judges requests from

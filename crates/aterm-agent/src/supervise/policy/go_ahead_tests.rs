@@ -433,17 +433,23 @@ fn a_remembered_reading_is_the_one_its_words_read_afresh() {
     });
 }
 
-/// A reply past the bound is read and never kept.
+/// A reply past the bound is read and never kept. The bound counts bytes, so the bytes past it are
+/// blank and no sentence of them is read: all that is read is the need, in all three shapes. What
+/// that gives up: nothing in the policy's tests now reads one sentence past about 1 KB, where the
+/// filler of 52,428 words did, so a panic or a quadratic reader at that scale shows nowhere (the
+/// old filler asserted nothing about speed, and could only have hung or panicked).
 #[test]
 fn a_reply_past_the_bound_is_read_and_not_remembered() {
     let long = format!(
         "NEEDS YOU: say \"go\" so I can rebuild the branch.\n\n{}",
-        "word ".repeat(REMEMBERED_REPLY_BYTES / 5)
+        " ".repeat(REMEMBERED_REPLY_BYTES)
     );
     REMEMBERED.with_borrow_mut(std::collections::VecDeque::clear);
     let half = &long[..long.len() / 2];
     for (said, tail) in [("", long.as_str()), (long.as_str(), ""), (half, half)] {
-        assert_eq!(parked(said, tail), read_park(said, tail));
+        let read = read_park(said, tail);
+        assert!(read.is_some(), "the need parks past the bound");
+        assert_eq!(parked(said, tail), read);
         REMEMBERED.with_borrow(|known| assert!(known.is_empty(), "{} kept", known.len()));
     }
 }
@@ -942,50 +948,54 @@ fn no_persons_line_is_ever_answered() {
             .collect()
     };
     let (parks, persons) = (needing(Row::Park), needing(Row::Person));
-    // Pure reading, so one park at a time on every core; each worker drops what this sweep drops
-    // ([`DROPPED`] is its thread's).
-    let sweep = |dropped: u16| {
-        aterm_spec::check::each(&parks, |park| {
-            DROPPED.with(|d| d.set(dropped));
-            let (mut answered, mut joined_parks, mut wrong) = (0, 0, Vec::new());
-            for person in &persons {
-                for columns in DRAWN {
-                    let joined = drawn(&format!("{park}\n{person}"), columns);
-                    let Some(p) = parked("", &joined) else {
-                        continue;
-                    };
-                    joined_parks += 1;
-                    for line in needs::needs_you(&drawn(person, columns)) {
-                        if p.needs.contains(&line) {
-                            answered += 1;
-                            wrong.push(format!("{columns:?}: {line:?} in {joined:?}"));
-                        }
-                    }
-                    let named = needs::needs_you(&joined);
-                    if columns.is_none() && !p.needs.iter().all(|l| named.contains(l)) {
-                        wrong.push(format!("not on the menu bar: {:?} of {joined:?}", p.needs));
+    // Pure reading, so one park at a time on every core.
+    let (joined_parks, wrong) = aterm_spec::check::each(&parks, |park| {
+        let (mut joined_parks, mut wrong) = (0, Vec::new());
+        for person in &persons {
+            for columns in DRAWN {
+                let joined = drawn(&format!("{park}\n{person}"), columns);
+                let Some(p) = parked("", &joined) else {
+                    continue;
+                };
+                joined_parks += 1;
+                for line in needs::needs_you(&drawn(person, columns)) {
+                    if p.needs.contains(&line) {
+                        wrong.push(format!("{columns:?}: {line:?} in {joined:?}"));
                     }
                 }
+                let named = needs::needs_you(&joined);
+                if columns.is_none() && !p.needs.iter().all(|l| named.contains(l)) {
+                    wrong.push(format!("not on the menu bar: {:?} of {joined:?}", p.needs));
+                }
             }
-            (answered, joined_parks, wrong)
-        })
-        .into_iter()
-        .fold(
-            (0, 0, Vec::new()),
-            |mut all, (answered, joined_parks, wrong)| {
-                all.0 += answered;
-                all.1 += joined_parks;
-                all.2.extend(wrong);
-                all
-            },
-        )
-    };
-    let (_, joined_parks, wrong) = sweep(0);
+        }
+        (joined_parks, wrong)
+    })
+    .into_iter()
+    .fold((0, Vec::new()), |mut all, (joined_parks, wrong)| {
+        all.0 += joined_parks;
+        all.1.extend(wrong);
+        all
+    });
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     assert!(joined_parks >= 100, "the sweep parks: {joined_parks}");
-    let (answered, ..) = sweep(Part::PersonOnly as u16);
+    // The control asks only whether one cell answers, so it reads to the first (past the memory:
+    // [`parked`] keeps nothing while a part is dropped). Were none to, it would read every cell.
+    let answered = dropping(Part::PersonOnly, || {
+        parks.iter().any(|park| {
+            persons.iter().any(|person| {
+                DRAWN.into_iter().any(|columns| {
+                    parked("", &drawn(&format!("{park}\n{person}"), columns)).is_some_and(|p| {
+                        needs::needs_you(&drawn(person, columns))
+                            .iter()
+                            .any(|line| p.needs.contains(line))
+                    })
+                })
+            })
+        })
+    });
     assert!(
-        answered > 0,
+        answered,
         "NEGATIVE CONTROL: without the person-only exclusion some person's line is answered"
     );
 }

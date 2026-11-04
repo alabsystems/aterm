@@ -570,8 +570,7 @@ fn the_mktemp_guards_exit_and_colon_prove_at_the_box() {
 #[cfg(unix)]
 #[test]
 fn an_rm_breaker_through_a_link_out_of_scratch_escalates() {
-    let base = std::env::temp_dir().join(format!("aterm-rm-box-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
+    let base = crate::supervise::ScratchDir::new("rm-box", "symlink");
     std::fs::create_dir_all(base.join("p")).expect("dir");
     std::os::unix::fs::symlink("/etc", base.join("p/out")).expect("link");
     let tmp = base.to_string_lossy().trim_end_matches('/').to_string();
@@ -583,7 +582,7 @@ fn an_rm_breaker_through_a_link_out_of_scratch_escalates() {
             PathBuf::from("/private/tmp/claude-502/scratch/work1"),
             Some(PathBuf::from("/Users/_owner")),
             502,
-            Some(base.clone()),
+            Some(base.to_path_buf()),
             std::sync::Arc::new(crate::supervise::policy::LiveProbe),
         )
     };
@@ -595,7 +594,6 @@ fn an_rm_breaker_through_a_link_out_of_scratch_escalates() {
     };
     let d_through = on_screen(&rows(&format!("S={tmp}/p; rm -rf \"$S/out/x\"")), &proven);
     let d_link = on_screen(&rows(&format!("S={tmp}/p; rm -rf \"$S/out\"")), &proven);
-    let _ = std::fs::remove_dir_all(&base);
     assert!(
         reason(&d_through).contains("leads through a symbolic link to"),
         "{d_through:?}"
@@ -3646,6 +3644,27 @@ fn the_advisory_word_reads_this_process_home() {
     }
     // NEGATIVE CONTROL
     assert_eq!(word("cat ~/.config/notes.txt"), Ok(()));
+}
+
+/// With no home known (no `HOME` or `USERPROFILE`, [`advisory_home`]'s `None`), a read that
+/// names the home is never read-only: the home's own secret rules cannot be listed, so a read of
+/// `~/.config/gh/hosts.yml` is unproven rather than approved, as is one under another account's
+/// `~user`. CONTROL: a path the home does not lead is still read.
+#[test]
+fn with_no_home_known_a_read_under_the_home_is_never_read_only() {
+    let word = |line: &str| readings_read_only_at(&[line.to_string()], &[], None);
+    for line in [
+        "cat ~/.config/gh/hosts.yml",
+        "cat ~",
+        "cat ~someone/.config/gh/hosts.yml",
+        "grep -rn token ~/.config",
+    ] {
+        let r = word(line).expect_err(line);
+        assert!(r.contains("a home this check knows none of"), "{line}: {r}");
+    }
+    // CONTROL
+    assert_eq!(word("cat README.md"), Ok(()));
+    assert_eq!(word("cat ~+/README.md"), Ok(()));
 }
 
 #[test]

@@ -32,14 +32,16 @@ impl Fixture {
         };
         fs::write(&path, format_roster_toml(&raw).unwrap()).unwrap();
         store
-            .transact_logins(NOW, &mut None, |_, logins| {
+            .transact_pool_logins_within(&[], &path, NOW, &mut None, |_, _, logins| {
                 logins
                     .labels
                     .insert(row.label.clone(), accounts::Binding::default());
+                accounts::admit_workflow(logins, &row.label)?;
                 Ok(Vec::new())
             })
             .unwrap();
         let logins = store.load_logins(NOW).unwrap().0;
+        assert!(accounts::current_workflow(&row, &logins).is_some());
         if state["parent"] == 1 {
             store
                 .transact_logins(NOW, &mut None, |_, current| {

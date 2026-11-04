@@ -16,6 +16,7 @@ use super::permission::Level;
 use super::run::RunDir;
 use super::state::{Row, State};
 use super::store::{Ended, How, Outcome, Store};
+use crate::harness::accounts_step::Step;
 
 /// The most of an answer kept.
 pub const ANSWER_MAX: usize = 256 * 1024;
@@ -315,10 +316,16 @@ pub fn reviewer_env(
         .var
         .is_none_or(|v| var(v).is_none_or(|s| s.is_empty()));
     if c.is_claude() && default_home {
-        let login = f
-            .accounts
-            .as_ref()
+        // The pool's choice stands where it makes one. Rotation off makes none, so a review runs
+        // on the login it was started with, as a new session does.
+        let account = f.accounts.as_ref();
+        let started = || {
+            var(crate::harness::accounts::LOGIN_ENV)
+                .filter(|_| !account.is_some_and(|a| a.pool_picks))
+        };
+        let login = account
             .and_then(|a| a.login.clone())
+            .or_else(started)
             .unwrap_or_default();
         env.retain(|(name, _)| name != crate::harness::accounts::LOGIN_ENV);
         env.push((crate::harness::accounts::LOGIN_ENV.to_string(), login));
@@ -520,7 +527,7 @@ fn run_one(h: &Host<'_>, prepared: &PreparedReview, ask: &Ask<'_>) -> (Answer, O
         && let Some(why) = crate::harness::codex_alab::auth_path_unread(&managed.path)
     {
         use crate::harness::codex_alab::{
-            DEFAULT_SIGN_IN, DefaultRow, only_default, only_default_pinned, unread_fix,
+            DefaultRow, default_sign_in, only_default, only_default_pinned, unread_fix,
         };
         let default = pool.default_row.clone().unwrap_or(DefaultRow::Unlisted);
         // The owner's pin holds the review to its serving row whatever the default row does.
@@ -534,7 +541,7 @@ fn run_one(h: &Host<'_>, prepared: &PreparedReview, ask: &Ask<'_>) -> (Answer, O
         answer.fix = match &default {
             DefaultRow::Serves(label) => Some(unread_fix(Some(label))),
             DefaultRow::Unlisted => Some(unread_fix(None)),
-            DefaultRow::SignedOut { .. } => Some(DEFAULT_SIGN_IN.to_string()),
+            DefaultRow::SignedOut { .. } => Some(default_sign_in()),
             DefaultRow::Moved(_) | DefaultRow::Walled { .. } | DefaultRow::Other { .. } => None,
         };
         return (answer, None);
@@ -654,7 +661,7 @@ fn run_one(h: &Host<'_>, prepared: &PreparedReview, ask: &Ask<'_>) -> (Answer, O
         answer.why = Some(format!("{}: {said}", answer.why.take().unwrap_or_default()));
     }
     answer.fix = match verdict {
-        Verdict::Auth => Some(format!("aterm ai login {}", c.id)),
+        Verdict::Auth => Some(Step::AiLogin(c.id.to_owned()).to_string()),
         _ => None,
     };
     let outcome = match verdict {
@@ -873,6 +880,7 @@ fn refresh_review_account(
         );
         account.listed = witness.row().is_some();
         account.login = witness.row().and_then(|row| row.dir.clone());
+        account.pool_picks = mode != crate::harness::accounts::Mode::Off;
         account.launch_refused = None;
     }
     Ok(Some((store, witness)))

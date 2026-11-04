@@ -52,8 +52,11 @@ pub fn error_json(stderr: &str) -> aterm_json::Value {
 
 /// A fresh 0700 scratch directory.
 pub fn scratch(label: &str) -> aterm_tempfile::TempDir {
+    let end = label.floor_char_boundary(24);
+    let prefix = format!("agh-{}-", &label[..end]);
     aterm_tempfile::Builder::new()
-        .prefix(&format!("agh-{label}-"))
+        .prefix(&prefix)
+        .suffix(".noindex")
         .tempdir()
         .expect("a scratch directory")
 }

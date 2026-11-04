@@ -17,8 +17,11 @@
 //! which may come a while after the gate opened (another process owns the home's observer, or
 //! the Commons state errs before its transport), so the slot is held for that use, and the
 //! question's 30 s hold, and a window's record that it lived through it, run from the use
-//! ([`FirstUse`]). A window's other first LAN uses wait for the step by the rule the gate's wait
-//! for it follows ([`hold_first_uses_for_the_step`]).
+//! ([`FirstUse`]). Where it asks by itself once the wait for System State's step ran out, its
+//! question is held as a use through `lan_first_use`'s door holds its own, which the question's
+//! watch (a window's) or the step's re-probe ends sooner ([`QuestionSlot`]). A window's other
+//! first LAN uses wait for the step by the rule the gate's wait for it follows
+//! ([`hold_first_uses_for_the_step`]).
 
 use std::path::Path;
 #[cfg(target_os = "macos")]
@@ -150,9 +153,11 @@ pub(crate) fn when_sharing_on(
 /// its uses go through once they waited for the step
 /// ([`aterm_types::macos_setup::lan_first_use::install_door`]): only time with a person at this
 /// Mac counts toward the wait, and past it a use goes only with a person there, the window's keys
-/// at rest and its dialog slot free. The node job has no window, so it installs no door: its wait
-/// counts the wall clock, and past it its uses go, as its Commons gate asks by itself under its
-/// own slot.
+/// at rest and its dialog slot free; and the watch of the question such a use, or its Commons
+/// gate's ask past that wait ([`asks_at_the_door`]), raises ([`question_watch_for`]), which ends
+/// the door's hold of it once it sees it answered. The node job has no window, so it installs no
+/// door: its wait counts the wall clock, and past it its uses go, as its Commons gate asks by
+/// itself under its own slot.
 /// A window also reads, as a use already asked, that this Mac's and app's vault subscriber used
 /// the local network ([`subscriber_asked_here`]): macOS asks each app once, so its System State
 /// step reads that question as asked and raises no second hold.
@@ -238,11 +243,32 @@ fn door_for(host: Host) -> Option<Door> {
     }
 }
 
-/// Install `host`'s door ([`door_for`]), where it has one.
+/// The watch of macOS's Local Network question a use raises through `host`'s door, or its Commons
+/// gate's ask past the wait for the step raises ([`asks_at_the_door`])
+/// ([`aterm_types::macos_setup::lan_first_use::install_question_watch`]), which ends the door's
+/// hold of the question once it sees it answered: a window's alone
+/// ([`aterm_gui::door_question_watch`], which reads the window list from a lane worker). A
+/// terminal session lane and the node job have no window, so they install none and read no
+/// window list.
+#[cfg(target_os = "macos")]
+fn question_watch_for(
+    host: Host,
+) -> Option<aterm_types::macos_setup::lan_first_use::QuestionWatch> {
+    match host {
+        Host::Window { .. } => Some(aterm_gui::door_question_watch()),
+        Host::SessionLane | Host::NodeServe => None,
+    }
+}
+
+/// Install `host`'s door ([`door_for`]), where it has one, and its question watch
+/// ([`question_watch_for`]), where it has one.
 #[cfg(target_os = "macos")]
 pub(crate) fn install_door(host: Host) {
     if let Some((present, quiet)) = door_for(host) {
         aterm_types::macos_setup::lan_first_use::install_door(present, quiet);
+    }
+    if let Some(watch) = question_watch_for(host) {
+        aterm_types::macos_setup::lan_first_use::install_question_watch(watch);
     }
 }
 
@@ -315,7 +341,7 @@ mod macos {
         let keep = super::use_keeper(record.clone(), host, super::here);
         wired(
             first_use(lived_through),
-            || MacosDialog::when_none_up(Duration::ZERO),
+            || MacosDialog::when_none_up(Duration::ZERO).map(GateSlot::Taken),
             Reads {
                 handed: || {
                     if let Some(revision) = lan_first_use::handed() {
@@ -356,7 +382,7 @@ mod macos {
     /// The runtime's first LAN use as the gate holds it: a slot the gate took is held for the use
     /// for as long as the question's hold, at most, and the question's hold runs from the use
     /// ([`FirstUse`]), with `lived_through` run once a window lived through it.
-    pub(super) fn first_use<G: Send + 'static>(
+    pub(super) fn first_use<G: super::QuestionSlot>(
         lived_through: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> Arc<FirstUse<G>> {
         Arc::new(FirstUse::new(
@@ -364,6 +390,41 @@ mod macos {
             LOCAL_NETWORK_QUESTION_HOLD,
             lived_through,
         ))
+    }
+
+    /// This process's dialog slot as the gate holds it for the runtime's first LAN use
+    /// ([`FirstUse`]).
+    pub(super) enum GateSlot {
+        /// As the gate took it: the question the use raises is held for
+        /// [`LOCAL_NETWORK_QUESTION_HOLD`] from the use ([`super::hold`]).
+        Taken(MacosDialog),
+        /// Readied for an ask past the wait for System State's step ([`super::asks_at_the_door`]):
+        /// in `lan_first_use`'s door hold, with the question's watch started where this process
+        /// installed one, so the use's question is held as a door pass's is, ended sooner by that
+        /// watch or the step's re-probe ([`lan_first_use::Asking`]).
+        Door(lan_first_use::Asking),
+    }
+
+    impl super::QuestionSlot for GateSlot {
+        fn readied(self, why: Option<&'static str>) -> Self {
+            match self {
+                Self::Taken(slot) if super::asks_at_the_door(why) => {
+                    Self::Door(lan_first_use::asking(slot))
+                }
+                held => held,
+            }
+        }
+
+        fn asked(self, bound: Duration, lived_through: Option<impl FnOnce() + Send + 'static>) {
+            match self {
+                Self::Taken(slot) => super::hold(slot, bound, lived_through),
+                Self::Door(asking) => asking.asked(move || {
+                    if let Some(lived_through) = lived_through {
+                        lived_through();
+                    }
+                }),
+            }
+        }
     }
 
     /// What each look of the gate reads ([`wired`]).
@@ -393,7 +454,7 @@ mod macos {
     /// reached the LAN starts the question's hold from it ([`FirstUse::made`]) and runs `keep`
     /// with why the gate opened, the first time; one that reached none lets the slot go
     /// ([`FirstUse::missed`]).
-    pub(super) fn wired<G: Send + 'static>(
+    pub(super) fn wired<G: super::QuestionSlot>(
         first: Arc<FirstUse<G>>,
         slot: impl Fn() -> Option<G> + Send + Sync + 'static,
         reads: Reads<
@@ -679,18 +740,54 @@ fn hold<G: Send + 'static, F: FnOnce() + Send + 'static>(
     }
 }
 
+/// This process's dialog slot as a [`FirstUse`] holds it for the runtime's first LAN use, and
+/// what holds the question that use raises once it is made.
+#[cfg(target_os = "macos")]
+trait QuestionSlot: Send + Sized + 'static {
+    /// The use goes now, right before it raises macOS's question, the gate having opened for
+    /// `why` ([`FirstUse::ready`]): the slot as it is held for the use. By default, as it is.
+    fn readied(self, _why: Option<&'static str>) -> Self {
+        self
+    }
+
+    /// The use was made: hold its question `bound` from now, run `lived_through` once the hold
+    /// ran out, and then let the slot go ([`hold`]), by default.
+    fn asked(
+        self,
+        bound: std::time::Duration,
+        lived_through: Option<impl FnOnce() + Send + 'static>,
+    ) {
+        hold(self, bound, lived_through);
+    }
+}
+
+/// Whether the gate, having opened for `why`, asks as a use through `lan_first_use`'s door asks
+/// (pure): it asks by itself because this process's uses waited
+/// [`aterm_types::macos_setup::lan_first_use::STEP_WAIT`] for System State's step
+/// ([`STEP_WAITED_OUT`]), so the door's hold holds its question, watched where the window installed
+/// a watch ([`macos::GateSlot`]). Every other ask of the gate's own (aterm's records say macOS
+/// asked or answered aterm, an earlier aterm used the LAN here, or no step will run for this
+/// process) keeps the gate's own hold, [`aterm_types::macos_setup::LOCAL_NETWORK_QUESTION_HOLD`]
+/// from the use, unwatched.
+#[cfg(target_os = "macos")]
+fn asks_at_the_door(why: Option<&'static str>) -> bool {
+    why == Some(STEP_WAITED_OUT)
+}
+
 /// The runtime's first LAN use, which puts macOS's Local Network question, between the gate that
 /// opened for it and that use. The runtime makes it right after the gate opens unless another
 /// process owns the home's observer or its Commons state errs before its transport, and then it
 /// may come much later, or never. So the dialog slot the gate took (`G`) is held for the use, and
-/// the question's hold runs from the use: the slot is held for `hold` after it and then let go,
-/// and a window's record that it lived through the question (`lived_through`, [`keep_asked_here`])
-/// is kept only then. One rule holds the slot until then: a slot held for the use goes `wait`
-/// after it was taken or last readied for a use ([`Self::ready`]), and at once when the use
-/// reached no LAN socket ([`Self::missed`]), so the process's other macOS questions never wait on
-/// a use that did not come, and a use that goes is never let go under (it binds within seconds of
-/// its ready). A use that reached the LAN (a socket bound, or failed only once it was made) is
-/// the use, and its hold runs. The use takes a slot that went again.
+/// the question's hold runs from the use: the slot is held for `hold` after it and then let go
+/// (for an ask past the wait for System State's step, by the door's hold, which an answer seen
+/// or heard ends sooner, [`QuestionSlot`]), and a window's record that it lived through the
+/// question (`lived_through`, [`keep_asked_here`]) is kept once that hold is over. One rule holds
+/// the slot until then: a slot held for the use goes `wait` after it was taken or last readied
+/// for a use ([`Self::ready`]), and at once when the use reached no LAN socket
+/// ([`Self::missed`]), so the process's other macOS questions never wait on a use that did not
+/// come, and a use that goes is never let go under (it binds within seconds of its ready). A use
+/// that reached the LAN (a socket bound, or failed only once it was made) is the use, and its
+/// hold runs. The use takes a slot that went again.
 #[cfg(target_os = "macos")]
 struct FirstUse<G> {
     state: std::sync::Mutex<Asking<G>>,
@@ -738,7 +835,7 @@ thread_local! {
 }
 
 #[cfg(target_os = "macos")]
-impl<G: Send + 'static> FirstUse<G> {
+impl<G: QuestionSlot> FirstUse<G> {
     fn new(
         wait: std::time::Duration,
         hold: std::time::Duration,
@@ -834,9 +931,11 @@ impl<G: Send + 'static> FirstUse<G> {
     /// held for the use, unless `waits` says what the use waits for first (the gate's decision is
     /// stale by then: System State's Local Network step may have come to be due since, as on a
     /// network it can name now), and with another macOS question of this process up, the use
-    /// waits. With none of Commons' own, or the use made, it goes, and `waits` is not read. Where
-    /// the wait cannot start the slot stays held: the use follows at once, and [`Self::made`] or
-    /// [`Self::missed`] ends it.
+    /// waits. Either way the slot is readied for the use first, with why the gate opened
+    /// ([`QuestionSlot::readied`]), outside this use's lock, since a slot readied for an ask past
+    /// the wait for the step waits for its question's watch's first read. With none of Commons'
+    /// own, or the use made, it goes, and `waits` is not read. Where the wait cannot start the
+    /// slot stays held: the use follows at once, and [`Self::made`] or [`Self::missed`] ends it.
     fn ready(
         self: &std::sync::Arc<Self>,
         waits: impl FnOnce() -> Option<&'static str>,
@@ -859,6 +958,12 @@ impl<G: Send + 'static> FirstUse<G> {
                 return None;
             }
         };
+        // Meanwhile the slot reads let go, so the wait of the hold before this one, should it run
+        // out now, lets nothing go; the use is made only once this returns.
+        let why = state.why;
+        drop(state);
+        let held = held.readied(why);
+        let mut state = self.lock();
         if let Err(error) = self.hold_for_use(&mut state, held) {
             aterm_log::warn!(
                 "Commons: the wait for the first local network use could not start ({error}); \
@@ -878,14 +983,14 @@ impl<G: Send + 'static> FirstUse<G> {
         self.changed.notify_all();
     }
 
-    /// The runtime made its first LAN use: hold the slot held for it for `hold` from now, run
-    /// `lived_through` once the hold ran out, and then let the slot go ([`hold`]). Why the gate
-    /// opened the first time, for the log; `None` after.
+    /// The runtime made its first LAN use: hold its question by the slot held for it, for `hold`
+    /// from now, run `lived_through` once the hold is over, and then let the slot go
+    /// ([`QuestionSlot::asked`]). Why the gate opened the first time, for the log; `None` after.
     fn made(&self) -> Option<&'static str> {
         let mut state = self.lock();
         match std::mem::replace(&mut state.slot, UseSlot::Used) {
             UseSlot::Used => return None,
-            UseSlot::Held { slot, .. } => hold(slot, self.hold, self.lived_through()),
+            UseSlot::Held { slot, .. } => slot.asked(self.hold, self.lived_through()),
             UseSlot::Unheld | UseSlot::LetGo => {}
         }
         self.changed.notify_all();
@@ -1442,9 +1547,113 @@ mod tests {
             let _ = self.0.send(());
         }
     }
+    impl super::QuestionSlot for Token {}
     fn token() -> (Token, std::sync::mpsc::Receiver<()>) {
         let (sent, gone) = std::sync::mpsc::channel();
         (Token(sent), gone)
+    }
+
+    /// Only the gate's ask past the wait for System State's step asks as a use through the door
+    /// does, so only its question is held by the door's hold and watched; the gate's other asks
+    /// of its own, and a gate that opened on a question already put, keep its own hold.
+    /// NEGATIVE CONTROL: an `asks_at_the_door` that reads every ask as the door's reads the
+    /// gate's ask on aterm's records as one.
+    #[test]
+    fn only_the_gates_ask_past_the_wait_asks_at_the_door() {
+        assert!(super::asks_at_the_door(Some(super::STEP_WAITED_OUT)));
+        for why in [
+            None,
+            Some(super::STEP_ASKED),
+            Some(super::USE_ASKED),
+            Some("aterm's records hear macOS's Local Network answer"),
+            Some("an earlier aterm used the local network on this Mac"),
+        ] {
+            assert!(!super::asks_at_the_door(why), "{why:?}");
+        }
+    }
+
+    /// The slot a gate's use holds is readied right before each try of the use, with why the gate
+    /// opened (the gate's own slot moves into the door's hold at its first readying past the wait,
+    /// and stays there at the next), and one taken again after it went is readied anew. The use
+    /// made, its question is held by the readied slot's own hold; a slot let go before a use (the
+    /// use reached no LAN socket) goes unasked. NEGATIVE CONTROLS: a `ready` that does not ready
+    /// the slot (`held.readied(why)` taken out) records no readying; a `made` that holds the
+    /// question by the gate's own hold whatever the slot (`hold(slot, ...)` in place of
+    /// `slot.asked(...)`) records no ask.
+    #[test]
+    fn the_gates_slot_is_readied_before_the_use_and_holds_its_question_from_it() {
+        use super::FirstUse;
+        use std::sync::{Arc, Mutex};
+        const HANG: Duration = Duration::from_secs(60);
+        type Said = Arc<Mutex<Vec<(u32, &'static str, Option<&'static str>)>>>;
+        /// A slot that says what was done with it.
+        struct Recorded(u32, Said);
+        impl super::QuestionSlot for Recorded {
+            fn readied(self, why: Option<&'static str>) -> Self {
+                self.1.lock().unwrap().push((self.0, "readied", why));
+                self
+            }
+            fn asked(
+                self,
+                _bound: Duration,
+                lived_through: Option<impl FnOnce() + Send + 'static>,
+            ) {
+                self.1.lock().unwrap().push((self.0, "asked", None));
+                if let Some(lived_through) = lived_through {
+                    lived_through();
+                }
+            }
+        }
+        impl Drop for Recorded {
+            fn drop(&mut self) {
+                self.1.lock().unwrap().push((self.0, "gone", None));
+            }
+        }
+        let said: Said = Arc::default();
+        let first = Arc::new(FirstUse::new(HANG, Duration::ZERO, None));
+        first.take(Recorded(1, said.clone()));
+        first.opened(super::STEP_WAITED_OUT);
+        assert!(
+            said.lock().unwrap().is_empty(),
+            "the gate's take readies nothing"
+        );
+        assert_eq!(first.ready(no_wait, || panic!("held")), None);
+        assert_eq!(first.ready(no_wait, || panic!("held")), None);
+        assert_eq!(first.made(), Some(super::STEP_WAITED_OUT));
+        let why = Some(super::STEP_WAITED_OUT);
+        assert_eq!(
+            *said.lock().unwrap(),
+            [
+                (1, "readied", why),
+                (1, "readied", why),
+                (1, "asked", None),
+                (1, "gone", None),
+            ],
+            "readied before each try of the use, then its question held by the slot's own hold"
+        );
+
+        said.lock().unwrap().clear();
+        let missed = Arc::new(FirstUse::new(HANG, Duration::ZERO, None));
+        missed.take(Recorded(2, said.clone()));
+        missed.opened(super::STEP_WAITED_OUT);
+        assert_eq!(missed.ready(no_wait, || panic!("held")), None);
+        missed.missed();
+        assert_eq!(
+            missed.ready(no_wait, || Some(Recorded(3, said.clone()))),
+            None
+        );
+        missed.made();
+        assert_eq!(
+            *said.lock().unwrap(),
+            [
+                (2, "readied", why),
+                (2, "gone", None),
+                (3, "readied", why),
+                (3, "asked", None),
+                (3, "gone", None),
+            ],
+            "no use made: the slot goes unasked, and the one taken again is readied anew"
+        );
     }
 
     /// A use's `waits` read ([`super::FirstUse::ready`]) that says it waits for nothing.
@@ -2070,6 +2279,26 @@ mod tests {
         assert!(super::door_for(WINDOW).is_some());
         assert!(super::door_for(Host::SessionLane).is_some());
         assert!(super::door_for(Host::NodeServe).is_none());
+    }
+
+    /// Only a window's door watches the question a use raises through it: the watch reads the
+    /// window list, which a terminal session lane and the node job, having no window, never read.
+    /// The watch is only built here, never started. NEGATIVE CONTROL: with `SessionLane` given
+    /// the window's watch in `question_watch_for`, the session lane reads as watched.
+    #[test]
+    fn only_a_windows_door_watches_its_question() {
+        for host in [
+            WINDOW,
+            Host::Window { runs_setup: false },
+            Host::SessionLane,
+            Host::NodeServe,
+        ] {
+            assert_eq!(
+                super::question_watch_for(host).is_some(),
+                matches!(host, Host::Window { .. }),
+                "{host:?}"
+            );
+        }
     }
 
     /// The vault subscriber (a background job with no window) used the local network on this

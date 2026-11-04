@@ -3738,7 +3738,7 @@ fn cachedir_tag_signed(p: &Path) -> bool {
     if !meta.is_file() || meta.len() > 4096 {
         return false;
     }
-    let mut buf = Vec::with_capacity(CACHEDIR_SIGNATURE.len());
+    let mut buf = Vec::with_capacity(CACHEDIR_SIGNATURE.len() + 1);
     file.take(CACHEDIR_SIGNATURE.len() as u64)
         .read_to_end(&mut buf)
         .is_ok()

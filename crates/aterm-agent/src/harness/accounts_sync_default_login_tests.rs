@@ -142,7 +142,7 @@ impl Bed {
         let code = alab_roster::with_lab(lab.clone(), || {
             run_cli_accounts_sync_with(
                 cli,
-                &self.env,
+                (&self.env, None),
                 (Some(alab_roster::SOURCE), None, true),
                 (&mut out, &mut err),
                 &fetch,
@@ -160,7 +160,7 @@ impl Bed {
         let code = alab_roster::with_lab(lab.clone(), || {
             run_cli_accounts_sync_with(
                 cli,
-                &self.env,
+                (&self.env, None),
                 (Some(alab_roster::SOURCE), None, false),
                 (&mut out, &mut err),
                 &fetch,
@@ -359,7 +359,7 @@ fn a_sync_with_nothing_to_read_names_the_pool_file() {
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let _ = run_cli_accounts_sync_with(
             cli,
-            &bed.env,
+            (&bed.env, None),
             (None, None, false),
             (&mut out, &mut err),
             &fetch,
@@ -520,6 +520,258 @@ enum TwinGuard {
     SourceNamesOwn,
 }
 
+/// A completed local check keeps its named recovery route even when the twin's bound
+/// directory is empty. The same roster without staged work still folds.
+#[test]
+fn a_local_completed_checkpoint_keeps_its_default_twin_recoverable() {
+    let cli = Cli::Codex;
+    let label = "codex-aaaaaa";
+    for (existing, prefix, owner) in [
+        (true, None, None),
+        (true, Some(label), Some(label)),
+        (true, Some("another-request"), Some(label)),
+        (true, Some(label), None),
+        (true, Some(label), Some("another-owner")),
+        (false, None, None),
+        (false, Some(label), Some(label)),
+        (false, Some("another-request"), Some(label)),
+    ] {
+        let completed = owner == Some(label);
+        let bed = Bed::new();
+        let address = email("ann");
+        bed.fleet_file(cli, &[(label, &address)]);
+        let empty = bed.dir(cli, label, false);
+        let mut seeded = vec![Row {
+            label: "main".into(),
+            ..Row::default()
+        }];
+        if existing {
+            seeded.push(Row {
+                label: label.into(),
+                dir: Some(empty),
+                email: Some(address.clone()),
+                ..Row::default()
+            });
+        }
+        bed.seed(cli, &seeded);
+        bed.login(&address);
+        fs::write(
+            bed.env.home.as_deref().unwrap().join(".codex/config.toml"),
+            "cli_auth_credentials_store = \"file\"\n",
+        )
+        .unwrap();
+        let store = bed.store(cli);
+        let staging = prefix.map(|prefix| {
+            let staging = store.claim_staging_dir(prefix).unwrap();
+            let token = crate::harness::codex_app_login::tests::make_chatgpt_jwt(
+                Some(&address),
+                "plus",
+                NOW + 3600,
+            );
+            fs::write(
+                staging.join("auth.json"),
+                aterm_json::json!({"tokens": {"access_token": token}}).to_string(),
+            )
+            .unwrap();
+            fs::write(
+                staging.join("config.toml"),
+                "cli_auth_credentials_store = \"file\"\n",
+            )
+            .unwrap();
+            let logins = store.load_logins(NOW).unwrap().0;
+            assert!(logins.labels.is_empty());
+            if let Some(owner) = owner {
+                accounts::write_renewal_checkpoint_for(
+                    cli,
+                    None,
+                    owner,
+                    &address,
+                    staging.to_str().unwrap(),
+                    None,
+                    Some(accounts::Proof::Status),
+                    NOW - 5,
+                    &logins,
+                )
+                .unwrap();
+                let actual = fs::canonicalize(&staging).unwrap();
+                let proof =
+                    accounts::read_renewal_checkpoint_for(cli, &staging, &actual, NOW).unwrap();
+                assert_eq!(proof.label, owner);
+                assert_eq!(proof.email, address);
+                if existing && prefix == label && owner == label {
+                    let healthy = local_renewal_checkpoints(cli, &store, NOW).unwrap();
+                    assert!(healthy.complete);
+                    let unrelated = Row {
+                        label: "not-owned".into(),
+                        email: Some(address.clone()),
+                        ..Row::default()
+                    };
+                    assert!(!healthy.holds_twin(cli, &unrelated));
+                    let read_checkpoint = |dir: &Path, actual: &Path| {
+                        accounts::read_renewal_checkpoint_checked_for(cli, dir, actual, NOW)
+                    };
+                    let partial = decode_local_renewal_checkpoints(
+                        cli,
+                        std::iter::once(Err(std::io::Error::other(
+                            "injected directory enumeration error",
+                        )))
+                        .chain(fs::read_dir(store.logins_dir()).unwrap()),
+                        std::fs::DirEntry::file_type,
+                        read_checkpoint,
+                    );
+                    assert!(!partial.complete);
+                    assert_eq!(
+                        partial.checkpoints.len(),
+                        healthy.checkpoints.len(),
+                        "an incomplete scan still yields available recovery candidates"
+                    );
+                    assert!(
+                        partial.holds_twin(cli, &unrelated),
+                        "incomplete enumeration cannot prove a twin owns nothing"
+                    );
+                    let unclassified = decode_local_renewal_checkpoints(
+                        cli,
+                        fs::read_dir(store.logins_dir()).unwrap(),
+                        |_| Err(std::io::Error::other("injected classification error")),
+                        read_checkpoint,
+                    );
+                    assert!(!unclassified.complete);
+                    assert!(unclassified.holds_twin(cli, &unrelated));
+                    let irrelevant = decode_local_renewal_checkpoints(
+                        cli,
+                        fs::read_dir(store.logins_dir()).unwrap().filter(|entry| {
+                            entry.as_ref().is_ok_and(|entry| entry.file_name() == label)
+                        }),
+                        |_| panic!("noncandidate names need no classification"),
+                        read_checkpoint,
+                    );
+                    assert!(irrelevant.complete);
+                    assert!(!irrelevant.holds_twin(cli, &unrelated));
+                }
+            }
+            staging
+        });
+        let staged_auth = staging
+            .as_ref()
+            .map(|dir| fs::read(dir.join("auth.json")).unwrap());
+        assert!(store.load(NOW).unwrap().0.accounts.is_empty());
+        let (code, document, error) = bed.sync_plain(cli);
+        assert_eq!(code, ExitCode::SUCCESS, "{error}");
+        let rows = bed.rows(cli);
+        assert_eq!(
+            rows.len(),
+            if completed { 2 } else { 1 },
+            "completed={completed}: {document}"
+        );
+        assert_eq!(document["twin_merged"].is_null(), completed);
+        assert_eq!(
+            document["twin"],
+            if completed {
+                aterm_json::json!({ "row": "main", "twin": label, "kept": "twin-checkpoint" })
+            } else {
+                Value::Null
+            },
+            "existing={existing}, completed={completed}: {document}"
+        );
+        if let Some(staging) = staging {
+            assert_eq!(
+                fs::read(staging.join("auth.json")).unwrap(),
+                staged_auth.unwrap(),
+                "sync never discards or rewrites staged credentials"
+            );
+            if !completed {
+                continue;
+            }
+            let raw = Roster::load_for(cli, &bed.roster_path(cli)).unwrap();
+            let logins = store.load_logins(NOW).unwrap().0;
+            let bound = accounts::bound(&raw, &logins);
+            assert_eq!(
+                bound.row(label).unwrap().dir.as_deref(),
+                staging.to_str(),
+                "the original named row recovers the checked login"
+            );
+            assert_eq!(raw.row("main").unwrap().email, None);
+        }
+    }
+}
+
+/// A valid local owner temporarily unreadable at the actual decoder input is not absent.
+#[test]
+fn unavailable_checkpoint_io_does_not_establish_an_empty_twin() {
+    let bed = Bed::new();
+    let cli = Cli::Codex;
+    let store = bed.store(cli);
+    let address = email("ann");
+    let mut owner = None;
+    for label in ["owner", "other"] {
+        let staging = store.claim_staging_dir(label).unwrap();
+        let token = crate::harness::codex_app_login::tests::make_chatgpt_jwt(
+            Some(&address),
+            "plus",
+            NOW + 3600,
+        );
+        fs::write(
+            staging.join("auth.json"),
+            aterm_json::json!({"tokens": {"access_token": token}}).to_string(),
+        )
+        .unwrap();
+        accounts::write_renewal_checkpoint_for(
+            cli,
+            None,
+            label,
+            &address,
+            staging.to_str().unwrap(),
+            None,
+            Some(accounts::Proof::Status),
+            NOW - 5,
+            &store.load_logins(NOW).unwrap().0,
+        )
+        .unwrap();
+        let actual = fs::canonicalize(&staging).unwrap();
+        assert_eq!(
+            accounts::read_renewal_checkpoint_for(cli, &staging, &actual, NOW)
+                .unwrap()
+                .label,
+            label
+        );
+        if label == "owner" {
+            owner = Some(staging);
+        }
+    }
+    let owner = owner.unwrap();
+    let row = Row {
+        label: "owner".into(),
+        email: Some(address),
+        ..Row::default()
+    };
+    let healthy = local_renewal_checkpoints(cli, &store, NOW).unwrap();
+    assert_eq!(healthy.checkpoints.len(), 2);
+    assert!(healthy.complete && healthy.holds_twin(cli, &row));
+    let unavailable = decode_local_renewal_checkpoints(
+        cli,
+        fs::read_dir(store.logins_dir()).unwrap(),
+        std::fs::DirEntry::file_type,
+        |dir, actual| {
+            if dir == owner {
+                Err(std::io::ErrorKind::PermissionDenied.into())
+            } else {
+                accounts::read_renewal_checkpoint_checked_for(cli, dir, actual, NOW)
+            }
+        },
+    );
+    assert_eq!(
+        unavailable.checkpoints.len(),
+        1,
+        "available recovery candidates remain readable"
+    );
+    assert_eq!(unavailable.checkpoints[0].proof.label, "other");
+    assert!(unavailable.holds_twin(cli, &row));
+    assert!(
+        !unavailable.complete,
+        "unavailable evidence cannot establish absence"
+    );
+}
+
 impl Bed {
     /// A fleet file in `~/.secrets` of `accounts`, each `(label, address)`, for machine `m16`.
     fn fleet_file(&self, cli: Cli, accounts: &[(&str, &str)]) {
@@ -544,7 +796,7 @@ impl Bed {
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let code = run_cli_accounts_sync_with(
             cli,
-            &self.env,
+            (&self.env, None),
             (None, None, true),
             (&mut out, &mut err),
             &fetch,
@@ -553,6 +805,21 @@ impl Bed {
         let doc = aterm_json::from_str(String::from_utf8_lossy(&out).trim())
             .unwrap_or_else(|_| panic!("a document: {err}"));
         (code, doc, err)
+    }
+
+    /// [`Self::sync_plain`], whatever it answers: a refusal prints no document.
+    fn sync_plain_any(&self, cli: Cli) -> (ExitCode, Value, String) {
+        let fetch = |_: &Env, _: &str| -> Result<String, String> { panic!("no source is fetched") };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = run_cli_accounts_sync_with(
+            cli,
+            (&self.env, None),
+            (None, None, true),
+            (&mut out, &mut err),
+            &fetch,
+        );
+        let doc = aterm_json::from_str(String::from_utf8_lossy(&out).trim()).unwrap_or(Value::Null);
+        (code, doc, String::from_utf8(err).unwrap())
     }
 
     /// A shared renewal `label` began and whose outcome is unknown: the row is in shared custody.
@@ -680,18 +947,34 @@ fn each_thing_a_twin_or_the_default_row_holds_keeps_both_rows() {
             .read_account_records(Some(&bed.roster_path(cli)), NOW)
             .unwrap();
         let (own, twin) = accounts::default_login_twin(&records.roster, Some(&ann)).unwrap();
-        let source = sync_source_here(cli, &bed.env).unwrap();
-        let named = default_twin_folds(
-            (own, twin),
-            &ann,
-            &source,
+        let named = sync_twin_verdict(
+            cli,
+            &bed.env,
+            (&own.label, &twin.label, &ann),
+            &records.roster,
             (&records.state, &records.logins),
             NOW,
-        );
+        )
+        .is_ok();
         let (code, doc, err) = bed.sync_plain(cli);
         assert_eq!(code, ExitCode::SUCCESS, "{guard:?}: {err}");
         let folded = doc["twin_merged"] != Value::Null;
         assert_eq!(folded, guard == Nothing, "{guard:?}: {doc}");
+        assert_eq!(
+            doc["twin"],
+            if folded {
+                Value::Null
+            } else {
+                aterm_json::json!({ "row": "main", "twin": "codex-aaaaaa", "kept": match guard {
+                    TwinHeld | TwinInCustody => "twin-held",
+                    OwnHeld | OwnInCustody => "row-held",
+                    OwnSignedOut => "row-signed-out",
+                    SourceNamesOwn => "source-names-row",
+                    _ => "twin-holds",
+                } })
+            },
+            "{guard:?}: {doc}"
+        );
         assert_eq!(named, folded, "{guard:?}: the report's sync: {doc}");
         let rows = bed.rows(cli);
         assert_eq!(
@@ -785,7 +1068,10 @@ fn a_sync_says_a_default_login_no_row_holds() {
         words.contains(&format!("default login: it names {far}")),
         "{words}"
     );
-    assert!(words.contains("`codex login`"), "{words}");
+    assert!(
+        words.contains("`aterm harness accounts login main --cli codex`"),
+        "{words}"
+    );
     assert_eq!(bed.rows(cli)[0].email, Some(main.clone()));
 
     bed.login(&main);
@@ -846,7 +1132,7 @@ fn a_refused_move_of_the_default_login_still_says_what_the_sync_changed() {
         let code = alab_roster::with_lab(lab.clone(), || {
             run_cli_accounts_sync_with(
                 cli,
-                &bed.env,
+                (&bed.env, None),
                 (Some(alab_roster::SOURCE), None, json),
                 (&mut out, &mut err),
                 &fetch,
@@ -861,12 +1147,15 @@ fn a_refused_move_of_the_default_login_still_says_what_the_sync_changed() {
     let (code, out, err) = run(false);
     assert_eq!(code, ExitCode::FAILURE, "{out}{err}");
     assert!(out.contains("hold cleared: `main`"), "{out}");
-    assert!(err.contains("holds a login that is not its own"), "{err}");
+    assert!(err.contains("holds a login that names no address"), "{err}");
     assert!(
         err.contains("move that directory away and sync again"),
         "{err}"
     );
-    assert!(err.contains("`codex login`"), "{err}");
+    assert!(
+        err.contains("`aterm harness accounts login main --cli codex`"),
+        "{err}"
+    );
     assert!(!err.contains("metadata is unchanged"), "{err}");
     let main_row = |rows: &[Row]| {
         rows.iter()
@@ -893,4 +1182,180 @@ fn a_refused_move_of_the_default_login_still_says_what_the_sync_changed() {
     assert!(out.contains("on this machine's own login: work"), "{out}");
     let rows = bed.rows(cli);
     assert_eq!(main_row(&rows).dir.as_deref(), foreign.to_str(), "CONTROL");
+}
+
+/// The report's verdict on folding `codex-aaaaaa` into `main`, under the lab where it reads one.
+fn report_folds(bed: &Bed, cli: Cli, ann: &str, lab: Option<&Lab>) -> Result<(), TwinKept> {
+    let records = bed
+        .store(cli)
+        .read_account_records(Some(&bed.roster_path(cli)), NOW)
+        .unwrap();
+    let verdict = || {
+        sync_twin_verdict(
+            cli,
+            &bed.env,
+            ("main", "codex-aaaaaa", ann),
+            &records.roster,
+            (&records.state, &records.logins),
+            NOW,
+        )
+    };
+    match lab {
+        Some(lab) => alab_roster::with_lab(lab.clone(), verdict),
+        None => verdict(),
+    }
+}
+
+/// THE REPORT AND THE SYNC ANSWER ONE PREDICATE WHERE THE SOURCE CHANGES A HOLD THE ROSTER SHOWS: a
+/// lab that clears a hold folds on both, and a pool that holds the twin elsewhere folds on neither.
+/// CONTROL: the same pool with the twin warm here folds on both.
+#[test]
+fn the_report_and_the_sync_judge_a_source_that_changes_a_hold_alike() {
+    let cli = Cli::Codex;
+    let seed = |bed: &Bed, ann: &str, held: bool| {
+        let dir = bed.dir(cli, "codex-aaaaaa", false);
+        bed.seed(
+            cli,
+            &[
+                Row {
+                    label: "main".into(),
+                    ..Row::default()
+                },
+                Row {
+                    label: "codex-aaaaaa".into(),
+                    dir: Some(dir),
+                    email: Some(ann.to_owned()),
+                    held_by: held.then(|| "m3".to_owned()),
+                    ..Row::default()
+                },
+            ],
+        );
+        bed.login(ann);
+    };
+
+    let bed = Bed::new();
+    let ann = email("ann");
+    seed(&bed, &ann, true);
+    let lab = lab(vec![lab_account(cli, "ann", "codex-aaaaaa", true)]);
+    let named = report_folds(&bed, cli, &ann, Some(&lab));
+    let doc = bed.sync(cli, &lab);
+    assert_eq!(
+        named.is_ok(),
+        doc["twin_merged"] != Value::Null,
+        "{named:?}: {doc}"
+    );
+
+    // A source this Mac is in no row of: a sync refuses, and the report names no sync.
+    let bed = Bed::new();
+    let ann = email("ann");
+    bed.fleet_file(cli, &[("codex-aaaaaa", &ann)]);
+    fs::write(&bed.toml, "").unwrap();
+    seed(&bed, &ann, false);
+    let (code, doc, err) = bed.sync_plain_any(cli);
+    if code == ExitCode::SUCCESS {
+        assert_eq!(report_folds(&bed, cli, &ann, None), Ok(()), "{doc}");
+    } else {
+        assert_eq!(
+            report_folds(&bed, cli, &ann, None),
+            Err(TwinKept::NoSync),
+            "{err}"
+        );
+    }
+
+    for (warm, folds) in [("m3", false), ("m16", true)] {
+        let bed = Bed::new();
+        let ann = email("ann");
+        let secrets = bed.env.home.as_deref().unwrap().join(".secrets");
+        fs::create_dir_all(&secrets).unwrap();
+        fs::write(
+            secrets.join(crate::harness::ai_pool::AI_POOL_FILE),
+            format!(
+                "version = 1\n\n[last_heard]\nm3 = \"2026-10-27\"\nm16 = \"2026-10-27\"\n\n\
+                 [[account]]\nprovider = \"codex\"\nemail = \"{ann}\"\nwarm = [\"{warm}\"]\n"
+            ),
+        )
+        .unwrap();
+        fs::write(&bed.toml, "[fleet]\nmachine = \"m16\"\n").unwrap();
+        seed(&bed, &ann, false);
+        let named = report_folds(&bed, cli, &ann, None);
+        let (code, doc, err) = bed.sync_plain(cli);
+        assert_eq!(code, ExitCode::SUCCESS, "{warm}: {err}");
+        assert_eq!(named.is_ok(), folds, "{warm}: {named:?}: {doc}");
+        assert_eq!(doc["twin_merged"] != Value::Null, folds, "{warm}: {doc}");
+    }
+}
+
+/// A RENEWAL'S COMPLETION THAT NAMES THE TWIN KEEPS IT ON BOTH SURFACES, for that reason and no
+/// other. CONTROL: with no completion both fold.
+#[test]
+fn a_completion_that_names_the_twin_keeps_it_on_the_report_and_the_sync() {
+    let cli = Cli::Codex;
+    let label = "codex-aaaaaa";
+    for completed in [false, true] {
+        let bed = Bed::new();
+        let address = email("ann");
+        bed.fleet_file(cli, &[(label, &address)]);
+        let empty = bed.dir(cli, label, false);
+        bed.seed(
+            cli,
+            &[
+                Row {
+                    label: "main".into(),
+                    ..Row::default()
+                },
+                Row {
+                    label: label.into(),
+                    dir: Some(empty),
+                    email: Some(address.clone()),
+                    ..Row::default()
+                },
+            ],
+        );
+        bed.login(&address);
+        let store = bed.store(cli);
+        if completed {
+            let staging = store.claim_staging_dir(label).unwrap();
+            let token = crate::harness::codex_app_login::tests::make_chatgpt_jwt(
+                Some(&address),
+                "plus",
+                NOW + 3600,
+            );
+            fs::write(
+                staging.join("auth.json"),
+                aterm_json::json!({"tokens": {"access_token": token}}).to_string(),
+            )
+            .unwrap();
+            fs::write(
+                staging.join("config.toml"),
+                "cli_auth_credentials_store = \"file\"\n",
+            )
+            .unwrap();
+            let logins = store.load_logins(NOW).unwrap().0;
+            accounts::write_renewal_checkpoint_for(
+                cli,
+                None,
+                label,
+                &address,
+                staging.to_str().unwrap(),
+                None,
+                Some(accounts::Proof::Status),
+                NOW - 5,
+                &logins,
+            )
+            .unwrap();
+        }
+        let named = report_folds(&bed, cli, &address, None);
+        assert_eq!(
+            named,
+            if completed {
+                Err(TwinKept::TwinCheckpoint)
+            } else {
+                Ok(())
+            }
+        );
+        let (code, doc, err) = bed.sync_plain(cli);
+        assert_eq!(code, ExitCode::SUCCESS, "{err}");
+        assert_eq!(doc["twin_merged"] == Value::Null, completed, "{doc}");
+        assert_eq!(bed.rows(cli).len(), if completed { 2 } else { 1 });
+    }
 }

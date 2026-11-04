@@ -716,20 +716,25 @@ fn a_codex_starter_is_codex_alab_and_carries_its_config() {
     let d = crate::supervise::ScratchDir::new("codex", "worker-starter");
     let (mine, other) = (abs("/Users//u"), abs("/Users//other"));
     let user = Path::new(&mine);
+    // The image as atpkg lays a build's executable (`bin/codex.exe` on Windows).
+    let entry = format!(
+        "bin/{}",
+        atpkg::store::ToolName::new("codex").unwrap().exe_file()
+    );
     let package = |name: &str, alab: bool| -> PathBuf {
         let root = d.join(name);
         std::fs::create_dir_all(root.join("bin")).expect("bin");
-        std::fs::write(root.join("bin/codex"), "").expect("exe");
+        std::fs::write(root.join(&entry), "").expect("exe");
         std::fs::write(
             root.join(super::super::codex_alab::PACKAGE_JSON),
-            r#"{"layoutVersion": 1, "version": "0.165.0", "entrypoint": "bin/codex"}"#,
+            format!(r#"{{"layoutVersion": 1, "version": "0.165.0", "entrypoint": "{entry}"}}"#),
         )
         .expect("manifest");
         if alab {
             std::fs::write(root.join(super::super::codex_alab::ALAB_BUILD_JSON), "{}")
                 .expect("marker");
         }
-        std::fs::canonicalize(root.join("bin/codex")).expect("the image")
+        std::fs::canonicalize(root.join(&entry)).expect("the image")
     };
     let alab = package("alab", true);
     let vendor = package("vendor", false);

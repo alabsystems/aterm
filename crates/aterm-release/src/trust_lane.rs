@@ -5412,7 +5412,14 @@ pub mod trustd {
 
     /// What a look at the socket gives each answer it waits for: a trustd that takes longer
     /// reads silent, and the wait looks again.
+    #[cfg(not(test))]
     const LOOK_GIVES: Duration = Duration::from_secs(10);
+
+    /// Under test, the one-minute hang detector, as [`TARGO_GIVES`]: a unit test's stand-in
+    /// trustd answers every look from a thread of the test binary, and no test holds one silent
+    /// for a look.
+    #[cfg(test)]
+    const LOOK_GIVES: Duration = aterm_spec::wait::MUST_HAPPEN;
 
     /// The most leases a wait line names.
     const LEASES_SAID: usize = 8;

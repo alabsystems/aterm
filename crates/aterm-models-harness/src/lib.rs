@@ -140,6 +140,7 @@ mod models_account_sync_report;
 mod models_account_tap_read;
 mod models_account_usage_observation;
 mod models_account_worker_environment;
+mod models_account_workflow_scope;
 mod models_agent_verdict;
 mod models_codex_login_publication;
 mod models_codex_refresh_authority;
@@ -172,6 +173,7 @@ mod models_program_queue;
 mod models_program_resolution;
 mod models_relaunch_prompt;
 mod models_scoped_health;
+mod models_self_claim_fact;
 mod models_shared_disposition;
 mod models_shared_recovery;
 mod models_shared_renewal;
@@ -287,6 +289,9 @@ pub use models_account_sync_report::account_sync_report_model;
 pub use models_account_tap_read::account_tap_read_model;
 pub use models_account_usage_observation::account_usage_observation_model;
 pub use models_account_worker_environment::account_worker_environment_model;
+pub use models_account_workflow_scope::{
+    account_workflow_runtime_model, account_workflow_scope_model,
+};
 pub use models_agent_verdict::claude_idle_at_composer_model;
 pub use models_codex_login_publication::codex_login_publication_model;
 pub use models_codex_refresh_authority::codex_refresh_authority_model;
@@ -334,6 +339,7 @@ pub use models_program_queue::{
 pub use models_program_resolution::program_resolution_retry_model;
 pub use models_relaunch_prompt::{relaunch_prompt_read_liveness, relaunch_prompt_read_model};
 pub use models_scoped_health::scoped_health_model;
+pub use models_self_claim_fact::self_claim_fact_model;
 pub use models_shared_disposition::shared_disposition_model;
 pub use models_shared_recovery::{
     shared_adoption_progress_model, shared_adoption_recovery_model,

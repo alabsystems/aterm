@@ -12014,7 +12014,7 @@ pub(super) fn cmd_deps(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode 
         }
         if let Some(value) = &brewfile {
             let path = super::bundle::deps_brewfile_path(value.as_deref());
-            let text = match std::fs::read_to_string(&path) {
+            let text = match crate::metadata_io::read_bounded_regular_utf8(&path, 4 * 1024 * 1024) {
                 Ok(text) => text,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     return failed("Error: No Brewfile found");
@@ -13377,7 +13377,7 @@ fn scan_linkage(prefix: &Prefix, keg: &std::path::Path) -> LinkageReport {
             if !crate::metadata_io::read_head(&p, 8).is_ok_and(|head| is_macho(&head)) {
                 continue;
             }
-            let Ok(bytes) = std::fs::read(&p) else {
+            let Ok(bytes) = crate::metadata_io::read_bounded_regular(&p, 512 * 1024 * 1024) else {
                 continue;
             };
             let Ok(names) = crate::macho::load_names(&bytes) else {
@@ -14903,7 +14903,7 @@ fn bundle_add_entries(api: &Api, rest: &[String]) -> ExitCode {
             Err(e) => return failed(&e),
         }
     } else {
-        std::fs::read_to_string(&path).unwrap_or_default()
+        crate::metadata_io::read_bounded_regular_utf8(&path, 4 * 1024 * 1024).unwrap_or_default()
     };
     content.push_str(&entries.join("\n"));
     content.push('\n');

@@ -962,6 +962,63 @@ fn a_codex_rollout_keeps_its_namespace_and_moves_its_millisecond_times() {
     }
 }
 
+/// GAPS 20 AND 25 IN THE REDUCER: a build nobody measured yet (its gate shut in aterm) still has
+/// its failed command's `exit_code` and its Autopilot's `turn_trigger` kept, because the
+/// reducer's readings read every gated read, and the reduction is what a later measurement opens
+/// the gate from. NEGATIVE CONTROLS: the command's output and the item's text are blanked.
+#[test]
+fn a_reduction_keeps_a_failed_command_and_its_autopilot_trigger() {
+    let src = concat!(
+        r#"{"timestamp":"2026-10-29T10:00:00.000Z","type":"session_meta","payload":{"id":"0199a0b1-0000-7000-8000-000000000abc","cli_version":"0.999.0-dev.1+gabc"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-10-29T10:00:00.100Z","type":"event_msg","payload":{"type":"task_started","turn_id":"0199a0b1-0000-7000-8000-000000000def","turn_attribution":{"turn_id":"0199a0b1-0000-7000-8000-000000000def","turn_trigger":"alab_autopilot"}}}"#,
+        "\n",
+        r#"{"timestamp":"2026-10-29T10:00:00.200Z","type":"turn_context","payload":{"turn_id":"0199a0b1-0000-7000-8000-000000000def","cwd":"/private/tmp/x/proj","model":"gpt-6.1-sol"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-10-29T10:00:01.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"exit 3\"}","call_id":"call_abc"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-10-29T10:00:01.500Z","type":"event_msg","payload":{"type":"item_completed","thread_id":"0199a0b1-0000-7000-8000-000000000abc","turn_id":"0199a0b1-0000-7000-8000-000000000def","item":{"type":"commandExecution","id":"call_abc","command":["SENTINEL-INPUT"],"aggregated_output":"SENTINEL-OUTPUT","status":"failed","exit_code":3}}}"#,
+        "\n",
+        r#"{"timestamp":"2026-10-29T10:00:01.600Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_abc","output":"SENTINEL-OUTPUT"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-10-29T10:00:02.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"0199a0b1-0000-7000-8000-000000000def","duration_ms":1800}}"#,
+        "\n"
+    );
+    let r = reduce(src, Program::Codex).expect("reduced");
+    assert!(r.text.contains(r#""exit_code":3"#), "{}", r.text);
+    assert!(
+        r.text.contains(r#""turn_trigger":"alab_autopilot""#),
+        "{}",
+        r.text
+    );
+    assert!(!r.text.contains("SENTINEL"), "{}", r.text);
+    let read = readings(&r.text, Program::Codex);
+    let failed = read
+        .steps
+        .iter()
+        .filter(|s| matches!(s.ev, StepEvent::ToolResult { error: true, .. }))
+        .count();
+    let harness = read
+        .steps
+        .iter()
+        .filter(|s| matches!(s.ev, StepEvent::HarnessTurn { .. }))
+        .count();
+    assert_eq!((failed, harness), (1, 1), "{:?}", read.steps);
+    let prompt = read
+        .steps
+        .iter()
+        .position(|s| matches!(s.ev, StepEvent::Prompt { .. }));
+    let began = read
+        .steps
+        .iter()
+        .position(|s| matches!(s.ev, StepEvent::HarnessTurn { .. }));
+    assert!(
+        prompt.is_some() && began == prompt.map(|p| p + 1),
+        "the harness step right after its prompt: {:?}",
+        read.steps
+    );
+}
+
 #[test]
 fn a_line_that_is_no_json_refuses_the_file() {
     let e = reduce("{\"type\":\"user\"}\n{\"type\":", Program::Claude).expect_err("refused");

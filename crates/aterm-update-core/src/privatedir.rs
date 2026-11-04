@@ -140,10 +140,7 @@ mod tests {
 
     #[test]
     fn an_already_private_dir_is_not_rewritten_and_a_drifted_one_is_hardened() {
-        let scratch = aterm_tempfile::Builder::new()
-            .prefix("atuc-privatedir-")
-            .tempdir()
-            .unwrap();
+        let scratch = crate::test_scratch_dir("privatedir");
         let dir = scratch.path().join("private");
         ensure_private_dir(&dir).unwrap();
         let stamp = || {
@@ -241,10 +238,7 @@ mod tests {
         if probe_missing_ancestors_are_never_shared_whatever_the_umask_if_asked() {
             return;
         }
-        let scratch = aterm_tempfile::Builder::new()
-            .prefix("atuc-open-umask-")
-            .tempdir()
-            .unwrap();
+        let scratch = crate::test_scratch_dir("open-umask");
         let out = aterm_uds::spawnfd::command(std::env::current_exe().unwrap())
             .args(["--exact", "--nocapture", OPEN_UMASK_PROBE])
             .env(OPEN_UMASK_ENV, scratch.path().as_os_str())

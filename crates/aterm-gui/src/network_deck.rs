@@ -18,8 +18,13 @@ mod repair;
 /// Fixed headroom, independent of the number or state of peers.
 pub(crate) const HEIGHT_PT: f64 = 30.0;
 
-/// Rendered long and short place captions, captured together before a frame is keyed.
-pub(crate) type PlaceCaption = (String, String);
+/// Place words and their offline classification, captured together before a frame is keyed.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct PlaceCaption {
+    pub(crate) long: String,
+    pub(crate) short: String,
+    offline: bool,
+}
 
 pub(crate) fn inactive_snapshot() -> std::sync::Arc<NetworkStateSnapshot> {
     let mut snapshot = NetworkStateSnapshot::default();
@@ -313,10 +318,17 @@ fn observation_time(at_ms: u64) -> String {
 pub(crate) fn place_caption(place: Option<&aterm_netplace::Place>) -> Option<PlaceCaption> {
     place
         .filter(|place| aterm_netplace::words::off_the_alab_lan(place))
-        .map(aterm_netplace::words::band)
+        .map(|place| {
+            let (long, short) = aterm_netplace::words::band(place);
+            PlaceCaption {
+                long,
+                short,
+                offline: place.at == aterm_netplace::Where::Offline,
+            }
+        })
 }
 
-/// Capture only the visible place words; paint never reads the changing place cache.
+/// Capture place words and status together; paint never reads the changing place cache.
 pub(crate) fn capture_place_caption() -> Option<PlaceCaption> {
     place_caption(crate::net_place::cached().as_ref())
 }
@@ -327,8 +339,7 @@ pub(crate) fn summary(snapshot: &NetworkStateSnapshot) -> String {
     summary_with_caption(snapshot, capture_place_caption().as_ref())
 }
 
-/// [`summary`] with this Mac's network place `place`: away from the ALab LAN, the place's words
-/// lead ([`place_caption`]).
+/// [`summary`] with this Mac's network place `place`, retaining independent observer failures.
 #[cfg(test)]
 pub(crate) fn summary_at(
     snapshot: &NetworkStateSnapshot,
@@ -347,8 +358,13 @@ pub(crate) fn summary_with_caption(
     {
         text.push_str(&format!(" · {} known", snapshot.network.peers.len()));
     }
-    if let Some((long, _)) = caption {
-        text.clone_from(long);
+    if let Some(caption) = caption {
+        if place_only(network_status(snapshot), caption) {
+            text.clone_from(&caption.long);
+        } else {
+            text.push_str(" · ");
+            text.push_str(&caption.short);
+        }
     }
     if snapshot.network.retention_limited {
         text.push_str(" · partial history");
@@ -361,6 +377,11 @@ enum NetworkStatus {
     Visibility(Visibility),
     HistoryUnavailable,
     HistoryRestoring,
+}
+
+fn place_only(status: NetworkStatus, caption: &PlaceCaption) -> bool {
+    status == NetworkStatus::Visibility(Visibility::Active)
+        || status == NetworkStatus::Visibility(Visibility::Offline) && caption.offline
 }
 
 fn network_status(snapshot: &NetworkStateSnapshot) -> NetworkStatus {
@@ -1001,13 +1022,21 @@ pub(crate) fn paint_with_inks(
                 text = known;
             }
         }
-        // Away from the ALab LAN, the frame's captured words explain its place.
-        if let Some((long, short)) = caption {
-            text = if p.ui_text_w(long, false) <= room {
-                long.clone()
+        // Place does not establish observer or history health. Keep their status first,
+        // dropping optional place words before the status when the strip is constrained.
+        if let Some(caption) = caption {
+            if place_only(status, caption) {
+                text = if p.ui_text_w(&caption.long, false) <= room {
+                    caption.long.clone()
+                } else {
+                    caption.short.clone()
+                };
             } else {
-                short.clone()
-            };
+                let composed = format!("{text} · {}", caption.short);
+                if p.ui_text_w(&composed, false) <= room {
+                    text = composed;
+                }
+            }
         }
         if snapshot.network.retention_limited {
             let partial = format!("{text} · partial history");
@@ -1370,6 +1399,100 @@ mod tests {
             }
             _ => None,
         })
+    }
+
+    #[test]
+    fn away_place_keeps_observer_and_history_failures_visible() {
+        let mut active = NetworkStateSnapshot::default();
+        active.network.visibility = Visibility::Active;
+        active.network.history = HistoryState::Ready;
+        active.network.observed_at_ms = 10_000;
+        active.services.accounts.availability = ServiceAvailability::Cached;
+        active.services.accounts.observed_at_ms = 10_000;
+        active.services.secrets = active.services.accounts.clone();
+        let active = std::sync::Arc::new(active);
+        let mut busy = false;
+        let mut cases = vec![
+            fresh_snapshot(active.clone(), Some(25_001)),
+            snapshot_after_read(None, &active, &mut busy, Some(10_000)),
+        ];
+        for (visibility, history) in [
+            (Visibility::Waiting, HistoryState::Ready),
+            (Visibility::Disabled, HistoryState::Ready),
+            (Visibility::Active, HistoryState::Restoring),
+            (Visibility::Active, HistoryState::Unavailable),
+            (Visibility::Offline, HistoryState::Restoring),
+            (Visibility::Offline, HistoryState::Unavailable),
+        ] {
+            let mut snapshot = active.as_ref().clone();
+            snapshot.network.visibility = visibility;
+            snapshot.network.history = history;
+            cases.push(std::sync::Arc::new(snapshot));
+        }
+        let mut offline = aterm_netplace::sample::hotspot(10_000, 10_000);
+        offline.at = aterm_netplace::Where::Offline;
+        for place in [aterm_netplace::sample::hotspot(10_000, 10_000), offline] {
+            let place = place_caption(Some(&place)).expect("away caption");
+            if place.offline {
+                let mut confirmed = active.as_ref().clone();
+                confirmed.network.visibility = Visibility::Offline;
+                assert_eq!(summary_with_caption(&confirmed, Some(&place)), place.long);
+            }
+            for snapshot in &cases {
+                let status = summary_with_caption(snapshot, None);
+                let composed = summary_with_caption(snapshot, Some(&place));
+                assert!(composed.starts_with(&status), "{status}: {composed}");
+                for scale in [1.0, 2.0] {
+                    for width in [350.0, 700.0, 1100.0] {
+                        let g = DeckGeom {
+                            w: width * scale,
+                            h: 200.0 * scale,
+                            pad: 0.0,
+                            scale,
+                            font_px: 14.0 * scale,
+                        };
+                        let inks = crate::stats_deck::cached_inks(
+                            [20, 20, 20],
+                            [230, 230, 230],
+                            [100, 180, 200],
+                        );
+                        let draw = |caption| {
+                            paint_with_inks(
+                                &g,
+                                170.0 * scale,
+                                snapshot,
+                                &crate::lab_deck::LabDeck::default(),
+                                caption,
+                                &inks,
+                                false,
+                            )
+                        };
+                        let original = draw(None);
+                        let composed = draw(Some(&place));
+                        assert_eq!(original.1, composed.1);
+                        for target in [Target::Local, Target::Accounts, Target::Secrets] {
+                            assert_eq!(
+                                crate::stats_deck::prims_fp(&cell_prims(
+                                    &original.0,
+                                    &original.1,
+                                    target
+                                )),
+                                crate::stats_deck::prims_fp(&cell_prims(
+                                    &composed.0,
+                                    &composed.1,
+                                    target
+                                )),
+                            );
+                        }
+                        let status = compact_caption(&original.0, 170.0 * scale, scale)
+                            .expect("status fits");
+                        let caption = compact_caption(&composed.0, 170.0 * scale, scale)
+                            .expect("composed status fits");
+                        assert!(caption.starts_with(status), "{status}: {caption}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

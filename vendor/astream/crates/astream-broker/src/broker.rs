@@ -1939,14 +1939,24 @@ fn hello_health(vitals: &crate::store::LogVitals) -> crate::proto::HelloHealth {
 /// is refreshed only when the writer publishes the batch's state, after the poison of a
 /// failure that latched it — so the tier is read from the vitals AFTER the poison, and
 /// an answer that names the poison names the tier the log serves with it
-/// ([`LogVitals::served`](crate::store::LogVitals::served)).
-fn hello_answer(told: HelloCopy, vitals: &crate::store::LogVitals) -> HelloCopy {
+/// ([`LogVitals::served`](crate::store::LogVitals::served)). And whether the broker
+/// gap-fences the writes of a connection that asks (`gap_fences`,
+/// [`Broker::sticky_batch_refusal`], [`Request::FenceGaps`]), fixed when the broker opens:
+/// the request set's [`REQUEST_GAP_FENCES`](crate::proto::REQUEST_GAP_FENCES) bit. A
+/// connection that asked can rely on that guarantee for its entire lifetime.
+fn hello_answer(told: HelloCopy, vitals: &crate::store::LogVitals, gap_fences: bool) -> HelloCopy {
     let HelloCopy { identity, mut ext } = told;
     ext.health = Some(hello_health(vitals));
     ext.durability = match ext.durability {
         Some(s) => Some(vitals.served(s)),
         None => None,
     };
+    if gap_fences {
+        ext.requests = Some(match ext.requests {
+            Some(r) => r | crate::proto::REQUEST_GAP_FENCES,
+            None => crate::proto::REQUEST_GAP_FENCES,
+        });
+    }
     HelloCopy { identity, ext }
 }
 
@@ -2183,7 +2193,7 @@ struct Shared {
     /// [`BrokerStats::rate_limited`].
     rate_limited: AtomicU64,
     /// Fast lock-free gate for [`Self::sticky_fences`] (`false` by default).
-    has_sticky_batch_refusal: AtomicBool,
+    has_sticky_batch_refusal: bool,
     /// Per-`(conn_id, producer_id)` sticky sequence gap fences (pure leaf lock).
     sticky_fences: Mutex<crate::sticky_fence::StickyFenceTable>,
     /// [`BrokerStats::peer_probes`].
@@ -3523,7 +3533,7 @@ impl Drop for ConnGuard<'_> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&self.id);
-        if self.shared.has_sticky_batch_refusal.load(Ordering::Acquire) {
+        if self.shared.has_sticky_batch_refusal {
             let mut fences = match self.shared.sticky_fences.lock() {
                 Ok(g) => g,
                 Err(p) => p.into_inner(),
@@ -3778,7 +3788,7 @@ impl Broker {
     /// a corrupt log — see [`BrokerLog::open_with`].
     pub fn open_with(log_path: impl AsRef<Path>, durability: Durability) -> io::Result<Broker> {
         let log = BrokerLog::open_with(log_path, durability)?;
-        Ok(Self::start(log, None, None))
+        Ok(Self::start(log, None, None, false))
     }
 
     /// Open at `durability`, preparing embedder sidecars under the log's own lock.
@@ -3800,7 +3810,7 @@ impl Broker {
         prepare: impl FnOnce() -> io::Result<()>,
     ) -> io::Result<Broker> {
         let log = BrokerLog::open_with_prepare(log_path, durability, prepare)?;
-        Ok(Self::start(log, None, None))
+        Ok(Self::start(log, None, None, false))
     }
 
     /// Open a broker as `opts` say — the open the other constructors are shorthands
@@ -3841,12 +3851,9 @@ impl Broker {
         let selective_tail_wake = opts.selective_tail_wake;
         let sticky_batch_refusal = opts.sticky_batch_refusal;
         let log = BrokerLog::open_opts(log_path, opts, prepare)?;
-        let broker = Self::start(log, None, guard);
+        let broker = Self::start(log, None, guard, sticky_batch_refusal);
         if selective_tail_wake {
             broker.set_selective_tail_wake(true);
-        }
-        if sticky_batch_refusal {
-            broker.set_sticky_batch_refusal(true);
         }
         if let Some(lim) = rate_limit {
             broker.set_rate_limit(Some(lim))?;
@@ -3906,7 +3913,7 @@ impl Broker {
     ) -> io::Result<Broker> {
         let mut log = BrokerLog::open_with(log_path, durability)?;
         log.declare_replica()?;
-        Ok(Self::start(log, None, None))
+        Ok(Self::start(log, None, None, false))
     }
 
     /// [`open_replica`](Self::open_replica) with capability enforcement on the accept
@@ -3932,7 +3939,7 @@ impl Broker {
         }
         let mut log = BrokerLog::open_with(log_path, durability)?;
         log.declare_replica()?;
-        Ok(Self::start(log, None, Some(secret)))
+        Ok(Self::start(log, None, Some(secret), false))
     }
 
     /// Open a broker whose durable log is ENCRYPTED AT REST: every record's payload
@@ -3945,7 +3952,7 @@ impl Broker {
     #[cfg(feature = "at-rest")]
     pub fn open_encrypted(log_path: impl AsRef<Path>, key: [u8; 32]) -> io::Result<Broker> {
         let log = BrokerLog::open_encrypted(log_path, key)?;
-        Ok(Self::start(log, None, None))
+        Ok(Self::start(log, None, None, false))
     }
 
     /// [`open_encrypted`](Self::open_encrypted) at a chosen [`Durability`].
@@ -3956,7 +3963,7 @@ impl Broker {
         key: [u8; 32],
     ) -> io::Result<Broker> {
         let log = BrokerLog::open_encrypted_with(log_path, durability, key)?;
-        Ok(Self::start(log, None, None))
+        Ok(Self::start(log, None, None, false))
     }
 
     /// Like [`open_encrypted`](Self::open_encrypted), additionally refusing legacy v1
@@ -3964,7 +3971,7 @@ impl Broker {
     #[cfg(feature = "at-rest")]
     pub fn open_encrypted_bound(log_path: impl AsRef<Path>, key: [u8; 32]) -> io::Result<Broker> {
         let log = BrokerLog::open_encrypted_bound(log_path, key)?;
-        Ok(Self::start(log, None, None))
+        Ok(Self::start(log, None, None, false))
     }
 
     /// [`open_encrypted_bound`](Self::open_encrypted_bound) at a chosen [`Durability`].
@@ -3975,7 +3982,7 @@ impl Broker {
         key: [u8; 32],
     ) -> io::Result<Broker> {
         let log = BrokerLog::open_encrypted_bound_with(log_path, durability, key)?;
-        Ok(Self::start(log, None, None))
+        Ok(Self::start(log, None, None, false))
     }
 
     /// Open a broker combining CAPABILITY ENFORCEMENT (`secret`, as
@@ -4015,7 +4022,7 @@ impl Broker {
         key: [u8; 32],
     ) -> io::Result<Broker> {
         let log = BrokerLog::open_encrypted_verified(log_path, key)?;
-        Ok(Self::start(log, None, None))
+        Ok(Self::start(log, None, None, false))
     }
 
     /// Bootstrap [`open_encrypted_verified`](Self::open_encrypted_verified): establish
@@ -4026,7 +4033,7 @@ impl Broker {
         key: [u8; 32],
     ) -> io::Result<Broker> {
         let log = BrokerLog::open_encrypted_verified_init(log_path, key)?;
-        Ok(Self::start(log, None, None))
+        Ok(Self::start(log, None, None, false))
     }
 
     /// Open a broker combining CAPABILITY ENFORCEMENT (`secret`), ENCRYPT-AT-REST (`key`),
@@ -4261,8 +4268,11 @@ impl Broker {
             .residency()
     }
 
-    #[cfg(all(test, unix))]
-    pub(crate) fn cold_reads(&self) -> u64 {
+    /// The records this broker's log has read back from its file because the residency budget
+    /// left them cold, since the open ([`BrokerLog::cold_reads`]): what the budget costs its
+    /// readers. 0 with no budget.
+    #[must_use]
+    pub fn cold_reads(&self) -> u64 {
         self.shared
             .log
             .lock()
@@ -4532,31 +4542,11 @@ impl Broker {
         Ok(())
     }
 
-    /// Enable or disable opt-in sticky producer gap fencing on refused batches
-    /// (`DESIGN-aterm-fabric` §14 Open Question 7 & §15).
-    ///
-    /// When `true`, refusing a `Publish` or `ProcessAndProduce` on `(conn_id, producer_id)`
-    /// latches `fence_seq` to `min(fence_seq, producer_seq)` and refuses subsequent
-    /// pipelined writes with `req_seq > fence_seq` (`gap-fenced=<fence_seq>: ...`) until
-    /// an idempotent retry at `<= fence_seq` commits. Disabling (`false`) clears all
-    /// active fences.
-    pub fn set_sticky_batch_refusal(&self, on: bool) {
-        if !on {
-            let mut fences = match self.shared.sticky_fences.lock() {
-                Ok(g) => g,
-                Err(p) => p.into_inner(),
-            };
-            fences.clear();
-        }
-        self.shared
-            .has_sticky_batch_refusal
-            .store(on, Ordering::Release);
-    }
-
-    /// Whether opt-in sticky producer gap fencing on refused batches is active.
+    /// Whether this broker was opened with sticky producer gap fencing.
+    /// Fixed for its lifetime so a producer can rely on the guarantee advertised by Hello.
     #[must_use]
     pub fn sticky_batch_refusal(&self) -> bool {
-        self.shared.has_sticky_batch_refusal.load(Ordering::Acquire)
+        self.shared.has_sticky_batch_refusal
     }
 
     /// Currently active per-principal / per-producer rate limit, if any.
@@ -4723,6 +4713,7 @@ impl Broker {
         mut log: BrokerLog,
         replicator: Option<Replicator>,
         cap_secret: Option<Vec<u8>>,
+        sticky_batch_refusal: bool,
     ) -> Broker {
         // Strict/Relaxed: everything durable is visible. Replicated: only what a quorum
         // already confirmed (the caller caught the followers up before handing us
@@ -4816,7 +4807,7 @@ impl Broker {
             has_rate_limit: AtomicBool::new(false),
             rate_limiter: Mutex::new(RateLimiterState::new()),
             rate_limited: AtomicU64::new(0),
-            has_sticky_batch_refusal: AtomicBool::new(false),
+            has_sticky_batch_refusal: sticky_batch_refusal,
             sticky_fences: Mutex::new(crate::sticky_fence::StickyFenceTable::new()),
             peer_probes: AtomicU64::new(0),
             parked_tails: AtomicUsize::new(0),
@@ -4956,7 +4947,7 @@ impl Broker {
             return Err(empty_secret());
         }
         let log = BrokerLog::open_with(log_path, durability)?;
-        Ok(Self::start(log, None, Some(secret)))
+        Ok(Self::start(log, None, Some(secret), false))
     }
 
     /// [`open_guarded_with`](Self::open_guarded_with) with sidecar preparation
@@ -4974,7 +4965,7 @@ impl Broker {
             return Err(empty_secret());
         }
         let log = BrokerLog::open_with_prepare(log_path, durability, prepare)?;
-        Ok(Self::start(log, None, Some(secret)))
+        Ok(Self::start(log, None, Some(secret), false))
     }
 
     /// Open a broker in the REPLICATED durability tier. The local write is page-cache
@@ -5309,7 +5300,7 @@ impl Broker {
                  at open (a follower refused, diverged, or timed out)"
             )));
         }
-        Ok(Self::start(log, Some(rep), secret))
+        Ok(Self::start(log, Some(rep), secret, false))
     }
 
     /// Override the wall-clock source sampled when stamping broker time (`bt=`) on
@@ -6465,7 +6456,8 @@ fn health_of(shared: &Shared) -> crate::health::BrokerHealth {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
-    let HelloCopy { identity, ext } = hello_answer(told, &shared.vitals);
+    let HelloCopy { identity, ext } =
+        hello_answer(told, &shared.vitals, shared.has_sticky_batch_refusal);
     let served = match ext.durability {
         Some(s) => s,
         None => shared
@@ -7395,6 +7387,11 @@ fn serve_conn(
     // marks, which would reset the socket timeout an old take/drain uses to stop on idle,
     // and they would read a gap notice as a reply of the wrong kind.
     let mut asks = TailAsks::default();
+    // Whether the connection asked to have its producers' writes GAP-FENCED
+    // ([`Request::FenceGaps`]), on a broker that offers it: until it does, a refused write
+    // latches no fence, and a write it pipelined behind one lands as on an unfenced broker,
+    // so a client that predates the verb is served as it always was.
+    let mut fences_gaps = false;
     let replicate_diverged = Arc::new(AtomicBool::new(false));
     // The requests read off the socket and not yet served: one read takes every frame
     // that has arrived, and the loop asks it whether the next request is already here
@@ -7525,7 +7522,8 @@ fn serve_conn(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
-            let HelloCopy { identity, ext } = hello_answer(told, &shared.vitals);
+            let HelloCopy { identity, ext } =
+                hello_answer(told, &shared.vitals, shared.has_sticky_batch_refusal);
             let log = Some(identity);
             write_frame(
                 &mut stream,
@@ -7613,7 +7611,7 @@ fn serve_conn(
                                     shared,
                                     &mut stream,
                                     &mut pipe,
-                                    conn_id,
+                                    fences_gaps.then_some(conn_id),
                                     *producer_id,
                                     *producer_seq,
                                     err,
@@ -7626,7 +7624,7 @@ fn serve_conn(
                                     shared,
                                     &mut stream,
                                     &mut pipe,
-                                    conn_id,
+                                    fences_gaps.then_some(conn_id),
                                     *producer_id,
                                     *producer_seq,
                                     err,
@@ -7661,6 +7659,7 @@ fn serve_conn(
             will,
             had_will,
             &mut asks,
+            &mut fences_gaps,
             &replicate_diverged,
             until,
             peer_id,
@@ -7718,6 +7717,7 @@ fn dispatch_request(
     will: &mut Vec<(WillRecord, u64)>,
     had_will: &mut bool,
     asks: &mut TailAsks,
+    fences_gaps: &mut bool,
     replicate_diverged: &Arc<AtomicBool>,
     until: u64,
     peer_id: Option<[u8; 32]>,
@@ -7725,6 +7725,8 @@ fn dispatch_request(
     req: Request,
     req_bt_ms: Option<u64>,
 ) -> io::Result<bool> {
+    // The connection a refused write fences, once it asked ([`Request::FenceGaps`]).
+    let fence = fences_gaps.then_some(conn_id);
     match req {
         Request::Publish {
             producer_id,
@@ -7734,7 +7736,7 @@ fn dispatch_request(
         } => serve_publish(
             shared,
             stream,
-            conn_id,
+            fence,
             pipe,
             producer_id,
             producer_seq,
@@ -7757,7 +7759,7 @@ fn dispatch_request(
                     shared,
                     stream,
                     pipe,
-                    conn_id,
+                    fence,
                     producer_id,
                     producer_seq,
                     (code, format!("output {err}")),
@@ -7772,7 +7774,7 @@ fn dispatch_request(
                     shared,
                     stream,
                     pipe,
-                    conn_id,
+                    fence,
                     producer_id,
                     producer_seq,
                     err,
@@ -7782,7 +7784,7 @@ fn dispatch_request(
                 shared,
                 stream,
                 pipe,
-                Some(conn_id),
+                fence,
                 WriteKind::ProcessAndProduce {
                     producer_id,
                     producer_seq,
@@ -7984,6 +7986,45 @@ fn dispatch_request(
             write_frame(stream, &encode_response(&mark_at_head(shared)))?;
             Ok(true)
         }
+        Request::FenceGaps => {
+            // Answered in the request loop after the pending acks, so every write this
+            // connection sent before the request was judged unfenced, as it was sent, and
+            // every write it sends after the answer is fenced. A broker opened without the
+            // option keeps none: it refuses the ask, and the producer keeps its order by
+            // keeping one write in flight (`ERR_REFUSED`, the code a broker that predates the
+            // verb answers it with).
+            finish_pipe(pipe)?;
+            if !shared.has_sticky_batch_refusal {
+                return emit(
+                    stream,
+                    pipe,
+                    Err(refusal(
+                        ERR_REFUSED,
+                        "gap fences not kept: the broker was opened without sticky_batch_refusal",
+                    )),
+                );
+            }
+            *fences_gaps = true;
+            write_frame(stream, &encode_response(&mark_at_head(shared)))?;
+            Ok(true)
+        }
+        Request::ClearGapFences => {
+            // Answered in the request loop after the pending acks: every write this
+            // connection sent before the request has been judged by then, each refused
+            // one's latch set before its ack went (`record_sticky_ack_refusal`), so the
+            // drop lifts the fences of writes already answered and none of a write still
+            // in flight. The same drop a close makes (`ConnGuard`'s `Drop`).
+            finish_pipe(pipe)?;
+            if shared.has_sticky_batch_refusal {
+                shared
+                    .sticky_fences
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .drop_conn(conn_id);
+            }
+            write_frame(stream, &encode_response(&mark_at_head(shared)))?;
+            Ok(true)
+        }
         Request::Stats { filter } => serve_stats(shared, stream, pipe, filter),
         Request::Budget { producer_id } => {
             // Answered in the request loop after the pending acks, so a count read
@@ -8074,7 +8115,7 @@ fn serve_retire(
 fn serve_publish(
     shared: &Arc<Shared>,
     stream: &mut Conn,
-    conn_id: u64,
+    fence: Option<u64>,
     pipe: &mut Option<Pipeline>,
     producer_id: u64,
     producer_seq: u64,
@@ -8135,36 +8176,20 @@ fn serve_publish(
         );
     }
     if let Some(err) = publish_subject_error(&subject) {
-        return emit_producer_refusal(
-            shared,
-            stream,
-            pipe,
-            conn_id,
-            producer_id,
-            producer_seq,
-            err,
-        );
+        return emit_producer_refusal(shared, stream, pipe, fence, producer_id, producer_seq, err);
     }
     if let Err(err) = check_publish_rate_limit(
         shared,
         producer_id,
         subject.len().saturating_add(body.len()),
     ) {
-        return emit_producer_refusal(
-            shared,
-            stream,
-            pipe,
-            conn_id,
-            producer_id,
-            producer_seq,
-            err,
-        );
+        return emit_producer_refusal(shared, stream, pipe, fence, producer_id, producer_seq, err);
     }
     emit_conn_op(
         shared,
         stream,
         pipe,
-        Some(conn_id),
+        fence,
         WriteKind::Publish {
             producer_id,
             producer_seq,
@@ -9159,9 +9184,12 @@ fn cap_authorized_until(
         // These grant nothing, but their `Mark` names the log's head, which an
         // unattached connection is told nothing about: any capability the ring still
         // holds — genuine and unexpired — answers for it.
-        Request::Keepalive | Request::IdleMarks | Request::GapNotices | Request::BrokerTimes => {
-            (CapPred::AnyValid, None)
-        }
+        Request::Keepalive
+        | Request::IdleMarks
+        | Request::GapNotices
+        | Request::BrokerTimes
+        | Request::FenceGaps
+        | Request::ClearGapFences => (CapPred::AnyValid, None),
         // A producer's budget is answered to whoever could spend it: a genuine,
         // unexpired read-write grant that publishes as that producer — bound to it,
         // or unbound (the god grant publishes as any). It names no subject, so no
@@ -9267,6 +9295,8 @@ fn oversized_name(req: &Request) -> Option<String> {
         | Request::IdleMarks
         | Request::GapNotices
         | Request::BrokerTimes
+        | Request::FenceGaps
+        | Request::ClearGapFences
         | Request::Budget { .. } => [NONE, NONE],
     };
     for (what, name) in names {
@@ -9480,21 +9510,25 @@ fn emit_conn_op(
     Ok(p.submit_conn_opt(conn_id, kind))
 }
 
+/// Answer a producer's write refused before the writer saw it. On a connection that asked to
+/// be gap-fenced (`fence`, its id) the refusal goes through the writer in send order, which
+/// latches the fence there before anything the producer sent after it is staged
+/// ([`WriteKind::PreRefused`]); on any other it is answered in order and fences nothing.
 fn emit_producer_refusal(
     shared: &Arc<Shared>,
     stream: &mut Conn,
     pipe: &mut Option<Pipeline>,
-    conn_id: u64,
+    fence: Option<u64>,
     producer_id: u64,
     producer_seq: u64,
     err: Refusal,
 ) -> io::Result<bool> {
-    if shared.has_sticky_batch_refusal.load(Ordering::Acquire) {
+    if fence.is_some() {
         emit_conn_op(
             shared,
             stream,
             pipe,
-            Some(conn_id),
+            fence,
             WriteKind::PreRefused {
                 producer_id,
                 producer_seq,
@@ -9886,13 +9920,9 @@ fn plan_tail_wakes(
             WakePlan::None
         };
     }
-    let sums = if before < visible {
-        log.visible_summaries(Offset(before), Offset(visible))
-    } else {
-        &[]
-    };
+    let sums = log.visible_summaries(Offset(before), Offset(visible));
     let mut has_any_deliverable = false;
-    for s in sums {
+    for s in sums.iter() {
         if !s.is_hidden() {
             has_any_deliverable = true;
             break;
@@ -9910,7 +9940,7 @@ fn plan_tail_wakes(
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut first_match: Option<u64> = None;
         if has_any_deliverable {
-            for s in sums {
+            for s in sums.iter() {
                 if !s.is_hidden() && p.filter.matches_str(s.subject()) {
                     first_match = Some(s.offset());
                     break;
@@ -10162,7 +10192,7 @@ fn stage_batch_ops(
     // answered at once.
     let mut local_only: Vec<bool> = Vec::new();
     let mut sticky_meta: Vec<Option<StickyOpMeta>> = Vec::new();
-    let mut fences_guard = if shared.has_sticky_batch_refusal.load(Ordering::Acquire) {
+    let mut fences_guard = if shared.has_sticky_batch_refusal {
         Some(match shared.sticky_fences.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
@@ -10959,7 +10989,7 @@ fn record_sticky_ack_refusal(shared: &Shared, meta: Option<StickyOpMeta>, send: 
     let Some(m) = meta else {
         return;
     };
-    if send.is_ok() || !shared.has_sticky_batch_refusal.load(Ordering::Acquire) {
+    if send.is_ok() || !shared.has_sticky_batch_refusal {
         return;
     }
     let mut fences = match shared.sticky_fences.lock() {
@@ -14505,7 +14535,7 @@ mod tests {
             Some(crate::proto::Tier::Relaxed),
             "the copy is not refreshed yet"
         );
-        let told = hello_answer(held.clone(), &b.shared.vitals);
+        let told = hello_answer(held.clone(), &b.shared.vitals, false);
         drop(held);
         let health = told.ext.health.expect("the health entry");
         assert_eq!(health.poisoned.as_deref(), Some(why.as_str()));

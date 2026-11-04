@@ -194,6 +194,9 @@ pub struct Held {
     pub resident_bytes: usize,
     /// Every record it retains.
     pub retained: usize,
+    /// The records it has read back from its log file since the open because the budget left
+    /// them cold (`Broker::cold_reads`, D10d): 0 with no budget.
+    pub cold_reads: u64,
     /// This process's physical footprint now, bytes (macOS `ri_phys_footprint`); `None` where
     /// the process table does not say.
     pub footprint: Option<u64>,
@@ -206,6 +209,7 @@ pub struct Held {
 #[must_use]
 pub fn held(broker: &astream_broker::Broker) -> Held {
     let (resident_records, resident_bytes, retained) = broker.residency();
+    let cold_reads = broker.cold_reads();
     let me = std::process::id();
     let mine = aterm_sysprobe::procs::processes()
         .and_then(|sweep| sweep.procs.into_iter().find(|p| p.pid == me));
@@ -213,6 +217,7 @@ pub fn held(broker: &astream_broker::Broker) -> Held {
         resident_records,
         resident_bytes,
         retained,
+        cold_reads,
         footprint: mine.as_ref().and_then(|p| p.footprint),
         peak_footprint: mine.as_ref().and_then(|p| p.peak_footprint),
     }

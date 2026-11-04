@@ -533,7 +533,7 @@ pub(crate) fn linux_children(pid: i32) -> Option<Vec<i32>> {
     let mut out = Vec::new();
     let mut read_any = false;
     for task in tasks.flatten() {
-        if let Ok(list) = std::fs::read_to_string(task.path().join("children")) {
+        if let Ok(list) = aterm_uds::process::read_proc_text(&task.path().join("children")) {
             read_any = true;
             out.extend(parse_children(&list));
         }

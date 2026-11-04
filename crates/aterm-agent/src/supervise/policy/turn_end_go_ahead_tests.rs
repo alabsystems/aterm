@@ -684,6 +684,7 @@ fn a_park_the_harness_attaches_to_gets_the_go_ahead() {
         answered: Some(ScreenAnswer {
             prompt: 7,
             work: None,
+            harness: false,
         }),
         ..idle(INCIDENT, Some(2 * MIN))
     };
@@ -704,6 +705,7 @@ fn a_reply_to_a_host_fact_or_a_carry_still_gets_the_go_ahead() {
                 answered: Some(ScreenAnswer {
                     prompt: 1,
                     work: None,
+                    harness: false,
                 }),
                 ..idle("Fetched main; nothing moved.", Some(3 * MIN))
             },
@@ -718,6 +720,7 @@ fn a_reply_to_a_host_fact_or_a_carry_still_gets_the_go_ahead() {
             answered: Some(ScreenAnswer {
                 prompt: 2,
                 work: None,
+                harness: false,
             }),
             ..idle(INCIDENT, Some(2 * MIN))
         };
@@ -1022,6 +1025,7 @@ fn a_key_in_a_turn_the_harness_opened_holds_the_hour() {
                     answered: Some(ScreenAnswer {
                         prompt: 1,
                         work: None,
+                        harness: false,
                     }),
                     ..idle("Fetched main; nothing moved.", Some(3 * MIN))
                 },
@@ -1044,6 +1048,7 @@ fn a_key_in_a_turn_the_harness_opened_holds_the_hour() {
             answered: Some(ScreenAnswer {
                 prompt: 9,
                 work: None,
+                harness: false,
             }),
             ..idle("The push still waits until you say so.", Some(2 * MIN))
         };
@@ -1299,6 +1304,7 @@ fn a_persons_turn_ending_at_a_wall_holds_the_hour() {
         answered: Some(ScreenAnswer {
             prompt: 3,
             work: None,
+            harness: false,
         }),
         ..persons_turn()
     };
@@ -1318,6 +1324,7 @@ fn a_persons_turn_ending_at_a_wall_holds_the_hour() {
         answered: Some(ScreenAnswer {
             prompt: 4,
             work: None,
+            harness: false,
         }),
         ..idle(
             "I'll merge main into my branch and push it once I get your go-ahead.",
@@ -1341,6 +1348,7 @@ fn a_turn_the_harness_opened_is_no_persons_past_a_second_break() {
             answered: Some(ScreenAnswer {
                 prompt: 1,
                 work: None,
+                harness: false,
             }),
             ..idle("Fetched main; nothing moved.", Some(3 * MIN))
         },
@@ -1359,6 +1367,7 @@ fn a_turn_the_harness_opened_is_no_persons_past_a_second_break() {
         answered: Some(ScreenAnswer {
             prompt: 2,
             work: None,
+            harness: false,
         }),
         ..idle(first, Some(2 * MIN))
     };
@@ -1378,6 +1387,7 @@ fn a_key_read_at_a_first_point_with_no_work_holds_from_the_key() {
         answered: Some(ScreenAnswer {
             prompt: 7,
             work: None,
+            harness: false,
         }),
         person: Some(5 * MIN),
         key: Some(5 * MIN),
@@ -1844,6 +1854,7 @@ fn a_key_after_a_restart_holds_from_the_terminals_clock() {
         answered: Some(ScreenAnswer {
             prompt: 7,
             work: None,
+            harness: false,
         }),
         person: Some(person),
         key: Some(person),

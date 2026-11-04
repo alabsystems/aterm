@@ -188,6 +188,14 @@ impl Fixture {
     }
 
     fn warm_lines(&self) -> Vec<atpkg::packages_log::Entry> {
+        self.log_lines()
+            .into_iter()
+            .filter(|e| e.kind == atpkg::packages_log::kind::WARM)
+            .collect()
+    }
+
+    /// Every line of the configured store's `packages.log`, of any kind.
+    fn log_lines(&self) -> Vec<atpkg::packages_log::Entry> {
         let log = aterm_types::dirs::resolve_logs_dir(
             None,
             aterm_types::dirs::StatePlatform {
@@ -202,7 +210,6 @@ impl Fixture {
             .unwrap_or_default()
             .lines()
             .map(|l| atpkg::packages_log::parse_line(l).unwrap_or_else(|| panic!("{l:?}")))
-            .filter(|e| e.kind == atpkg::packages_log::kind::WARM)
             .collect()
     }
 }
@@ -271,6 +278,29 @@ fn a_failing_program_fails_nothing() {
     let lines = fx.warm_lines();
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert_eq!(lines[0].get("outcome"), Some("exit=5"));
+}
+
+#[test]
+fn a_warm_of_a_store_other_than_the_configured_one_runs_but_logs_nothing() {
+    let mut fx = Fixture::new("unconfigured");
+    fx.prefix = fx.home.join("other-pkg");
+    assert_ne!(
+        fx.prefix,
+        atpkg::store::default_prefix(&fx.home),
+        "not the store the empty [packages] table resolves"
+    );
+    fx.layout().ensure_dir(&fx.prefix).unwrap();
+    fx.install_claude(2_001_280, 0);
+    silent_success(&fx.warm_build(2_001_280), "a warm of another store");
+    assert!(
+        fx.recorded("args").is_some(),
+        "the warm ran: the log's silence is not a refusal"
+    );
+    let lines = fx.log_lines();
+    assert!(
+        lines.is_empty(),
+        "another store's warm reached the person's packages.log: {lines:?}"
+    );
 }
 
 #[test]

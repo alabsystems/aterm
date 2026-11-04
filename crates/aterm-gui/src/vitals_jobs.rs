@@ -831,6 +831,33 @@ fn has_run(pid: u32, ms: u64) -> bool {
         .is_some_and(|age| age >= ms)
 }
 
+/// WHAT SESSION `sid`'S AGENT MAY BE TOLD of its calls at no progress at (`now`, `now_ms`), as
+/// the facts seam reads it: the board's no-progress calls ([`JobsBoard::facts`] at `now`), each
+/// leader re-proved alive at its birth by `lives` after the board's lock is let go, the reading
+/// stamped `now_ms` less the view's age; its held programs unread (`held` is `None`). `None` with
+/// no view or one older than [`JOBS_FRESH`]. Both clocks are given, so a test moves them
+/// together. The one reading aterm's own loop (`harness_host::WorkerIdle::facts`, which adds
+/// the held part) and a proven self-claim's act (`harness fact`) both take.
+pub(crate) fn facts_reading(
+    board: &JobsBoard,
+    lives: fn(u32, u64) -> bool,
+    sid: &str,
+    now: Instant,
+    now_ms: i64,
+) -> Option<aterm_agent::supervise::FactsReading> {
+    let (age, calls) = board.facts(sid, now)?;
+    let age_ms = i64::try_from(age.as_millis()).unwrap_or(i64::MAX);
+    Some(aterm_agent::supervise::FactsReading {
+        as_of_ms: now_ms.saturating_sub(age_ms),
+        no_progress: calls
+            .into_iter()
+            .filter(|(leader, call)| call.birth.is_some_and(|birth| lives(*leader, birth)))
+            .map(|(_, call)| call)
+            .collect(),
+        held: None,
+    })
+}
+
 /// Whether the call whose leader is `pid`, born at `birth`, still lives (the facts' re-proof at
 /// the ask): one read by the jobs engine's own reader, in the engine's unit, naming the same start
 /// and no zombie, so a reused pid, a reaped call and an unreaped exit are not alive. Kernel reads

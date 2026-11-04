@@ -451,6 +451,7 @@ fn a_handoff_after_an_untaken_land_act_types_it_again() {
                 answered: Some(ScreenAnswer {
                     prompt: said,
                     work: Some(3 * MIN),
+                    harness: false,
                 }),
                 ..stale.clone()
             },

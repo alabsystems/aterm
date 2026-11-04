@@ -1084,7 +1084,7 @@ fn ignored_claim_entry(e: &io::Error) -> bool {
 /// The pid the admissions' lock at `path` names: its holder's, unless it was let go meanwhile.
 fn lock_holder(path: &Path) -> Option<u32> {
     let file = crate::open_regular_reader(path).ok()?;
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(65);
     file.take(64).read_to_end(&mut bytes).ok()?;
     let text = std::str::from_utf8(&bytes).ok()?.trim();
     (!text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()))
@@ -1121,10 +1121,11 @@ fn probe_opened(file: File, path: &Path, held: bool, reap: bool) -> io::Result<O
                     format!("capacity claim {}: {why}", path.display()),
                 )
             };
-            if file.metadata()?.len() > RECORD_MAX {
+            let len = file.metadata()?.len();
+            if len > RECORD_MAX {
                 return Err(invalid("locked capacity record exceeds its size bound"));
             }
-            let mut bytes = Vec::new();
+            let mut bytes = Vec::with_capacity(usize::try_from(len.saturating_add(1)).unwrap_or(0));
             (&file).take(RECORD_MAX).read_to_end(&mut bytes)?;
             if file.metadata()?.len() > RECORD_MAX {
                 return Err(invalid("locked capacity record grew past its size bound"));

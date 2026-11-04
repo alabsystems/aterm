@@ -35,7 +35,7 @@ pub type ProbeClt = Box<dyn Fn(&dyn System) -> Found + Send + Sync>;
 /// run, so the label rides the one password wherever the roster gave it by then.
 pub type NameMac = Box<dyn Fn() -> Option<String> + Send + Sync>;
 
-/// Why the install the Command Line Tools tab runs did not finish
+/// Why the install the Mac Setup tab runs did not finish
 /// ([`aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB`]): the plain words the tab ends on
 /// ([`Unfinished::reason`]) and, for what the root half finds, the exit code `aterm machines here
 /// apply --plain` says it with ([`Unfinished::code`]), so the root half prints nothing of its own.
@@ -176,7 +176,7 @@ impl Unfinished {
         }
     }
 
-    /// The plain reason the tab says after `The install did not finish:`.
+    /// The plain reason the tab says after `Mac Setup did not finish:`.
     #[must_use]
     pub const fn reason(self) -> &'static str {
         match self {
@@ -203,8 +203,8 @@ impl Unfinished {
     }
 
     /// The tab's last line for this class:
-    /// `The install did not finish: <reason>. Install… on System State tries again.`, except
-    /// where pressing Install… again would only say the same: Low Data Mode says how to lift it
+    /// `Mac Setup did not finish: <reason>. Running aterm init in a terminal tries again.`,
+    /// except where another try would only say the same: Low Data Mode says how to lift it
     /// ([`TAB_LOW_DATA`]), and an account that is no administrator's who must install them
     /// ([`TAB_NOT_ADMIN`]).
     #[must_use]
@@ -231,22 +231,35 @@ pub const TAB_LOW_DATA: &str = "Low Data Mode is on, so the download waits. Turn
 pub const TAB_NOT_ADMIN: &str = "Only an administrator of this Mac can install Apple's Command \
                                  Line Tools. Ask one to install them from their own login.";
 
-/// The one line the tab says before macOS asks for the password.
+/// The one line the tab says before macOS asks for the password, with the tools missing.
 pub const TAB_INTRO: &str = "aterm is installing Apple's Command Line Tools, which git and your \
-                             GitHub repositories need. macOS asks for your Mac password once.";
+                             GitHub repositories need, and turning on developer mode. macOS asks \
+                             for your Mac password once.";
+
+/// [`TAB_INTRO`] on a Mac that has the tools, where the elevation runs for its other root steps
+/// ([`crate::root_steps::Owed`]).
+pub const TAB_INTRO_SETUP: &str = "aterm is finishing the part of this Mac's setup only an \
+                                   administrator can do: developer mode for debuggers, and the \
+                                   Mac's name. macOS asks for your Mac password once.";
 
 /// The one line a run outside the tab says right before `sudo` asks for the Mac password, so the
 /// prompt never comes bare after whatever the terminal showed last (a package install's output).
 pub const INTRO: &str = "aterm init: installing Apple's Command Line Tools (git, cc, the macOS \
-                         SDK); sudo asks for your Mac password once";
+                         SDK) and turning on developer mode; sudo asks for your Mac password once";
+
+/// [`INTRO`] on a Mac that has the tools.
+pub const INTRO_SETUP: &str = "aterm init: finishing the administrator's part of setup \
+                               (developer mode, the Mac's name); sudo asks for your Mac password \
+                               once";
 
 /// The password prompt (`sudo -p`), in the tab and outside it.
 pub const TAB_PROMPT: &str = "Mac password: ";
 
-/// The tab's last line once the tools are installed; the window then closes the tab unless it is
-/// its window's last (`aterm-gui`'s `App::developer_tools_install_ended`).
+/// The tab's last line once the tools are installed and the rest of the elevation ran; the
+/// window then closes the tab unless it is its window's last (`aterm-gui`'s
+/// `App::developer_tools_install_ended`).
 pub const TAB_INSTALLED: &str =
-    "Successfully completed: Apple's Command Line Tools are installed. This tab closes by itself.";
+    "Successfully completed: Apple's Command Line Tools are in place. This tab closes by itself.";
 
 /// Where the tab's own words go (its terminal), and why its install did not finish, once the
 /// item knows: what [`CommandLineTools::in_tab`] speaks through.
@@ -300,7 +313,7 @@ pub struct CommandLineTools {
     found: ProbeClt,
     /// The `aterm` that `sudo` runs (this executable).
     aterm: PathBuf,
-    /// System State's Command Line Tools tab, when this run is its program: plain words, a
+    /// System State's Mac Setup tab, when this run is its program: plain words, a
     /// plain password prompt, and the root half's `--plain` exit codes.
     tab: Option<Tab>,
     /// What holds the ask back in a run aterm decided ([`Self::unbidden`]); `None` in a person's
@@ -313,7 +326,17 @@ pub struct CommandLineTools {
     /// by the time the root half runs: the root half names the Mac by it under the same password
     /// ([`plain_name`], [`Self::baseline_named`]).
     name: NameMac,
+    /// What the elevation still owes this Mac beside the tools ([`crate::root_steps::owed`]),
+    /// read as the probe runs: on a Mac that has the tools, a run that may ask still asks for the
+    /// one password where anything is owed ([`Self::with_owed`]).
+    owed: Owing,
+    /// Whether this run's root half ran: what it left owed then goes to the journal, and the
+    /// row's read-back says the tools alone.
+    asked: std::sync::atomic::AtomicBool,
 }
+
+/// The reader of what the elevation still owes ([`CommandLineTools::with_owed`]).
+pub type Owing = Box<dyn Fn(&dyn System) -> Vec<crate::root_steps::Owed> + Send + Sync>;
 
 /// `word` when it is a name the root half gives the Mac: a bare swarm label, `m` and a number
 /// with no leading zero (`m42`), which is also a DNS label and a fleet name. Anything else,
@@ -340,7 +363,17 @@ impl CommandLineTools {
                 let _ = std::io::stderr().lock().write_all(text.as_bytes());
             }),
             name: Box::new(|| None),
+            owed: Box::new(|_| Vec::new()),
+            asked: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// This item reading what the elevation still owes this Mac beside the tools with `owed`
+    /// ([`crate::root_steps::owed_here`] on a Mac): where anything is, a Mac that has the tools
+    /// still gets the one password, from a run that may ask for it.
+    #[must_use]
+    pub fn with_owed(self, owed: Owing) -> Self {
+        Self { owed, ..self }
     }
 
     /// This item naming the Mac by what `name` reads as its root half is about to run, where
@@ -350,7 +383,7 @@ impl CommandLineTools {
         Self { name, ..self }
     }
 
-    /// This item as the Command Line Tools tab's program speaks it, through `tab`.
+    /// This item as the Mac Setup tab's program speaks it, through `tab`.
     #[must_use]
     pub fn in_tab(self, tab: Tab) -> Self {
         Self {
@@ -361,7 +394,7 @@ impl CommandLineTools {
 
     /// This item in a run aterm decided ([`crate::init::Decider::Aterm`]: the follow-up of a
     /// person's own package install or update), held as `unbidden` says: it asks for the Mac
-    /// password at most once per build, sharing System State's Command Line Tools tab's ask
+    /// password at most once per build, sharing System State's Mac Setup tab's ask
     /// ([`aterm_types::clt_mark`]), and never while the person's choices hold that tab, as read
     /// when its probe runs and again right before it claims the ask; where it asks nothing it is
     /// deferred, naming the person's step ([`PERSONS_STEP`]), and an ask a Stop or another asker
@@ -381,24 +414,28 @@ impl CommandLineTools {
         Self { say, ..self }
     }
 
-    /// The one-table baseline the root half applies.
+    /// The baseline the root half applies.
     #[must_use]
     pub fn baseline() -> String {
         Self::baseline_named(None)
     }
 
-    /// [`Self::baseline`], with the Mac's Computer Name and Local hostname set to `name` where
-    /// it is a [`plain_name`] (`--name`): the one password that installs the tools also gives
-    /// the Mac the name its vault and fleet know it by.
+    /// [`Self::baseline`], with the Mac's Computer Name, Local hostname and host name set to
+    /// `name` where it is a [`plain_name`] (`--name`): the one password that installs the tools
+    /// also gives the Mac the name its vault and fleet know it by. Every run of it turns on
+    /// developer mode ([`crate::root_steps::DeveloperMode`]) and puts the rule in place that
+    /// names the Mac at an admission that comes later ([`crate::root_steps::NameRule`]), so the
+    /// one password does every root step setup has.
     #[must_use]
     pub fn baseline_named(name: Option<&str>) -> String {
         let mut text = format!(
-            "schema = {}\n\n[developer]\ncommand_line_tools = true\n",
+            "schema = {}\n\n[developer]\ncommand_line_tools = true\ndebugger = true\n\n\
+             [names]\nadmitted_name_rule = true\n",
             crate::SCHEMA
         );
         if let Some(name) = name.and_then(plain_name) {
             text.push_str(&format!(
-                "\n[names]\ncomputer_name = \"{name}\"\nlocal_host_name = \"{name}\"\n"
+                "computer_name = \"{name}\"\nlocal_host_name = \"{name}\"\nhost_name = \"{name}\"\n"
             ));
         }
         text
@@ -428,7 +465,8 @@ impl CommandLineTools {
     /// half then exited with (a Ctrl-C at the password prompt ends `sudo` on its own 1, which
     /// alone would read as a password macOS refused); else the root half's exit
     /// ([`Unfinished::after_root`]); and tools that arrived anyway are installed, whatever it
-    /// said.
+    /// said, where the elevation owes nothing else ([`Self::with_owed`]): on a Mac that had the
+    /// tools all along, a refused password is no success.
     fn ended(
         &self,
         sys: &dyn System,
@@ -441,14 +479,30 @@ impl CommandLineTools {
             Err(_) => Err(Unfinished::Other),
         };
         match ended {
-            Err(_) if matches!((self.found)(sys), Found::Present(_)) => Ok(()),
+            Err(_)
+                if matches!((self.found)(sys), Found::Present(_))
+                    && (self.owed)(sys).is_empty() =>
+            {
+                Ok(())
+            }
             ended => ended,
+        }
+    }
+
+    /// The line said right before `sudo` asks: [`TAB_INTRO`] or [`INTRO`] while the tools are
+    /// missing, else the setup's own ([`TAB_INTRO_SETUP`], [`INTRO_SETUP`]).
+    fn intro(&self, sys: &dyn System, in_tab: bool) -> &'static str {
+        match ((self.found)(sys), in_tab) {
+            (Found::Present(_), true) => TAB_INTRO_SETUP,
+            (Found::Present(_), false) => INTRO_SETUP,
+            (_, true) => TAB_INTRO,
+            (_, false) => INTRO,
         }
     }
 }
 
 /// What holds back the ask of a run aterm decided ([`CommandLineTools::unbidden`]): this
-/// account's record of aterm's own ask, which System State's Command Line Tools tab reads and
+/// account's record of aterm's own ask, which System State's Mac Setup tab reads and
 /// writes too ([`aterm_types::clt_mark`]), the build that asks, and the person's choices in
 /// System State that hold that tab ([`held_by`]), read from the setup records as the item's probe
 /// runs and again right before its apply claims the ask, so a Stop pressed after `aterm init`
@@ -555,7 +609,7 @@ impl Unbidden {
 }
 
 /// Why the person's choices in System State hold a run aterm decided back from asking for the
-/// Mac password, as they hold System State's own Command Line Tools tab: their Stop of setup, or
+/// Mac password, as they hold System State's own Mac Setup tab: their Stop of setup, or
 /// records that cannot be read now (which hold every group, [`crate::init::Holds::stopped`]), or
 /// records a newer aterm saved ([`NEWER`]). `None` when they hold nothing of it: a group turned
 /// off holds no tab.
@@ -702,7 +756,8 @@ impl Item for CommandLineTools {
                 Err(error) => return Err(format!("{NOT_NOTED} ({error}): {PERSONS_STEP}")),
             }
         }
-        (self.say)(&format!("{INTRO}\n"));
+        (self.say)(&format!("{}\n", self.intro(sys, false)));
+        self.asked.store(true, std::sync::atomic::Ordering::Relaxed);
         // The root half runs in this terminal's foreground, so a Ctrl-C (which the
         // through-installer wait invites) or a closed terminal reaches this run too: held until
         // the root half has finished its step and aterm's own ask is kept or taken back, then
@@ -734,10 +789,15 @@ impl CommandLineTools {
     /// account that is no administrator's (each blocked, asking nothing), or, in a run aterm
     /// decided, the person's Stop as the setup records read now, this build's ask spent, or a
     /// record that cannot say ([`Unbidden::withheld`]: deferred, naming the person's step); else
-    /// the change.
+    /// the change. With the tools present, the change is the elevation's other root steps where
+    /// any is owed ([`Self::with_owed`]) and this run may ask for the password now: in the tab,
+    /// a run that may not says why as it would for the tools (Low Data Mode and an install under
+    /// way aside, which hold only a download); outside it, the row reads the tools in place and
+    /// names the steps left for setup's one password, so no pass blocks on them. Once this run's
+    /// root half ran, its read-back says the tools alone: what that left owed is in the journal.
     fn read(&self, sys: &dyn System) -> (Probe, Option<Unfinished>) {
         let from = match (self.found)(sys) {
-            Found::Present(now) => return (Probe::Ok { now }, None),
+            Found::Present(now) => return self.read_present(sys, now),
             Found::Refuses(why) => return (Probe::Blocked { why }, Some(Unfinished::Refuses)),
             Found::Unknown(why) => return (Probe::Unusable { why }, Some(Unfinished::Unread)),
             Found::NotHere(why) => return (Probe::NotApplicable { why }, None),
@@ -762,51 +822,8 @@ impl CommandLineTools {
             }
             crate::items::developer::Holder::Nothing | crate::items::developer::Holder::Unread => {}
         }
-        let presence = crate::console::presence(sys);
-        if let Some(person) = presence.needs_person() {
-            return (
-                Probe::Deferred {
-                    why: format!("{from}; installing them {person}"),
-                },
-                Some(Unfinished::Other),
-            );
-        }
-        if !sys.has_tty() {
-            return (
-                Probe::Blocked {
-                    why: format!("{from}; {NO_TTY}"),
-                },
-                Some(Unfinished::Other),
-            );
-        }
-        // Asked before the password: the download waits for a network without Low Data Mode.
-        if let Some(why) = crate::items::developer::low_data(sys) {
-            return (
-                Probe::Blocked {
-                    why: format!("{from}; {why}"),
-                },
-                Some(Unfinished::LowData),
-            );
-        }
-        if sys.administrator() == Some(false) {
-            return (
-                Probe::Blocked {
-                    why: format!("{from}; {NOT_ADMIN}"),
-                },
-                Some(Unfinished::NotAdmin),
-            );
-        }
-        if let Some(why) = self
-            .unbidden
-            .as_ref()
-            .and_then(|unbidden| unbidden.withheld(sys))
-        {
-            return (
-                Probe::Deferred {
-                    why: format!("{from}; {why}"),
-                },
-                Some(Unfinished::Other),
-            );
+        if let Some(held) = self.held_back(sys, &from, true) {
+            return held;
         }
         (
             Probe::Change {
@@ -820,6 +837,97 @@ impl CommandLineTools {
         )
     }
 
+    /// [`Self::read`] with the tools present (`now`).
+    fn read_present(&self, sys: &dyn System, now: String) -> (Probe, Option<Unfinished>) {
+        let owed = (self.owed)(sys);
+        if owed.is_empty() || self.asked.load(std::sync::atomic::Ordering::Relaxed) {
+            return (Probe::Ok { now }, None);
+        }
+        let steps = owed
+            .iter()
+            .map(|step| step.plain())
+            .collect::<Vec<_>>()
+            .join("; ");
+        let from = format!("{now}; still owed: {steps}");
+        match self.held_back(sys, &from, false) {
+            Some(held) if self.tab.is_some() => held,
+            Some(_) => (
+                Probe::Ok {
+                    now: format!("{now}; left for setup's one Mac password: {steps}"),
+                },
+                None,
+            ),
+            None => (
+                Probe::Change {
+                    from,
+                    to: format!(
+                        "done as root by `{} machines here apply --plain` (one password prompt)",
+                        Cmd::new(SUDO).arg(self.aterm.as_os_str()).display()
+                    ),
+                },
+                None,
+            ),
+        }
+    }
+
+    /// Why this run may not ask for the password now, as the probe reads it (`from`, what it
+    /// found): no person at this Mac's console (only a person there types the Mac password,
+    /// never an agent's tab, a script or a remote shell), no terminal, Low Data Mode where the
+    /// run would `download` the tools, an account that is no administrator's, or a run aterm
+    /// decided whose ask is held ([`Unbidden::withheld`]). `None` where it may ask.
+    fn held_back(
+        &self,
+        sys: &dyn System,
+        from: &str,
+        download: bool,
+    ) -> Option<(Probe, Option<Unfinished>)> {
+        let presence = crate::console::presence(sys);
+        if let Some(person) = presence.needs_person() {
+            return Some((
+                Probe::Deferred {
+                    why: format!("{from}; installing them {person}"),
+                },
+                Some(Unfinished::Other),
+            ));
+        }
+        if !sys.has_tty() {
+            return Some((
+                Probe::Blocked {
+                    why: format!("{from}; {NO_TTY}"),
+                },
+                Some(Unfinished::Other),
+            ));
+        }
+        // Asked before the password: the download waits for a network without Low Data Mode.
+        if download && let Some(why) = crate::items::developer::low_data(sys) {
+            return Some((
+                Probe::Blocked {
+                    why: format!("{from}; {why}"),
+                },
+                Some(Unfinished::LowData),
+            ));
+        }
+        if sys.administrator() == Some(false) {
+            return Some((
+                Probe::Blocked {
+                    why: format!("{from}; {NOT_ADMIN}"),
+                },
+                Some(Unfinished::NotAdmin),
+            ));
+        }
+        self.unbidden
+            .as_ref()
+            .and_then(|unbidden| unbidden.withheld(sys))
+            .map(|why| {
+                (
+                    Probe::Deferred {
+                        why: format!("{from}; {why}"),
+                    },
+                    Some(Unfinished::Other),
+                )
+            })
+    }
+
     /// [`Item::apply`] as the tab's program: one plain line before `sudo` asks for the Mac
     /// password with the plain prompt, and the root half run `--plain`. Once that has started,
     /// this run waits for it to end, holding off a Ctrl-C or a closed tab (which reach the root
@@ -831,7 +939,8 @@ impl CommandLineTools {
             return Err(tab.note(Unfinished::Other));
         }
         let stops = sys.catch_stops();
-        tab.line(TAB_INTRO);
+        tab.line(self.intro(sys, true));
+        self.asked.store(true, std::sync::atomic::Ordering::Relaxed);
         let ran = sys.run_tty(&self.command());
         let stopped = sys.stopped();
         drop(stops);
@@ -958,6 +1067,64 @@ mod tests {
         );
     }
 
+    /// On a Mac that has the tools, the elevation still runs where its other root steps are
+    /// owed: a person's run at the console asks for the one password, saying the setup's own
+    /// line, and its read-back reads the tools in place whatever the root half left owed; the
+    /// root half's baseline turns on developer mode and puts the naming rule in place. A refused
+    /// password there is no success. NEGATIVE CONTROLS: with nothing owed nothing is asked, and a
+    /// run outside the tab that may not ask (no terminal) reads in place, naming what is left,
+    /// and asks nothing.
+    #[test]
+    fn a_mac_with_the_tools_still_gets_the_one_password_for_what_is_owed() {
+        use crate::root_steps::Owed;
+        let present = || item(Found::Present("installed".into()));
+        let owing = |item: CommandLineTools| {
+            item.with_owed(Box::new(|_: &dyn System| {
+                vec![Owed::Debugger, Owed::NameRule]
+            }))
+        };
+        let said = Arc::new(Mutex::new(String::new()));
+        let sink = said.clone();
+        let item = owing(present()).saying(Arc::new(move |text: &str| {
+            sink.lock().unwrap().push_str(text);
+        }));
+        let sys = console();
+        assert_eq!(run(&sys, &item, Mode::Plan).outcome, Outcome::Planned);
+        sys.on(&argv(), Ran::ok(""));
+        let row = run(&sys, &item, Mode::Apply);
+        assert_eq!(row.outcome, Outcome::Changed, "{row:?} {:?}", sys.calls());
+        assert_eq!(
+            asked(&sys),
+            [argv()],
+            "one password prompt: {:?}",
+            sys.calls()
+        );
+        assert_eq!(*said.lock().unwrap(), format!("{INTRO_SETUP}\n"));
+        let parsed = crate::baseline::parse(&CommandLineTools::baseline()).unwrap();
+        assert_eq!(parsed.developer.and_then(|t| t.debugger), Some(true));
+        assert_eq!(parsed.names.and_then(|t| t.admitted_name_rule), Some(true));
+
+        let refused = console();
+        refused.on(&argv(), Ran::exit(1, "Sorry, try again."));
+        let row = run(&refused, &owing(present()), Mode::Apply);
+        assert_eq!(row.outcome, Outcome::Failed, "{row:?}");
+
+        let settled = console();
+        let row = run(&settled, &present(), Mode::Apply);
+        assert_eq!(row.outcome, Outcome::Ok, "{row:?}");
+        assert!(asked(&settled).is_empty(), "{:?}", settled.calls());
+
+        let mut away = console();
+        away.tty = false;
+        let row = run(&away, &owing(present()), Mode::Apply);
+        assert_eq!(row.outcome, Outcome::Ok, "{row:?}");
+        assert!(
+            format!("{row:?}").contains("left for setup's one Mac password"),
+            "{row:?}"
+        );
+        assert!(asked(&away).is_empty(), "{:?}", away.calls());
+    }
+
     /// A swarm label known when the root half runs rides the same prompt: the one argv gains
     /// `--name`, and the root half's baseline names the Mac by it. Free text is never passed
     /// (NEGATIVE CONTROL: `Mac-mini-M4`, `M42`, `m42-studio`, `m042` and none leave the argv and
@@ -982,7 +1149,8 @@ mod tests {
         let names = parsed.names.expect("a [names] table");
         assert_eq!(names.computer_name.as_deref(), Some("m42"));
         assert_eq!(names.local_host_name.as_deref(), Some("m42"));
-        assert_eq!(names.host_name, None);
+        assert_eq!(names.host_name.as_deref(), Some("m42"));
+        assert_eq!(names.admitted_name_rule, Some(true));
 
         for word in ["Mac-mini-M4", "M42", "m42-studio", "m042", ""] {
             let sys = console();
@@ -1578,7 +1746,7 @@ mod tests {
     }
 
     /// A run aterm decided asks for no password while the person's choices hold System State's
-    /// own Command Line Tools tab (their Stop, setup records that cannot be read, a newer
+    /// own Mac Setup tab (their Stop, setup records that cannot be read, a newer
     /// aterm's records) or where the record has no place or cannot be read: deferred, naming why
     /// and the person's step, writing nothing; a record that cannot say is named as such, never
     /// as this build's ask. A group turned off holds no tab, so it holds nothing here.
@@ -1934,8 +2102,8 @@ mod tests {
     }
 
     /// Every reason is a plain clause a person reads in the tab (no argv, path, item id or
-    /// engine word); each line is `The install did not finish: <reason>. Install… on System
-    /// State tries again.` except Low Data Mode's and a non-administrator's, which say what
+    /// engine word); each line is `Mac Setup did not finish: <reason>. Running aterm init in a
+    /// terminal tries again.` except Low Data Mode's and a non-administrator's, which say what
     /// lifts them, with their own tab exit; and each root code is its class's own, clear of the
     /// codes `sudo`, a usage error, a panic and a failed exec end on.
     #[test]
@@ -1979,7 +2147,7 @@ mod tests {
                     assert_eq!(
                         why.line(),
                         format!(
-                            "The install did not finish: {reason}. Install\u{2026} on System State tries again."
+                            "Mac Setup did not finish: {reason}. Running aterm init in a terminal tries again."
                         ),
                     );
                     assert_eq!(
@@ -1995,7 +2163,7 @@ mod tests {
                     assert_eq!(
                         why.line(),
                         format!(
-                            "The install did not finish: {reason}. Install\u{2026} on System State tries again."
+                            "Mac Setup did not finish: {reason}. Running aterm init in a terminal tries again."
                         ),
                     );
                     assert_eq!(why.tab_exit(), 1, "{why:?}");

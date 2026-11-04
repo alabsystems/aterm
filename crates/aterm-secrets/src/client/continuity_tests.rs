@@ -346,6 +346,8 @@ fn asked_on_lan(request: &DeviceRequest, node_key: [u8; 32]) -> Proven<'_> {
 /// folders (synthetic keys, a loopback server), and a clock a day past that record, by which a
 /// proof of `node(7)` would move seat m7.
 fn m7_published() -> (TwoMacs, u64) {
+    // The server it reads is its own on loopback, which answers.
+    let _answering = ServersAnswering::set();
     let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
     let pair = node_pair(7);
     publish_local_node_key(&macs.m7, node(7), |network, actor| {

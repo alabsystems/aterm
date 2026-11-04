@@ -2803,7 +2803,7 @@ mod sh_shim_tests {
         std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
         std::fs::write(&marker, "program = \"grok-alab\"\n").unwrap();
         assert_eq!(run(&argv, false), handed, "dev-linked: the harness");
-        for other in ["claude", "codex", "agy", "muse", "kimi"] {
+        for other in ["claude", "codex", "agy", "muse"] {
             let prelude = twin_prelude(other, &prefix, None, &[], &crate::yolo::policy_of(other));
             assert!(
                 !prelude.contains("grok-alab") && !prelude.contains(" run -- "),

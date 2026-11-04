@@ -205,10 +205,12 @@ pub fn read_regular_file(path: &Path, limit: u64) -> Option<Vec<u8>> {
         }
         std::fs::File::open(path).ok()?
     };
-    if !regular(file.metadata().ok()?) {
+    let meta = file.metadata().ok()?;
+    let len = meta.len();
+    if !regular(meta) || len > limit {
         return None;
     }
-    let mut text = Vec::new();
+    let mut text = Vec::with_capacity(usize::try_from(len).unwrap_or(0).saturating_add(1));
     file.take(limit.saturating_add(1))
         .read_to_end(&mut text)
         .ok()?;

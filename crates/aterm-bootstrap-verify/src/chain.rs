@@ -151,17 +151,18 @@ pub fn withdrawn_floor(
 /// `read_bounded`: at most `maximum` bytes of `path`, else `oversized <path>`.
 pub(crate) fn read_bounded(path: &PyPath, maximum: u64) -> Verdict<Vec<u8>> {
     let real = path.to_path();
-    let file = open_file(&real)?;
-    read_bounded_file(file, path, maximum)
+    let opened = open_file(&real)?;
+    read_bounded_file(opened, path, maximum)
 }
 
-/// [`read_bounded`] over an already-opened descriptor.
+/// [`read_bounded`] over an already-opened descriptor and its `fstat` metadata.
 pub(crate) fn read_bounded_file(
-    file: std::fs::File,
+    (file, meta): (std::fs::File, std::fs::Metadata),
     path: &PyPath,
     maximum: u64,
 ) -> Verdict<Vec<u8>> {
-    let mut data = Vec::new();
+    require(meta.len() <= maximum, &format!("oversized {path}"))?;
+    let mut data = Vec::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
     file.take(maximum + 1)
         .read_to_end(&mut data)
         .map_err(|e| bare_os_error(&e))?;
@@ -173,7 +174,7 @@ pub(crate) fn read_bounded_file(
 }
 
 /// `open(path, "rb")`: a directory is refused as Python's `open` refuses it.
-pub(crate) fn open_file(path: &std::path::Path) -> Verdict<std::fs::File> {
+pub(crate) fn open_file(path: &std::path::Path) -> Verdict<(std::fs::File, std::fs::Metadata)> {
     #[cfg(unix)]
     let file = {
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -198,7 +199,7 @@ pub(crate) fn open_file(path: &std::path::Path) -> Verdict<std::fs::File> {
             path,
         ));
     }
-    Ok(file)
+    Ok((file, meta))
 }
 
 /// `tomllib.loads(bytes.decode("utf-8"))`.

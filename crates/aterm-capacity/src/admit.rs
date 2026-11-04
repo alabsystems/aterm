@@ -1142,6 +1142,17 @@ pub struct Claim {
 
 impl Claim {
     #[cfg(unix)]
+    pub(crate) fn check_retained_description(&self) -> io::Result<()> {
+        if !self.entry_custody {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "retained CPU binding requires the original admission",
+            ));
+        }
+        self.laid.check_retained_description()
+    }
+
+    #[cfg(unix)]
     pub(crate) fn check_cohort_namespace(
         &self,
         namespace: &crate::cohort_namespace::Namespace,
@@ -1535,6 +1546,14 @@ impl Claim {
         self.laid.cancel_cohort(proof)?;
         self.record.accounting = crate::Accounting::Holder;
         Ok(())
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn check_cohort_cancel(
+        &self,
+        proof: &aterm_uds::spawnfd::NotSpawned,
+    ) -> io::Result<()> {
+        self.laid.check_cohort_cancel(proof)
     }
 
     /// Complete custody only after conclusive kernel drain, recording settlement durably.

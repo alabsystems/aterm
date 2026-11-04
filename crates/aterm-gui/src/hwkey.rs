@@ -36,7 +36,7 @@ const MAX_INTERVAL_MS: u64 = 1000;
 const DEFAULT_INTERVAL_MS: u64 = 40;
 
 /// Set while the front window holds acts only a person may take: System State as its active view
-/// (an Apply that admits a setup plan as the window's own, a row's `Turn On…`;
+/// (an Apply that admits a setup plan as the window's own, a row's `Open …` or `Turn On Sync`;
 /// `docs/DESIGN-system-state-2026-10-21.md` §6) or a gateway card (a palette, the Overview or a
 /// tab menu: Take Over and Hand Back behind a key). The main thread sets it
 /// ([`publish_persons_front`], from `App::publish_hwkey_front` at every park and at `hwkey`'s own

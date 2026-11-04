@@ -86,8 +86,8 @@ use aterm_secrets::discover::{LAB_MEMBER_SERVICE_ENV, MEMBER_SERVICE};
 use super::advert::{self, Split, Whose};
 use super::{
     ALAB_SERVICE, GUEST_HELPER, GUEST_NUX, Guest, LOCAL_VAULT, LOCAL_VAULT_PORT, Row, Value,
-    browse_adds, drive_cells_within, guest_browse, guest_dns_sd, guest_heard, host_guests,
-    or_missing, secs_to_ms, squeeze,
+    browse_adds, distinct_messages, drive_cells_within, guest_browse, guest_dns_sd, guest_heard,
+    host_guests, local_network_blocks, or_missing, secs_to_ms, squeeze,
 };
 use crate::mac::{POLL, STEP};
 use crate::{Fail, stop};
@@ -1242,6 +1242,171 @@ fn await_phrase(g: &Guest, record: &str) -> Result<Result<Desk, String>, Fail> {
     }))
 }
 
+/// How many of mDNSResponder's messages of the ask's `dns-sd` a row names.
+const MDNS_SHOWN: usize = 8;
+
+/// Where the ask's pid is written ([`with_pid`]).
+const ASK_PID: &str = "phrase-ask.pid";
+
+/// `cmd` (a command line) under a shell that writes its own pid to [`ASK_PID`] and then becomes
+/// it (`exec`, and `/usr/bin/env` execs in turn), so the pid is the command's own.
+fn with_pid(cmd: &str) -> String {
+    format!(
+        "/bin/sh -c {}",
+        crate::util::shell_quote(&format!("echo $$ > {GUEST_NUX}/{ASK_PID}; exec {cmd}"))
+    )
+}
+
+/// Whether macOS's Local Network question is what kept the ask from the member, read with nobody
+/// at the console and nothing pressed: a plain TCP connect to the member's desk from a process
+/// macOS does not hold (`nc`, a platform binary the guest agent starts), and every Local Network
+/// hold macOS logged since the ask (UserEventAgent's `local network blocked notification`), the
+/// ask's own pid named. A connect that reaches the desk while macOS held the ask's pid puts the
+/// cause on the unanswered question ([`lan_cause`]).
+fn lan_cause_cells(
+    g: &Guest,
+    row: &mut Row,
+    lab: &Lab,
+    asked: Option<u64>,
+    said: &str,
+) -> Result<(), Fail> {
+    let (host, port) = lab.listen.rsplit_once(':').unwrap_or((&lab.listen, ""));
+    let nc = g.run(
+        &format!("/usr/bin/nc -z -G 5 {host} {port} >/dev/null 2>&1; echo $?"),
+        STEP,
+    )?;
+    let reached = nc.trim() == "0";
+    row.cell(
+        "a plain connect to the member's desk (nc, which macOS does not hold)",
+        Value::Text(if reached {
+            format!("connected to {}", lab.listen)
+        } else {
+            format!("did not connect to {} (nc exit {})", lab.listen, nc.trim())
+        }),
+    );
+    let pid: Option<u32> = g
+        .run(
+            &format!("cat {GUEST_NUX}/{ASK_PID} 2>/dev/null || true"),
+            STEP,
+        )?
+        .trim()
+        .parse()
+        .ok();
+    let now = g.clock_ms()?;
+    let since_s = asked.map_or(600, |at| now.saturating_sub(at) / 1000 + 5);
+    let log = g.sh(
+        &format!(
+            "/usr/bin/log show --last {since_s}s --info --style ndjson --predicate \
+             'subsystem == \"com.apple.networkextension\" AND eventMessage CONTAINS \"local network blocked notification\"' \
+             2>/dev/null || true"
+        ),
+        STEP,
+    )?;
+    let blocks: Vec<(Option<u64>, u32)> = local_network_blocks(&log)
+        .into_iter()
+        .filter(|(at, _)| at.zip(asked).is_none_or(|(at, asked)| at >= asked))
+        .collect();
+    row.cell(
+        "macOS's Local Network holds since the ask",
+        Value::Text(if blocks.is_empty() {
+            "none".to_owned()
+        } else {
+            blocks
+                .iter()
+                .map(|(at, p)| {
+                    let who = if Some(*p) == pid {
+                        "the ask"
+                    } else {
+                        "another aterm process"
+                    };
+                    match at.zip(asked) {
+                        Some((at, asked)) => {
+                            format!("{who} (pid {p}) +{} ms", at.saturating_sub(asked))
+                        }
+                        None => format!("{who} (pid {p})"),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        }),
+    );
+    // What mDNSResponder said of the `dns-sd` the ask's browse ran: a client macOS keeps off the
+    // local network is refused there (PolicyDenied), whatever the ask printed.
+    let mdns = g.sh(
+        &format!(
+            "/usr/bin/log show --last {since_s}s --info --style ndjson --predicate \
+             'process == \"mDNSResponder\" AND eventMessage CONTAINS[c] \"dns-sd\"' \
+             2>/dev/null || true"
+        ),
+        STEP,
+    )?;
+    let said_of = distinct_messages(&mdns, MDNS_SHOWN);
+    row.cell(
+        "mDNSResponder of the ask's dns-sd",
+        Value::Text(if said_of.is_empty() {
+            "nothing".to_owned()
+        } else {
+            said_of.join(" | ")
+        }),
+    );
+    row.cell(
+        "why the member heard no ask",
+        Value::Text(lan_cause(said, reached, pid, &blocks).to_owned()),
+    );
+    Ok(())
+}
+
+/// Each line `out` printed, trimmed, one ` | ` apart: a row reads every line, not only the last
+/// (the ask's first line says whether its browse heard a member). Pure.
+#[must_use]
+pub fn said_lines(out: &str) -> String {
+    out.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+/// What `members join --no-wait` prints when its browse heard no member
+/// (`aterm_agent::members_cli`'s `said_no_wait`).
+const NO_MEMBER_ANSWERS: &str = "no ALab member answers on this network";
+
+/// What a missing ask's readings say of its cause: what the ask `said`, `reached` (a plain
+/// connect got to the desk), the ask's `pid`, and macOS's Local Network holds. The ask's own
+/// words come first: a browse macOS refused names Local Network privacy
+/// ([`aterm_http::LOCAL_NETWORK_REFUSED`]), and one that heard nothing while the guest's own
+/// browse heard the member and a plain connect reached it puts the miss in the ask's browse. Pure.
+#[must_use]
+pub fn lan_cause(
+    said: &str,
+    reached: bool,
+    pid: Option<u32>,
+    blocks: &[(Option<u64>, u32)],
+) -> &'static str {
+    let held = pid.is_some_and(|pid| blocks.iter().any(|(_, p)| *p == pid));
+    if said.contains(aterm_http::LOCAL_NETWORK_REFUSED) {
+        return "macOS's Local Network privacy: it refused the ask's browse while its question \
+                stood unanswered";
+    }
+    if said.contains(NO_MEMBER_ANSWERS) && reached && !held {
+        return "the ask's browse heard no member though the guest's own browse heard it and a \
+                plain connect reached it: macOS answered aterm's browse with nothing, and logged \
+                no refusal or hold";
+    }
+    match (reached, held) {
+        (true, true) => {
+            "macOS's unanswered Local Network question: it held the ask while a plain connect \
+             reached the desk"
+        }
+        (true, false) if pid.is_none() => "not established: the ask's pid did not read",
+        (true, false) => {
+            "not the Local Network question: macOS logged no hold of the ask, and the desk was \
+             reachable"
+        }
+        (false, _) => "not established: the desk was not reachable from the guest either",
+    }
+}
+
 /// The joiner's ask, as install.sh's windowless lanes run it, `me` its command line
 /// ([`as_joiner`]): named no member, so it browses for one.
 fn ask_cmd(me: &str) -> String {
@@ -1368,18 +1533,14 @@ pub(super) fn vault_phrase(g: &Guest, run: &Path, row: &mut Row) -> Result<(), F
         return Ok(());
     }
 
-    // The ask, as install.sh's windowless lanes run it.
-    let (ask, ask_out) = g.notty_within("phrase-ask", &ask_cmd(&me), HANG)?;
+    // The ask, as install.sh's windowless lanes run it, its pid kept for [`lan_cause_cells`].
+    let (ask, ask_out) = g.notty_within("phrase-ask", &with_pid(&ask_cmd(&me)), HANG)?;
     drive_cells_within(row, "ask: ", &ask, HANG);
     row.cell(
         "ask: said",
         or_missing(
-            ask_out
-                .lines()
-                .rev()
-                .find(|l| !l.trim().is_empty())
-                .map(|l| squeeze(l.trim(), 100)),
-            Value::Text,
+            Some(said_lines(&ask_out)).filter(|said| !said.is_empty()),
+            |said| Value::Text(squeeze(&said, 400)),
             "the ask printed nothing",
         ),
     );
@@ -1389,6 +1550,7 @@ pub(super) fn vault_phrase(g: &Guest, run: &Path, row: &mut Row) -> Result<(), F
     let desk = match await_phrase(g, &record)? {
         Ok(desk) => desk,
         Err(why) => {
+            lan_cause_cells(g, row, &lab, asked, &ask_out)?;
             row.fail(why);
             return Ok(());
         }
@@ -1704,6 +1866,40 @@ pub(super) fn vault_phrase(g: &Guest, run: &Path, row: &mut Row) -> Result<(), F
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_missing_ask_is_the_local_network_question_only_when_it_held_the_ask_and_the_desk_answered()
+     {
+        let held = [(Some(10), 700), (Some(12), 812)];
+        let sent = "Joined ALab: a member let this Mac in by its proof.";
+        assert!(
+            lan_cause(sent, true, Some(812), &held).starts_with("macOS's unanswered Local Network")
+        );
+        // Negative controls: no hold of the ask's own pid, an unreachable desk, an unread pid.
+        assert!(lan_cause(sent, true, Some(900), &held).starts_with("not the Local Network"));
+        assert!(lan_cause(sent, false, Some(812), &held).starts_with("not established: the desk"));
+        assert!(lan_cause(sent, true, None, &held).starts_with("not established: the ask's pid"));
+        // The ask's own words: a refused browse is Local Network privacy whatever else read; a
+        // browse that heard no member is named as such only where the desk was reachable.
+        let refused = format!(
+            "browsing _x._tcp: {}; this Mac's request waits",
+            aterm_http::LOCAL_NETWORK_REFUSED
+        );
+        assert!(lan_cause(&refused, false, None, &[]).starts_with("macOS's Local Network privacy"));
+        let none = "no ALab member answers on this network yet: x | this Mac's vault subscriber does not run";
+        assert!(
+            lan_cause(none, true, Some(900), &held).starts_with("the ask's browse heard no member")
+        );
+        assert!(lan_cause(none, false, Some(900), &held).starts_with("not established: the desk"));
+        assert_eq!(said_lines("a\n\n  b  \n"), "a | b");
+        let wrapped = with_pid("/usr/bin/env HOME=/h /a/aterm members join --no-wait");
+        assert!(wrapped.starts_with("/bin/sh -c "), "{wrapped}");
+        assert!(
+            wrapped
+                .contains("echo $$ > /var/tmp/aterm-nux/phrase-ask.pid; exec /usr/bin/env HOME=/h"),
+            "{wrapped}"
+        );
+    }
 
     /// The run's lab members service in these tests.
     const LAB: &str = "_alab-lab-k3x9q2._tcp";

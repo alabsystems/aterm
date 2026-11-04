@@ -1180,13 +1180,13 @@ pub const MAX_BUNDLE_BYTES: u64 = 16 << 20;
 /// # Errors
 /// Why the file was not read, as a phrase.
 pub fn read_bounded(path: &str, max: u64) -> Result<Vec<u8>, String> {
-    let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
-    if !meta.is_file() {
-        return Err("not a regular file".to_owned());
+    let (f, meta) = aterm_uds::regular_file::open(Path::new(path)).map_err(|e| e.to_string())?;
+    if meta.len() > max {
+        return Err(format!("holds more than {max} bytes"));
     }
-    let mut bytes = Vec::new();
-    std::fs::File::open(path)
-        .and_then(|f| f.take(max.saturating_add(1)).read_to_end(&mut bytes))
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0).saturating_add(1));
+    f.take(max.saturating_add(1))
+        .read_to_end(&mut bytes)
         .map_err(|e| e.to_string())?;
     if u64::try_from(bytes.len()).map_or(true, |n| n > max) {
         return Err(format!("holds more than {max} bytes"));

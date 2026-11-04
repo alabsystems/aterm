@@ -485,9 +485,12 @@ fn relaunch_held(
         let detail = format!(
             "the session ran on its own Codex account ({}), but {why}: this build runs only this \
              machine's own login, and a relaunch never moves the conversation onto another, so \
-             relaunching it needs a codex-alab from its cd79a420c on (`aterm pkg update codex` \
-             once atpkg serves one); nothing was typed",
-            ca::AUTH_PATH_ENV
+             relaunching it needs a codex-alab from its cd79a420c on (`{}` once atpkg serves \
+             one); nothing was typed",
+            ca::AUTH_PATH_ENV,
+            crate::harness::accounts_step::Step::Update(
+                crate::harness::accounts::Cli::Codex.id().to_owned()
+            )
         );
         return fail(opts, r, st, "auth-path-unread", &detail);
     }

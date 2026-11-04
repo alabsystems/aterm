@@ -1674,6 +1674,25 @@ fn a_removed_mac_asking_again_with_fresh_secrets_key_and_same_node_key_is_restor
     assert!(restored_labels.contains(&label));
     assert!(restored_nodes.contains(&aterm_codec::hex::encode_lower(&node_key)));
 
+    let snapshot = roster::swarm_roster_for_denial_snapshot(m7)
+        .unwrap()
+        .unwrap();
+    assert!(!snapshot.is_label_denied(&label));
+    assert!(
+        snapshot
+            .member_by_recipient(&request_fresh.binding().recipient().to_bech32())
+            .is_some()
+    );
+    let lock = StateLock::observe(m7).unwrap().unwrap();
+    let held = roster::swarm_roster_for_denial_held(m7, &lock)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        snapshot.to_toml(),
+        held.to_toml(),
+        "contention observations must retain the same restoration semantics"
+    );
+
     macs.server.stop();
 }
 
@@ -2096,6 +2115,8 @@ fn removed_labels_overlay_and_local_label_resolution_enforce_node_and_recipient_
     // 3. `resolve_local_swarm_label` returns `Ok(None)` when the local Mac is removed in the log
     // or denied in the roster, even if `source.toml` (`host = "m7"`) and `state.toml` (`name = "m7"`)
     // still name `"m7"`.
+    // Every server it reads is its own on loopback, which answers.
+    let _answering = ServersAnswering::set();
     let macs = two_macs(&[(Audience::Everyone, "shared", b"v1".as_slice())]);
     let (m22, m7) = (&macs.m22, &macs.m7);
     assert_eq!(

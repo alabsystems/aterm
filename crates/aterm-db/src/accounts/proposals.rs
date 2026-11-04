@@ -306,6 +306,13 @@ fn encode(command: &Command) -> Result<Vec<u8>> {
     Ok(payload)
 }
 
+fn validate_collection(collection: &str) -> Result<()> {
+    match collection {
+        "accounts" | "mailboxes" | "email-addresses" | "phones" | "machine-proposals" => Ok(()),
+        _ => Err(Error::new("unsupported account proposal collection")),
+    }
+}
+
 fn decode(payload: &[u8]) -> Result<Command> {
     if payload.len() > MAX_PAYLOAD {
         return Err(Error::new("account proposal exceeds payload limit"));
@@ -321,14 +328,11 @@ fn decode(payload: &[u8]) -> Result<Command> {
         .changes()
         .ok_or_else(|| Error::new("account proposals cannot authorize resources or membership"))?;
     for change in changes {
-        match change.collection.as_str() {
-            "accounts" | "mailboxes" | "email-addresses" | "phones" => {}
-            "machine-proposals" => {
-                if let Some(value) = &change.value {
-                    crate::machines::validate(&change.key, value)?;
-                }
-            }
-            _ => return Err(Error::new("unsupported account proposal collection")),
+        validate_collection(&change.collection)?;
+        if change.collection == "machine-proposals"
+            && let Some(value) = &change.value
+        {
+            crate::machines::validate(&change.key, value)?;
         }
     }
     Ok(command)

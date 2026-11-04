@@ -88,10 +88,7 @@ fn slug_text(tier: i64) -> &'static str {
 }
 
 fn scratch() -> aterm_tempfile::TempDir {
-    aterm_tempfile::Builder::new()
-        .prefix("agh-git-grant-")
-        .tempdir()
-        .expect("a scratch root")
+    crate::test_fixtures::scratch_dir("git-grant")
 }
 
 /// The canonical agh.toml (an in-crate copy of the fixture's text), with both token files

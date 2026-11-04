@@ -890,7 +890,11 @@ fn read_bounded(path: &Path) -> Result<Option<String>, ReadFailure> {
             metadata.len()
         )));
     }
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.len())
+            .unwrap_or(0)
+            .saturating_add(1),
+    );
     file.take(MAX_POLICY_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| unreadable(&error))?;
@@ -1569,28 +1573,24 @@ mod tests {
         );
     }
 
-    fn scratch_bundle(label: &str, write: impl FnOnce(&Path)) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "aterm-handoff-policy-{label}-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        let resources = root.join("Contents/Resources");
+    fn scratch_bundle(label: &str, write: impl FnOnce(&Path)) -> aterm_tempfile::TempDir {
+        let root = crate::test_scratch_dir(&format!("hp-{label}"));
+        let resources = root.path().join("Contents/Resources");
         std::fs::create_dir_all(&resources).expect("scratch bundle");
-        write(&root.join(BUNDLE_PATH));
+        write(&root.path().join(BUNDLE_PATH));
         root
     }
 
     #[test]
     fn a_bundle_policy_is_read_absent_or_ignored_never_followed_through_a_link() {
         let absent = scratch_bundle("absent", |_| {});
-        assert_eq!(read_from_bundle(&absent), PolicyRead::Absent);
+        assert_eq!(read_from_bundle(absent.path()), PolicyRead::Absent);
 
         let parsed = scratch_bundle("parsed", |path| {
             std::fs::write(path, "schema = 1\ncarry = \"visible\"\n").expect("write")
         });
         assert_eq!(
-            read_from_bundle(&parsed),
+            read_from_bundle(parsed.path()),
             PolicyRead::Parsed(PolicyFile {
                 legacy: HandoffPolicy {
                     carry: Some(CarryCeiling::Visible),
@@ -1604,7 +1604,7 @@ mod tests {
             std::fs::write(path, "schema = 1\ncarry = \"sideways\"\n").expect("write")
         });
         assert!(
-            matches!(read_from_bundle(&malformed), PolicyRead::Ignored(why) if why.contains("carry"))
+            matches!(read_from_bundle(malformed.path()), PolicyRead::Ignored(why) if why.contains("carry"))
         );
 
         let huge = scratch_bundle("huge", |path| {
@@ -1613,14 +1613,14 @@ mod tests {
             std::fs::write(path, text).expect("write")
         });
         assert!(
-            matches!(read_from_bundle(&huge), PolicyRead::Ignored(why) if why.contains("bound"))
+            matches!(read_from_bundle(huge.path()), PolicyRead::Ignored(why) if why.contains("bound"))
         );
 
         let binary = scratch_bundle("binary", |path| {
             std::fs::write(path, [0xff, 0xfe, 0x00]).expect("write")
         });
         assert!(
-            matches!(read_from_bundle(&binary), PolicyRead::Ignored(why) if why.contains("UTF-8"))
+            matches!(read_from_bundle(binary.path()), PolicyRead::Ignored(why) if why.contains("UTF-8"))
         );
 
         let directory = scratch_bundle("directory", |path| {
@@ -1628,28 +1628,21 @@ mod tests {
         });
         let why_directory = if cfg!(unix) { "regular" } else { "unreadable" };
         assert!(
-            matches!(read_from_bundle(&directory), PolicyRead::Ignored(why) if why.contains(why_directory))
+            matches!(read_from_bundle(directory.path()), PolicyRead::Ignored(why) if why.contains(why_directory))
         );
 
         #[cfg(unix)]
         {
-            let elsewhere = std::env::temp_dir().join(format!(
-                "aterm-handoff-policy-target-{}.toml",
-                std::process::id()
-            ));
+            let target_dir = crate::test_scratch_dir("hp-target");
+            let elsewhere = target_dir.path().join("target.toml");
             std::fs::write(&elsewhere, "schema = 1\ncarry = \"repaint\"\n").expect("write");
             let linked = scratch_bundle("linked", |path| {
                 std::os::unix::fs::symlink(&elsewhere, path).expect("symlink")
             });
             assert!(
-                matches!(read_from_bundle(&linked), PolicyRead::Ignored(why) if why.contains("regular")),
+                matches!(read_from_bundle(linked.path()), PolicyRead::Ignored(why) if why.contains("regular")),
                 "a link out of the bundle is never followed"
             );
-            let _ = std::fs::remove_file(&elsewhere);
-            let _ = std::fs::remove_dir_all(&linked);
-        }
-        for root in [absent, parsed, malformed, huge, binary, directory] {
-            let _ = std::fs::remove_dir_all(root);
         }
     }
 
@@ -1711,7 +1704,7 @@ mod tests {
             assert_eq!(made, 0, "mkfifo: {}", std::io::Error::last_os_error());
         });
         let (tx, rx) = std::sync::mpsc::channel();
-        let root = fifo.clone();
+        let root = fifo.path().to_path_buf();
         std::thread::spawn(move || {
             let _ = tx.send(read_from_bundle(&root));
         });
@@ -1722,7 +1715,6 @@ mod tests {
             matches!(&read, PolicyRead::Ignored(why) if why.contains("regular")),
             "{read:?}"
         );
-        let _ = std::fs::remove_dir_all(fifo);
     }
 
     #[test]

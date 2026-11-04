@@ -180,6 +180,8 @@ impl Host<'_> {
         self.opened.set(self.opened.get() + 1);
         if matches!(self.case, 4..=6 | 8 | 10) {
             self.change();
+        } else if !self.changed.get() {
+            *self.after.borrow_mut() = self.bed.records();
         }
     }
     fn change(&self) {
@@ -325,9 +327,30 @@ fn exercise(browser: bool, provider: i64, case: i64) -> (bool, bool, bool, i64) 
         }
         if browser && case == 11 {
             assert_eq!(
-                &after[1..3],
-                &before[1..3],
-                "a browser clock rollback must preserve existing account and login records"
+                after[1], before[1],
+                "a browser clock rollback preserves existing authentication records"
+            );
+            let old = accounts::Logins::from_json(
+                std::str::from_utf8(before[2].as_ref().unwrap()).unwrap(),
+                bed.env.now,
+            )
+            .unwrap();
+            let current = accounts::Logins::from_json(
+                std::str::from_utf8(after[2].as_ref().unwrap()).unwrap(),
+                bed.env.now,
+            )
+            .unwrap();
+            let row = bed.raw.row("main").unwrap();
+            assert_eq!(current.workflow_clock, old.workflow_clock);
+            assert_eq!(
+                accounts::current_workflow(row, &current),
+                accounts::current_workflow(row, &old),
+                "the completion does not replace the workflow"
+            );
+            assert!(accounts::workflow_event_matches(row, &current, completion));
+            assert_eq!(
+                current, old,
+                "the scoped completion preserves login records and credential clocks"
             );
         }
     }

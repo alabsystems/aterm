@@ -574,6 +574,19 @@ fn turn_line(n: u32, t: &TurnInfo<'_>, link: Option<MailLink>, shed: TxShed, now
         && let Some(Val::Id(opener)) = t.close.and_then(|c| c.f.get(Key::OpBy))
     {
         let _ = write!(line, " by={opener}");
+    } else if let Some(role) = t.amends.iter().find_map(|a| a.f.get_word(Key::TurnBy)) {
+        // A HARNESS TURN (gap 25): the role the vendor's row named, where the connection named
+        // nobody, with the act that typed it (the turn's cause amend, written once the host
+        // paired the act) unless the open names a cause already.
+        let _ = write!(line, " by={role}");
+        if t.open.is_none_or(|o| o.f.get(Key::Cause).is_none())
+            && let Some(c) = t.amends.iter().find_map(|a| match a.f.get(Key::Cause) {
+                Some(Val::Id(c)) => Some(c),
+                _ => None,
+            })
+        {
+            let _ = write!(line, " cause={c}");
+        }
     }
     let (from, keys): (Option<&Rec>, &[Key]) = match t.open {
         Some(o) => (Some(o), &[Key::Ledger, Key::Cause, Key::Cont]),

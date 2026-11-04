@@ -87,7 +87,7 @@ pub(crate) fn open_regular(path: &Path) -> io::Result<(std::fs::File, usize)> {
 pub(crate) fn read_bytes(path: &Path) -> io::Result<Vec<u8>> {
     use std::io::Read as _;
     let (file, cap) = open_regular(path)?;
-    let mut out = Vec::with_capacity(cap.min(64 * 1024));
+    let mut out = Vec::with_capacity(cap.min(64 * 1024).saturating_add(1));
     file.take(MAX_FILE_BYTES + 1).read_to_end(&mut out)?;
     if out.len() as u64 > MAX_FILE_BYTES {
         return Err(io::Error::new(
@@ -110,7 +110,7 @@ pub(crate) fn read_to_string(path: &Path) -> io::Result<String> {
     }
     use std::io::Read as _;
     let (file, cap) = open_regular(path)?;
-    let mut out = String::with_capacity(cap.min(64 * 1024));
+    let mut out = String::with_capacity(cap.min(64 * 1024).saturating_add(1));
     file.take(MAX_FILE_BYTES + 1).read_to_string(&mut out)?;
     if out.len() as u64 > MAX_FILE_BYTES {
         return Err(io::Error::new(

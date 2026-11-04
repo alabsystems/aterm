@@ -12,6 +12,7 @@ pub(crate) mod ffi;
 pub(crate) mod loss;
 pub(crate) mod pipelines;
 pub(crate) mod present;
+pub(crate) mod quiet_probe;
 pub(crate) mod resources;
 pub(crate) mod shaders;
 pub(crate) mod swapchain;

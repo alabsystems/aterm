@@ -12,8 +12,10 @@ mod support;
 
 mod brief_budget;
 mod carry;
+mod claimed_boxes;
 mod claims;
 mod close_ledger;
+mod conformance_claimed_boxes;
 mod conformance_claimed_turns;
 mod conformance_claims;
 mod conformance_cursor;
@@ -30,6 +32,7 @@ mod conformance_transcript;
 mod conformance_turn;
 mod discipline;
 mod fold_laws;
+mod harness_turn;
 mod journal_codec;
 mod journal_view;
 mod kept_copy;

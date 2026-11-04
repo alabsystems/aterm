@@ -3053,11 +3053,14 @@ impl Wake {
             Wake::CommitSessionRename { .. } => None,
             #[cfg(target_os = "macos")]
             Wake::CancelSessionRename { .. } => None,
+            #[cfg(target_os = "macos")]
+            Wake::AllocationMonitorChanged => None,
             Wake::MailChanged
             | Wake::WorkstationSetup(_)
             | Wake::DeveloperToolsInstall(_, _)
             | Wake::DeveloperToolsWatch(_)
             | Wake::DeveloperToolsLowData(_)
+            | Wake::RootStepsOwed(_)
             | Wake::InitialSetupStatus { .. }
             | Wake::InitialSetupApplyResolved
             | Wake::InitialSetupPhraseJoined

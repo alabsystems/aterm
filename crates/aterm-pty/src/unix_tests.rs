@@ -3681,6 +3681,146 @@ fn a_session_whose_leader_exited_leaving_its_group_on_the_slave_ends() {
     assert!(status.success(), "sh exited 0: {status}");
 }
 
+/// The pty's foreground job, a group of the session other than its leader's, is ended with the
+/// session: here a job-control `sh` (`set -m`) runs `sleep 600` in the foreground, in a group of
+/// its own, ignoring the hangup the leader's end sends, so only [`end_session_on_pty`]'s signal
+/// to the pty's foreground group ends it.
+#[test]
+fn the_ptys_foreground_job_is_ended_with_the_session() {
+    use std::os::fd::AsRawFd as _;
+    use std::time::{Duration, Instant};
+    let (master, slave, mut leader) = spawn_session_leader_on_pty(|slave| {
+        let tty = || slave.try_clone().map(std::process::Stdio::from);
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", "set -m; trap '' HUP; sleep 600; :"])
+            .stdin(tty()?)
+            .stdout(tty()?)
+            .stderr(tty()?);
+        Ok(cmd)
+    })
+    .expect("sh spawns onto a pty");
+    let pid = i32::try_from(leader.id()).expect("a pid");
+    let until = Instant::now() + HANG_DETECTOR;
+    let job = loop {
+        // SAFETY: `tcgetpgrp` is a read-only ioctl on the master this test holds.
+        let front = unsafe { libc::tcgetpgrp(master.as_raw_fd()) };
+        if front > 1 && front != pid {
+            break front;
+        }
+        assert!(
+            Instant::now() < until,
+            "sh's job never took the pty's foreground"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let ended = end_session_on_pty(
+        master,
+        Some(slave),
+        &mut leader,
+        aterm_spec::wait::MUST_HAPPEN,
+        &mut |_| {},
+    );
+    // SAFETY: a plain syscall taking no pointer; `job` > 1 names the job's group, and signal 0
+    // only asks whether it has a member to signal.
+    let group_lives = || unsafe { libc::kill(-job, 0) } == 0;
+    let until = Instant::now() + HANG_DETECTOR;
+    while group_lives() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    if group_lives() {
+        // A group keeps its id while it has a member, so the id just found live names the job's
+        // group still: ended here, so a broken end leaves no `sleep 600` running past the test.
+        let _ = aterm_uds::process::kill_group_until_empty(job);
+        panic!("the foreground job outlived the session's end by the hang detector");
+    }
+    ended.expect("the session ends");
+}
+
+/// A foreground read naming a group outside the session being ended, as an id read stale, or
+/// reused since, would name, is never signalled. The read stands in ([`front_read::reads_as`])
+/// for another session's group: a `sleep` leading its own session on a pty of its own, which
+/// the end of `sh`'s session leaves running.
+#[test]
+fn a_foreground_read_naming_another_sessions_group_is_never_signalled() {
+    let (other_master, other_slave, mut other) = spawn_session_leader_on_pty(|_slave| {
+        let mut cmd = std::process::Command::new("/bin/sleep");
+        cmd.arg("600");
+        Ok(cmd)
+    })
+    .expect("sleep spawns onto a pty");
+    let other_pid = i32::try_from(other.id()).expect("a pid");
+    let (master, slave, mut leader) = spawn_session_leader_on_pty(|_slave| {
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", "read line"]);
+        Ok(cmd)
+    })
+    .expect("sh spawns onto a pty");
+    front_read::reads_as(other_pid);
+    let ended = end_session_on_pty(
+        master,
+        Some(slave),
+        &mut leader,
+        aterm_spec::wait::MUST_HAPPEN,
+        &mut |_| {},
+    );
+    let other_runs = child_exit_unreaped(other_pid);
+    let other_ended = end_session_on_pty(
+        other_master,
+        Some(other_slave),
+        &mut other,
+        aterm_spec::wait::MUST_HAPPEN,
+        &mut |_| {},
+    );
+    ended.expect("sh's session ends");
+    other_ended.expect("sleep's session ends");
+    assert_eq!(
+        other_runs,
+        Some(false),
+        "the other session's sleep ran on through the end of sh's"
+    );
+}
+
+/// A leader the caller has already reaped is never signalled, nor is the group it led: once
+/// reaped, its pid, and so that group's id, may name another process's group. Here the group
+/// still has a member, sh's job that ignored the exit's hangup, so the id names that group yet,
+/// and [`end_session_on_pty`] leaves the job running: the call takes no id from a reaped leader.
+/// The test then ends the group itself, which it has just found live.
+#[test]
+fn a_reaped_leaders_group_is_never_signalled() {
+    use std::time::Duration;
+    let (master, slave, mut leader) = spawn_session_leader_on_pty(|slave| {
+        let tty = || slave.try_clone().map(std::process::Stdio::from);
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", "trap '' HUP; sleep 600 & exit 0"])
+            .stdout(tty()?)
+            .stderr(tty()?);
+        Ok(cmd)
+    })
+    .expect("sh spawns onto a pty");
+    let pid = i32::try_from(leader.id()).expect("a pid");
+    let status = leader.wait().expect("sh, reaped");
+    // SAFETY: a plain syscall taking no pointer; `pid` > 1 names the group sh led, which its job
+    // keeps while it lives, and signal 0 only asks whether it has a member to signal.
+    let group_lives = || unsafe { libc::kill(-pid, 0) } == 0;
+    let lived = group_lives();
+    // Linux's master ends only once the job lets the slave go, so its end is not waited for.
+    let _ = end_session_on_pty(
+        master,
+        Some(slave),
+        &mut leader,
+        Duration::from_secs(1),
+        &mut |_| {},
+    );
+    let lives = group_lives();
+    if lives {
+        // The id just found live names sh's group still.
+        let _ = aterm_uds::process::kill_group_until_empty(pid);
+    }
+    assert!(status.success(), "sh exited 0: {status}");
+    assert!(lived, "sh's job lived on in its group once sh was reaped");
+    assert!(lives, "the reaped leader's group was not signalled");
+}
+
 /// A pty whose `grantpt` never returns by itself, as XNU's spins on a pty whose node could not
 /// be made (ATERM-KI-1028-4), is let go at [`GRANT_BOUND`] and replaced: the open returns a
 /// working pair on another pty, the stuck one held open until then: its master still answers by

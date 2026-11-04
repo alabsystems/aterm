@@ -446,6 +446,9 @@ aterm-digest = { workspace = true }
 aterm-winres = { workspace = true }
 
 [dev-dependencies]
+# The hash-table size a keyframe's charge names (`heap::table_bytes`), held to
+# what this crate's counting allocator sees a `HashMap` free (temporal.rs).
+aterm-alloc = { workspace = true }
 # `verify perf throughput`'s corpus, for the `c_cut_cost` bench (a lib with no
 # dependencies of its own).
 aterm-bench = { path = "../aterm-bench" }

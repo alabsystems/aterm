@@ -1,0 +1,42 @@
+# claude-code 2.1.318 · MEASURED 2026-11-04, `aterm ctl text` of a private headless aterm (144x50, aterm 0.153.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · Claude Code's prompt-history search (ctrl+r) opened with no query over the grey suggestion a turn left (CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=1, the stub drafting it): the composer row keeps the suggestion (column 2 reads r 999999 111318 dim, no caret drawn over it), the cursor (40,18) on the footer row after the empty query · cursor=40,18
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.lab0/proj
+
+
+❯ please read the readme
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ x
+
+✻ Baked for 3s · done 4:57 AM
+
+❯ LABREADME say hi
+
+⏺ Implemented the parser module and its unit tests in this turn.
+
+✻ Baked for 3s · done 4:59 AM
+
+❯ please read it again
+
+⏺ Implemented the parser module and its unit tests in this turn.
+
+✻ Cooked for 3s · done 4:59 AM
+
+❯ SCENE-E please look
+
+⏺ Implemented the parser module and its unit tests in this turn.
+
+✻ Worked for 7s · done 5:07 AM
+
+❯ please check the parser
+
+⏺ Implemented the parser module and its unit tests in this turn.
+
+✻ Worked for 3s · done 5:12 AM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ run the whole test suite again
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  search prompts:   ⏵⏵ auto mode on (shift+tab to cycle)

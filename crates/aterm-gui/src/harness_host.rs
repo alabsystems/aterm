@@ -1548,6 +1548,7 @@ impl ExitWatched {
 struct AccountKept {
     progress: Option<progress::BoundProgress>,
     execution_progress: Option<progress::BoundProgress>,
+    activity_context: Option<progress::AccountActivityContext>,
     /// An Off transition retires display authority without changing the retained decision.
     progress_policy: Arc<()>,
     advised: Option<Advised>,
@@ -3100,6 +3101,7 @@ impl AccountsSaid {
     /// What a roster that admits (or the machine's own row standing for none) says.
     fn listed(
         roster: &accounts::Roster,
+        raw_roster: &accounts::Roster,
         state: &accounts::State,
         logins: &accounts::Logins,
         now: i64,
@@ -3128,7 +3130,7 @@ impl AccountsSaid {
             ),
             wrong: accounts::wrong_accounts(roster, logins),
             no_sign_in: {
-                let failing = accounts::failing_sign_ins(roster, state, logins, now);
+                let failing = accounts::failing_sign_ins(roster, raw_roster, state, logins, now);
                 if !failing.is_empty()
                     && accounts::claude_serves(roster, state, &enrolled, default_signed_in(), now)
                 {
@@ -3498,7 +3500,9 @@ pub(crate) struct Acts {
     pub(crate) account_made: Arc<AccountMadeFn>,
     /// The login a relaunch with no process to read carries ([`account_cold_at`]).
     pub(crate) account_cold: Arc<AccountColdFn>,
-    /// A cold Codex relaunch moved off a pool row now limited or signed out ([`codex_cold_at`]).
+    /// A cold Codex relaunch, or a self-claimed codex-alab's relaunch after it crashed or was
+    /// restarted ([`self_claimed_exit`]), moved off a pool row now limited or signed out
+    /// ([`codex_cold_at`]).
     pub(crate) codex_cold: Arc<CodexColdFn>,
     /// The live upgrade's clocks held through the loop's limit episode ([`upgrade_drive::hold_clock`], [`WorkerIdle::limited`]).
     pub(crate) hold: Arc<HoldFn>,
@@ -5011,19 +5015,18 @@ impl IdleHost for WorkerIdle {
     fn facts(&self) -> Option<aterm_agent::supervise::FactsReading> {
         let now = Instant::now();
         let board = self.hooks.acts.jobs_board;
-        let (age, calls) = board.facts(&self.sid, now)?;
-        let held = board.held(&self.sid, now);
         let now_ms = i64::try_from(aterm_time::unix_millis()?).ok()?;
+        let calls = crate::vitals_jobs::facts_reading(
+            board,
+            self.hooks.acts.leader_lives,
+            &self.sid,
+            now,
+            now_ms,
+        )?;
+        let held = board.held(&self.sid, now);
         let ms = |age: Duration| i64::try_from(age.as_millis()).unwrap_or(i64::MAX);
-        let lives = self.hooks.acts.leader_lives;
         let held_now = self.hooks.acts.held_now;
         Some(aterm_agent::supervise::FactsReading {
-            as_of_ms: now_ms.saturating_sub(ms(age)),
-            no_progress: calls
-                .into_iter()
-                .filter(|(leader, call)| call.birth.is_some_and(|birth| lives(*leader, birth)))
-                .map(|(_, call)| call)
-                .collect(),
             held: held.and_then(|(age, rows)| {
                 let age_ms = ms(age);
                 if rows.is_empty() {
@@ -5045,6 +5048,7 @@ impl IdleHost for WorkerIdle {
                     programs,
                 })
             }),
+            ..calls
         })
     }
 
@@ -8167,15 +8171,18 @@ impl WorkerIdle {
         with_kept_of(&self.kept, |k| k.account.unjudged = None);
         let enrolled = accounts::enrolled(&roster);
         if unread.is_none()
-            && let Ok((logins, None)) = store.load_logins(seat.now)
+            && let Ok(records) = store.read_account_records(seat.roster.as_deref(), seat.now)
+            && records.notes.is_empty()
+            && records.roster == roster
         {
             accounts_tell(
                 &self.switches,
                 &self.hooks,
                 AccountsSaid::listed(
                     &roster,
-                    &state,
-                    &logins,
+                    &records.raw_roster,
+                    &records.state,
+                    &records.logins,
                     seat.now,
                     &self.login_latches.carried_rows(),
                     &|| default_claude_signed_in(&seat.home),
@@ -10761,6 +10768,8 @@ fn left_to_asker(job: &WorkerJob, hooks: &Hooks, by: &EndAsked, said: Say) {
 }
 
 /// The crash rule: the exit of an agent a proven self-claim supervised, decided by this host's watch-only worker alone.
+/// Its relaunch types the copy's line, moved off a Codex pool row that no longer serves onto the
+/// serving one as a cold restore's is ([`Acts::codex_cold`]).
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -10846,7 +10855,7 @@ fn self_claimed_exit(
             copy.start
         );
     }
-    let resume = match &copy.resume {
+    let mut resume = match &copy.resume {
         Ok(resume) => resume.clone(),
         Err(why) if copy.seen == self_claimed::Seen::Never => {
             settled(job);
@@ -10904,16 +10913,24 @@ fn self_claimed_exit(
         ));
         return None;
     };
+    let mut owed = snap.clone();
+    if let Some(run) = owed.codex_mut() {
+        run.self_claimed = Some(resume.clone());
+    }
+    // The cold restore's row swap: a relaunch leaves a pool row that no longer serves for the
+    // serving row, its line otherwise the copy's.
+    if let Some(moved) = (hooks.acts.codex_cold)(&owed)
+        && let Some(to) = moved.codex().and_then(|run| run.self_claimed.clone())
+    {
+        resume = to;
+        owed = moved;
+    }
     aterm_log::info!(
         "harness @{sid}: the self-supervised codex-alab crashed; relaunching it on its \
          conversation {}",
         resume.session
     );
     crate::self_claim::typed(sid, &resume);
-    let mut owed = snap.clone();
-    if let Some(run) = owed.codex_mut() {
-        run.self_claimed = Some(resume.clone());
-    }
     with_kept(job, |k| {
         if !job.revoked.load(Ordering::SeqCst) {
             k.owed = Some(OwedRelaunch { snap: owed, asked });
@@ -14621,6 +14638,7 @@ fn host_pass(
         host.phase_epoch_seen,
         phase_now,
     );
+    let activity_wake = host.full_epoch_seen != full_now;
     host.full_epoch_seen = full_now;
     host.phase_epoch_seen = phase_now;
     let (cfg, cfg_gen, admission_gen, active, suspended, shutting_down, switched_on, agent_off) = {
@@ -14815,6 +14833,7 @@ fn host_pass(
         (cfg_gen, admission_gen),
         hooks,
     );
+    progress::activity::refresh_kept(shared, hooks, activity_wake);
     unworked.extend(
         wanted
             .iter()
@@ -19960,16 +19979,24 @@ fn accounts_said(
         Err(unread) => return Some(unread.into()),
     };
     let store = accounts::Store::at(&seat.state);
-    let (state, None) = store.load(seat.now).ok()? else {
+    let records = store
+        .read_account_records(seat.roster.as_deref(), seat.now)
+        .ok()?;
+    if !records.notes.is_empty() {
         return None;
-    };
-    let (logins, None) = store.load_logins(seat.now).ok()? else {
+    }
+    let raw = if records.roster == roster {
+        records.raw_roster
+    } else if records.roster.rows.is_empty() && roster == accounts::Roster::own() {
+        accounts::Roster::own()
+    } else {
         return None;
     };
     Some(AccountsSaid::listed(
         &roster,
-        &state,
-        &logins,
+        &raw,
+        &records.state,
+        &records.logins,
         seat.now,
         carried,
         &|| default_claude_signed_in(&seat.home),
@@ -20022,12 +20049,18 @@ fn pools_said(seat: &AccountSeat) -> Vec<PoolSaid> {
         .filter_map(|pool| {
             let roster = pool.rows.ok()?;
             let store = accounts::Store::at_for(&seat.state, pool.cli, &seat.home);
-            let (logins, _) = store.load_logins(seat.now).ok()?;
+            let records = store
+                .read_account_records(Some(&pool.roster), seat.now)
+                .ok()?;
+            if records.roster != roster || !records.notes.is_empty() {
+                return None;
+            }
+            let logins = records.logins;
             let said = PoolSaid {
                 cli: pool.cli,
                 due: accounts::renew_due(&roster, &logins, &pool.state, &pool.enrolled, seat.now),
                 wrong: accounts::wrong_accounts(&roster, &logins),
-                sign_in: accounts::sign_in_tasks(&roster, &logins),
+                sign_in: accounts::sign_in_tasks(&records.raw_roster, &logins),
                 asked: aterm_agent::ai::state::named(pool.cli.id(), &settings)
                     || pool.state.pinned
                     || logins.labels.values().any(|b| b.served_at.is_some()),
@@ -21742,7 +21775,22 @@ fn disk_look_pass(
     let faults = if reading.off_by_fault {
         config_path
             .as_deref()
-            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|path| {
+                use std::io::Read as _;
+                const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+                let (file, meta) = aterm_uds::regular_file::open(path).ok()?;
+                if meta.len() > MAX_CONFIG_BYTES {
+                    return None;
+                }
+                let cap = usize::try_from(meta.len().min(MAX_CONFIG_BYTES))
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                let mut text = String::with_capacity(cap);
+                file.take(MAX_CONFIG_BYTES + 1)
+                    .read_to_string(&mut text)
+                    .ok()?;
+                (text.len() as u64 <= MAX_CONFIG_BYTES).then_some(text)
+            })
             .map(|text| aterm_agent::harness::cli::disk_faults(&text))
             .unwrap_or_default()
     } else {
@@ -23759,8 +23807,9 @@ pub(crate) fn live_accounts_upkeep() -> AccountsUpkeep {
         && crate::headless_seam_admits(
             aterm_types::dev_seam!(aterm_agent::harness::accounts_sync::UPKEEP_SEAM).is_some(),
         );
-    let arm = accounts_upkeep_arm(not_own, seam);
-    if let (AccountsUpkeep::Inert, Some(why)) = (&arm, not_own) {
+    let arm = accounts_upkeep_here(not_own, seam);
+    if matches!(arm, AccountsUpkeep::Inert) {
+        let why = not_own.unwrap_or("it is a debug build");
         aterm_log::info!(
             "harness: accounts-upkeep=inert: {why}, so this instance keeps no fleet accounts \
              (no roster is fetched and no sign-in is started, whatever aterm.toml says)"
@@ -24014,10 +24063,19 @@ fn claims_touch(act: aterm_agent::harness::claims::Act<'_>) {
     }
 }
 
-/// The live upkeep where the instance runs as its account's own (`not_own` is `None`) or the
-/// development seam `accounts_sync::UPKEEP_SEAM` was admitted (`seam`), else the inert one.
-const fn accounts_upkeep_arm(not_own: Option<&str>, seam: bool) -> AccountsUpkeep {
-    if not_own.is_none() || seam {
+/// [`accounts_upkeep_arm`] for this build: the arm's `debug` is this build's debug assertions.
+const fn accounts_upkeep_here(not_own: Option<&str>, seam: bool) -> AccountsUpkeep {
+    accounts_upkeep_arm(not_own, seam, cfg!(debug_assertions))
+}
+
+/// The live upkeep where a shipped build (`debug` false) runs as its account's own (`not_own` is
+/// `None`) or the development seam `accounts_sync::UPKEEP_SEAM` was admitted (`seam`), else the
+/// inert one. A debug build never signs the person's accounts in on its own: it may be a test
+/// binary copied under a name that gives it no scratch root
+/// (`aterm_uds::test_binary::is_test_binary`), which reads as its account's own and would start a
+/// real sign-in from a test. `debug` is passed in, so a test reaches the shipped build's answer.
+const fn accounts_upkeep_arm(not_own: Option<&str>, seam: bool, debug: bool) -> AccountsUpkeep {
+    if seam || (not_own.is_none() && !debug) {
         AccountsUpkeep::Live
     } else {
         AccountsUpkeep::Inert

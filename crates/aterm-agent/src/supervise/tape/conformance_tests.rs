@@ -8,6 +8,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use astream_effects::EffectRecord;
+use astream_wire::frame::{FrameError, HEADER_SIZE, decode_frame_header_bytes};
+use astream_wire::hash::crc32_ieee;
+use astream_wire::steps::{
+    STEP_HEADER, StepEnd, StepFault, StepScan, decode_step_header, end_at_corrupt_frame,
+    end_without_frame,
+};
 use aterm_models_harness::{
     supervise_replay_cursor_model, supervise_tape_recovery_model, supervisor_raised_latch_model,
 };
@@ -20,9 +26,9 @@ use super::codec::{ctl_reply, ctl_request};
 use super::ctl::is_act;
 use super::doors;
 use super::frame::{Hint, MAGIC, TapeWriter};
-use super::frame_tests::{HEADER, Memory, Said, arranged, mono, noise, screen_read};
+use super::frame_tests::{HEADER, Memory, Said, arranged, fault_as_torn, mono, noise, screen_read};
 use super::header::VERBATIM;
-use super::recover::{Check, Keep, Limits, Recovered, Tail, read, recover};
+use super::recover::{HELD_MAX, Keep, Recovered, Tail, read, recover, steps};
 use super::replay::ReplayCore;
 use crate::supervise::fx::Fx;
 use crate::supervise::{Ctl, CtlReply};
@@ -289,17 +295,78 @@ fn the_real_writer_and_reader_conform_to_the_model() {
     assert!(audit.stray.is_empty(), "{audit:?}");
 }
 
+/// A scan of a tape's records that checks each frame's CRC only when `sums`, and
+/// each record's step only when `places`. With both it is astream's own scan
+/// (`the_lax_scan_with_every_check_is_astreams`); with one off it is a negative
+/// control's reader.
+fn lax(records: &[u8], sums: bool, places: bool) -> StepScan {
+    let mut out = StepScan {
+        steps: Vec::new(),
+        valid_len: 0,
+        end: StepEnd::Clean,
+    };
+    let mut pos = 0;
+    out.end = loop {
+        let rest = &records[pos..];
+        let Some(head) = rest.first_chunk::<HEADER_SIZE>() else {
+            break end_without_frame(records, pos);
+        };
+        let (len, crc) = match decode_frame_header_bytes(head) {
+            Ok(pair) => pair,
+            Err(e) => break end_at_corrupt_frame(records, pos, e),
+        };
+        let Some(payload) = rest.get(HEADER_SIZE..HEADER_SIZE + len) else {
+            break end_without_frame(records, pos);
+        };
+        if sums && crc32_ieee(payload) != crc {
+            break end_at_corrupt_frame(records, pos, FrameError::ChecksumMismatch);
+        }
+        let Some((step, body_len)) = decode_step_header(payload, len) else {
+            break StepEnd::Fault {
+                at: pos,
+                kind: StepFault::BadStep,
+            };
+        };
+        let expected = out.steps.len() as u64;
+        if places && step != expected {
+            break StepEnd::Fault {
+                at: pos,
+                kind: StepFault::OutOfOrder {
+                    expected,
+                    found: step,
+                },
+            };
+        }
+        let body = pos + HEADER_SIZE + STEP_HEADER;
+        out.steps.push((step, body..body + body_len));
+        pos += HEADER_SIZE + len;
+        out.valid_len = pos;
+    };
+    out
+}
+
 #[test]
-fn a_reader_that_ignores_xxh64_is_rejected() {
+fn the_lax_scan_with_every_check_is_astreams() {
+    let model = interp::with_buggy(&supervise_tape_recovery_model(), 0);
+    let tape = write_tape(&model, &mut StepEvidence::new(MACHINE), 3);
+    let mut scanned = 0;
+    for case in cases(&tape) {
+        if let Some(records) = case.bytes.strip_prefix(MAGIC.as_slice()) {
+            assert_eq!(lax(records, true, true), steps(records), "{}", case.what);
+            scanned += 1;
+        }
+    }
+    assert!(scanned > 1_000, "{scanned} cases scanned");
+}
+
+#[test]
+fn a_reader_that_ignores_the_crc_is_rejected() {
     let model = interp::with_buggy(&supervise_tape_recovery_model(), 0);
     let blind_model = interp::with_buggy(&supervise_tape_recovery_model(), 1);
     let tape = write_tape(&model, &mut StepEvidence::new(MACHINE), 3);
-    let blind = |bytes: &[u8]| read(bytes, Keep::Refuse, Check::Nothing, Limits::TAPE);
+    let blind = |bytes: &[u8]| read(bytes, Keep::Refuse, HELD_MAX, |r| lax(r, false, true));
     let wrong = bind(&model, &tape, &blind, None);
-    assert!(
-        !wrong.is_empty(),
-        "the bind rejects a checksum-blind reader"
-    );
+    assert!(!wrong.is_empty(), "the bind rejects a CRC-blind reader");
     let read_through: Vec<&Disagreement> = wrong
         .iter()
         .filter(|d| d.broken.contains(&"RotRefused"))
@@ -324,7 +391,7 @@ fn a_reader_that_ignores_places_is_rejected() {
     let model = interp::with_buggy(&supervise_tape_recovery_model(), 0);
     let unplaced_model = interp::with_buggy(&supervise_tape_recovery_model(), 6);
     let tape = write_tape(&model, &mut StepEvidence::new(MACHINE), 3);
-    let unplaced = |bytes: &[u8]| read(bytes, Keep::Refuse, Check::Unplaced, Limits::TAPE);
+    let unplaced = |bytes: &[u8]| read(bytes, Keep::Refuse, HELD_MAX, |r| lax(r, true, false));
     let wrong = bind(&model, &tape, &unplaced, None);
     assert!(
         wrong.iter().all(|d| d.schedule.contains(&"Misplace")),
@@ -347,6 +414,29 @@ fn a_reader_that_ignores_places_is_rejected() {
             .all(|v| unplaced_state[v] == d.real[v])
     });
     assert!(predicted, "the Buggy = 6 machine predicts a read-through");
+}
+
+#[test]
+fn a_reader_that_reads_a_fault_as_torn_is_rejected() {
+    let model = interp::with_buggy(&supervise_tape_recovery_model(), 0);
+    let tape = write_tape(&model, &mut StepEvidence::new(MACHINE), 3);
+    let wrong = bind(&model, &tape, &fault_as_torn, None);
+    for law in ["RotRefused", "MisplacedRefused"] {
+        assert!(
+            wrong.iter().any(|d| d.broken.contains(&law)),
+            "NEGATIVE CONTROL: {law} holds of a reader that reads a fault as torn: {:?}",
+            wrong.first()
+        );
+    }
+    assert!(
+        wrong
+            .iter()
+            .all(|d| !d.schedule.contains(&"Tear") && !d.schedule.contains(&"RotLast")),
+        "a torn tail reads as it did: {:?}",
+        wrong
+            .iter()
+            .find(|d| d.schedule.contains(&"Tear") || d.schedule.contains(&"RotLast"))
+    );
 }
 
 const CURSOR: &str = "SuperviseReplayCursor";

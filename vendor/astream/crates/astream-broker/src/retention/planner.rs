@@ -239,6 +239,7 @@ pub fn stamped_at(stamps: &[(u64, u64)], off: u64, now: u64) -> u64 {
 /// decides its class) and its bytes ([`record_bytes`]); and, when the entry carries it,
 /// the whole record, which the planning needs only for a record below the cut that a
 /// hold rule carries.
+#[cfg(any(test, debug_assertions))]
 pub trait Planned {
     /// The record's offset.
     fn offset(&self) -> u64;
@@ -250,6 +251,7 @@ pub trait Planned {
     fn whole(&self) -> Option<Arc<BrokerRecord>>;
 }
 
+#[cfg(any(test, debug_assertions))]
 impl Planned for Arc<BrokerRecord> {
     fn offset(&self) -> u64 {
         self.seq.0
@@ -265,7 +267,66 @@ impl Planned for Arc<BrokerRecord> {
     }
 }
 
+/// One retained record as the planning reads it: what [`Planned`] gives, and its broker time.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Entry<'a> {
+    pub(crate) offset: u64,
+    pub(crate) subject: &'a str,
+    pub(crate) bytes: u64,
+    pub(crate) bt: Option<u64>,
+}
+
+/// The retained records a planning reads, from the base, in offset order: a [`View`]'s
+/// slice, or the log's packed tier (`tier.rs`), which keeps no struct per record to slice.
+pub(crate) trait Records {
+    /// How many records there are.
+    fn count(&self) -> usize;
+    /// Record `i`'s entry.
+    fn entry(&self, i: usize) -> Option<Entry<'_>>;
+    /// Record `i` whole, or `None` for records held only as entries.
+    fn whole(&self, i: usize) -> Option<Arc<BrokerRecord>>;
+}
+
+/// A [`View`]'s records: the slice, and the broker times beside it.
+#[cfg(any(test, debug_assertions))]
+struct Listed<'a, R> {
+    records: &'a [R],
+    bts: &'a [Option<u64>],
+}
+
+#[cfg(any(test, debug_assertions))]
+impl<R: Planned> Records for Listed<'_, R> {
+    fn count(&self) -> usize {
+        self.records.len()
+    }
+
+    fn entry(&self, i: usize) -> Option<Entry<'_>> {
+        let r = self.records.get(i)?;
+        Some(Entry {
+            offset: r.offset(),
+            subject: r.subject(),
+            bytes: r.bytes(),
+            bt: self.bts.get(i).copied().flatten(),
+        })
+    }
+
+    fn whole(&self, i: usize) -> Option<Arc<BrokerRecord>> {
+        self.records.get(i)?.whole()
+    }
+}
+
+/// What the planning reads beside the records: a [`View`] without them.
+pub(crate) struct Scene<'a> {
+    pub(crate) base: u64,
+    pub(crate) ceiling: u64,
+    pub(crate) stamps: &'a [(u64, u64)],
+    pub(crate) groups: &'a HashMap<String, u64>,
+    pub(crate) held: &'a BTreeMap<u64, Held>,
+    pub(crate) now: u64,
+}
+
 /// What the planning reads: the log as one moment saw it.
+#[cfg(any(test, debug_assertions))]
 pub struct View<'a, R: Planned = Arc<BrokerRecord>> {
     /// The log's base: its oldest retained offset.
     pub base: u64,
@@ -360,21 +421,30 @@ struct Walk {
     aged_to: u64,
 }
 
-fn walk<R: Planned>(rules: &Retention, v: &View<'_, R>) -> Walk {
+/// Records `from..to`'s entries with their indices (`to` clamped to the count).
+fn entries<S: Records + ?Sized>(
+    recs: &S,
+    from: usize,
+    to: usize,
+) -> impl Iterator<Item = (usize, Entry<'_>)> {
+    (from..to.min(recs.count())).filter_map(move |i| Some((i, recs.entry(i)?)))
+}
+
+fn walk<S: Records + ?Sized>(rules: &Retention, v: &Scene<'_>, recs: &S) -> Walk {
     let mut bytes = rules.per_class(0u64);
     let mut aged_to = v.base;
-    for rec in v.records {
-        let c = rules.class_of(rec.subject());
+    for (_, rec) in entries(recs, 0, usize::MAX) {
+        let c = rules.class_of(rec.subject);
         if let Some(slot) = bytes.get_mut(c) {
-            *slot = slot.saturating_add(rec.bytes());
+            *slot = slot.saturating_add(rec.bytes);
         }
         let rule = rules.rule(c);
         if rule.class == Class::Prefix {
             let age = v
                 .now
-                .saturating_sub(stamped_at(v.stamps, rec.offset(), v.now));
+                .saturating_sub(stamped_at(v.stamps, rec.offset, v.now));
             if rule.aged(age) {
-                aged_to = aged_to.max(rec.offset().saturating_add(1));
+                aged_to = aged_to.max(rec.offset.saturating_add(1));
             }
         }
     }
@@ -408,7 +478,13 @@ fn limits(rules: &Retention, retained: &[u64], held: &[u64]) -> Vec<u64> {
 /// THE CUT the rules take on `v`: walking up from the base, each class's oldest retained
 /// records go below the cut until what the class keeps above it is within its `limit`, and
 /// every prefix record past its age is below it. Not yet held to the ceiling.
-fn natural_cut<R: Planned>(rules: &Retention, v: &View<'_, R>, w: &Walk, limit: &[u64]) -> u64 {
+fn natural_cut<S: Records + ?Sized>(
+    rules: &Retention,
+    v: &Scene<'_>,
+    recs: &S,
+    w: &Walk,
+    limit: &[u64],
+) -> u64 {
     let mut need = rules.per_class(0u64);
     let mut left = 0usize;
     for (c, n) in need.iter_mut().enumerate() {
@@ -420,20 +496,20 @@ fn natural_cut<R: Planned>(rules: &Retention, v: &View<'_, R>, w: &Walk, limit: 
         }
     }
     let mut cut = v.base;
-    for rec in v.records {
-        if left == 0 && rec.offset() >= w.aged_to {
+    for (_, rec) in entries(recs, 0, usize::MAX) {
+        if left == 0 && rec.offset >= w.aged_to {
             break;
         }
-        let c = rules.class_of(rec.subject());
+        let c = rules.class_of(rec.subject);
         if let Some(n) = need.get_mut(c) {
             if *n > 0 {
-                *n = n.saturating_sub(rec.bytes());
+                *n = n.saturating_sub(rec.bytes);
                 if *n == 0 {
                     left = left.saturating_sub(1);
                 }
             }
         }
-        cut = rec.offset().saturating_add(1);
+        cut = rec.offset.saturating_add(1);
     }
     cut.max(w.aged_to)
 }
@@ -471,7 +547,34 @@ pub fn plan_with<R: Planned>(
     p
 }
 
+/// THE PLANNING over a [`View`]: its slice of records and the broker times beside them
+/// (the broker's own tick plans the same way over its packed tier, `plan_over`).
+#[cfg(any(test, debug_assertions))]
 pub fn plan<R: Planned>(rules: &Retention, v: &View<'_, R>, forced: Option<u64>) -> Plan {
+    let scene = Scene {
+        base: v.base,
+        ceiling: v.ceiling,
+        stamps: v.stamps,
+        groups: v.groups,
+        held: v.held,
+        now: v.now,
+    };
+    let recs = Listed {
+        records: v.records,
+        bts: v.record_bts,
+    };
+    plan_over(rules, &scene, &recs, forced)
+}
+
+/// THE PLANNING over `v` and its retained records `recs`, from its base in offset order: a
+/// record `recs` cannot give whole is carried as `Plan::carry_unloaded`, for the caller to
+/// load.
+pub(crate) fn plan_over<S: Records + ?Sized>(
+    rules: &Retention,
+    v: &Scene<'_>,
+    recs: &S,
+    forced: Option<u64>,
+) -> Plan {
     let mut p = Plan {
         cut: v.base,
         headroom: u64::MAX,
@@ -507,21 +610,21 @@ pub fn plan<R: Planned>(rules: &Retention, v: &View<'_, R>, forced: Option<u64>)
             }
         }
     }
-    let w = walk(rules, v);
+    let w = walk(rules, v, recs);
     let limit = limits(rules, &w.bytes, &held);
     let want = match forced {
         Some(c) => c,
-        None => natural_cut(rules, v, &w, &limit),
+        None => natural_cut(rules, v, recs, &w, &limit),
     };
     let cut = want.min(v.ceiling).max(v.base);
     // The visible head held the cut back: a class may still be past its bytes.
     let capped = want > cut;
     p.cut = cut;
-    let kept = kept_bytes(rules, v, cut);
+    let kept = kept_bytes(rules, v, recs, cut);
     let below = usize::try_from(cut.saturating_sub(v.base)).unwrap_or(usize::MAX);
-    let mut fresh: BTreeMap<u64, (usize, &R, u64, Option<u64>)> = BTreeMap::new();
-    for (idx, rec) in v.records.iter().take(below).enumerate() {
-        let (off, subject) = (rec.offset(), rec.subject());
+    let mut fresh: BTreeMap<u64, (usize, u64, Option<u64>)> = BTreeMap::new();
+    for (idx, rec) in entries(recs, 0, below) {
+        let (off, subject) = (rec.offset, rec.subject);
         if is_hidden_subject(subject) {
             continue;
         }
@@ -537,13 +640,9 @@ pub fn plan<R: Planned>(rules: &Retention, v: &View<'_, R>, forced: Option<u64>)
             p.give_up(off, subject, Why::Aged);
         } else {
             if let Some(list) = by_class.get_mut(c) {
-                list.push((off, rec.bytes(), true));
+                list.push((off, rec.bytes, true));
             }
-            let bt_ms = match v.record_bts.get(idx) {
-                Some(&b) => b,
-                None => None,
-            };
-            fresh.insert(off, (idx, rec, at_ms, bt_ms));
+            fresh.insert(off, (idx, at_ms, rec.bt));
         }
     }
     // Each class within its limit: what it keeps above the cut first, then its held
@@ -567,7 +666,7 @@ pub fn plan<R: Planned>(rules: &Retention, v: &View<'_, R>, forced: Option<u64>)
             total = total.saturating_sub(b);
             let subj = if is_new {
                 match fresh.remove(&off) {
-                    Some((_, rec, _, _)) => Some(rec.subject()),
+                    Some((idx, _, _)) => recs.entry(idx).map(|e| e.subject),
                     None => None,
                 }
             } else {
@@ -596,8 +695,8 @@ pub fn plan<R: Planned>(rules: &Retention, v: &View<'_, R>, forced: Option<u64>)
     }
     p.kept = kept;
     p.room = room;
-    for (idx, rec, at_ms, bt_ms) in fresh.into_values() {
-        match rec.whole() {
+    for (idx, at_ms, bt_ms) in fresh.into_values() {
+        match recs.whole(idx) {
             Some(whole) => p.carry.push(Held {
                 rec: whole,
                 at_ms,
@@ -612,13 +711,18 @@ pub fn plan<R: Planned>(rules: &Retention, v: &View<'_, R>, forced: Option<u64>)
 }
 
 /// Each class's bytes in the retained suffix from `cut`.
-fn kept_bytes<R: Planned>(rules: &Retention, v: &View<'_, R>, cut: u64) -> Vec<u64> {
+fn kept_bytes<S: Records + ?Sized>(
+    rules: &Retention,
+    v: &Scene<'_>,
+    recs: &S,
+    cut: u64,
+) -> Vec<u64> {
     let mut acc = rules.per_class(0u64);
     let skip = usize::try_from(cut.saturating_sub(v.base)).unwrap_or(usize::MAX);
-    for rec in v.records.iter().skip(skip) {
-        let c = rules.class_of(rec.subject());
+    for (_, rec) in entries(recs, skip, usize::MAX) {
+        let c = rules.class_of(rec.subject);
         if let Some(slot) = acc.get_mut(c) {
-            *slot = slot.saturating_add(rec.bytes());
+            *slot = slot.saturating_add(rec.bytes);
         }
     }
     acc

@@ -1372,6 +1372,23 @@ pub(crate) struct RetainedNativeLeafArtifact<'a> {
     pub(crate) scale: f64,
 }
 
+impl crate::LeafRenderCache {
+    /// Whether `raster`, this leaf's retained raster, owes paint: damage is pending on it, or the
+    /// leaf's paint serial rose after it was painted (`App::native_paint_serial`).
+    fn native_paint_owed(&self, raster: &crate::NativeLeafRaster) -> bool {
+        self.native_damage.is_some() || raster.paint_serial != self.native_paint_serial
+    }
+
+    /// Whether `raster`'s compiled tree still answers for its view, as the hit geometry a pointer
+    /// meets and the tree inspection reports model-current: no paint is owed on it, or only
+    /// host-owned pointer feedback is (`native_pointer_style_only`). Any other invalidation,
+    /// `App::invalidate_native_ui_cache`'s included, revokes that until a repaint. The compile
+    /// stamp is checked apart from this.
+    pub(crate) fn native_tree_current(&self, raster: &crate::NativeLeafRaster) -> bool {
+        !self.native_paint_owed(raster) || self.native_pointer_style_only
+    }
+}
+
 struct NativeConfigPersistenceJob {
     plan: crate::native_config_service::ConfigPersistencePlan,
     undo: Option<u64>,
@@ -2283,9 +2300,17 @@ impl App {
     pub(crate) fn invalidate_native_ui_cache(&mut self, wid: WindowId) {
         if let Some(window) = self.windows.get_mut(&wid) {
             window.native_ui_compiled = None;
+            #[cfg(a11y_tree)]
+            {
+                window.native_a11y_staged = None;
+            }
             for cache in window.leaf_render_cache.values_mut() {
-                cache.native = None;
+                // Invalidation can run after a successful present (a load-policy
+                // transition). Its pixels and stamp still describe that frame;
+                // retain them for capture provenance until the next repaint.
                 cache.native_damage = Some(DamageRegion::All);
+                cache.native_paint_serial = cache.native_paint_serial.wrapping_add(1);
+                cache.native_pointer_style_only = false;
             }
         }
     }
@@ -2313,7 +2338,36 @@ impl App {
             None => damage,
         });
         cache.native_paint_serial = cache.native_paint_serial.wrapping_add(1);
+        cache.native_pointer_style_only = false;
         window.last_present = None;
+    }
+
+    /// Repaint host-owned hover, pressed and focus marks without changing the presented hit geometry.
+    /// A prior generic invalidation stays fenced; pointer feedback cannot turn it into a current input frame.
+    pub(crate) fn invalidate_native_pointer_style(
+        &mut self,
+        wid: WindowId,
+        view: crate::tab_model::ViewId,
+    ) {
+        let style_only = self
+            .windows
+            .get(&wid)
+            .and_then(|window| window.leaf_render_cache.get(&view))
+            .is_some_and(|cache| {
+                cache.native_pointer_style_only
+                    || cache.native_damage.is_none()
+                        && cache.native.as_ref().is_some_and(|raster| {
+                            raster.presented && raster.paint_serial == cache.native_paint_serial
+                        })
+            });
+        self.invalidate_native_view_cache(wid, view, DamageRegion::All);
+        if let Some(cache) = self
+            .windows
+            .get_mut(&wid)
+            .and_then(|window| window.leaf_render_cache.get_mut(&view))
+        {
+            cache.native_pointer_style_only = style_only;
+        }
     }
 
     /// The paint serial of `view` in window `wid`: it rises with every change to what the view
@@ -2331,6 +2385,7 @@ impl App {
         self.windows.get_mut(&wid).map_or(0, |window| {
             let cache = window.leaf_render_cache.entry(view).or_default();
             cache.native_paint_serial = cache.native_paint_serial.wrapping_add(1);
+            cache.native_pointer_style_only = false;
             cache.native_paint_serial
         })
     }
@@ -2494,7 +2549,8 @@ impl App {
         }
     }
 
-    /// Resolve one exact retained native artifact, the tree and destination paint, pointer routing, accessibility and inspection all consume.
+    /// Resolve one exact retained native artifact that owes no paint, as the glass present,
+    /// accessibility and IME read it; pointer routing reads `retained_native_pointer_artifact`.
     #[cfg(test)]
     pub(crate) fn retained_native_leaf_artifact(
         &self,
@@ -2512,6 +2568,53 @@ impl App {
         view: crate::tab_model::ViewId,
         require_presented: bool,
         plan: &crate::tab_model::VisibleLeafPlan,
+    ) -> Option<RetainedNativeLeafArtifact<'_>> {
+        self.native_leaf_artifact_from_plan(wid, view, require_presented, plan, false)
+    }
+
+    /// Presented hit geometry, including while only its pointer feedback awaits paint.
+    /// This supplies no current-pixel or accessibility authority.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "NativePointerPaint",
+            action = "AnotherCase",
+            reason = "The bounded App fixture selects a scenario; case selection is not a production input transition."
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "NativePointerPaint",
+            action = "Read",
+            project = "aterm_gui::native_pointer_paint_conformance::pointer_paint_transition"
+        )
+    )]
+    pub(crate) fn retained_native_pointer_artifact(
+        &self,
+        wid: WindowId,
+        view: crate::tab_model::ViewId,
+    ) -> Option<RetainedNativeLeafArtifact<'_>> {
+        let plan = self.active_visible_leaf_plan(wid)?;
+        self.retained_native_pointer_artifact_from_plan(wid, view, &plan)
+    }
+
+    pub(crate) fn retained_native_pointer_artifact_from_plan(
+        &self,
+        wid: WindowId,
+        view: crate::tab_model::ViewId,
+        plan: &crate::tab_model::VisibleLeafPlan,
+    ) -> Option<RetainedNativeLeafArtifact<'_>> {
+        self.native_leaf_artifact_from_plan(wid, view, true, plan, true)
+    }
+
+    fn native_leaf_artifact_from_plan(
+        &self,
+        wid: WindowId,
+        view: crate::tab_model::ViewId,
+        require_presented: bool,
+        plan: &crate::tab_model::VisibleLeafPlan,
+        pointer_feedback: bool,
     ) -> Option<RetainedNativeLeafArtifact<'_>> {
         let window = self.windows.get(&wid)?;
         if window.overlay.is_some() {
@@ -2537,8 +2640,15 @@ impl App {
         let expected_stamp = self
             .native_ui_compile_stamp_for(wid, native.instance, view, viewport)
             .ok()?;
-        let raster = window.leaf_render_cache.get(&view)?.native.as_ref()?;
-        if raster.stamp != expected_stamp
+        let cache = window.leaf_render_cache.get(&view)?;
+        let raster = cache.native.as_ref()?;
+        let current = if pointer_feedback {
+            cache.native_tree_current(raster)
+        } else {
+            !cache.native_paint_owed(raster)
+        };
+        if !current
+            || raster.stamp != expected_stamp
             || raster.stamp.generation != generation
             || require_presented && !raster.presented
         {
@@ -2642,7 +2752,7 @@ impl App {
         let plan = self.active_visible_leaf_plan(wid)?;
         for leaf in &plan.leaves {
             let Some(artifact) =
-                self.retained_native_leaf_artifact_from_plan(wid, leaf.view, true, &plan)
+                self.retained_native_pointer_artifact_from_plan(wid, leaf.view, &plan)
             else {
                 continue;
             };

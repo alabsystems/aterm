@@ -1422,7 +1422,7 @@ impl App {
         match body.trim() {
             atpkg::cli::C_TOOLCHAIN_MISSING => {
                 self.except_clear(&broken.key());
-                // aterm's own Command Line Tools tab (or an installer) is installing them: an
+                // aterm's own Mac Setup tab (or an installer) is installing them: an
                 // entry telling the person to run the install would be one aterm makes moot. It
                 // waits for that install to end without them.
                 if self.developer_tools_on_their_way() {

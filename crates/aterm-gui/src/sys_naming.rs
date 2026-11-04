@@ -407,6 +407,11 @@ mod tests {
             "the request owns its connection duplicate"
         );
         drop(client);
+        // A sibling test's fork may retain the peer until exec closes its copy.
+        // Wait for the required hangup, then exercise cancellation exactly once.
+        aterm_spec::wait::until_within(BOUND, "the last caller descriptor closes", || {
+            request.caller_gone().then_some(())
+        });
         // The probe thread has no control-worker TLS and the original descriptor is closed.
         let result = std::thread::spawn(move || {
             request.run_active(|| -> Result<(), NamingError> {

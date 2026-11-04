@@ -352,8 +352,9 @@ pub fn parse_facts(text: &str) -> Option<BuildFacts> {
 }
 
 /// Returns the absolute target binary path from the last line of a managed twin shim:
-/// `exec '/<path>' "$@"` after a `#!/bin/sh` line in a `sh` twin, `@"<path>" %* & @exit /b`
-/// (or the legacy ` %*` tail) in a Windows `.cmd` twin, absolute as Windows reads a path.
+/// `exec '/<path>' "$@"` after a `#!/bin/sh` line in a `sh` twin, and on Windows
+/// `@"<path>" %* & @exit /b` (or the legacy ` %*` tail) in a `.cmd` twin, absolute as Windows
+/// reads a path. A `.cmd` body names nothing on another host, which runs none.
 #[must_use]
 pub fn twin_binary(twin_text: &str) -> Option<std::path::PathBuf> {
     let last = twin_text
@@ -367,6 +368,9 @@ pub fn twin_binary(twin_text: &str) -> Option<std::path::PathBuf> {
             .to_str()
             .is_some_and(|target| target.starts_with('/'))
             .then_some(target);
+    }
+    if !cfg!(windows) {
+        return None;
     }
     let (path, tail) = last.strip_prefix("@\"")?.split_once('"')?;
     (matches!(tail, " %* & @exit /b" | " %*") && Path::new(path).is_absolute())
@@ -427,20 +431,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_twin_names_its_binary_in_either_dialect_and_only_absolutely() {
+    fn a_twin_names_its_binary_in_its_hosts_dialects_and_only_absolutely() {
         let sh = |p: &str| format!("#!/bin/sh\nexec '{p}' \"$@\"\n");
         let cmd = |p: &str| format!("@echo off\r\n@\"{p}\" %* & @exit /b\r\n");
         let named = |p: &str| Some(std::path::PathBuf::from(p));
         assert_eq!(twin_binary(&sh("/s/codex")), named("/s/codex"));
+        // A `.cmd` twin is Windows' alone: elsewhere its body names nothing, even an absolute path.
         let windows = if cfg!(windows) {
             r"C:\s\codex.exe"
         } else {
             "/s/codex"
         };
-        assert_eq!(twin_binary(&cmd(windows)), named(windows));
+        let on_windows = |p: &str| named(p).filter(|_| cfg!(windows));
+        assert_eq!(twin_binary(&cmd(windows)), on_windows(windows));
         assert_eq!(
             twin_binary(&format!("@\"{windows}\" %*\r\n")),
-            named(windows),
+            on_windows(windows),
             "the legacy tail"
         );
         for relative in ["s/codex", r"s\codex.exe"] {
@@ -515,9 +521,7 @@ mod tests {
     #[test]
     fn the_scan_finds_a_marker_across_a_chunk_boundary() {
         const BOUNDARY_SINGLE: &[u8] = b"VERSION:\"9.9.9\"";
-        let dir =
-            std::env::temp_dir().join(format!("aterm-upgrade-catalog-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("dir");
+        let dir = crate::supervise::ScratchDir::new("upgrade-catalog", "boundary");
         let path = dir.join("claude");
         let mut bytes = vec![b'x'; CHUNK - 15 - BOUNDARY_SINGLE.len()];
         bytes.extend_from_slice(BOUNDARY_SINGLE);
@@ -550,7 +554,6 @@ mod tests {
             Some("2.1.281"),
             "a marker near chunk end still scans version literals in the lookahead window"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

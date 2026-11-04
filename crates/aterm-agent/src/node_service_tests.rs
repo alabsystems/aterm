@@ -256,9 +256,11 @@ fn node_units_stay_separate_from_secrets_and_put_atpkg_bin_first_on_path() {
     );
     assert_eq!(kept_program_in_unit(&plist).as_deref(), Some(prog));
     // A dialer waits on this job's handshakes for 3 s: launchd's Background band holds every thread
-    // at priority 4, which a loaded Mac starves past that (docs/measured/fleet-lan-m100-2026-11-02.md).
+    // at priority 4, which a loaded Mac starves past that (docs/measured/fleet-lan-m100-2026-11-02.md),
+    // and its Standard band clamps every thread at utility, where the fleet book's lock lift does
+    // not reach its holder. Interactive clamps none; `aterm node serve` holds itself at utility.
     assert!(
-        plist.contains("<key>ProcessType</key>\n\t<string>Standard</string>\n"),
+        plist.contains("<key>ProcessType</key>\n\t<string>Interactive</string>\n"),
         "{plist}"
     );
 
@@ -332,10 +334,13 @@ fn sync_node_installs_respects_off_and_fleet_leave_removes_job() {
     assert!(!node_turned_off(&state));
     *sup.stop_error.borrow_mut() = None;
     let removed = remove_with(&home, &state, false, &sup).unwrap();
-    assert_eq!(removed, Some(plist_path(&home)));
+    assert_eq!(removed, Removal::Removed(plist_path(&home)));
     assert!(!plist_path(&home).is_file());
     assert!(!node_turned_off(&state));
-    assert_eq!(remove_with(&home, &state, false, &sup).unwrap(), None);
+    assert_eq!(
+        remove_with(&home, &state, false, &sup).unwrap(),
+        Removal::Nothing
+    );
 
     // `aterm node off` records node-off so sync.node stays NotApplicable until `aterm node on`.
     remove_with(&home, &state, true, &sup).unwrap();
@@ -347,6 +352,12 @@ fn sync_node_installs_respects_off_and_fleet_leave_removes_job() {
     run_admin_subcommand("on", &[], &home, &state, &prog, &sup).unwrap();
     assert!(!node_turned_off(&state));
     assert!(plist_path(&home).is_file());
+}
+
+/// A file-only supervisor whose account's own home is a folder under `at` no test installs
+/// under, so it writes and removes the unit of every scratch home a test names.
+fn file_only_beside(at: &Path) -> FileOnlySupervisor {
+    FileOnlySupervisor::guarding(Some(at.join("account-home")))
 }
 
 fn join_node_book(state: &Path) {
@@ -388,7 +399,7 @@ fn a_delayed_fleet_leave_keeps_the_node_a_later_join_started() {
     leave_node_book(&state);
     assert_eq!(
         remove_after_fleet_leave_with(&home, &state, &sup).unwrap(),
-        Some(plist_path(&home))
+        Removal::Removed(plist_path(&home))
     );
     assert_eq!(*sup.unloads.borrow(), 1);
     assert!(!plist_path(&home).exists());
@@ -418,7 +429,11 @@ fn a_delayed_fleet_leave_keeps_the_node_a_later_join_started() {
         Some(next)
     );
     let removed = remove_after_fleet_leave_with(&home, &state, &sup).unwrap();
-    assert_eq!(removed, None, "the old leave no longer owns this node job");
+    assert_eq!(
+        removed,
+        Removal::Nothing,
+        "the old leave no longer owns this node job"
+    );
     assert_eq!(*sup.unloads.borrow(), 0);
     assert_eq!(*sup.pid.borrow(), Some(4242));
     assert_eq!(std::fs::read(&unit).unwrap(), before);
@@ -480,15 +495,23 @@ fn a_waiting_fleet_leave_rechecks_membership_after_taking_node_admin() {
     std::fs::write(&program, b"inert program bytes").unwrap();
     aterm_uds::private_file::ensure_private_dir(&state).unwrap();
     join_node_book(&state);
-    let unit = install_with(&program, &home, &state, false, &FileOnlySupervisor).unwrap();
+    let unit = install_with(
+        &program,
+        &home,
+        &state,
+        false,
+        &file_only_beside(tmp.path()),
+    )
+    .unwrap();
     leave_node_book(&state);
     let guard = node_admin_lock(&state).unwrap();
     let (told, waiting) = std::sync::mpsc::channel();
     let worker_home = home.clone();
     let worker_state = state.clone();
+    let worker_sup = file_only_beside(tmp.path());
     let worker = std::thread::spawn(move || {
         NODE_ADMIN_WAITER.with(|waiter| *waiter.borrow_mut() = Some(told));
-        remove_after_fleet_leave_with(&worker_home, &worker_state, &FileOnlySupervisor)
+        remove_after_fleet_leave_with(&worker_home, &worker_state, &worker_sup)
     });
     waiting.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap();
     // Only the node-admin lock is held here: the new membership can be written without
@@ -496,8 +519,130 @@ fn a_waiting_fleet_leave_rechecks_membership_after_taking_node_admin() {
     join_node_book(&state);
     let before = std::fs::read(&unit).unwrap();
     drop(guard);
-    assert_eq!(worker.join().unwrap().unwrap(), None);
+    assert_eq!(worker.join().unwrap().unwrap(), Removal::Nothing);
     assert_eq!(std::fs::read(&unit).unwrap(), before);
+}
+
+/// The file-only supervisor (a private state root or `CI`) leaves the unit file under the
+/// account's own home alone whichever caller reaches it, as it stops no job that unit loaded:
+/// `fleet leave`'s removal keeps it and says why, `aterm node off` records off and says the unit
+/// was left alone, and `aterm node on` and `sync.node`'s apply refuse before any change. The
+/// account's home under another spelling (a link to it, on macOS its data volume firmlink, which
+/// `canonicalize` keeps apart) is the account's too, as is a scratch home whose unit folder is
+/// the account's through a link, and a home is taken for the account's when the account's home
+/// could not be read.
+/// NEGATIVE CONTROL: the same removal through a supervisor whose account home is elsewhere removes
+/// the unit, as `main` did through every file-only supervisor.
+#[test]
+fn the_file_only_supervisor_leaves_the_accounts_own_unit_alone() {
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let state = tmp.path().join("state");
+    let program = tmp.path().join("program");
+    std::fs::write(&program, b"inert program bytes").unwrap();
+    aterm_uds::private_file::ensure_private_dir(&state).unwrap();
+    // The account's own unit, as a session outside the private root installed it.
+    let unit = install_with(
+        &program,
+        &home,
+        &state,
+        false,
+        &file_only_beside(tmp.path()),
+    )
+    .unwrap();
+    let before = std::fs::read(&unit).unwrap();
+    let own = FileOnlySupervisor::guarding(Some(home.clone()));
+    let kept = |removal: Removal, at: &Path| match removal {
+        Removal::Kept { unit, why } if unit == at => why,
+        other => panic!("{} was not kept: {other:?}", at.display()),
+    };
+
+    // `fleet leave`, its key gone.
+    let why = kept(
+        remove_after_fleet_leave_with(&home, &state, &own).unwrap(),
+        &unit,
+    );
+    assert!(why.contains("account's own"), "{why}");
+    // `aterm node off`.
+    let said = run_admin_subcommand("off", &[], &home, &state, &program, &own).unwrap();
+    assert!(
+        said.contains(&format!("{} was left alone", unit.display())) && !said.contains("removed"),
+        "{said}"
+    );
+    assert!(node_turned_off(&state));
+    // `aterm node on`.
+    let (said, code) = run_admin_subcommand("on", &[], &home, &state, &program, &own).unwrap_err();
+    assert_eq!(code, 1);
+    assert!(said.contains("left alone, and nothing changed"), "{said}");
+    assert!(node_turned_off(&state), "a refused `on` keeps node-off");
+    // `sync.node`'s apply, every gate of its own passed: in a fleet, not off, not CI.
+    std::fs::remove_file(off_path(&state)).unwrap();
+    join_node_book(&state);
+    let refused =
+        ensure_for_sync_with(&home, &state, None, Some(&program), false, &own).unwrap_err();
+    assert!(
+        refused.contains("left alone, and nothing changed"),
+        "{refused}"
+    );
+    leave_node_book(&state);
+    // Through a link to the account's home, and with the account's home unread.
+    let link = tmp.path().join("home-link");
+    std::os::unix::fs::symlink(&home, &link).unwrap();
+    kept(
+        remove_after_fleet_leave_with(&link, &state, &own).unwrap(),
+        &own.unit_file(&link),
+    );
+    if cfg!(target_os = "macos") {
+        let canonical = std::fs::canonicalize(&home).unwrap();
+        let alias = Path::new("/System/Volumes/Data").join(canonical.strip_prefix("/").unwrap());
+        assert_ne!(std::fs::canonicalize(&alias).unwrap(), canonical);
+        kept(
+            remove_after_fleet_leave_with(&alias, &state, &own).unwrap(),
+            &own.unit_file(&alias),
+        );
+    }
+    let scratch = tmp.path().join("scratch-home");
+    let folder = own.unit_file(&scratch);
+    let folder = folder.parent().unwrap();
+    std::fs::create_dir_all(folder.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(unit.parent().unwrap(), folder).unwrap();
+    kept(
+        remove_after_fleet_leave_with(&scratch, &state, &own).unwrap(),
+        &own.unit_file(&scratch),
+    );
+    let unread = FileOnlySupervisor::guarding(None);
+    assert!(
+        kept(
+            remove_after_fleet_leave_with(&home, &state, &unread).unwrap(),
+            &unit
+        )
+        .contains("could not be read")
+    );
+    assert_eq!(std::fs::read(&unit).unwrap(), before);
+
+    assert_eq!(
+        remove_after_fleet_leave_with(&home, &state, &file_only_beside(tmp.path())).unwrap(),
+        Removal::Removed(unit.clone())
+    );
+    assert!(!unit.exists());
+}
+
+/// A test binary runs under a private state root, so `supervisor_here`, which `aterm node`,
+/// `fleet leave` and `sync.node` reach the job through, is the file-only supervisor of this
+/// account: it would leave the account's own unit alone (only asked here, never touched) and
+/// writes one under a scratch home.
+/// NEGATIVE CONTROL: a supervisor built without the account's home answers `None` for it.
+#[test]
+fn supervisor_here_leaves_the_accounts_own_unit_alone_under_a_private_root() {
+    assert!(aterm_types::dirs::runs_under_private_state_root());
+    let account = aterm_uds::account::home().expect("this account's home");
+    assert!(supervisor_here().leaves_unit_alone(&account).is_some());
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    assert_eq!(supervisor_here().leaves_unit_alone(scratch.path()), None);
+    assert_eq!(
+        file_only_beside(scratch.path()).leaves_unit_alone(&account),
+        None
+    );
 }
 
 #[test]
@@ -881,9 +1026,24 @@ fn sync_node_renews_a_replaced_build_and_moves_a_misplaced_job() {
 }
 
 /// A PLIST AN EARLIER BUILD WROTE IS REWRITTEN: a running job whose unit is not the one this build
-/// writes (here, the identifier no app has) is reloaded from a fresh unit, even on a replaced build.
+/// writes (the identifier no app has, or the `Background` or `Standard` `ProcessType` the builds
+/// before this one wrote) is reloaded from a fresh unit, even on a replaced build.
 #[test]
 fn sync_node_rewrites_a_unit_an_earlier_build_wrote() {
+    rewrites_the_unit(|prog, home, state| {
+        node_plist_text(prog, home, state, Some("systems.alab.aterm"))
+    });
+    for earlier in ["Background", "Standard"] {
+        rewrites_the_unit(|prog, home, state| {
+            node_plist_text(prog, home, state, Some("com.aterm.aterm")).replace(
+                "<string>Interactive</string>",
+                &format!("<string>{earlier}</string>"),
+            )
+        });
+    }
+}
+
+fn rewrites_the_unit(earlier: impl Fn(&Path, &Path, &Path) -> String) {
     let tmp = aterm_tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
     let state = tmp.path().join("state");
@@ -902,7 +1062,8 @@ fn sync_node_rewrites_a_unit_an_earlier_build_wrote() {
     let sup = FakeSupervisor::new(None);
     ensure_for_sync_with(&home, &state, Some(&config), Some(&prog), false, &sup).unwrap();
     let unit = plist_path(&home);
-    let earlier = node_plist_text(&prog, &home, &state, Some("systems.alab.aterm"));
+    let earlier = earlier(&prog, &home, &state);
+    assert_ne!(earlier, sup.render_unit(&prog, &home, &state));
     std::fs::write(&unit, &earlier).unwrap();
     sup.replaced.set(true);
     assert!(matches!(
@@ -1048,28 +1209,25 @@ fn node_off_serializes_with_an_in_progress_service_change() {
     let tmp = aterm_tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
     let state = tmp.path().join("state");
-    let unit = FileOnlySupervisor.unit_file(&home);
-    install_with(
-        &tmp.path().join("aterm"),
-        &home,
-        &state,
-        false,
-        &FileOnlySupervisor,
-    )
-    .unwrap();
+    let sup = file_only_beside(tmp.path());
+    let unit = sup.unit_file(&home);
+    install_with(&tmp.path().join("aterm"), &home, &state, false, &sup).unwrap();
     let guard = node_admin_lock(&state).unwrap();
     let (wait_tx, wait_rx) = std::sync::mpsc::channel();
     let other_home = home.clone();
     let other_state = state.clone();
     let worker = std::thread::spawn(move || {
         NODE_ADMIN_WAITER.with(|waiter| *waiter.borrow_mut() = Some(wait_tx));
-        remove_with(&other_home, &other_state, true, &FileOnlySupervisor)
+        remove_with(&other_home, &other_state, true, &sup)
     });
     wait_rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap();
     assert!(!node_turned_off(&state));
     assert!(unit.is_file());
     drop(guard);
-    assert!(worker.join().unwrap().unwrap().is_some());
+    assert_eq!(
+        worker.join().unwrap().unwrap(),
+        Removal::Removed(unit.clone())
+    );
     assert!(node_turned_off(&state));
     assert!(!unit.exists());
 }

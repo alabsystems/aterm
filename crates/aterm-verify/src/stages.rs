@@ -937,16 +937,34 @@ type Compiled = (
 );
 
 fn compile_tests(ctx: &Ctx, r: &mut Report, label: &str, compile: &Cmd) -> Compiled {
-    let mut out = exec::run(compile, ctx.exec_env());
-    for event in crate::report::compile_unit_events(label, &out.output) {
+    let exec::MachineRun { mut run, stdout } = exec::run_machine(compile, ctx.exec_env());
+    let mut stdout = match stdout {
+        Ok(stdout) => stdout,
+        Err(why) => {
+            r.raw(run.output.as_str());
+            r.decide_child(&run, label);
+            r.cannot_run(&why);
+            return (false, Err(why), Vec::new());
+        }
+    };
+    for event in crate::report::compile_unit_events(label, &stdout) {
         eprintln!("{event}");
         r.raw(event);
     }
-    let artifacts = crate::shape::artifacts(&out.output);
-    let exes = crate::testrun::take_test_executables(&mut out.output);
-    r.raw(out.output.as_str());
-    r.decide_child(&out, label);
-    (out.ok, exes, artifacts)
+    let artifacts = crate::shape::artifacts(&stdout);
+    let exes = crate::testrun::take_test_executables(&mut stdout);
+    // Stream order is preserved within each capture; these headings do not claim interleaving.
+    if !stdout.is_empty() {
+        stdout.insert_str(0, "--- compiler stdout ---\n");
+    }
+    if !run.output.is_empty() {
+        stdout.push_str("\n--- compiler stderr / executor diagnostics ---\n");
+        stdout.push_str(&run.output);
+    }
+    run.output = stdout;
+    r.raw(run.output.as_str());
+    r.decide_child(&run, label);
+    (run.ok, exes, artifacts)
 }
 
 /// After call `part` of a shaped test compile, which began at `began`, passed with `artifacts`: a
@@ -2332,6 +2350,73 @@ mod tests {
             EnvSnapshot::default(),
             PathBuf::from("/tmp"),
         )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compiler_stderr_cannot_supply_unit_artifacts_or_test_executables() {
+        let root = crate::mktemp_dir("atv-machine-stream").expect("scratch");
+        let wire = include_str!("../tests/fixtures/targo-unit-dispatch-v1.jsonl")
+            .replace("\"test\":false", "\"test\":true")
+            .replace("\"executable\":null", "\"executable\":\"/synthetic-test\"");
+        std::fs::write(root.join("wire"), &wire).expect("wire");
+        let c = Ctx::new(
+            root.clone(),
+            Scope::workspace(),
+            EnvSnapshot::default(),
+            root.clone(),
+        );
+        let mut failures = Vec::new();
+        for (source, code) in [("stderr", 0), ("stderr", 3), ("stdout", 3)] {
+            let script = if source == "stderr" {
+                "printf 'human stdout\\n'; /bin/cat wire >&2; printf 'human stderr\\n' >&2; exit \"$1\""
+            } else {
+                "printf 'human stdout\\n'; /bin/cat wire; printf 'human stderr\\n' >&2; exit \"$1\""
+            };
+            let cmd =
+                Cmd::new("/bin/sh").args(["-c", script, "machine-fixture", &code.to_string()]);
+            let mut report = Report::new("machine stream");
+            let (ok, exes, artifacts) = compile_tests(&c, &mut report, "machine stream", &cmd);
+            assert_eq!(ok, code == 0);
+            let exes = exes.expect("complete wire");
+            let raw = report.render();
+            assert!(raw.contains("human stdout") && raw.contains("human stderr"));
+            let expected = usize::from(source == "stdout");
+            let causes = raw.matches("\"rebuild_reason\":\"changed-env\"").count();
+            if (exes.len(), artifacts.len(), causes) != (expected, expected, expected) {
+                failures.push(format!(
+                    "{source}/exit{code}: executables={}, artifacts={}, causes={causes}; expected {expected}",
+                    exes.len(), artifacts.len()
+                ));
+            }
+        }
+        for code in [0, 3] {
+            let cmd = Cmd::new("/bin/sh").args([
+                "-c",
+                "printf '\\377\\n'; /bin/cat wire; printf 'human stderr\\n' >&2; exit \"$1\"",
+                "invalid-fixture",
+                &code.to_string(),
+            ]);
+            let mut report = Report::new("invalid machine stream");
+            let (ok, exes, artifacts) = compile_tests(&c, &mut report, "invalid stream", &cmd);
+            assert!(!ok);
+            assert!(exes.is_err() && artifacts.is_empty());
+            let actual = if code == 0 {
+                crate::Outcome::Ok
+            } else {
+                crate::Outcome::Fail(crate::Severity::GateFailed)
+            };
+            assert_eq!(
+                report.outcomes().next().map(|(outcome, _)| outcome),
+                Some(actual)
+            );
+            assert!(report.outcomes().any(|(outcome, _)| {
+                outcome == crate::Outcome::Fail(crate::Severity::CouldNotRun)
+            }));
+            assert!(report.render().contains("human stderr"));
+        }
+        std::fs::remove_dir_all(&root).expect("cleanup");
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     fn fixture_gated() -> Vec<(String, String)> {

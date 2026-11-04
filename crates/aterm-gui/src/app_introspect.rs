@@ -12682,6 +12682,90 @@ mod encode_worker_tests {
         assert!(wire.contains(&format!("seq{}", retained.snapshot_seq)));
     }
 
+    #[test]
+    fn native_image_metadata_retains_presented_provenance_during_invalidation() {
+        let mut app = crate::scripted_redraw_fixture::scripted_app();
+        let wid = WindowId(0);
+        // Focus on post-present invalidation after startup font synchronization.
+        app.first_present_done = true;
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::About));
+        let (_, view) = app.active_native_view(wid).unwrap();
+        #[cfg(a11y_tree)]
+        {
+            app.windows.get_mut(&wid).unwrap().a11y_active = true;
+        }
+        app.redraw_window(wid);
+        let plan = app.active_visible_leaf_plan(wid).unwrap();
+        let ((width, height), _) = crate::scripted_redraw_fixture::glass(&mut app);
+        let facts = || ImageFrameFacts {
+            phase: "presented",
+            capture_serial: None,
+            width: width.try_into().unwrap(),
+            height: height.try_into().unwrap(),
+        };
+        let before = app
+            .native_image_metadata_from_plan(wid, &plan, facts())
+            .unwrap();
+        let raster = app.windows[&wid].leaf_render_cache[&view]
+            .native
+            .as_ref()
+            .unwrap();
+        let (stamp, pixels, paint_serial) =
+            (raster.stamp, raster.rgba.as_ptr(), raster.paint_serial);
+        assert!(raster.presented);
+        assert!(app.retained_native_leaf_artifact(wid, view, true).is_some());
+        #[cfg(a11y_tree)]
+        assert!(app.windows[&wid].native_a11y_staged.is_some());
+
+        // A successful present may invalidate its next compile after a load
+        // policy transition, before capture reads that present's metadata.
+        // Keep the model stamp unchanged here as a negative control for input:
+        // stamp equality alone cannot establish that dirty paint is current.
+        app.invalidate_native_ui_cache(wid);
+        let retained = app.windows[&wid].leaf_render_cache[&view]
+            .native
+            .as_ref()
+            .unwrap();
+        assert_eq!(retained.stamp, stamp);
+        assert_eq!(retained.rgba.as_ptr(), pixels);
+        assert_eq!(retained.paint_serial, paint_serial);
+        assert!(app.cached_native_ui(wid).is_none());
+        assert!(app.retained_native_leaf_artifact(wid, view, true).is_none());
+        assert!(
+            app.retained_native_leaf_artifact(wid, view, false)
+                .is_none()
+        );
+        #[cfg(a11y_tree)]
+        {
+            assert!(app.windows[&wid].native_a11y_staged.is_none());
+            assert!(matches!(
+                app.take_native_accessibility_update_from_plan(wid, &plan),
+                Some(Err(_))
+            ));
+        }
+        let after = app
+            .native_image_metadata_from_plan(wid, &plan, facts())
+            .unwrap();
+        assert_eq!(after.capture_serial, before.capture_serial);
+        assert_eq!(after.compiled_fingerprint, before.compiled_fingerprint);
+        assert_eq!(after.raster_fingerprint, before.raster_fingerprint);
+        assert_eq!(
+            after.leaves[0].raster_fingerprint,
+            before.leaves[0].raster_fingerprint
+        );
+        assert_eq!(after.paint_revision, before.paint_revision);
+
+        let compiles = crate::app_native::native_ui_compile_count();
+        app.redraw_window(wid);
+        assert!(crate::app_native::native_ui_compile_count() > compiles);
+        let cache = &app.windows[&wid].leaf_render_cache[&view];
+        assert!(cache.native_damage.is_none());
+        let raster = cache.native.as_ref().unwrap();
+        assert_eq!(raster.paint_serial, cache.native_paint_serial);
+        assert_ne!(raster.paint_serial, paint_serial);
+        assert!(app.retained_native_leaf_artifact(wid, view, true).is_some());
+    }
+
     fn image_metadata_now(
         app: &mut App,
         dir: &std::path::Path,

@@ -10,13 +10,13 @@
 //! ```
 //!
 //! Three kinds of lane. The FLOOR lanes ([`floors`], [`deck`], [`wasm`], [`vte_engine`],
-//! [`vte_marks`]) measure headless, opening no window, and judge each metric against its
-//! committed baseline in
+//! [`vte_marks`], `cli_start`) measure headless, opening no window, and judge each metric
+//! against its committed baseline in
 //! `crates/aterm-verify/perf/golden/`; whatever they measured then meets the
 //! same-box trend ledger ([`trend`]), and a green run appends to it. A bare `verify
 //! perf` runs every floor lane. Each lane waits for a quiet machine first but
-//! `vte-engine` and `vte-marks`, which run at the load they find, report it, and judge
-//! cycles, not time. The ARENA lanes ([`arena`]) open real
+//! `vte-engine`, `vte-marks` and `cli-start`, which run at the load they find, report it, and
+//! judge cycles or instructions, not time. The ARENA lanes ([`arena`]) open real
 //! windows and take minutes; they run only when named, and what they measure
 //! has no floor, so they report MEASURED, never a pass. The MEASURED lanes
 //! ([`fabric`], [`restore_e2e`], [`aos`], [`commons`], [`journal`]) are headless but just as unjudgeable —
@@ -43,6 +43,8 @@ mod aos;
 pub(crate) mod arena;
 #[cfg(unix)]
 mod bench_build;
+#[cfg(target_os = "macos")]
+mod cli_start;
 #[cfg(unix)]
 mod commons;
 mod deck;
@@ -123,6 +125,7 @@ pub(crate) enum Lane {
     Wasm,
     VteEngine,
     VteMarks,
+    CliStart,
     Start,
     Compare,
     Cat,
@@ -148,7 +151,7 @@ pub(crate) enum Kind {
 }
 
 impl Lane {
-    pub(crate) const ALL: [Lane; 25] = [
+    pub(crate) const ALL: [Lane; 26] = [
         Lane::Throughput,
         Lane::Pathological,
         Lane::ScrollScrub,
@@ -164,6 +167,7 @@ impl Lane {
         Lane::Wasm,
         Lane::VteEngine,
         Lane::VteMarks,
+        Lane::CliStart,
         Lane::Start,
         Lane::Compare,
         Lane::Cat,
@@ -193,6 +197,7 @@ impl Lane {
             Lane::Wasm => "wasm",
             Lane::VteEngine => "vte-engine",
             Lane::VteMarks => "vte-marks",
+            Lane::CliStart => "cli-start",
             Lane::Start => "start",
             Lane::Compare => "compare",
             Lane::Cat => "cat",
@@ -222,7 +227,8 @@ impl Lane {
             | Lane::Deck
             | Lane::Wasm
             | Lane::VteEngine
-            | Lane::VteMarks => Kind::Floor,
+            | Lane::VteMarks
+            | Lane::CliStart => Kind::Floor,
             Lane::Start | Lane::Compare | Lane::Cat | Lane::Scroll | Lane::Vte => Kind::Arena,
             Lane::Fabric
             | Lane::RestoreE2e
@@ -238,12 +244,12 @@ impl Lane {
         self.kind() == Kind::Arena
     }
 
-    /// Whether the lane waits for a quiet machine before it starts ([`quiet`]). `vte-engine` and
-    /// `vte-marks` do not: they measure at the load they find, report that load beside their
-    /// numbers, and are judged by performance-core cycles, which the clock and the core a sample
-    /// ran on do not move.
+    /// Whether the lane waits for a quiet machine before it starts ([`quiet`]). `vte-engine`,
+    /// `vte-marks` and `cli-start` do not: they measure at the load they find, report that load
+    /// beside their numbers, and are judged by what the clock and the core a sample ran on do not
+    /// move (performance-core cycles; instructions retired).
     fn takes_quiet_claim(self) -> bool {
-        !matches!(self, Lane::VteEngine | Lane::VteMarks)
+        !matches!(self, Lane::VteEngine | Lane::VteMarks | Lane::CliStart)
     }
 
     /// What the lane measures, for `--list`.
@@ -291,6 +297,12 @@ impl Lane {
                  corpora (NFD Latin, Hindi and Thai, conjoining Hangul jamo, emoji selectors, \
                  skin tones, joiners and flags) replayed into Terminal::process at 120x40: the \
                  write path's mark branch, at the load it finds"
+            }
+            Lane::CliStart => {
+                "instructions retired by one fresh aterm process (`--version`, `ctl --help`, `ctl \
+                 status` against a headless instance), split by empty programs linking none, all \
+                 or all but the window-only of the dylibs aterm's load commands name; at the \
+                 load it finds"
             }
             Lane::Start => "fresh-process real-window startup timing of one aterm",
             Lane::Compare => "paired ABBA startup A/B of two aterm binaries",
@@ -353,6 +365,10 @@ impl Lane {
             Lane::VteMarks => {
                 "unix, targo (release build of aterm-bench); macOS's per-core-type cycle \
                  counters to judge anything"
+            }
+            Lane::CliStart => {
+                "macOS, targo (release builds of aterm, unless --binary names one, and of \
+                 aterm-start-controls; a build of aterm-lab for ctl-status's headless instance)"
             }
             Lane::Start => "macOS, a built aterm (--binary)",
             Lane::Compare => "macOS, two built aterm binaries (--baseline, --candidate)",
@@ -513,6 +529,7 @@ struct OptSpec {
 
 const START_LANES: &[Lane] = &[Lane::Start, Lane::Compare];
 const JSON_LANES: &[Lane] = &[
+    Lane::CliStart,
     Lane::Start,
     Lane::Compare,
     Lane::Fabric,
@@ -529,8 +546,9 @@ const OPTIONS: &[OptSpec] = &[
     OptSpec {
         flag: "--binary",
         value: Some("PATH"),
-        lanes: &[Lane::Start],
-        help: "the aterm to time (default: target/profiling/aterm, else target/release/aterm)",
+        lanes: &[Lane::Start, Lane::CliStart],
+        help: "the aterm to time (start: default target/profiling/aterm, else \
+               target/release/aterm; cli-start: default a fresh release build)",
     },
     OptSpec {
         flag: "--baseline",
@@ -547,8 +565,8 @@ const OPTIONS: &[OptSpec] = &[
     OptSpec {
         flag: "--samples",
         value: Some("N"),
-        lanes: &[Lane::Start],
-        help: "independent launches (default 7)",
+        lanes: &[Lane::Start, Lane::CliStart],
+        help: "independent launches (start: default 7; cli-start: per arm, default 50)",
     },
     OptSpec {
         flag: "--pairs",
@@ -1058,6 +1076,26 @@ fn lane_args(cli: &Cli) -> Result<(arena::Args, fabric::Args, restore_e2e::Args)
     ))
 }
 
+/// `cli-start`'s options, parsed before any lane runs, so a bad value is a usage error (exit 2):
+/// the aterm to measure, the launches per arm and where its JSON goes.
+#[cfg(target_os = "macos")]
+fn cli_start_args(cli: &Cli) -> Result<cli_start::Args, String> {
+    let samples = match cli.options.get("--samples") {
+        Some(v) if cli.lanes.contains(&Lane::CliStart) => Some(
+            v.parse::<usize>()
+                .ok()
+                .filter(|n| *n > 0)
+                .ok_or_else(|| format!("`--samples` takes a positive count, not `{v}`"))?,
+        ),
+        _ => None,
+    };
+    Ok(cli_start::Args {
+        binary: cli.options.get("--binary").map(PathBuf::from),
+        samples,
+        json_out: cli.options.get("--json-out").map(PathBuf::from),
+    })
+}
+
 /// The `verify perf` verb.
 fn main(args: &[String]) -> ExitCode {
     let cli = match parse(args) {
@@ -1092,6 +1130,14 @@ fn main(args: &[String]) -> ExitCode {
     };
     #[cfg(unix)]
     let (arena_args, fabric_args, restore_args) = match lane_args(&cli) {
+        Ok(a) => a,
+        Err(why) => {
+            eprintln!("verify perf: {why}\n\n{}", usage());
+            return ExitCode::from(2);
+        }
+    };
+    #[cfg(target_os = "macos")]
+    let cli_start_args = match cli_start_args(&cli) {
         Ok(a) => a,
         Err(why) => {
             eprintln!("verify perf: {why}\n\n{}", usage());
@@ -1159,6 +1205,13 @@ fn main(args: &[String]) -> ExitCode {
             Lane::VteMarks => LaneRun::skip(
                 "its corpora live in the arena's cache and scratch, which are unix-only",
                 "run it on macOS or Linux",
+            ),
+            #[cfg(target_os = "macos")]
+            Lane::CliStart => cli_start::run(&cli_start_args, record),
+            #[cfg(not(target_os = "macos"))]
+            Lane::CliStart => LaneRun::skip(
+                "it reads instructions retired from macOS's proc_pid_rusage",
+                "run it on a Mac",
             ),
             #[cfg(unix)]
             Lane::Start => arena::start::run(&arena_args),
@@ -1424,7 +1477,8 @@ mod tests {
                 Lane::Deck,
                 Lane::Wasm,
                 Lane::VteEngine,
-                Lane::VteMarks
+                Lane::VteMarks,
+                Lane::CliStart
             ]
         );
         assert!(cli.record.is_empty());
@@ -1608,6 +1662,32 @@ mod tests {
         );
         let why = parse(&args("start --profile opt")).unwrap_err();
         assert!(why.contains("--profile") && why.contains("fabric"), "{why}");
+    }
+
+    /// `cli-start` is a floor lane that takes no quiet claim, records, and reads `--binary`,
+    /// `--samples` and `--json-out`, a bad count refused before anything runs.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cli_start_is_an_unclaimed_floor_lane_with_its_own_options() {
+        assert_eq!(Lane::CliStart.kind(), Kind::Floor);
+        assert!(!Lane::CliStart.takes_quiet_claim());
+        assert!(!Lane::CliStart.opens_windows());
+        let cli = parse(&args(
+            "--record cli-start --binary /a/aterm --samples 5 --json-out /tmp/c.json",
+        ))
+        .expect("parses");
+        assert_eq!(cli.record, [Lane::CliStart]);
+        let got = cli_start_args(&cli).expect("its options");
+        assert_eq!(got.binary, Some(PathBuf::from("/a/aterm")));
+        assert_eq!(got.samples, Some(5));
+        assert_eq!(got.json_out, Some(PathBuf::from("/tmp/c.json")));
+        for line in ["cli-start --samples 0", "cli-start --samples many"] {
+            let cli = parse(&args(line)).expect(line);
+            assert!(cli_start_args(&cli).is_err(), "{line}");
+        }
+        let start_only = parse(&args("start --samples 0")).expect("parses");
+        assert_eq!(cli_start_args(&start_only).expect("unread").samples, None);
+        assert!(parse(&args("cli-start start --json-out /tmp/c.json")).is_err());
     }
 
     #[test]

@@ -194,3 +194,35 @@ impl From<InitError> for InitModeFromFlagError {
         Self::Init(value)
     }
 }
+
+/// Create a `.ubd`-quiet `.noindex` scratch directory for `aterm-containment` unit tests.
+#[cfg(test)]
+pub(crate) fn test_scratch_dir(tag: &str) -> aterm_tempfile::TempDir {
+    let mut end = tag.len().min(16);
+    while end > 0 && !tag.is_char_boundary(end) {
+        end -= 1;
+    }
+    let short = &tag[..end];
+    aterm_tempfile::Builder::new()
+        .prefix(&format!("at-cnt-{short}-"))
+        .suffix(".noindex")
+        .tempdir()
+        .expect("containment scratch dir")
+}
+
+#[cfg(test)]
+mod scratch_tests {
+    /// NEGATIVE CONTROL: even an oversized multi-byte UTF-8 tag truncates cleanly on a character
+    /// boundary and preserves the `.noindex` Spotlight-exclusion suffix.
+    #[test]
+    fn test_scratch_dir_truncates_utf8_tags_and_preserves_noindex_suffix() {
+        let scratch = crate::test_scratch_dir("oversized-containment-tag-ééé-with-utf8-tail");
+        let name = scratch
+            .path()
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("utf-8 scratch dir name");
+        assert!(name.starts_with("at-cnt-"), "unexpected prefix: {name}");
+        assert!(name.ends_with(".noindex"), "missing .noindex: {name}");
+    }
+}

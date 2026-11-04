@@ -40,9 +40,14 @@ use aterm_secrets::commons::roster::Role;
 
 use crate::{Fail, Res};
 
-/// Repair passes per exchange: enough for a roll's records and the catalog's seal to reach
-/// every Mac of a side.
-const ROUNDS: usize = 6;
+/// Repair passes per exchange. One pass repairs one table with each peer, m1 with m2 and then with
+/// m3, so a record from m3 reaches m2 only through m1, on a later pass. 3 passes cover the calls
+/// with 3 common tables (the catalog and two generations), which rely on no such crossing, and the
+/// 2-table calls after the seal, where m3's cover must cross to m2: one more table common to m1
+/// there already needs this raised. Below what a call needs, which table a pass picks follows
+/// digests that differ per lab, so the run turns flaky (2 passes passed 2 of 24 runs) rather than
+/// steadily red. This also sets what `lab alab-roll` runs.
+const ROUNDS: usize = 3;
 
 /// What the run saw, as [`judge`] reads it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

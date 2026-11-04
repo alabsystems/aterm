@@ -410,6 +410,12 @@ pub trait ScreenReader: Sync {
     fn composer(&self, _rows: &[String]) -> Option<(usize, Vec<String>)> {
         None
     }
+    /// Whether the program's prompt-history search is open over its composer on `rows`: keys then
+    /// type into the search's query and Enter sends the old prompt it matched, so no row of the
+    /// composer is a person's draft.
+    fn history_search(&self, _rows: &[String]) -> bool {
+        false
+    }
     /// Row index where the transcript ends and the live zone begins.
     fn transcript_end(&self, rows: &[String]) -> usize {
         rows.iter()
@@ -653,6 +659,9 @@ impl ScreenReader for ClaudeReader {
         has_composer_frame(rows)
             .then(|| composer_draft(rows))
             .flatten()
+    }
+    fn history_search(&self, rows: &[String]) -> bool {
+        crate::phase::history_search(rows)
     }
     fn transcript_end(&self, rows: &[String]) -> usize {
         crate::phase::transcript_end(rows)
@@ -933,6 +942,9 @@ impl ScreenReader for MuseReader {
     }
     fn composer(&self, rows: &[String]) -> Option<(usize, Vec<String>)> {
         muse::composer_draft(rows)
+    }
+    fn history_search(&self, rows: &[String]) -> bool {
+        muse::history_search(rows)
     }
     fn caret(&self) -> Option<char> {
         Some('❯')

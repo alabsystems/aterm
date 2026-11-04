@@ -94,7 +94,7 @@ fn client(fake: &FakeGithub, secret: Option<&str>, recorder: &Arc<Recorder>) -> 
 }
 
 fn scratch() -> aterm_tempfile::TempDir {
-    aterm_tempfile::TempDir::new().unwrap()
+    crate::test_scratch_dir("gh-rest")
 }
 
 #[test]
@@ -613,7 +613,7 @@ fn a_spawn_that_refuses_once_interrupted_is_a_refusal_made_here() {
 /// that started and failed is not marked, and neither is an error raised anywhere else.
 #[test]
 fn a_child_that_never_started_is_marked_so() {
-    let dir = aterm_tempfile::tempdir().unwrap();
+    let dir = scratch();
     let missing = dir.path().join("no-such-curl");
     let failed = Direct
         .run(&mut aterm_uds::spawnfd::command(&missing), Some(b"secret"))

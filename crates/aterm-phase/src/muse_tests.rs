@@ -114,6 +114,35 @@ fn an_unsent_draft_is_the_composers() {
     );
 }
 
+/// MUSE CODE'S PROMPT-HISTORY SEARCH (Ctrl-R, measured on 1.4.14-R7309.1) draws its row between the
+/// composer's bottom rule and the footer: the frame is still read, idle at its composer, and the
+/// search is read open, over its match and over an empty composer. With the row gone it is closed,
+/// and its words in a person's draft read nothing.
+/// NEGATIVE CONTROL: `bottom_and_footer` not stepping over the search's row, and the frame is lost:
+/// the screen's phase is no longer read with authority, and no composer.
+#[test]
+fn the_history_search_keeps_the_composer_frame_and_is_read_open() {
+    for text in [HISTORY_SEARCH, HISTORY_SEARCH_EMPTY] {
+        let r = muse(text);
+        let rows = screen(text);
+        assert_eq!((r.phase, r.phase_authoritative), (Phase::Idle, true));
+        assert!(r.composer.is_some(), "{rows:#?}");
+        assert!(MuseReader.history_search(&rows), "{rows:#?}");
+    }
+    let rows = screen(HISTORY_SEARCH);
+    let at = rows
+        .iter()
+        .rposition(|r| is_search_row(r))
+        .expect("the search row");
+    let mut closed = rows.clone();
+    let words = closed.remove(at);
+    assert!(composer_rules(&closed).is_some(), "{closed:#?}");
+    assert!(!history_search(&closed));
+    let quoted = edited(&closed, "❯", &format!("❯ {}", crate::text::trim(&words)));
+    assert!(composer_rules(&quoted).is_some(), "{quoted:#?}");
+    assert!(!history_search(&quoted));
+}
+
 #[test]
 fn a_retracted_turn_is_a_draft_no_reader_can_tell_from_a_typed_one() {
     let r = muse(INTERRUPTED);

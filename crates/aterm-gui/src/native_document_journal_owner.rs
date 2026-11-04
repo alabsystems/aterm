@@ -303,7 +303,8 @@ impl Candidate {
     fn read_image(&self) -> Option<(ContentFingerprint, bool)> {
         use std::io::Read as _;
 
-        let mut bytes = Vec::new();
+        let mut bytes =
+            Vec::with_capacity(usize::try_from(self.stamp.len().saturating_add(1)).unwrap_or(0));
         (&self.image)
             .take(MAX_JOURNAL_BYTES as u64 + 1)
             .read_to_end(&mut bytes)

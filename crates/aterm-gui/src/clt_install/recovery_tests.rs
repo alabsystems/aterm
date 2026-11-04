@@ -351,8 +351,8 @@ fn clt_recovery_an_update_adopted_tab_adopted_again_after_a_crash_takes_back_its
 }
 
 /// A live tab an earlier aterm opened whose recovery record this launch cannot read (none, an
-/// earlier format, another folder) gives no custody here, but it still runs the Command Line
-/// Tools tab's program under aterm's pinned title, its `sudo` perhaps asking now with nothing a
+/// earlier format, another folder) gives no custody here, but it still runs the Mac Setup
+/// tab's program under aterm's pinned title, its `sudo` perhaps asking now with nothing a
 /// probe could see: the automatic tab waits for it, at its due check and at its landing, and
 /// opens once that tab's program has ended.
 /// NEGATIVE CONTROL: an adopted live tab under another title, or none, holds nothing. The mutant

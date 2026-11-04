@@ -51,6 +51,15 @@ pub(crate) struct LevelUp {
     motion: f32,
 }
 
+/// Structural repaint key for [`LevelUp`], quantized to the [`FRAME`] step while animating.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LevelUpRepaintKey {
+    /// Staged build number driving this rim.
+    pub(crate) build: u64,
+    /// Quantized [`FRAME`] step while [`LevelUp::animates`] holds, or `None` when still.
+    pub(crate) frame_step: Option<u64>,
+}
+
 impl LevelUp {
     /// Begin the rim for `build` at `now`.
     #[cfg(any(unix, test))]
@@ -191,17 +200,16 @@ impl LevelUp {
         mix_rgb(accent, ELECTRIC, self.electric(now))
     }
 
-    /// A repaint fingerprint folded into `RepaintKey::level_up_fp`, quantized to
+    /// Structural repaint key folded into `RepaintKey::level_up_fp`, quantized to
     /// the [`FRAME`] step so the animation re-presents ~30×/s.
-    pub(crate) fn fingerprint(&self, now: Instant) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        self.build.hash(&mut h);
-        if self.animates(now) {
-            let step = (now.duration_since(self.spawned).as_millis() / FRAME.as_millis()) as u64;
-            step.hash(&mut h);
+    pub(crate) fn fingerprint(&self, now: Instant) -> LevelUpRepaintKey {
+        let frame_step = self
+            .animates(now)
+            .then(|| (now.duration_since(self.spawned).as_millis() / FRAME.as_millis()) as u64);
+        LevelUpRepaintKey {
+            build: self.build,
+            frame_step,
         }
-        h.finish() | 1
     }
 }
 
@@ -294,18 +302,30 @@ mod tests {
         assert_eq!(cs.deadline(now), cs.deadline(now + Duration::from_secs(5)));
     }
 
+    /// NEGATIVE CONTROL: `Some(l.fingerprint(now))` is disjoint from the `None` no-rim key,
+    /// constant within a [`FRAME`] quantum, and distinct across steps and builds.
     #[test]
     fn fingerprint_is_nonzero_stable_per_frame_and_steps() {
         let now = Instant::now();
         let l = LevelUp::charging(830, now, 1.0);
-        assert_ne!(l.fingerprint(now), 0, "never the no-rim sentinel");
+        assert_ne!(Some(l.fingerprint(now)), None, "never the no-rim sentinel");
+        assert_eq!(
+            l.fingerprint(now),
+            LevelUpRepaintKey {
+                build: 830,
+                frame_step: Some(0),
+            }
+        );
         assert_eq!(
             l.fingerprint(now),
             l.fingerprint(now + Duration::from_millis(10))
         );
-        assert_ne!(
-            l.fingerprint(now),
-            l.fingerprint(now + FRAME + Duration::from_millis(1))
+        assert_eq!(
+            l.fingerprint(now + FRAME + Duration::from_millis(1)),
+            LevelUpRepaintKey {
+                build: 830,
+                frame_step: Some(1),
+            }
         );
         assert_ne!(
             LevelUp::charging(831, now, 1.0).fingerprint(now),

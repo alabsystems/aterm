@@ -540,7 +540,7 @@ pub(crate) fn read_private_text(path: &Path) -> std::io::Result<String> {
             "private sidecar is not a bounded regular file",
         ));
     }
-    let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
     file.take(MAX_PRIVATE_TEXT_BYTES + 1)
         .read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_PRIVATE_TEXT_BYTES {

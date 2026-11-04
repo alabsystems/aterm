@@ -132,6 +132,24 @@ impl Due {
         self.start(applied || back, now_ms, routes, last)
     }
 
+    /// Local progress while the source remains unavailable can need a runner,
+    /// but cannot consume the trigger for the source's eventual return.
+    pub fn after_unreachable_pass(
+        &mut self,
+        outcome: &SyncOutcome,
+        now_ms: u64,
+        routes: Routes,
+        last: Last,
+    ) -> bool {
+        self.failed();
+        self.start(
+            matches!(outcome, SyncOutcome::Applied { .. }),
+            now_ms,
+            routes,
+            last,
+        )
+    }
+
     /// Note a pass that failed: the next healthy one is due ([`Due::after_pass`]).
     pub fn failed(&mut self) {
         self.failing = true;

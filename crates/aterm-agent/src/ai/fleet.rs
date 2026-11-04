@@ -201,13 +201,21 @@ pub(crate) fn read_sig_file(path: &Path, refuse_symlink: bool) -> std::io::Resul
         open.custom_flags(flags);
     }
     let file = open.open(path)?;
-    if !file.metadata()?.is_file() {
+    let meta = file.metadata()?;
+    if !meta.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "not a regular file",
         ));
     }
-    let mut raw = Vec::new();
+    if meta.len() > SIG_MAX {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            "signature exceeds bound",
+        ));
+    }
+    let cap = usize::try_from(meta.len().min(SIG_MAX).saturating_add(1)).unwrap_or(0);
+    let mut raw = Vec::with_capacity(cap);
     file.take(SIG_MAX + 1).read_to_end(&mut raw)?;
     if raw.len() as u64 > SIG_MAX {
         return Err(std::io::Error::new(

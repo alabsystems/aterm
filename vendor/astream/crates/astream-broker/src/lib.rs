@@ -131,6 +131,7 @@ pub mod health;
 mod held;
 mod last_view;
 pub use last_view::{LastStep, LastView, LastViewError, LastViewGarbage};
+mod dedup;
 pub mod logid;
 /// The power-loss model of a compaction's files, for its crash tests.
 #[cfg(all(test, unix, feature = "retention"))]
@@ -214,8 +215,8 @@ pub use logid::{
 pub use proto::{
     AttachedProducerStats, FaceStats, Gap, HelloHealth, NonceExt, Request, Response, ServedInfo,
     ServedReason, Tier, WireStats, ERR_RATE_LIMITED, ERR_RETIRE_REFUSED, HELLO_REASON_MAX,
-    RATE_LIMITED_PREFIX, REQUEST_BROKER_TIMES, REQUEST_GAP_NOTICES, REQUEST_RETIRE, REQUEST_STATS,
-    REQUEST_TOLD_FETCH,
+    RATE_LIMITED_PREFIX, REQUEST_BROKER_TIMES, REQUEST_GAP_FENCES, REQUEST_GAP_NOTICES,
+    REQUEST_RETIRE, REQUEST_STATS, REQUEST_TOLD_FETCH,
 };
 pub use recover::{recover_keep_within_len, recover_unit_start_advance};
 pub use refill::{

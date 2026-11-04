@@ -216,3 +216,139 @@ fn claude_adoption_conforms_to_identity_and_current_roster() {
     wrong.insert("published", 1);
     assert!(!model.check_invariant("IdentityAndPolicyRequired", &wrong));
 }
+
+#[cfg(unix)]
+struct NativeAdoption {
+    case: u8,
+    calls: Cell<u32>,
+}
+
+#[cfg(unix)]
+impl AccountsHost for NativeAdoption {
+    fn stdin_is_terminal(&self) -> bool {
+        false
+    }
+    fn auth_status(&self, _: &str) -> Result<Captured, String> {
+        panic!("Claude status")
+    }
+    fn unaskable(&self) -> Option<String> {
+        None
+    }
+    fn login(&self, _: Option<&str>) -> Result<i32, String> {
+        panic!("adoption started login")
+    }
+    fn now(&self) -> i64 {
+        2000
+    }
+    fn default_native_profile(
+        &self,
+        cli: Cli,
+        home: &Path,
+        row: &accounts::Row,
+        _: i64,
+    ) -> Result<Box<dyn shared_provider::LoginProof>, String> {
+        assert!(matches!(cli, Cli::Kimi | Cli::Agy));
+        assert_eq!(row.expected_identity_email(), Some("owner@example.com"));
+        self.calls.set(self.calls.get() + 1);
+        if self.case == 2 {
+            return Err("provider unavailable".into());
+        }
+        let proof = shared_provider::kimi_pending_proof_fixture(
+            home,
+            crate::ai::connector::Region::Global,
+            if self.case == 1 {
+                "another@example.com"
+            } else {
+                "owner@example.com"
+            },
+            true,
+        );
+        if self.case == 3 {
+            aterm_secrets::fsx::write_atomic(
+                &shared_provider::kimi_credential_path(home, crate::ai::connector::Region::Global),
+                b"changed-before-metadata-write",
+                0o600,
+            )
+            .unwrap();
+        }
+        Ok(Box::new(proof))
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn native_default_adoption_requires_current_provider_proof_without_login_or_token_refresh() {
+    for cli in [Cli::Kimi, Cli::Agy] {
+        for case in 0..7 {
+            let tmp = tmp_dir("native-adoption");
+            let mut env = env_at(&tmp);
+            env.now = 2000;
+            let host = NativeAdoption {
+                case,
+                calls: Cell::new(0),
+            };
+            let identity = if case == 4 {
+                ""
+            } else if case == 5 {
+                " --identity-email invalid"
+            } else {
+                " --identity-email owner@example.com"
+            };
+            let region = if cli == Cli::Kimi {
+                " --region global"
+            } else {
+                ""
+            };
+            let command = parsed(&format!(
+                "accounts adopt-default local --cli {} --email alias@example.com{identity}{region}",
+                cli.id()
+            ));
+            if case == 5 && command.is_err() {
+                continue;
+            }
+            let Cmd::AccountsOf(of) = command.unwrap() else {
+                panic!("native adoption command");
+            };
+            let mut err = Vec::new();
+            let code = if case == 6 {
+                let row = accounts::Row {
+                    label: "local".into(),
+                    email: Some("alias@example.com".into()),
+                    identity_email: Some("owner@example.com".into()),
+                    vendor: of.vendor,
+                    ..Default::default()
+                };
+                run_accounts_adopt(cli, &env, &host, &row, None, &mut Vec::new(), &mut err)
+            } else {
+                run_accounts_of(&of, &env, &host, &mut Vec::new(), &mut err)
+            };
+            let published = code == ExitCode::SUCCESS;
+            assert_eq!(
+                published,
+                matches!(case, 0 | 4),
+                "{} case {case}: {}",
+                cli.id(),
+                String::from_utf8_lossy(&err)
+            );
+            assert_eq!(host.calls.get(), u32::from(case < 4));
+            let roster = env.accounts_roster_for(cli).unwrap();
+            if published {
+                let roster = Roster::load_for(cli, &roster).unwrap();
+                let row = roster.row("local").unwrap();
+                assert_eq!(row.email.as_deref(), Some("alias@example.com"));
+                assert_eq!(
+                    row.identity_email.as_deref(),
+                    (case == 0).then_some("owner@example.com")
+                );
+                assert!(row.dir.is_none());
+            } else {
+                assert!(!roster.exists());
+            }
+            let store = env.accounts_store_for(cli).unwrap();
+            assert!(
+                !store.logins_file().exists(),
+                "metadata adoption created renewable credential authority"
+            );
+        }
+    }
+}

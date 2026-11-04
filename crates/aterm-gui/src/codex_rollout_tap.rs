@@ -16,12 +16,30 @@ use aterm_agent::harness::steps::StepState;
 
 use crate::claude_footer::LogWake;
 use crate::self_claim::{TapTarget, Tapped, Untapped};
-use crate::session_log::transcript::{Applied, RolloutWord, Source, TapRun, apply_rollout_batch};
+use crate::session_log::transcript::{
+    Applied, ReadWait, RolloutWord, Source, TapRun, apply_rollout_batch,
+};
 use crate::session_timeline::SessionTimeline;
 
 /// Minimum interval between rollout reads while a `codex-alab` session is in front: a read-only
 /// target's record is read again on the same cadence ([`crate::self_claim::tapped`]).
 pub(crate) const RECHECK: Duration = Duration::from_secs(1);
+
+/// How long after a codex-alab tab's screen last moved its rollout and record are read once more,
+/// while its record names a count ([`Look::counted`]): codex-alab writes a change it drew up to its
+/// record writer's interval (1 s, CONTRACT §4) after the frame, so the read the move itself caused
+/// may precede the write; a further [`RECHECK`] covers the sweep's own lag.
+pub(crate) const SETTLE: Duration = Duration::from_secs(2);
+
+/// What the status sweep saw of a tab when it asked ([`due`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Look {
+    /// The tab's screen generation at the sweep.
+    pub(crate) screen: crate::control::ScreenGen,
+    /// Its codex-alab's record named a count at the last read the timeline took
+    /// ([`SessionTimeline::codex_terminals`]).
+    pub(crate) counted: bool,
+}
 
 /// Per-session rollout cadence state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,6 +52,56 @@ pub(crate) struct RolloutAsk {
     /// The session's last output (`latest_output_activity_ns` on the sweep's clock) as that read
     /// was dispatched; `None` where it had written nothing.
     pub(crate) output: Option<Instant>,
+    /// The screen generation the last call saw ([`Look::screen`]); `None` when asked with no look.
+    pub(crate) screen: Option<crate::control::ScreenGen>,
+    /// The settle read owed ([`SETTLE`]): the screen moved while the record named a count.
+    pub(crate) settle: Option<Instant>,
+    /// The harness pairing's read wait the session's log last named ([`pair_wait`]).
+    pub(crate) wait: Option<ReadWait>,
+    /// The pair read owed ([`pair_wait`]): a read to the rollout's end begun at or after this
+    /// instant settles a harness turn's read side.
+    pub(crate) pair: Option<Instant>,
+}
+
+impl RolloutAsk {
+    /// When this ask wants the sweep again: its trailing read, its settle read or its pair read,
+    /// the earliest, and never before [`RECHECK`] after the last read, since [`due`] reads no
+    /// sooner: a settle or a pair kept across a late trailing read can lie inside that window, and
+    /// a wake there would only be refused at every sweep until the window ends.
+    pub(crate) fn wake(&self) -> Option<Instant> {
+        let recheck = self.at.checked_add(RECHECK);
+        let trailing = recheck.filter(|_| self.owed);
+        let after = |at: Instant| recheck.map_or(at, |r| at.max(r));
+        let settle = self.settle.map(after);
+        let pair = self.pair.map(after);
+        [trailing, settle, pair].into_iter().flatten().min()
+    }
+}
+
+/// THE PAIR READ (gap 25): `session`'s log names its run's harness read wait `wait`
+/// ([`crate::session_log::SessionLog::harness_wait`]) with the instant a read to the rollout's end
+/// settles it from, or none. A wait the ask has not taken owes one read at or after that instant
+/// ([`RolloutAsk::pair`]): [`RolloutAsk::wake`] carries it to the loop's deadline
+/// ([`crate::session_status::StatusObserver::next_wake`]) and it stands, through sweeps that skip
+/// the session or come too soon, until [`due`] dispatches a read at or after it. A wait the ask
+/// took already owes nothing more: a read that fails or stops short of the file's end leaves the
+/// wait's [`ReadWait::read_ms`] as it was, so unless the rows it applied or an act logged since
+/// move the wait, only the tap's own cadence reads again. No wait clears the pair read, and a
+/// session with no ask takes none.
+pub(crate) fn pair_wait(
+    asked: &mut HashMap<u64, RolloutAsk>,
+    session: u64,
+    wait: Option<(ReadWait, Instant)>,
+) {
+    let Some(ask) = asked.get_mut(&session) else {
+        return;
+    };
+    ask.pair = match wait {
+        Some((key, at)) if ask.wait != Some(key) => Some(at),
+        Some(_) => ask.pair,
+        None => None,
+    };
+    ask.wait = wait.map(|(key, _)| key);
 }
 
 /// Rollout action selected by the status sweep for one session.
@@ -47,18 +115,23 @@ pub(crate) enum Ask {
     Stop,
 }
 
-/// Returns the next rollout [`Ask`] for `session` at `now`, its last output at `output`.
+/// Returns the next rollout [`Ask`] for `session` at `now`, its last output at `output`, given
+/// what the sweep saw of the tab (`look`; `None` asks on the output's cadence alone).
 /// A sweep inside [`RECHECK`] owes the trailing read where the session wrote since the last read,
 /// or where that read went out within [`RECHECK`] of the session's last output: codex-alab hands
 /// its rollout items to a writer task of its own (`RolloutCmd::AddItems`), so a record can reach
 /// the file just after the frame a burst ended on, and the read that frame's sweep sent. A
 /// codex-alab at rest, its output older than [`RECHECK`] at the read, swept again by a wake of
 /// someone else's (its own `aterm ctl` reads, the fabric bridge's `sessions status`), owes none and
-/// arms no timer for a rollout nothing moved.
+/// arms no timer for a rollout nothing moved. Apart from that, a screen that moved while the
+/// record names a count owes one more read [`SETTLE`] after the move, re-armed by each later move
+/// and discharged by the first read at or after it; a pair read ([`pair_wait`]) is kept, and
+/// discharged, the same way.
 pub(crate) fn due(
     asked: &mut HashMap<u64, RolloutAsk>,
     session: u64,
     target: Option<TapTarget>,
+    look: Option<Look>,
     (now, output): (Instant, Option<Instant>),
 ) -> Ask {
     let Some(target) = target else {
@@ -68,6 +141,13 @@ pub(crate) fn due(
             Ask::Nothing
         };
     };
+    let prior = asked.get(&session).copied();
+    let screen = look.map(|l| l.screen);
+    let settle = match look {
+        Some(l) if l.counted && prior.is_none_or(|p| p.screen != screen) => now.checked_add(SETTLE),
+        Some(l) if l.counted => prior.and_then(|p| p.settle),
+        _ => None,
+    };
     if let Some(prior) = asked.get_mut(&session)
         && now.saturating_duration_since(prior.at) < RECHECK
     {
@@ -75,6 +155,8 @@ pub(crate) fn due(
             || prior
                 .output
                 .is_some_and(|wrote| prior.at.saturating_duration_since(wrote) < RECHECK);
+        prior.screen = screen;
+        prior.settle = settle;
         return Ask::Nothing;
     }
     asked.insert(
@@ -83,6 +165,10 @@ pub(crate) fn due(
             at: now,
             owed: false,
             output,
+            screen,
+            settle: settle.filter(|at| *at > now),
+            wait: prior.and_then(|p| p.wait),
+            pair: prior.and_then(|p| p.pair).filter(|at| *at > now),
         },
     );
     Ask::Read(target)
@@ -261,6 +347,8 @@ struct Held {
     task: Option<String>,
     /// What [`publish_facts`] last published from it.
     shown: Option<crate::survey::CodexSurvey>,
+    /// The background terminals [`publish_terminals`] last published from the claimant's record.
+    terminals: Option<u32>,
 }
 
 /// The taps by session.
@@ -304,7 +392,7 @@ fn stop_tap(taps: &mut Taps, session: u64, timeline: Option<&Arc<Mutex<SessionTi
 fn drop_held(taps: &mut Taps, session: u64, ctx: Option<&crate::SessionCtx>) {
     if taps
         .remove(&session)
-        .is_some_and(|held| held.shown.is_some())
+        .is_some_and(|held| held.shown.is_some() || held.terminals.is_some())
         && let Some(ctx) = ctx
         && ctx
             .timeline
@@ -394,17 +482,18 @@ fn read_on(
     let (pid, start) = (job.target.pid(), job.target.start());
     let read = || {
         let ctx = job.ctx.upgrade()?;
-        let arm = {
+        let (arm, began) = {
             let _claim = crate::self_claim::hold_rollout(&ctx, &tapped)?;
             let timeline = ctx.timeline.lock().unwrap_or_else(PoisonError::into_inner);
-            timeline
+            let arm = timeline
                 .slog()
                 .transcript_arm(Source::Rollout)
-                .filter(|arm| arm.run == job.run)?
+                .filter(|arm| arm.run == job.run)?;
+            (arm, timeline.slog().now().wall_ms)
         };
-        ((job.image.start)(pid).as_deref() == Some(start)).then_some((ctx, arm))
+        ((job.image.start)(pid).as_deref() == Some(start)).then_some((ctx, arm, began))
     };
-    let Some((ctx, arm)) = read() else {
+    let Some((ctx, arm, began)) = read() else {
         drop_held(taps, job.session, job.ctx.upgrade().as_deref());
         return (None, RolloutWord::Stale);
     };
@@ -428,6 +517,7 @@ fn read_on(
                 facts: None,
                 task: (job.image.task)(pid),
                 shown: None,
+                terminals: None,
             })
         }
     };
@@ -435,7 +525,14 @@ fn read_on(
     let running = (job.image.build)(pid);
     let version = (job.image.version)(pid);
     held.tap.arm(floor, arm.given, running.as_deref());
-    let _ = held.tap.read(FOLD_BUDGET);
+    // A read that reached the rollout's end read every row written before it began (`began`, on
+    // the log's clock): the harness pairing's watermark (`SessionLog::harness_pair`). A read that
+    // failed or stopped short gives none.
+    let eof = held
+        .tap
+        .read(FOLD_BUDGET)
+        .filter(|read| read.complete)
+        .map(|_| began);
     let refused = held.tap.refused();
     if refused != held.said {
         held.said = refused;
@@ -454,7 +551,12 @@ fn read_on(
         (None, None) => RolloutWord::Unbound,
     };
     let batch = held.tap.take();
-    let survey = read_facts(held, &tapped);
+    let record = aterm_agent::harness::self_claimed::read_record_facts(
+        tapped.target.home(),
+        tapped.target.pid(),
+        &tapped.thread,
+    );
+    let survey = read_facts(held, &tapped, record.goal);
     after_read();
     if (job.image.start)(pid).as_deref() != Some(start)
         || (job.image.build)(pid) != running
@@ -463,7 +565,7 @@ fn read_on(
         drop_held(taps, job.session, Some(&ctx));
         return (None, RolloutWord::Stale);
     }
-    let applied = apply_rollout_batch(&ctx, &tapped, job.run, &batch, held.tap.is_bound());
+    let applied = apply_rollout_batch(&ctx, &tapped, job.run, &batch, (held.tap.is_bound(), eof));
     if applied.disarm {
         drop_held(taps, job.session, Some(&ctx));
         return (Some(applied), RolloutWord::Stale);
@@ -471,13 +573,20 @@ fn read_on(
     if let Some(survey) = survey {
         publish_facts(&ctx, job, &tapped, held, survey);
     }
+    if held.terminals != record.background_terminals {
+        publish_terminals(&ctx, job, &tapped, held, record.background_terminals);
+    }
     (Some(applied), word)
 }
 
 /// The survey's facts from `held`'s rollout, whatever build wrote it (the tap's steps refuse a
-/// `session_meta` of a shape the fold does not know, these facts are any codex's), when they
-/// differ from those last shown.
-fn read_facts(held: &mut Held, tapped: &Tapped) -> Option<crate::survey::CodexSurvey> {
+/// `session_meta` of a shape the fold does not know, these facts are any codex's), with the `goal`
+/// the claimant's own record names ([`read_on`] reads it), when they differ from those last shown.
+fn read_facts(
+    held: &mut Held,
+    tapped: &Tapped,
+    goal: Option<String>,
+) -> Option<crate::survey::CodexSurvey> {
     if held.facts.is_none()
         && let Some(path) = rollout_path(tapped.target.home(), &tapped.thread)
     {
@@ -494,11 +603,6 @@ fn read_facts(held: &mut Held, tapped: &Tapped) -> Option<crate::survey::CodexSu
         Some(GitHeadRead::Found(branch, _)) => Some(branch),
         _ => None,
     };
-    let goal = aterm_agent::harness::self_claimed::read_record_goal(
-        tapped.target.home(),
-        tapped.target.pid(),
-        &tapped.thread,
-    );
     if held.facts.is_none() && held.task.is_none() && goal.is_none() && held.shown.is_none() {
         return None;
     }
@@ -525,6 +629,23 @@ fn publish_facts(
         timeline.set_codex_survey(group, survey.clone())
     }) {
         held.shown = Some(survey);
+    }
+}
+
+/// Publishes the background terminals codex-alab's own record counts for the claimant's thread on
+/// their own slot: a count alone is no survey fact, so a tab with no rollout keeps its screen's
+/// read. Kept as shown only once the timeline took it, as [`publish_facts`] keeps its facts.
+fn publish_terminals(
+    ctx: &crate::SessionCtx,
+    job: &Job,
+    tapped: &Tapped,
+    held: &mut Held,
+    count: Option<u32>,
+) {
+    if publish(ctx, job, tapped, |timeline, group| {
+        timeline.set_codex_terminals(group, count)
+    }) {
+        held.terminals = count;
     }
 }
 
@@ -632,41 +753,50 @@ mod tests {
         let mut asked = HashMap::new();
         let t0 = Instant::now();
         let at = |ms: u64| t0 + Duration::from_millis(ms);
-        assert_eq!(due(&mut asked, 7, None, (at(0), None)), Ask::Nothing);
+        assert_eq!(due(&mut asked, 7, None, None, (at(0), None)), Ask::Nothing);
         assert_eq!(
-            due(&mut asked, 7, Some(target(THREAD)), (at(0), None)),
+            due(&mut asked, 7, Some(target(THREAD)), None, (at(0), None)),
             Ask::Read(target(THREAD))
         );
         assert_eq!(asked.get(&7).map(|a| a.owed), Some(false));
         for ms in [1, 250, 999] {
             assert_eq!(
-                due(&mut asked, 7, Some(target(THREAD)), (at(ms), Some(at(ms)))),
+                due(
+                    &mut asked,
+                    7,
+                    Some(target(THREAD)),
+                    None,
+                    (at(ms), Some(at(ms)))
+                ),
                 Ask::Nothing,
                 "{ms}"
             );
             assert_eq!(asked.get(&7).map(|a| a.owed), Some(true), "{ms}");
         }
         assert_eq!(
-            due(&mut asked, 8, Some(target(THREAD)), (at(500), None)),
+            due(&mut asked, 8, Some(target(THREAD)), None, (at(500), None)),
             Ask::Read(target(THREAD))
         );
         assert_eq!(
-            due(&mut asked, 7, Some(target(THREAD)), (at(1_000), None)),
+            due(&mut asked, 7, Some(target(THREAD)), None, (at(1_000), None)),
             Ask::Read(target(THREAD))
         );
         assert_eq!(asked.get(&7).map(|a| a.owed), Some(false));
         assert_eq!(
-            due(&mut asked, 7, Some(target(THREAD)), (at(1_400), None)),
+            due(&mut asked, 7, Some(target(THREAD)), None, (at(1_400), None)),
             Ask::Nothing
         );
-        assert_eq!(due(&mut asked, 7, None, (at(1_500), None)), Ask::Stop);
-        assert_eq!(due(&mut asked, 7, None, (at(1_600), None)), Ask::Nothing);
+        assert_eq!(due(&mut asked, 7, None, None, (at(1_500), None)), Ask::Stop);
         assert_eq!(
-            due(&mut asked, 7, Some(target(THREAD)), (at(1_700), None)),
+            due(&mut asked, 7, None, None, (at(1_600), None)),
+            Ask::Nothing
+        );
+        assert_eq!(
+            due(&mut asked, 7, Some(target(THREAD)), None, (at(1_700), None)),
             Ask::Read(target(THREAD)),
             "back in front: asked at once"
         );
-        assert_eq!(due(&mut asked, 8, None, (at(1_800), None)), Ask::Stop);
+        assert_eq!(due(&mut asked, 8, None, None, (at(1_800), None)), Ask::Stop);
     }
 
     /// AT REST, NO TRAILING READ: a claimant whose last output was older than [`RECHECK`] at its
@@ -681,12 +811,12 @@ mod tests {
         let at = |ms: u64| t0 + Duration::from_millis(ms);
         let wrote = Some(t0 - Duration::from_secs(5));
         assert_eq!(
-            due(&mut asked, 7, Some(target(THREAD)), (at(0), wrote)),
+            due(&mut asked, 7, Some(target(THREAD)), None, (at(0), wrote)),
             Ask::Read(target(THREAD))
         );
         for ms in [300, 600, 900] {
             assert_eq!(
-                due(&mut asked, 7, Some(target(THREAD)), (at(ms), wrote)),
+                due(&mut asked, 7, Some(target(THREAD)), None, (at(ms), wrote)),
                 Ask::Nothing
             );
             assert_eq!(
@@ -700,6 +830,7 @@ mod tests {
                 &mut asked,
                 7,
                 Some(target(THREAD)),
+                None,
                 (at(950), Some(at(940)))
             ),
             Ask::Nothing
@@ -724,11 +855,11 @@ mod tests {
         let at = |ms: u64| t0 + Duration::from_millis(ms);
         let wrote = Some(at(0));
         assert_eq!(
-            due(&mut asked, 7, Some(target(THREAD)), (at(250), wrote)),
+            due(&mut asked, 7, Some(target(THREAD)), None, (at(250), wrote)),
             Ask::Read(target(THREAD))
         );
         assert_eq!(
-            due(&mut asked, 7, Some(target(THREAD)), (at(500), wrote)),
+            due(&mut asked, 7, Some(target(THREAD)), None, (at(500), wrote)),
             Ask::Nothing
         );
         assert_eq!(
@@ -737,12 +868,24 @@ mod tests {
             "a read 250 ms after the burst owes a trailing read"
         );
         assert_eq!(
-            due(&mut asked, 7, Some(target(THREAD)), (at(1_250), wrote)),
+            due(
+                &mut asked,
+                7,
+                Some(target(THREAD)),
+                None,
+                (at(1_250), wrote)
+            ),
             Ask::Read(target(THREAD)),
             "the trailing read"
         );
         assert_eq!(
-            due(&mut asked, 7, Some(target(THREAD)), (at(1_500), wrote)),
+            due(
+                &mut asked,
+                7,
+                Some(target(THREAD)),
+                None,
+                (at(1_500), wrote)
+            ),
             Ask::Nothing
         );
         assert_eq!(
@@ -752,12 +895,345 @@ mod tests {
         );
         let mut rest = HashMap::new();
         let old = Some(t0 - Duration::from_secs(5));
-        let _ = due(&mut rest, 7, Some(target(THREAD)), (at(250), old));
-        let _ = due(&mut rest, 7, Some(target(THREAD)), (at(500), old));
+        let _ = due(&mut rest, 7, Some(target(THREAD)), None, (at(250), old));
+        let _ = due(&mut rest, 7, Some(target(THREAD)), None, (at(500), old));
         assert_eq!(
             rest.get(&7).map(|a| a.owed),
             Some(false),
             "CONTROL: a read sent at rest"
         );
+    }
+
+    /// THE SETTLE: while the record names a count, each sweep that sees the screen move owes one
+    /// more read [`SETTLE`] after it, re-armed by each later move and kept across a read
+    /// dispatched before it (that read may precede codex-alab's coalesced write); the first read at
+    /// or after it discharges it, and nothing more is owed while the screen rests. An uncounted
+    /// look, or none, arms nothing. The wake never falls inside the [`RECHECK`] after a read,
+    /// where `due` would refuse it.
+    #[test]
+    fn a_settle_read_follows_the_screens_last_move_while_the_record_counts() {
+        const THREAD: &str = "019a0000-0000-7000-8000-00000000000b";
+        let g = |seq: u64| crate::control::ScreenGen { epoch: 1, seq };
+        let look = |seq: u64, counted: bool| {
+            Some(Look {
+                screen: g(seq),
+                counted,
+            })
+        };
+        let mut asked = HashMap::new();
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let ask = |asked: &HashMap<u64, RolloutAsk>| *asked.get(&7).expect("asked");
+
+        assert_eq!(
+            due(
+                &mut asked,
+                7,
+                Some(target(THREAD)),
+                look(1, true),
+                (t0, Some(t0))
+            ),
+            Ask::Read(target(THREAD))
+        );
+        assert_eq!(
+            ask(&asked).settle,
+            Some(t0 + SETTLE),
+            "the first look arms it"
+        );
+        assert_eq!(
+            due(
+                &mut asked,
+                7,
+                Some(target(THREAD)),
+                look(1, true),
+                (at(500), Some(at(500)))
+            ),
+            Ask::Nothing
+        );
+        assert!(ask(&asked).owed);
+        assert_eq!(
+            ask(&asked).settle,
+            Some(t0 + SETTLE),
+            "a still screen keeps it"
+        );
+        assert_eq!(
+            due(
+                &mut asked,
+                7,
+                Some(target(THREAD)),
+                look(2, true),
+                (at(800), Some(at(800)))
+            ),
+            Ask::Nothing
+        );
+        assert_eq!(
+            ask(&asked).settle,
+            Some(at(800) + SETTLE),
+            "a move re-arms it"
+        );
+        assert_eq!(
+            ask(&asked).wake(),
+            Some(t0 + RECHECK),
+            "the trailing read first"
+        );
+        assert_eq!(
+            due(
+                &mut asked,
+                7,
+                Some(target(THREAD)),
+                look(2, true),
+                (t0 + RECHECK, Some(t0 + RECHECK))
+            ),
+            Ask::Read(target(THREAD))
+        );
+        assert_eq!(
+            ask(&asked).settle,
+            Some(at(800) + SETTLE),
+            "a read before the settle keeps it"
+        );
+        assert_eq!(ask(&asked).wake(), Some(at(800) + SETTLE));
+        assert_eq!(
+            due(
+                &mut asked,
+                7,
+                Some(target(THREAD)),
+                look(2, true),
+                (at(800) + SETTLE, Some(at(800) + SETTLE))
+            ),
+            Ask::Read(target(THREAD))
+        );
+        assert_eq!(ask(&asked).settle, None, "the settle read discharges it");
+        assert_eq!(
+            ask(&asked).wake(),
+            None,
+            "nothing more while the screen rests"
+        );
+        assert_eq!(
+            due(
+                &mut asked,
+                7,
+                Some(target(THREAD)),
+                look(3, false),
+                (at(6_000), Some(at(6_000)))
+            ),
+            Ask::Read(target(THREAD))
+        );
+        assert_eq!(
+            ask(&asked).settle,
+            None,
+            "a record naming no count arms nothing"
+        );
+        assert_eq!(
+            due(
+                &mut asked,
+                7,
+                Some(target(THREAD)),
+                None,
+                (at(8_000), Some(at(8_000)))
+            ),
+            Ask::Read(target(THREAD))
+        );
+        assert_eq!(ask(&asked).settle, None, "no look arms nothing");
+        assert_eq!(ask(&asked).screen, None);
+
+        let base = RolloutAsk {
+            at: t0,
+            owed: false,
+            output: None,
+            screen: None,
+            settle: None,
+            wait: None,
+            pair: None,
+        };
+        assert_eq!(base.wake(), None, "neither");
+        assert_eq!(
+            RolloutAsk { owed: true, ..base }.wake(),
+            Some(t0 + RECHECK),
+            "owed only"
+        );
+        assert_eq!(
+            RolloutAsk {
+                settle: Some(at(1_500)),
+                ..base
+            }
+            .wake(),
+            Some(at(1_500)),
+            "settle only"
+        );
+        assert_eq!(
+            RolloutAsk {
+                settle: Some(at(300)),
+                ..base
+            }
+            .wake(),
+            Some(t0 + RECHECK),
+            "settle only, inside the recheck: due reads no sooner"
+        );
+        assert_eq!(
+            RolloutAsk {
+                owed: true,
+                settle: Some(at(300)),
+                ..base
+            }
+            .wake(),
+            Some(t0 + RECHECK),
+            "both, the settle inside the recheck"
+        );
+        assert_eq!(
+            RolloutAsk {
+                owed: true,
+                settle: Some(at(3_000)),
+                ..base
+            }
+            .wake(),
+            Some(t0 + RECHECK),
+            "both: the trailing read is earlier"
+        );
+
+        // A late trailing read keeps a settle that lies within RECHECK of it: the wake names the
+        // first instant due reads, not the settle, which due would refuse.
+        let mut late = HashMap::new();
+        assert_eq!(
+            due(
+                &mut late,
+                9,
+                Some(target(THREAD)),
+                look(1, true),
+                (t0, Some(t0))
+            ),
+            Ask::Read(target(THREAD))
+        );
+        assert_eq!(
+            due(
+                &mut late,
+                9,
+                Some(target(THREAD)),
+                look(2, true),
+                (at(100), Some(at(100)))
+            ),
+            Ask::Nothing
+        );
+        assert_eq!(
+            due(
+                &mut late,
+                9,
+                Some(target(THREAD)),
+                look(2, true),
+                (at(1_500), Some(at(1_500)))
+            ),
+            Ask::Read(target(THREAD)),
+            "the trailing read, late"
+        );
+        let kept = *late.get(&9).expect("asked");
+        assert_eq!(kept.settle, Some(at(2_100)), "the settle stands past it");
+        let mut refused = late.clone();
+        assert_eq!(
+            due(
+                &mut refused,
+                9,
+                Some(target(THREAD)),
+                look(2, true),
+                (at(2_100), Some(at(2_100)))
+            ),
+            Ask::Nothing,
+            "premise: due refuses a read at the settle itself"
+        );
+        assert_eq!(
+            kept.wake(),
+            Some(at(1_500) + RECHECK),
+            "the wake waits out the recheck"
+        );
+        assert_eq!(
+            due(
+                &mut late,
+                9,
+                Some(target(THREAD)),
+                look(2, true),
+                (at(1_500) + RECHECK, Some(at(1_500) + RECHECK))
+            ),
+            Ask::Read(target(THREAD))
+        );
+        assert_eq!(
+            late.get(&9).expect("asked").settle,
+            None,
+            "that read discharges the settle"
+        );
+    }
+
+    /// THE PAIR READ (gap 25, [`pair_wait`]): a harness read wait the log names owes one read at
+    /// or after the instant it gives, carried by [`RolloutAsk::wake`] and kept across a read
+    /// dispatched before it; the first read at or after it discharges it. The same wait handed
+    /// again (the read failed or stopped short of the file's end) owes nothing more, so the ask
+    /// arms no wake for it, however long the turn waits; a wait a read to the end moved (its
+    /// watermark rose, the read begun before the wait's time) owes one more read, no sooner than
+    /// the recheck. No wait clears it, and a session with no ask takes none.
+    #[test]
+    fn a_harness_read_wait_owes_one_read_at_or_after_it() {
+        const THREAD: &str = "019a0000-0000-7000-8000-00000000000e";
+        let mut asked = HashMap::new();
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let ask = |asked: &HashMap<u64, RolloutAsk>| *asked.get(&7).expect("asked");
+        let wait = |read_ms: u64| ReadWait {
+            since: 9_000,
+            read_ms,
+        };
+        let read = |asked: &mut HashMap<u64, RolloutAsk>, ms: u64| {
+            due(asked, 7, Some(target(THREAD)), None, (at(ms), None))
+        };
+
+        pair_wait(&mut asked, 7, Some((wait(0), at(3_000))));
+        assert!(asked.is_empty(), "no ask, nothing taken");
+        assert_eq!(read(&mut asked, 0), Ask::Read(target(THREAD)));
+        assert_eq!(
+            ask(&asked).wake(),
+            None,
+            "premise: a read at rest owes nothing"
+        );
+        pair_wait(&mut asked, 7, Some((wait(0), at(3_000))));
+        assert_eq!(
+            ask(&asked).wake(),
+            Some(at(3_000)),
+            "a new wait owes its read"
+        );
+        assert_eq!(read(&mut asked, 1_500), Ask::Read(target(THREAD)));
+        assert_eq!(
+            ask(&asked).wake(),
+            Some(at(3_000)),
+            "a read before it keeps it"
+        );
+        pair_wait(&mut asked, 7, Some((wait(0), at(3_000))));
+        assert_eq!(
+            ask(&asked).wake(),
+            Some(at(3_000)),
+            "the same wait again keeps it"
+        );
+        assert_eq!(read(&mut asked, 2_000), Ask::Nothing, "inside the recheck");
+        assert_eq!(
+            ask(&asked).wake(),
+            Some(at(3_000)),
+            "a refused sweep keeps it"
+        );
+        assert_eq!(read(&mut asked, 3_000), Ask::Read(target(THREAD)));
+        assert_eq!(ask(&asked).pair, None, "the read at it discharges it");
+        assert_eq!(ask(&asked).wake(), None);
+        pair_wait(&mut asked, 7, Some((wait(0), at(3_000))));
+        assert_eq!(
+            ask(&asked).wake(),
+            None,
+            "a failed read leaves the wait as it was: nothing more is owed"
+        );
+        assert_eq!(read(&mut asked, 4_000), Ask::Read(target(THREAD)));
+        pair_wait(&mut asked, 7, Some((wait(0), at(4_000))));
+        assert_eq!(ask(&asked).wake(), None, "nor at the next read's");
+        pair_wait(&mut asked, 7, Some((wait(1_900), at(4_000))));
+        assert_eq!(
+            ask(&asked).wake(),
+            Some(at(4_000) + RECHECK),
+            "a read to the end that left it waiting owes one more, after the recheck"
+        );
+        pair_wait(&mut asked, 7, None);
+        assert_eq!((ask(&asked).wait, ask(&asked).pair), (None, None));
+        assert_eq!(ask(&asked).wake(), None, "no wait clears it");
     }
 }

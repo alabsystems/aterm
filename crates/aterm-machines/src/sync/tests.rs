@@ -138,7 +138,7 @@ pub(crate) struct Inert {
     awake: Mutex<AwakeRead>,
     /// What `sync.awake`'s apply answers; an `Ok` makes the read right.
     awake_done: Mutex<Result<String, String>>,
-    /// Whether the person turned aCaffiene's Enable at Startup off ([`Ports::awake_startup_off`]).
+    /// Whether the person turned aCaffeine's Enable at Startup off ([`Ports::awake_startup_off`]).
     awake_startup_off: AtomicBool,
     /// Old `aterm caffeine` login jobs no aterm will run again ([`Ports::awake_retired_jobs`]).
     awake_retired: Mutex<Vec<String>>,
@@ -868,7 +868,7 @@ fn each_off_switch_reads_not_applicable_and_applies_nothing() {
     *ports.accounts.lock().unwrap() = AccountsRead::Off;
     *ports.fabric.lock().unwrap() = FabricRead::NotApplicable("the fabric is off".to_owned());
     *ports.awake.lock().unwrap() =
-        AwakeRead::NotApplicable("aCaffiene is off by your choice".to_owned());
+        AwakeRead::NotApplicable("aCaffeine is off by your choice".to_owned());
     let pass = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
     for (id, says) in [
         (VAULT, "agent on"),
@@ -1659,7 +1659,7 @@ fn outside_the_accounts_own_login_a_pass_refuses_and_reads_nothing() {
 fn the_subscribers_pass_keeps_this_mac_awake() {
     let scratch = aterm_tempfile::tempdir().unwrap();
     let ports = Inert::new(scratch.path());
-    *ports.awake.lock().unwrap() = AwakeRead::Due("no aCaffiene mug runs".to_owned());
+    *ports.awake.lock().unwrap() = AwakeRead::Due("no aCaffeine mug runs".to_owned());
     let pass = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
     let kept = row(&pass.rows, AWAKE);
     assert_eq!(kept.outcome, Outcome::Changed, "{kept:?}");
@@ -1667,7 +1667,7 @@ fn the_subscribers_pass_keeps_this_mac_awake() {
 
     let scratch = aterm_tempfile::tempdir().unwrap();
     let ports = Inert::new(scratch.path());
-    *ports.awake.lock().unwrap() = AwakeRead::Due("no aCaffiene mug runs".to_owned());
+    *ports.awake.lock().unwrap() = AwakeRead::Due("no aCaffeine mug runs".to_owned());
     *ports.awake_done.lock().unwrap() = Err("launchctl bootstrap: 5".to_owned());
     let pass = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
     assert_eq!(row(&pass.rows, AWAKE).outcome, Outcome::Failed);
@@ -1683,21 +1683,21 @@ fn the_subscribers_pass_keeps_this_mac_awake() {
     for trigger in [Trigger::Window, Trigger::Setup] {
         let scratch = aterm_tempfile::tempdir().unwrap();
         let ports = Inert::new(scratch.path());
-        *ports.awake.lock().unwrap() = AwakeRead::Due("no aCaffiene mug runs".to_owned());
+        *ports.awake.lock().unwrap() = AwakeRead::Due("no aCaffeine mug runs".to_owned());
         let pass = ran(ports.pass(trigger, Mode::Apply));
         assert_eq!(row(&pass.rows, AWAKE).outcome, Outcome::NotApplicable);
         assert!(!ports.applies().contains(&"awake"), "{trigger:?}");
     }
 }
 
-/// A person who turned aCaffiene's Enable at Startup off chose no mug at login: the subscriber's
+/// A person who turned aCaffeine's Enable at Startup off chose no mug at login: the subscriber's
 /// pass, which runs at login with no window, starts none, while a person's `aterm init
 /// --converge` still does (and an aterm window's watch, which no pass is).
 #[test]
 fn the_subscribers_pass_keeps_a_persons_startup_off() {
     let scratch = aterm_tempfile::tempdir().unwrap();
     let ports = Inert::new(scratch.path());
-    *ports.awake.lock().unwrap() = AwakeRead::Due("no aCaffiene mug runs".to_owned());
+    *ports.awake.lock().unwrap() = AwakeRead::Due("no aCaffeine mug runs".to_owned());
     ports.awake_startup_off.store(true, Ordering::SeqCst);
     let pass = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
     let left = row(&pass.rows, AWAKE);
@@ -1706,7 +1706,7 @@ fn the_subscribers_pass_keeps_a_persons_startup_off() {
 
     let scratch = aterm_tempfile::tempdir().unwrap();
     let ports = Inert::new(scratch.path());
-    *ports.awake.lock().unwrap() = AwakeRead::Due("no aCaffiene mug runs".to_owned());
+    *ports.awake.lock().unwrap() = AwakeRead::Due("no aCaffeine mug runs".to_owned());
     ports.awake_startup_off.store(true, Ordering::SeqCst);
     let pass = ran(ports.pass(Trigger::Init, Mode::Apply));
     assert_eq!(row(&pass.rows, AWAKE).outcome, Outcome::Changed);
@@ -1748,7 +1748,7 @@ fn the_subscribers_pass_retires_old_caffeine_login_items_without_starting_a_mug(
         ports.awake_startup_off.store(startup_off, Ordering::SeqCst);
         if !startup_off {
             *ports.awake.lock().unwrap() =
-                AwakeRead::NotApplicable("aCaffiene is off by your choice".to_owned());
+                AwakeRead::NotApplicable("aCaffeine is off by your choice".to_owned());
         }
         *ports.awake_retired.lock().unwrap() = vec!["com.aterm.aterm.caffeine".to_owned()];
         let pass = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
@@ -1946,7 +1946,7 @@ fn swarm_enabled_false_marks_every_sync_item_not_applicable_and_reads_nothing() 
     *ports.peers.lock().unwrap() = PeersRead::Joinable("open vault alab".to_owned());
     *ports.shared.lock().unwrap() =
         SharedRead::Foundable("vault alab has no Commons control".to_owned());
-    *ports.awake.lock().unwrap() = AwakeRead::Due("no aCaffiene mug runs".to_owned());
+    *ports.awake.lock().unwrap() = AwakeRead::Due("no aCaffeine mug runs".to_owned());
     *ports.swarm.lock().unwrap() = Ok(false);
 
     for trigger in [

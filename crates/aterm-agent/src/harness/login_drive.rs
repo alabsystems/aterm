@@ -616,6 +616,11 @@ pub enum Outcome {
     Hung,
     /// No provider action or retained completion was used.
     NotRun(String),
+    /// The CLI's sign-in named its page and the approver stopped before opening it (no browser to
+    /// open it in, its download failed), so nothing was approved and the CLI was ended. A person
+    /// reads this as [`Outcome::NotRun`]: no sign-in ran. Shared recovery reads it as
+    /// [`Outcome::Unverified`]: the CLI's own request for that page may have reached the provider.
+    PageNotOpened(String),
     /// A provider action may have occurred, but its result is unverified.
     /// This is not evidence that repeating the provider action is safe.
     Unverified(String),
@@ -636,7 +641,7 @@ impl Outcome {
             Outcome::BotCheck(_) => "bot-check".to_owned(),
             Outcome::Failed => "failed".to_owned(),
             Outcome::Hung => "hung".to_owned(),
-            Outcome::NotRun(_) => "not-run".to_owned(),
+            Outcome::NotRun(_) | Outcome::PageNotOpened(_) => "not-run".to_owned(),
             Outcome::Unverified(_) => "unverified".to_owned(),
         }
     }
@@ -822,7 +827,7 @@ pub fn drive(spec: &Spec<'_>, approver: &mut dyn Approver) -> Drove {
                 Approval::NotRun(why) => {
                     end(&mut child);
                     return Drove {
-                        outcome: Outcome::Unverified(why),
+                        outcome: Outcome::PageNotOpened(why),
                         host,
                     };
                 }
@@ -909,13 +914,29 @@ impl std::fmt::Debug for RecoveryKey {
 
 type RecoveryCheck = dyn Fn(Option<[u8; 32]>) -> Result<(), String> + Send + Sync;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecoveryDomain {
+    SharedRoot,
+    #[cfg(unix)]
+    Pool,
+}
+
 /// Live authority retained alongside an admitted recovery key. Constructing a key
 /// alone cannot authorize root-scoped browser work or session publication.
 #[derive(Clone)]
 pub struct RecoveryAdmission {
+    domain: RecoveryDomain,
     key: RecoveryKey,
     check: std::sync::Arc<RecoveryCheck>,
     native_entry: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(unix)]
+    kimi: std::sync::Arc<std::sync::Mutex<Option<PoolKimiProof>>>,
+}
+
+#[cfg(unix)]
+struct PoolKimiProof {
+    native: super::cli::shared_provider::KimiProof,
+    _claim: std::sync::Arc<super::browser_window::ProfileLock>,
 }
 
 impl RecoveryAdmission {
@@ -925,10 +946,77 @@ impl RecoveryAdmission {
         check: impl Fn(Option<[u8; 32]>) -> Result<(), String> + Send + Sync + 'static,
     ) -> Self {
         Self {
+            domain: RecoveryDomain::SharedRoot,
             key,
             check: std::sync::Arc::new(check),
             native_entry: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(native_entry)),
+            #[cfg(unix)]
+            kimi: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    #[cfg(unix)]
+    pub(super) fn pool(
+        key: RecoveryKey,
+        check: impl Fn(Option<[u8; 32]>) -> Result<(), String> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            domain: RecoveryDomain::Pool,
+            key,
+            check: std::sync::Arc::new(check),
+            native_entry: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            kimi: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    #[cfg(unix)]
+    pub(super) fn is_shared_root(&self) -> bool {
+        self.domain == RecoveryDomain::SharedRoot
+    }
+
+    #[cfg(unix)]
+    pub(super) fn retain_kimi(
+        &self,
+        native: super::cli::shared_provider::KimiProof,
+        claim: std::sync::Arc<super::browser_window::ProfileLock>,
+    ) -> Result<(), String> {
+        use super::cli::shared_provider::LoginProof as _;
+        if self.is_shared_root() {
+            return Err("pool Kimi proof has a shared-root admission".into());
+        }
+        self.current(Some(native.principal()))?;
+        let mut kept = self
+            .kimi
+            .lock()
+            .map_err(|_| "pool Kimi proof custody is unavailable")?;
+        if kept.is_some() {
+            return Err("pool Kimi proof was already retained".into());
+        }
+        *kept = Some(PoolKimiProof {
+            native,
+            _claim: claim,
+        });
+        Ok(())
+    }
+
+    /// Bounded local evidence only; safe inside the pool publication transaction.
+    #[cfg(unix)]
+    pub(super) fn kimi_principal(
+        &self,
+        staging: &Path,
+        region: crate::ai::connector::Region,
+        expected: &str,
+    ) -> Result<Option<[u8; 32]>, String> {
+        use super::cli::shared_provider::LoginProof as _;
+        let kept = self
+            .kimi
+            .lock()
+            .map_err(|_| "pool Kimi proof custody is unavailable")?;
+        let Some(kept) = kept.as_ref() else {
+            return Ok(None);
+        };
+        kept.native.check_native(staging, region, expected)?;
+        Ok(Some(kept.native.principal()))
     }
 
     pub(super) fn key(&self) -> RecoveryKey {
@@ -958,7 +1046,9 @@ impl std::fmt::Debug for RecoveryAdmission {
 }
 impl PartialEq for RecoveryAdmission {
     fn eq(&self, other: &Self) -> bool {
-        self.key == other.key && std::sync::Arc::ptr_eq(&self.check, &other.check)
+        self.domain == other.domain
+            && self.key == other.key
+            && std::sync::Arc::ptr_eq(&self.check, &other.check)
     }
 }
 impl Eq for RecoveryAdmission {}
@@ -1261,7 +1351,7 @@ fn complete_sign_in(
     deadline: Instant,
     retained: bool,
 ) -> Drove {
-    if retained && let Outcome::NotRun(why) = &drove.outcome {
+    if retained && let Outcome::NotRun(why) | Outcome::PageNotOpened(why) = &drove.outcome {
         drove.outcome = Outcome::Unverified(why.clone());
     }
     if let Err(why) = req.check_admission() {

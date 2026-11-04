@@ -727,6 +727,7 @@ mod tests {
             enrich_inventory(
                 &mut progress,
                 &roster,
+                &roster,
                 state,
                 &Logins::default(),
                 &enrolled,

@@ -18,10 +18,10 @@
 //! refused ([`lan_waits`]), and none asks. A subscriber pass handed to the installed app uses that
 //! app's answer; a held-copy fallback keeps its job's network, whose rounds reach the vault
 //! ([`publish_lan`]).
-//! `sync.awake` starts the installed app's aCaffiene mug when none runs, so the subscriber's pass
-//! keeps a Mac with no window awake ([`aterm_acaffiene::cli::keep_installed_awake`], which first
+//! `sync.awake` starts the installed app's aCaffeine mug when none runs, so the subscriber's pass
+//! keeps a Mac with no window awake ([`aterm_acaffeine::cli::keep_installed_awake`], which first
 //! retires the old `aterm caffeine` name's login jobs no aterm will run again), retires those old
-//! login jobs directly when the mug already runs ([`aterm_acaffiene::cli::retire_old_jobs`]), and
+//! login jobs directly when the mug already runs ([`aterm_acaffeine::cli::retire_old_jobs`]), and
 //! never turns a person's off on: neither keep-awake's off nor, at the subscriber's pass, Enable
 //! at Startup's.
 
@@ -42,23 +42,23 @@ pub(crate) struct Live;
 /// `sync.fabric` on a Mac with no fabric command, as the renewal reads it.
 const FABRIC_OFF: &str = "off: no [fabric] command (`aterm fabric on` turns it on)";
 
-/// `sync.awake`'s read of what macOS holds ([`aterm_acaffiene::held::Held`]): `installed` finds
+/// `sync.awake`'s read of what macOS holds ([`aterm_acaffeine::held::Held`]): `installed` finds
 /// the installed app a mug starts from (in `/Applications` or `~/Applications`, with the
-/// `acaffiene` verb), asked only when keep-awake is on here.
+/// `acaffeine` verb), asked only when keep-awake is on here.
 ///
 /// # Errors
 /// The mug runs and the power manager gave no answer, or the installed app did not answer
 /// whether it has the verb.
 fn awake_of(
-    installed: impl FnOnce() -> aterm_acaffiene::launchd::Installed,
-    held: aterm_acaffiene::held::Held,
+    installed: impl FnOnce() -> aterm_acaffeine::launchd::Installed,
+    held: aterm_acaffeine::held::Held,
 ) -> Result<AwakeRead, String> {
-    use aterm_acaffiene::held::Held;
-    use aterm_acaffiene::launchd::Installed;
+    use aterm_acaffeine::held::Held;
+    use aterm_acaffeine::launchd::Installed;
     let because = |why: Option<String>| why.map_or_else(String::new, |why| format!(": {why}"));
     let off = || {
         AwakeRead::NotApplicable(
-            "aCaffiene is off by your choice (`aterm acaffiene on` turns it on)".to_owned(),
+            "aCaffeine is off by your choice (`aterm acaffeine on` turns it on)".to_owned(),
         )
     };
     match held {
@@ -81,7 +81,7 @@ fn awake_of(
             "the mug (pid {pid}) runs and asks macOS again every minute{}",
             because(why)
         )),
-        Held::Stopped { why } => AwakeRead::Due(format!("no aCaffiene mug runs{}", because(why))),
+        Held::Stopped { why } => AwakeRead::Due(format!("no aCaffeine mug runs{}", because(why))),
         Held::Unread { pid, why } => {
             return Err(format!("the mug (pid {pid}) runs; {why}"));
         }
@@ -807,13 +807,14 @@ pub(crate) fn mac_names() -> Result<MacName, String> {
     })
 }
 
-/// Where any of the Mac's own names the root half sets (`own`: `ComputerName` and
-/// `LocalHostName`, each its own row, so one can take while the other fails) is not yet the
-/// roster's `label` and `target` is that label: what names it. macOS lets only root set them, so
-/// the root half of a Command Line Tools install sets them under its one password (its argv
-/// carries the label when the roster gave it by the time the root half ran), and
-/// otherwise the one command a person types the password for. `None` where both are the label,
-/// or the Mac is named by the person's own `[identity] name` (never set as the Mac's own).
+/// Where any of the Mac's own names (`own`: `ComputerName` and `LocalHostName`, each its own
+/// row, so one can take while the other fails) is not yet the roster's `label` and `target` is
+/// that label: what names it. macOS lets only root set them: setup's one early Mac password sets
+/// them where the roster gave the label by then (its argv carries it), and otherwise leaves the
+/// narrow rule through which `sync.identity` sets them with no password once admission gives the
+/// label ([`aterm_machines::root_steps::name_by_rule`], [`own_name_by_rule`]). `None` where both
+/// are the label, or the Mac is named by the person's own `[identity] name` (never set as the
+/// Mac's own).
 pub(crate) fn own_name_pending(
     target: &str,
     label: Option<&str>,
@@ -826,10 +827,38 @@ pub(crate) fn own_name_pending(
         .find(|(_, name)| *name != Some(label))?;
     let now = now.unwrap_or("unread");
     Some(format!(
-        "this Mac's own name is {now} ({which}), not {label}: only root sets it, so the root half \
-         of the next Command Line Tools install sets it under its one password, or now `sudo \
-         aterm machines here apply --plain --name {label}`"
+        "this Mac's own name is {now} ({which}), not {label}: only root sets it, so the next \
+         pass sets it through the rule setup's one Mac password leaves, or that password names it"
     ))
+}
+
+/// `read` where the Mac's own names are still owed `label` and the rule that sets them with no
+/// password is in place (`by_rule`): a read that is current otherwise is due, so the pass's
+/// apply names the Mac ([`own_name_by_rule`]). Any other read stays as it is.
+fn own_name_due(read: IdentityRead, label: Option<&str>, by_rule: bool) -> IdentityRead {
+    match (read, label) {
+        (IdentityRead::Current(now), Some(label)) if by_rule => IdentityRead::Due {
+            from: "this Mac's own names".to_owned(),
+            to: format!("{now}; own names {label}, through setup's naming rule"),
+        },
+        (read, _) => read,
+    }
+}
+
+/// Name this Mac `label` through the rule setup's elevation left
+/// ([`aterm_machines::root_steps::name_by_rule`]), as this account, never asking for a password:
+/// what the pass's row says of it, `None` where no rule is in place or nothing changed.
+#[cfg(target_os = "macos")]
+fn own_name_by_rule(label: &str) -> Option<String> {
+    let sys = aterm_machines::port::Live::new();
+    if aterm_machines::root_steps::rule_in_place(&sys) != Some(true) {
+        return None;
+    }
+    match aterm_machines::root_steps::name_by_rule(&sys, label) {
+        Ok(set) if set.is_empty() => None,
+        Ok(set) => Some(format!("this Mac's {} now {label}", set.join(", "))),
+        Err(why) => Some(format!("this Mac's own names left as they are: {why}")),
+    }
 }
 
 /// `read` (`sync.identity`'s `aterm.toml` keys) with the fleet name beside it (`fleet`, against
@@ -1354,7 +1383,17 @@ impl Ports for Live {
         // Only a Mac's own names are aterm's to align (the root half is macOS's): elsewhere
         // the record names none.
         let own = label.as_deref().filter(|_| cfg!(target_os = "macos"));
-        Ok(with_fleet_name(read, &target, own, &fleet, &names))
+        let read = with_fleet_name(read, &target, own, &fleet, &names);
+        // An admission after setup's one password: the rule it left names the Mac, so the
+        // pass is due while the Mac's own names are not yet the label.
+        let pending = own_name_pending(&target, own, &names).and(own);
+        #[cfg(target_os = "macos")]
+        let by_rule = pending.is_some()
+            && aterm_machines::root_steps::rule_in_place(&aterm_machines::port::Live::new())
+                == Some(true);
+        #[cfg(not(target_os = "macos"))]
+        let by_rule = false;
+        Ok(own_name_due(read, pending, by_rule))
     }
 
     fn sync_identity(&self) -> Result<String, String> {
@@ -1367,7 +1406,8 @@ impl Ports for Live {
             return Ok("left as it is: [identity] name = false".to_owned());
         }
         let paths = vault_paths()?;
-        let hostnames = local_hostnames(&own_names());
+        let names = own_names();
+        let hostnames = local_hostnames(&names);
         let label = aterm_secrets::client::resolve_local_swarm_label(&paths, &hostnames)
             .map_err(|why| why.to_string())?;
         let keys = write_identity_after_read(
@@ -1385,6 +1425,13 @@ impl Ports for Live {
         let fleet = aterm_agent::follow_fleet_name(&target, &|word| {
             roster_gives(&paths, label.as_deref(), word)
         })?;
+        #[cfg(target_os = "macos")]
+        if let Some(label) =
+            own_name_pending(&target, label.as_deref(), &names).and(label.as_deref())
+            && let Some(named) = own_name_by_rule(label)
+        {
+            return Ok(format!("{keys}; {fleet}; {named}"));
+        }
         Ok(format!("{keys}; {fleet}"))
     }
 
@@ -1740,34 +1787,34 @@ impl Ports for Live {
 
     fn awake(&self) -> Result<AwakeRead, String> {
         awake_of(
-            aterm_acaffiene::cli::installed_app,
-            aterm_acaffiene::held::held(),
+            aterm_acaffeine::cli::installed_app,
+            aterm_acaffeine::held::held(),
         )
     }
 
     fn awake_startup_off(&self) -> bool {
-        aterm_acaffiene::cli::installed_startup_turned_off()
+        aterm_acaffeine::cli::installed_startup_turned_off()
     }
 
     fn awake_retired_jobs(&self) -> Vec<String> {
-        aterm_acaffiene::cli::retired_old_jobs()
+        aterm_acaffeine::cli::retired_old_jobs()
     }
 
     fn retire_awake_old_jobs(&self) -> Result<String, String> {
-        aterm_acaffiene::cli::retire_old_jobs()
+        aterm_acaffeine::cli::retire_old_jobs()
     }
 
     fn keep_awake(&self) -> Result<String, String> {
-        use aterm_acaffiene::cli::Kept;
-        use aterm_acaffiene::held::Held;
-        let kept = aterm_acaffiene::cli::keep_installed_awake();
+        use aterm_acaffeine::cli::Kept;
+        use aterm_acaffeine::held::Held;
+        let kept = aterm_acaffeine::cli::keep_installed_awake();
         match &kept {
             Kept::NotHere(why) | Kept::Failed(why) => return Err(why.clone()),
             Kept::Off => return Ok(kept.line()),
             Kept::Running(_) => {}
         }
         let until = std::time::Instant::now() + AWAKE_SETTLE;
-        while !matches!(aterm_acaffiene::held::held(), Held::Held { .. })
+        while !matches!(aterm_acaffeine::held::held(), Held::Held { .. })
             && std::time::Instant::now() < until
         {
             std::thread::sleep(std::time::Duration::from_millis(500));
@@ -1837,10 +1884,11 @@ mod tests {
 
     /// `sync.identity` reads the fleet name beside the `aterm.toml` keys: a fleet name still due
     /// makes the row due even where the keys are current, and the Mac's own names that differ
-    /// from the roster's label are recorded, never made due (no pass asks a password of its own).
-    /// NEGATIVE CONTROLS: a fleet name in place leaves current keys current, a Mac already
-    /// called by its label records nothing about its own names, and a person's own `[identity]
-    /// name` never names the Mac's own names.
+    /// from the roster's label are recorded, made due only where the rule setup's one Mac
+    /// password left is in place to name them with no password (no pass asks a password of its
+    /// own). NEGATIVE CONTROLS: a fleet name in place leaves current keys current, a Mac already
+    /// called by its label records nothing about its own names, a person's own `[identity]
+    /// name` never names the Mac's own names, and without the rule a current read stays current.
     #[test]
     fn the_identity_row_reads_the_fleet_name_and_records_the_macs_own_name() {
         use aterm_agent::FleetName;
@@ -1857,7 +1905,7 @@ mod tests {
             IdentityRead::Due { from, to } => {
                 assert_eq!(from, "fleet name node-3fa2");
                 assert!(to.contains("fleet name m42"), "{to}");
-                assert!(to.contains("--name m42"), "{to}");
+                assert!(to.contains("through the rule"), "{to}");
             }
             other => panic!("{other:?}"),
         }
@@ -1919,6 +1967,20 @@ mod tests {
             with_fleet_name(off.clone(), "m42", Some("m42"), &due, &own),
             off
         );
+        let current = with_fleet_name(keys(), "m42", Some("m42"), &FleetName::Current, &own);
+        match own_name_due(current.clone(), Some("m42"), true) {
+            IdentityRead::Due { from, to } => {
+                assert_eq!(from, "this Mac's own names");
+                assert!(
+                    to.ends_with("own names m42, through setup's naming rule"),
+                    "{to}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(own_name_due(current.clone(), Some("m42"), false), current);
+        assert_eq!(own_name_due(current.clone(), None, true), current);
+        assert_eq!(own_name_due(off.clone(), Some("m42"), true), off);
     }
 
     /// `sync.awake` plans a start only where one keeps the Mac awake: never over a person's off
@@ -1927,8 +1989,8 @@ mod tests {
     /// about over an off, and one that did not answer fails the read for the next pass.
     #[test]
     fn the_awake_row_plans_a_start_only_where_one_helps() {
-        use aterm_acaffiene::held::Held;
-        use aterm_acaffiene::launchd::Installed;
+        use aterm_acaffeine::held::Held;
+        use aterm_acaffeine::launchd::Installed;
         let stopped = || Held::Stopped {
             why: Some("the menu bar refused the mug".to_owned()),
         };
@@ -1961,7 +2023,7 @@ mod tests {
         ));
         assert!(
             awake_of(
-                || Installed::Unanswered("did not answer `help acaffiene`".to_owned()),
+                || Installed::Unanswered("did not answer `help acaffeine`".to_owned()),
                 stopped()
             )
             .is_err()

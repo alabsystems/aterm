@@ -152,10 +152,7 @@ fn config_text(root: &std::path::Path) -> String {
 
 impl Setup {
     fn new(label: &str) -> Setup {
-        let root = aterm_tempfile::Builder::new()
-            .prefix(&format!("agh-{label}-"))
-            .tempdir()
-            .expect("a scratch root");
+        let root = crate::test_fixtures::scratch_dir(label);
         let base = root.path();
         let fake = FakeGithub::start();
         for (dir, name, seed, login) in [

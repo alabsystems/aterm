@@ -53,7 +53,8 @@ pub(crate) fn version() -> &'static str {
     stamp().app_version
 }
 
-/// Short git commit hash, with `-dirty` when built from a modified tree.
+/// Short git commit hash, with `-dirty` when built from a tree modified outside the measured
+/// ledger `docs/measured` (`crates/aterm/stamp_paths.rs`).
 #[must_use]
 pub(crate) fn git_commit() -> &'static str {
     stamp().git_commit

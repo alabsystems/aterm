@@ -31,10 +31,10 @@ pub fn subsystem(head: &[u8]) -> Option<u16> {
 #[must_use]
 pub fn file_subsystem(path: &Path) -> Option<u16> {
     use std::io::Read as _;
-    let mut head = Vec::new();
-    crate::fs_restricted::open_regular_nonblock(path)
-        .and_then(|file| file.take(HEAD_BYTES).read_to_end(&mut head))
-        .ok()?;
+    let (file, meta) = crate::fs_restricted::open_regular_nonblock_with_meta(path).ok()?;
+    let cap = usize::try_from(meta.len().min(HEAD_BYTES).saturating_add(1)).unwrap_or(0);
+    let mut head = Vec::with_capacity(cap);
+    file.take(HEAD_BYTES).read_to_end(&mut head).ok()?;
     subsystem(&head)
 }
 

@@ -9,17 +9,21 @@ use std::time::{Duration, Instant};
 use aterm_json::{Map, Value, json};
 use aterm_uds::spawnfd::{Stdio, command};
 
-use super::{Args, Halt, Scratch, await_socket, private, sha256_file, without_aterm_env};
+use super::{
+    Args, Halt, Scratch, await_socket, in_scratch_world, private, scratch_config, sha256_file,
+    without_aterm_env,
+};
 use crate::perf::LaneRun;
 use crate::perf::stats::{median, tail_summary};
 
-/// Every launch's scratch `aterm.toml`: no persisted window, no update or
-/// package cadence, and the audible bell off (this window is never the
-/// owner's terminal, so a BEL its shell rings must not play their alert
-/// sound; the key is read once with the rest and costs the start nothing).
-pub(crate) const CONFIG: &str = "restore_session = false\nbell_sound = false\n\n\
-                      [update]\nenabled = false\nauto_apply = false\n\
-                      [packages]\nenabled = false\n";
+/// Every launch's scratch `aterm.toml`: no persisted window, the audible bell
+/// off (this window is never the owner's terminal, so a BEL its shell rings
+/// must not play their alert sound; the key is read once with the rest and
+/// costs the start nothing), and the scratch world's lanes off
+/// ([`scratch_config`]): no update or package cadence, no keeper, no swarm.
+pub(crate) fn config() -> String {
+    scratch_config("restore_session = false\nbell_sound = false\n")
+}
 
 /// The grid every launch asks for, and checks it got.
 pub(crate) const COLS: u64 = 110;
@@ -724,7 +728,7 @@ impl Launcher {
                 .map_err(|e| format!("could not create {}: {e}", d.display()))?;
             private(d)?;
         }
-        std::fs::write(root.join("config/aterm/aterm.toml"), CONFIG)
+        std::fs::write(root.join("config/aterm/aterm.toml"), config())
             .map_err(|e| format!("could not write the config: {e}"))?;
         let _ = std::fs::remove_file(sock);
         let log_path = root.join("aterm.log");
@@ -736,7 +740,7 @@ impl Launcher {
         let thermal = super::thermal();
 
         let mut cmd = command(&self.binary);
-        without_aterm_env(&mut cmd);
+        in_scratch_world(&mut cmd, &home)?;
         cmd.env("HOME", &home);
         for (k, d) in &dirs {
             cmd.env(k, d);
@@ -1279,22 +1283,38 @@ fn start_json(artifact: &Frozen, chip: &str, args: &Args, samples: &[Sample]) ->
 pub(crate) mod tests {
     use super::*;
 
-    /// Every launch starts with the audible bell off (aterm's default is on)
-    /// and the restore, update and package lanes off, as one document
-    /// aterm's parser reads.
+    /// Every launch starts with the audible bell off (aterm's default is on),
+    /// the restore lane off and every lane of the scratch world's tables off
+    /// ([`aterm_types::world::LANES_OFF`]), as one document aterm's parser
+    /// reads.
     #[test]
     fn a_start_launch_has_the_audible_bell_off() {
-        let doc = aterm_toml::from_str::<aterm_toml::Value>(CONFIG).expect("one document");
+        let doc = aterm_toml::from_str::<aterm_toml::Value>(&config()).expect("one document");
         let flag = |v: Option<&aterm_toml::Value>| v.and_then(aterm_toml::Value::as_bool);
         assert_eq!(flag(doc.get("bell_sound")), Some(false));
         assert_eq!(flag(doc.get("restore_session")), Some(false));
         assert_eq!(
-            flag(doc.get("update").and_then(|t| t.get("enabled"))),
-            Some(false)
+            crate::smoke_stages::tests::lanes_left_on(&doc),
+            Vec::<String>::new()
         );
+    }
+
+    /// A launch is marked a scratch world, the strip of inherited `ATERM_*`
+    /// variables notwithstanding: a release build's local-network lanes read
+    /// the marker raw.
+    #[test]
+    fn an_arena_launch_carries_the_scratch_worlds_marker() {
+        let home = Path::new("/w/home");
+        let mut cmd = command("/usr/bin/true");
+        in_scratch_world(&mut cmd, home).expect("a platform with state under HOME");
+        let marker = cmd
+            .get_envs()
+            .find(|(k, _)| *k == std::ffi::OsStr::new(aterm_types::world::MARKER))
+            .and_then(|(_, v)| v.map(Path::new));
         assert_eq!(
-            flag(doc.get("packages").and_then(|t| t.get("enabled"))),
-            Some(false)
+            marker,
+            aterm_types::world::state_home(home).as_deref(),
+            "the marker names the world's state folder"
         );
     }
 

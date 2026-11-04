@@ -671,10 +671,12 @@ fn program_file(exe: &Path) -> PathBuf {
 fn read_regular_head(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
     let file = astream_sys::open_nonblocking(path, astream_sys::Links::Refuse)?;
-    if !file.metadata()?.is_file() {
+    let meta = file.metadata()?;
+    if !meta.is_file() {
         return Err(std::io::Error::other("not a regular program or hold file"));
     }
-    let mut bytes = Vec::new();
+    let cap = usize::try_from(meta.len().min(limit).saturating_add(1)).unwrap_or(0);
+    let mut bytes = Vec::with_capacity(cap);
     file.take(limit).read_to_end(&mut bytes)?;
     Ok(bytes)
 }

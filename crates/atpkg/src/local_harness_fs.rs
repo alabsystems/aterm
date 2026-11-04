@@ -47,7 +47,10 @@ fn identity(file: &File) -> io::Result<(u64, u64)> {
     let m = file.metadata()?;
     Ok((m.dev(), m.ino()))
 }
-pub(super) fn regular(parent: &File, name: &OsStr) -> io::Result<File> {
+pub(super) fn regular_with_meta(
+    parent: &File,
+    name: &OsStr,
+) -> io::Result<(File, std::fs::Metadata)> {
     let f = File::from(
         aterm_dirfd::openat(
             parent,
@@ -57,8 +60,11 @@ pub(super) fn regular(parent: &File, name: &OsStr) -> io::Result<File> {
         )
         .map_err(io::Error::from)?,
     );
-    owned_file(&f)?;
-    Ok(f)
+    let meta = owned_file(&f)?;
+    Ok((f, meta))
+}
+pub(super) fn regular(parent: &File, name: &OsStr) -> io::Result<File> {
+    regular_with_meta(parent, name).map(|(f, _)| f)
 }
 fn sync_dir(file: &File) -> io::Result<()> {
     aterm_durable::refusal_accepted(aterm_dirfd::fsync(file).map_err(io::Error::from))
@@ -181,11 +187,12 @@ impl Parent {
         sync_dir(self.held())
     }
     pub(super) fn read(&self, name: &str, max: usize) -> io::Result<Vec<u8>> {
-        let mut file = regular(self.held(), OsStr::new(name))?;
-        if file.metadata()?.len() > max as u64 {
+        let (mut file, meta) = regular_with_meta(self.held(), OsStr::new(name))?;
+        if meta.len() > max as u64 {
             return Err(invalid("local metadata is oversized"));
         }
-        let mut bytes = Vec::new();
+        let mut bytes =
+            Vec::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
         std::io::Read::by_ref(&mut file)
             .take(max as u64 + 1)
             .read_to_end(&mut bytes)?;

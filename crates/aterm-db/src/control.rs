@@ -32,6 +32,44 @@ pub(crate) mod enrollment;
 mod frontier;
 mod peers;
 
+/// Mutants of the session rules, which their tests switch on to show they catch them.
+#[cfg(test)]
+pub(crate) mod mutants {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Mutant {
+        /// Store a peer's pushed evidence before judging it, as if a push were records to take.
+        StoresPushFirst,
+        /// Decode a legacy log witness within this build's held budget, not the legacy count.
+        WitnessAtHeldBudget,
+        /// End an `atdb/5` session when its membership rounds leave records for a later one.
+        DeferredEndsSession,
+        /// Refuse a whole `atdb/5` push at a record its receiver has no room for, rather than
+        /// judge the peer on the records that fit.
+        CapacityRefusesPush,
+    }
+
+    thread_local! {
+        static ON: std::cell::Cell<Option<Mutant>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// Run `run` with `mutant` on in this thread.
+    pub(crate) fn with<T>(mutant: Mutant, run: impl FnOnce() -> T) -> T {
+        struct Restore(Option<Mutant>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                ON.with(|slot| slot.set(self.0));
+            }
+        }
+        let _restore = Restore(ON.with(|slot| slot.replace(Some(mutant))));
+        run()
+    }
+
+    /// Whether `mutant` is on in this thread.
+    pub(crate) fn on(mutant: Mutant) -> bool {
+        ON.with(|slot| slot.get() == Some(mutant))
+    }
+}
+
 /// At most 4.5 MiB of sealed nodes are buffered per direction. The durable
 /// inventory, rather than an acknowledgement cursor, determines missing data.
 pub const RECORDS_PER_ROUND: usize = 16;
@@ -462,13 +500,15 @@ enum Protocol {
     Legacy,
     Repair,
     Credentials,
-    Frontier,
+    /// `atdb/4` or `atdb/5`, as the wire names.
+    Frontier(frontier::Wire),
 }
 
 impl Protocol {
     fn from_alpn(alpn: Option<&[u8]>) -> Self {
         match alpn {
-            Some(frontier::ALPN) => Self::Frontier,
+            Some(fleet::ALPN_DATABASE_DELTA) => Self::Frontier(frontier::Wire::Delta),
+            Some(fleet::ALPN_DATABASE_FRONTIER) => Self::Frontier(frontier::Wire::Whole),
             Some(fleet::ALPN_DATABASE_CREDENTIALS) => Self::Credentials,
             Some(fleet::ALPN_DATABASE_REPAIR) => Self::Repair,
             _ => Self::Legacy,
@@ -485,11 +525,33 @@ fn require_legacy_bound(bound: aterm_secrets::crossing::RecordsBound) -> Result<
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// MUTANT of the legacy database fence, on for one test thread:
+    /// [`Endpoint::require_legacy_records`] reads only the bound the endpoint's log stated when
+    /// it was made and the membership store ([`MembershipDisk`]) only the count its log holds,
+    /// neither the durable mark, so a Mac that holds a crossed log's records within the legacy
+    /// bound sends a legacy peer its hello and its log.
+    pub(crate) static MARK_UNREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 impl Endpoint {
     /// Legacy protocols carry no crossed-state metadata. Read the durable mark even when
     /// the endpoint's cached witness or the current records file is short.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "SwarmRecordsCapacity",
+            action = "LegacyDbHello",
+            project = "aterm_db::control::tests::crossing_tests::records_capacity_hello"
+        )
+    )]
     fn require_legacy_records(&self) -> Result<()> {
         require_legacy_bound(self.records_bound)?;
+        #[cfg(test)]
+        if MARK_UNREAD.with(std::cell::Cell::get) {
+            return Ok(());
+        }
         if let Some(paths) = &self.paths {
             let crossed = aterm_secrets::client::records_marked_crossed(paths)
                 .map_err(|error| local_failure("records protocol", error))?;
@@ -1155,8 +1217,8 @@ impl Endpoint {
         until: Instant,
         protocol: Protocol,
     ) -> Result<Report> {
-        if protocol == Protocol::Frontier {
-            return frontier::connected(self, stream, proof, side, repair, until);
+        if let Protocol::Frontier(wire) = protocol {
+            return frontier::connected(self, stream, proof, side, repair, until, wire);
         }
         let recovery_first = protocol != Protocol::Legacy;
         repair.begin_round();
@@ -1444,7 +1506,7 @@ impl Endpoint {
         repair: &mut Repair,
         protocol: Protocol,
     ) {
-        if protocol != Protocol::Frontier
+        if !matches!(protocol, Protocol::Frontier(_))
             && let Err(error) = self.require_legacy_records()
         {
             repair.application_error = Some(error.to_string());
@@ -1460,7 +1522,7 @@ impl Endpoint {
                 repair.application = result.ok();
                 return;
             }
-            let result = if matches!(protocol, Protocol::Credentials | Protocol::Frontier) {
+            let result = if matches!(protocol, Protocol::Credentials | Protocol::Frontier(_)) {
                 application.exchange(stream, actor, side, &mut repair.data)
             } else {
                 application.exchange_with_compatibility(stream, actor, side, &mut repair.data)
@@ -1605,9 +1667,21 @@ impl WitnessLogs {
     }
 }
 
-/// Decode a peer's membership-log witness under `trust`, verifying each record into its log.
+/// Decode a peer's membership-log witness under `trust`, verifying each record into its log. Only
+/// a peer on `atdb/3` or older sends one (an `ACX2` hello, an `ACW2` enrollment answer), and such
+/// a build holds at most [`aterm_secrets::membership_log::LEGACY_RECORDS`], so a witness past them
+/// is refused before the record past them is verified, whatever this build holds.
 fn decode_log_witness(trust: Trust, wire: &[u8]) -> Result<aterm_secrets::membership_log::Log> {
-    let records = aterm_secrets::membership_log::decode_records(wire).map_err(failure)?;
+    #[cfg(test)]
+    let bound = if mutants::on(mutants::Mutant::WitnessAtHeldBudget) {
+        aterm_secrets::membership_log::RecordBudgets::current().held
+    } else {
+        aterm_secrets::membership_log::LEGACY_RECORDS
+    };
+    #[cfg(not(test))]
+    let bound = aterm_secrets::membership_log::LEGACY_RECORDS;
+    let records =
+        aterm_secrets::membership_log::decode_records_bounded(wire, bound).map_err(failure)?;
     log_witness_from_records(trust, records)
 }
 
@@ -2287,6 +2361,16 @@ impl<'a> MembershipDisk<'a> {
         let store = guard.as_ref().expect("populated above");
         let bound = aterm_secrets::client::records_bound(self.paths, store)
             .map_err(|error| local_failure(op, error))?;
+        #[cfg(test)]
+        let bound = if MARK_UNREAD.with(std::cell::Cell::get) {
+            aterm_secrets::crossing::RecordsBound::here(aterm_secrets::crossing::past_legacy(
+                store
+                    .log()
+                    .map_or(0, aterm_secrets::membership_log::Log::held_count),
+            ))
+        } else {
+            bound
+        };
         require_legacy_bound(bound)?;
         f(store)
     }

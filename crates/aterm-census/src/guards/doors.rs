@@ -23,8 +23,13 @@ fn product<'a>(tree: &Tree<'a>) -> impl Iterator<Item = &'a SourceFile> {
 const DEVTOOLS_HOME: &str = "crates/aterm-containment/src/consent.rs";
 /// The file of the one function that may run a change.
 const DEVTOOLS_FLOW: &str = "crates/aterm-gui/src/debugger_access.rs";
-/// That function: the live arm that runs a change for a yes, the owner's in aterm's alert or
-/// System State's standing one.
+/// Setup's one early elevation (owner ruling 2026-11-02): its root half, run as root under the
+/// person's own Mac password, turns developer mode on (`DeveloperMode::apply`). Its one shipped
+/// spelling of the tool is the path constant's definition ([`ELEVATION_PATH_LINE`]).
+const ELEVATION: &str = "crates/aterm-machines/src/root_steps.rs";
+/// That definition, whole, as [`squeeze_code`] reads it.
+const ELEVATION_PATH_LINE: &str = r#"pubconstDEVTOOLS_SECURITY:&str="/usr/sbin/DevToolsSecurity";"#;
+/// That function: the live arm that runs a change for a yes, the owner's in aterm's alert.
 const DEVTOOLS_WORKER: &str = "spawn_devtools_worker";
 /// The runner: public, so aterm-gui can reach it.
 const DEVTOOLS_RUNNER: &str = "run_devtools_change";
@@ -72,9 +77,8 @@ const AUTHZ_LITERALS: &[&str] = &["authorizationdb write", "with administrator p
 /// its private mark ([`Token::mark`]) and its doors.
 const OWNER_YES: &str = "OwnerYes";
 const OWNER_YES_LEAF: &str = "crates/aterm-gui/src/native_settings_owner_yes.rs";
-/// The window's own admission `OwnerYes::from_admitted` spends, and its leaf:
-/// the type, its mark, and the gate whose `admitted` alone makes one.
-const ADMISSION: &str = "AdmittedAccess";
+/// The permission gate's leaf, which records the window's own admission of a setup plan and a
+/// person's press ([`FENCES`]).
 const ADMISSION_LEAF: &str = "crates/aterm-gui/src/workstation_setup_gate.rs";
 /// The module name the gate's parent mounts its leaf under.
 const GATE_MODULE: &str = "permission_gate";
@@ -124,67 +128,33 @@ enum DoorShape {
         gestures: &'static str,
         arm: &'static str,
     },
-    /// The standing yes spent: a parameter of the type, by value
-    /// (`admitted: AdmittedAccess`), so each yes consumes one admission.
-    Spends(&'static str),
-    /// The gate's answer: a method on `&self`, reading the gate's own record.
-    Reads,
     /// A mint for tests: `#[cfg(test)]` on it.
     TestOnly,
 }
 
-/// The two tokens and their doors: the owner's yes in aterm's alert (the free
-/// fn `owner_confirms_with`) and System State's standing yes
-/// (`OwnerYes::from_admitted`, design docs/DESIGN-system-state-2026-10-21.md
-/// §6), which spends the window's own admission that only
-/// `PermissionGate::admitted` makes; each token's `for_test` under
-/// `#[cfg(test)]`.
-const TOKENS: [Token; 2] = [
-    Token {
-        ty: OWNER_YES,
-        mark: "YesSeal",
-        leaf: OWNER_YES_LEAF,
-        parent: "crates/aterm-gui/src/native_settings.rs",
-        doors: &[
-            YesDoor {
-                name: "owner_confirms_with",
-                within: None,
-                shape: DoorShape::Asks {
-                    gestures: "ConsentGestures",
-                    arm: "ConfirmArm",
-                },
+/// The token and its doors: the owner's yes in aterm's alert (the free fn
+/// `owner_confirms_with`), and its `for_test` under `#[cfg(test)]`.
+const TOKENS: [Token; 1] = [Token {
+    ty: OWNER_YES,
+    mark: "YesSeal",
+    leaf: OWNER_YES_LEAF,
+    parent: "crates/aterm-gui/src/native_settings.rs",
+    doors: &[
+        YesDoor {
+            name: "owner_confirms_with",
+            within: None,
+            shape: DoorShape::Asks {
+                gestures: "ConsentGestures",
+                arm: "ConfirmArm",
             },
-            YesDoor {
-                name: "from_admitted",
-                within: Some(OWNER_YES),
-                shape: DoorShape::Spends(ADMISSION),
-            },
-            YesDoor {
-                name: "for_test",
-                within: Some(OWNER_YES),
-                shape: DoorShape::TestOnly,
-            },
-        ],
-    },
-    Token {
-        ty: ADMISSION,
-        mark: "AdmissionSeal",
-        leaf: ADMISSION_LEAF,
-        parent: "crates/aterm-gui/src/workstation_setup.rs",
-        doors: &[
-            YesDoor {
-                name: "admitted",
-                within: Some("PermissionGate"),
-                shape: DoorShape::Reads,
-            },
-            YesDoor {
-                name: "for_test",
-                within: Some(ADMISSION),
-                shape: DoorShape::TestOnly,
-            },
-        ],
-    },
-];
+        },
+        YesDoor {
+            name: "for_test",
+            within: Some(OWNER_YES),
+            shape: DoorShape::TestOnly,
+        },
+    ],
+}];
 
 /// The derives a token or its mark may carry: none makes or copies one.
 const TOKEN_DERIVES: &[&str] = &["Debug", "PartialEq", "Eq"];
@@ -240,8 +210,9 @@ const UNSAFE_READS: &[(&str, Bound)] = &[
 /// leaf can name); this guard keeps the leaf to the shape that makes that so
 /// ([`leaf_findings`]), the alert's arm to a plain enum of aterm's alert or nobody, each a unit
 /// ([`arm_findings`]), the rest of the product to what privacy does not stop
-/// ([`outside_findings`]), and what the doors trust (the window's own admission and a person's
-/// press) to their fenced callers ([`FENCES`], [`caller_findings`], [`gate_macro_findings`]). A
+/// ([`outside_findings`]), and what the permission gate trusts (the window's own admission and
+/// a person's press, which alone open a page of a grant only a person can give) to their fenced
+/// callers ([`FENCES`], [`caller_findings`], [`gate_macro_findings`]). A
 /// file is test code only while no shipped line loads it ([`TestCode`]).
 ///
 /// It is lexical, and does not see an unsafe read under another name (a generic helper, a
@@ -260,25 +231,25 @@ pub(super) const DEVTOOLS_DOOR: Rule = Rule {
     why: "DevToolsSecurity changes the debug right for the whole Mac and ENABLES when run with no \
           flag: no shipped line builds a process naming it, its path constant and argv live in \
           consent.rs's builders alone, only a yes runs `run_devtools_change`, through aterm-gui's \
-          one worker `spawn_devtools_worker`; the yes (`OwnerYes`) and the window's own \
-          admission it can spend (`AdmittedAccess`) are each a braced struct with a field of a \
-          private mark (`YesSeal`, `AdmissionSeal`) in a leaf module of its own, which nothing \
+          one worker `spawn_devtools_worker`; the yes (`OwnerYes`) is a braced struct with a \
+          field of a private mark (`YesSeal`) in a leaf module of its own, which nothing \
           else can build, and the leaf holds no `mod`, macro definition, macro but by an \
           extern-prelude path, alias, glob or shadowing import, `unsafe`, trait impl for the \
           token, attribute that expands into code or function type on a shipped line, and a \
           value of the mark only in a door's body — the free `owner_confirms_with`, which asks \
           its `ConsentGestures`' arm through `ConfirmArm::ask` (an enum of aterm's alert or \
-          nobody, a stand-in only under `#[cfg(test)]`); \
-          `OwnerYes::from_admitted`, which takes an `AdmittedAccess` by value; \
-          `PermissionGate::admitted`, on `&self`; each token's `#[cfg(test)]` `for_test`; \
+          nobody, a stand-in only under `#[cfg(test)]`), and its `#[cfg(test)]` `for_test`; \
           outside its leaf no line names a mark, no type takes a token's name, and nothing \
           aliases one, copies one by an impl, reads one through an unsafe read or a raw \
-          pointer, or mounts the leaf again; the admission and the press the doors trust are \
+          pointer, or mounts the leaf again; the admission and the press the gate trusts are \
           taken only by their fenced callers, each one `App` method defined once, from the \
           window's events and the worker's replies in, the gate's parent brings in no source \
           and no product macro takes a gate transition; no shipped line holds the bare tool \
           path, and \
-          aterm calls no authorization-database or privileged-helper API",
+          aterm calls no authorization-database or privileged-helper API. The one other door is \
+          setup's one early elevation (owner ruling 2026-11-02): aterm-machines' root_steps.rs, \
+          whose root half runs `DevToolsSecurity -enable` as root under the person's own Mac \
+          password, defines the path once, as its `DEVTOOLS_SECURITY` constant",
     scope: &[
         DEVTOOLS_HOME,
         DEVTOOLS_FLOW,
@@ -290,6 +261,7 @@ pub(super) const DEVTOOLS_DOOR: Rule = Rule {
         ACCESS,
         NATIVE_EVENTS,
         MOUSE_EVENTS,
+        ELEVATION,
     ],
     check: devtools_door,
 };
@@ -342,7 +314,9 @@ fn devtools_door(tree: &Tree<'_>, out: &mut Vec<Finding>) {
             } else {
                 bare_path(
                     line.text,
-                    home && has(line.code, DEVTOOLS_PATH_CONST, Bound::Word),
+                    (home && has(line.code, DEVTOOLS_PATH_CONST, Bound::Word))
+                        || (file.rel == ELEVATION
+                            && squeeze_code(line.text) == ELEVATION_PATH_LINE),
                 )
             };
             if let Some(why) = why {
@@ -405,11 +379,11 @@ const KEY_EVENTS: &str = "crates/aterm-gui/src/app_input.rs";
 const NATIVE_EVENTS: &str = "crates/aterm-gui/src/app_native.rs";
 const MOUSE_EVENTS: &str = "crates/aterm-gui/src/app_mouse.rs";
 
-/// A function a yes's input passes through: what the window's own admission is read from (the
-/// page's Apply, its acceptance, the status naming the plan) and a person's press. The leaves
-/// trust what these hand them, so each is named only in the bodies of `callers`; a caller
-/// anywhere else could hand a door a made-up admission or a press nobody made
-/// (`admitted_by_press(true)`).
+/// A function the permission gate's input passes through: what the window's own admission is
+/// read from (the page's Apply, its acceptance, the status naming the plan) and a person's press.
+/// The gate trusts what these hand it, so each is named only in the bodies of `callers`; a
+/// caller anywhere else could hand it a made-up admission or a press nobody made
+/// (`open_access_from_system_state(access, true)`).
 struct Fence {
     name: &'static str,
     /// The file that defines it (`fn <name>`): a fence whose function is gone
@@ -491,18 +465,12 @@ const FENCES: &[Fence] = &[
         gate: None,
         callers: &[(HOST, "run_system_state_action")],
     },
-    // A person's press on a Permissions row's `Turn On…`.
+    // A person's press on a Permissions row's button.
     Fence {
         name: "open_access_from_system_state",
         home: ACCESS,
         gate: None,
         callers: &[(HOST, "run_system_state_action_with_handlers")],
-    },
-    Fence {
-        name: "turn_on_debugger_from_system_state",
-        home: GUI_LIB,
-        gate: None,
-        callers: &[(ACCESS, "open_access_from_system_state")],
     },
     // The App's way into the gate.
     Fence {
@@ -538,22 +506,6 @@ const FENCES: &[Fence] = &[
         gate: None,
         callers: &[(HOST, "receive_system_state_status")],
     },
-    Fence {
-        name: "admitted_by_press",
-        home: SETUP,
-        gate: None,
-        callers: &[(GUI_LIB, "turn_on_debugger_from_system_state")],
-    },
-    Fence {
-        name: "admitted_access",
-        home: SETUP,
-        gate: None,
-        callers: &[
-            (GUI_LIB, "debugger_step_look"),
-            (GUI_LIB, "spend_debugger_step"),
-            (GUI_LIB, "debugger_step_ended"),
-        ],
-    },
     // The gate's own transitions, each behind its one App function.
     Fence {
         name: "note_touch",
@@ -585,15 +537,9 @@ const FENCES: &[Fence] = &[
         gate: Some(SETUP),
         callers: &[(SETUP, "observe_initial_setup_permissions")],
     },
-    Fence {
-        name: "admitted",
-        home: ADMISSION_LEAF,
-        gate: Some(SETUP),
-        callers: &[(SETUP, "admitted_access"), (SETUP, "admitted_by_press")],
-    },
 ];
 
-/// The yes's inputs, fenced ([`Fence`]). Findings: in aterm-gui's shipped code (test code is a
+/// The gate's inputs, fenced ([`Fence`]). Findings: in aterm-gui's shipped code (test code is a
 /// `#[cfg(test)]` item, or a file its parent declares test-only that no shipped line loads), a
 /// fenced function named outside its callers' bodies; a caller defined twice or outside
 /// `impl App` ([`caller_findings`]); in the gate's parent, a module beside the gate's leaf or an
@@ -694,7 +640,7 @@ fn fence_findings(tree: &Tree<'_>, out: &mut Vec<Finding>) {
                     DEVTOOLS_DOOR.id,
                     line.no,
                     format!(
-                        "names `{}` in `{func}`: a yes's input, taken only in `{}`",
+                        "names `{}` in `{func}`: the gate's input, taken only in `{}`",
                         fence.name,
                         callers.join("`, `")
                     ),
@@ -1297,14 +1243,6 @@ fn door_shape(door: &YesDoor, head: &str, signature: &str, body: &str) -> Result
             .contains("#[cfg(test)]")
             .then_some(())
             .ok_or_else(|| "it carries no `#[cfg(test)]`".to_string()),
-        DoorShape::Spends(ty) => params
-            .iter()
-            .any(|p| {
-                p.split_once(':')
-                    .is_some_and(|(_, t)| plain_path_to(t.trim(), ty))
-            })
-            .then_some(())
-            .ok_or_else(|| format!("it takes no `{ty}` by value, so it spends none")),
         DoorShape::Asks { gestures, arm } => {
             let asked = params.iter().find_map(|p| {
                 let (name, t) = p.split_once(':')?;
@@ -1321,9 +1259,6 @@ fn door_shape(door: &YesDoor, head: &str, signature: &str, body: &str) -> Result
                     )
                 })
         }
-        DoorShape::Reads => (params.first() == Some(&"&self"))
-            .then_some(())
-            .ok_or_else(|| "it is no method on `&self`, so it reads no gate".to_string()),
     }
 }
 
@@ -1932,6 +1867,11 @@ fn path_argv_flag(text: &str) -> Option<&str> {
 
 /// A full tool path with neither quiet flag after it, unless the line defines
 /// the path constant (`defines`).
+/// `text` with every whitespace character dropped: a definition's spelling, however wrapped.
+fn squeeze_code(text: &str) -> String {
+    text.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
 fn bare_path(text: &str, defines: bool) -> Option<String> {
     hits(text, DEVTOOLS_PATH, Bound::Sub).find_map(|start| {
         let after = text[start + DEVTOOLS_PATH.len()..].trim_start_matches([' ', '\t']);
@@ -2441,6 +2381,18 @@ mod tests {
                     "crates/aterm-gui/tests/t.rs",
                     "fn t() { run_devtools_change(c, g, f); }\n",
                 ),
+                // The elevation's one definition is admitted; a second spelling there, or the
+                // same definition in another file, is not.
+                (
+                    ELEVATION,
+                    "pub const DEVTOOLS_SECURITY: &str = \"/usr/sbin/DevToolsSecurity\";\n\
+                     fn on() { run(&Cmd::new(DEVTOOLS_SECURITY).arg(\"-enable\")); }\n\
+                     const AGAIN: &str = \"/usr/sbin/DevToolsSecurity\";\n",
+                ),
+                (
+                    "crates/aterm-machines/src/items/developer.rs",
+                    "pub const DEVTOOLS_SECURITY: &str = \"/usr/sbin/DevToolsSecurity\";\n",
+                ),
             ],
         );
         assert_eq!(
@@ -2456,6 +2408,8 @@ mod tests {
                 "crates/aterm-containment/src/consent.rs:17",
                 "crates/aterm-containment/src/consent.rs:19",
                 "crates/aterm-gui/src/debugger_access.rs:5",
+                "crates/aterm-machines/src/items/developer.rs:1",
+                "crates/aterm-machines/src/root_steps.rs:3",
             ]
         );
     }
@@ -2474,7 +2428,6 @@ mod tests {
     const SIBLING: &str = "crates/aterm-gui/src/native_settings_tabs.rs";
 
     const YES: &str = r#"use super::{ConsentGestures, OwnerAnswer, SharedOwnerQuiet};
-use crate::workstation_setup::AdmittedAccess;
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct OwnerYes {
     _seal: YesSeal,
@@ -2482,10 +2435,6 @@ pub(crate) struct OwnerYes {
 #[derive(Debug, PartialEq, Eq)]
 struct YesSeal;
 impl OwnerYes {
-    pub(crate) fn from_admitted(admitted: AdmittedAccess) -> Self {
-        ::aterm_log::info!("revision {}", admitted.revision());
-        Self { _seal: YesSeal }
-    }
     #[cfg(test)]
     pub(crate) const fn for_test() -> Self {
         Self { _seal: YesSeal }
@@ -2496,7 +2445,10 @@ pub(crate) fn owner_confirms_with(
     gestures: &ConsentGestures,
 ) -> OwnerAnswer {
     match ConfirmArm::ask(gestures.confirm, "Title?", "Body.", "Go") {
-        Some(true) => OwnerAnswer::Yes(OwnerYes { _seal: YesSeal }),
+        Some(true) => {
+            ::aterm_log::info!("the owner said yes");
+            OwnerAnswer::Yes(OwnerYes { _seal: YesSeal })
+        }
         Some(false) => OwnerAnswer::No,
         None => OwnerAnswer::NotAsked,
     }
@@ -2527,27 +2479,6 @@ enum PermissionHold {
     None,
     FreshStatus,
 }
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct AdmittedAccess {
-    revision: u64,
-    by: AdmittedBy,
-    _seal: AdmissionSeal,
-}
-#[derive(Debug, PartialEq, Eq)]
-struct AdmissionSeal;
-impl AdmittedAccess {
-    pub(crate) const fn revision(&self) -> u64 {
-        self.revision
-    }
-    #[cfg(test)]
-    pub(crate) const fn for_test(revision: u64) -> Self {
-        Self {
-            revision,
-            by: AdmittedBy::Window,
-            _seal: AdmissionSeal,
-        }
-    }
-}
 #[derive(Default)]
 pub(super) struct PermissionGate {
     hold: PermissionHold,
@@ -2557,36 +2488,27 @@ impl PermissionGate {
     pub(super) fn allowed(&self) -> bool {
         ::std::matches!(self.hold, PermissionHold::None)
     }
-    pub(super) fn admitted(&self, person_press: bool) -> Option<AdmittedAccess> {
-        let (by, revision) = self.own?;
-        Some(AdmittedAccess {
-            revision,
-            by,
-            _seal: AdmissionSeal,
-        })
-    }
 }
 "#;
 
     const YES_MOUNT: &str = "#[path = \"native_settings_owner_yes.rs\"]\nmod owner_yes;\n\
                              pub(crate) use owner_yes::{OwnerYes, owner_confirms_with};\n";
     const GATE_MOUNT: &str = "#[path = \"workstation_setup_gate.rs\"]\nmod permission_gate;\n\
-                              pub(crate) use permission_gate::AdmittedAccess;\n\
                               use permission_gate::PermissionGate;\n";
 
-    /// A caller that names, holds, aliases inside another type, spends and reads the tokens,
-    /// implements traits for other types, and reads a raw pointer where it names no token: none
-    /// of it is a finding.
+    /// A caller that names, holds, aliases inside another type and spends the token, implements
+    /// traits for other types, and reads a raw pointer where it names no token: none of it is a
+    /// finding.
     const CALLER: &str = r#"use crate::native_settings::{OwnerAnswer, OwnerYes};
 type Answer = Option<OwnerYes>;
 pub(crate) struct ChangeTicket {
     _yes: crate::native_settings::OwnerYes,
 }
-fn spend(admitted: crate::workstation_setup::AdmittedAccess) -> OwnerAnswer {
-    OwnerAnswer::Yes(OwnerYes::from_admitted(admitted))
-}
-fn read(y: Option<OwnerYes>) -> Option<AdmittedAccess> {
-    None
+fn spend(answer: OwnerAnswer) -> Option<OwnerYes> {
+    match answer {
+        OwnerAnswer::Yes(yes) => Some(yes),
+        _ => None,
+    }
 }
 fn elsewhere(p: *const u8) -> u8 {
     unsafe { std::ptr::read(p) }
@@ -2665,13 +2587,13 @@ impl Default for PagePress {}
             ),
             (
                 YES_LEAF,
-                "impl Other {\n    fn from_admitted(a: AdmittedAccess) -> OwnerYes {\n        \
+                "impl Other {\n    fn for_test() -> OwnerYes {\n        \
                  OwnerYes { _seal: YesSeal }\n    }\n}\n",
                 &[3],
             ),
             (
                 YES_LEAF,
-                "impl Marker for OwnerYes {\n    fn from_admitted(a: AdmittedAccess) -> Self {\n        \
+                "impl Marker for OwnerYes {\n    fn for_test() -> Self {\n        \
                  Self { _seal: YesSeal }\n    }\n}\n",
                 &[1, 3],
             ),
@@ -2695,39 +2617,6 @@ impl Default for PagePress {}
                  OwnerAnswer::Yes(OwnerYes { _seal: YesSeal })\n}\n",
                 &[4],
             ),
-            (
-                GATE_LEAF,
-                "fn from_poll(revision: u64) -> Option<AdmittedAccess> {\n    \
-                 Some(AdmittedAccess { revision, by: AdmittedBy::Window, _seal: AdmissionSeal })\n}\n",
-                &[2],
-            ),
-            (
-                GATE_LEAF,
-                "impl Sneak for PermissionGate {\n    fn admitted(&self) -> Option<AdmittedAccess> {\n        \
-                 Some(AdmittedAccess { revision: 9, by: AdmittedBy::Window, _seal: AdmissionSeal })\n    \
-                 }\n}\n",
-                &[3],
-            ),
-            (
-                GATE_LEAF,
-                "impl App {\n    fn admitted(&self) -> Option<AdmittedAccess> {\n        \
-                 Some(AdmittedAccess { revision: 9, by: AdmittedBy::Window, _seal: AdmissionSeal })\n    \
-                 }\n}\n",
-                &[3],
-            ),
-            (
-                GATE_LEAF,
-                "trait Sneak {\n    fn admitted(&self) -> Option<AdmittedAccess> {\n        \
-                 Some(AdmittedAccess { revision: 8, by: AdmittedBy::Window, _seal: AdmissionSeal })\n    \
-                 }\n}\n",
-                &[3],
-            ),
-            (
-                GATE_LEAF,
-                "impl AdmittedAccess {\n    pub(crate) fn new(revision: u64) -> Self {\n        \
-                 Self { revision, by: AdmittedBy::Window, _seal: AdmissionSeal }\n    }\n}\n",
-                &[3],
-            ),
         ];
         for (rel, plant, lines) in cases {
             assert_eq!(
@@ -2742,19 +2631,6 @@ impl Default for PagePress {}
     /// door's body is a finding of its own.
     #[test]
     fn a_door_holds_its_shape() {
-        let from = "pub(crate) fn from_admitted(admitted: AdmittedAccess) -> Self {";
-        for spent in [
-            "pub(crate) fn from_admitted() -> Self {",
-            "pub(crate) fn from_admitted(admitted: &AdmittedAccess) -> Self {",
-            "pub(crate) fn from_admitted(admitted: Option<AdmittedAccess>) -> Self {",
-        ] {
-            let yes = YES.replace(from, spent);
-            assert_eq!(
-                with_plant(&yes, GATE, CALLER_FILE, ""),
-                at(YES_LEAF, &[10, 12]),
-                "{spent}"
-            );
-        }
         for (old, new) in [
             (
                 "match ConfirmArm::ask(gestures.confirm, \"Title?\", \"Body.\", \"Go\") {",
@@ -2769,7 +2645,7 @@ impl Default for PagePress {}
             let yes = YES.replace(old, new);
             assert_eq!(
                 with_plant(&yes, GATE, CALLER_FILE, ""),
-                at(YES_LEAF, &[19, 24]),
+                at(YES_LEAF, &[14, 21]),
                 "{new}"
             );
         }
@@ -2779,21 +2655,13 @@ impl Default for PagePress {}
         );
         assert_eq!(
             with_plant(&yes, GATE, CALLER_FILE, ""),
-            at(YES_LEAF, &[15, 16])
-        );
-        let gate = GATE.replace(
-            "fn admitted(&self, person_press: bool)",
-            "fn admitted(gate: &PermissionGate, person_press: bool)",
-        );
-        assert_eq!(
-            with_plant(YES, &gate, CALLER_FILE, ""),
-            at(GATE_LEAF, &[38, 40, 43])
+            at(YES_LEAF, &[10, 11])
         );
         let yes = YES.replace(
-            "::aterm_log::info!(\"revision {}\", admitted.revision());",
+            "::aterm_log::info!(\"the owner said yes\");",
             "fn leak() -> OwnerYes { OwnerYes { _seal: YesSeal } }",
         );
-        assert_eq!(with_plant(&yes, GATE, CALLER_FILE, ""), at(YES_LEAF, &[11]));
+        assert_eq!(with_plant(&yes, GATE, CALLER_FILE, ""), at(YES_LEAF, &[20]));
     }
 
     /// In either leaf, a plant that could build beside the doors, expand into code no line spells
@@ -2846,42 +2714,40 @@ impl Default for PagePress {}
             ),
         ];
         for (plant, lines) in plants {
-            for (rel, mark) in [(YES_LEAF, "YesSeal"), (GATE_LEAF, "AdmissionSeal")] {
-                let plant = plant.replace("{mark}", mark);
-                assert_eq!(
-                    with_plant(YES, GATE, rel, &plant),
-                    planted(rel, lines),
-                    "{rel}: {plant}"
-                );
-            }
+            let plant = plant.replace("{mark}", "YesSeal");
+            assert_eq!(
+                with_plant(YES, GATE, YES_LEAF, &plant),
+                planted(YES_LEAF, lines),
+                "{plant}"
+            );
         }
         for (old, new, line) in [
             (
                 "    _seal: YesSeal,\n}",
                 "    pub(crate) _seal: YesSeal,\n}",
-                4,
+                3,
             ),
-            ("    _seal: YesSeal,\n}", "    _seal: (),\n}", 4),
+            ("    _seal: YesSeal,\n}", "    _seal: (),\n}", 3),
             (
                 "pub(crate) struct OwnerYes {\n    _seal: YesSeal,\n}",
                 "pub(crate) struct OwnerYes(YesSeal);\n// a tuple\n//",
-                4,
+                3,
             ),
             (
                 "#[derive(Debug, PartialEq, Eq)]\npub(crate) struct OwnerYes",
                 "#[derive(Debug, Clone)]\npub(crate) struct OwnerYes",
-                4,
+                3,
             ),
             (
                 "#[derive(Debug, PartialEq, Eq)]\npub(crate) struct OwnerYes",
                 "#[derive(Default)]\npub(crate) struct OwnerYes",
-                4,
+                3,
             ),
-            ("\nstruct YesSeal;", "\npub(crate) struct YesSeal;", 8),
+            ("\nstruct YesSeal;", "\npub(crate) struct YesSeal;", 7),
             (
                 "#[derive(Debug, PartialEq, Eq)]\nstruct YesSeal;",
                 "#[derive(Clone, Copy)]\nstruct YesSeal;",
-                8,
+                7,
             ),
             ("\nstruct YesSeal;", "\nstruct Other;", 1),
         ] {
@@ -2891,18 +2757,6 @@ impl Default for PagePress {}
                 with_plant(&yes, GATE, CALLER_FILE, ""),
                 at(YES_LEAF, &[line]),
                 "{new}"
-            );
-        }
-        for derive in ["Debug, Clone", "Copy, Clone", "Default"] {
-            let gate = GATE.replacen(
-                "#[derive(Debug, PartialEq, Eq)]\npub(crate) struct AdmittedAccess",
-                &format!("#[derive({derive})]\npub(crate) struct AdmittedAccess"),
-                1,
-            );
-            assert_eq!(
-                with_plant(YES, &gate, CALLER_FILE, ""),
-                at(GATE_LEAF, &[9]),
-                "{derive}"
             );
         }
     }
@@ -2990,16 +2844,16 @@ impl Default for PagePress {}
     #[test]
     fn outside_its_leaf_nothing_renames_copies_forges_or_remounts_a_token() {
         let caller = "pub(crate) struct OwnerYes;\n\
-                      pub(crate) use crate::other::Yes as AdmittedAccess;\n\
-                      type Admission = crate::workstation_setup::AdmittedAccess;\n\
-                      impl std::clone::Clone for crate::workstation_setup::AdmittedAccess {}\n\
+                      pub(crate) use crate::other::Yes as OwnerYes;\n\
+                      type Granted = crate::native_settings::OwnerYes;\n\
+                      impl std::clone::Clone for crate::native_settings::OwnerYes {}\n\
                       unsafe impl Copy for OwnerYes {}\n\
                       impl Default for OwnerYes {\n    fn default() -> Self { todo!() }\n}\n\
                       const FORGED: OwnerYes = unsafe {\n    std::mem::zeroed()\n};\n\
-                      fn pointer(a: &AdmittedAccess) -> AdmittedAccess {\n    \
-                      unsafe { (a as *const AdmittedAccess).read() }\n}\n\
+                      fn pointer(a: &OwnerYes) -> OwnerYes {\n    \
+                      unsafe { (a as *const OwnerYes).read() }\n}\n\
                       #[path = \"native_settings_owner_yes.rs\"]\nmod again;\n\
-                      include!(\"workstation_setup_gate.rs\");\n\
+                      include!(\"native_settings_owner_yes.rs\");\n\
                       type Answer = Option<OwnerYes>;\n\
                       impl Clone for Other {}\n\
                       fn count(y: &OwnerYes) -> usize {\n    1\n}\n\
@@ -3014,7 +2868,7 @@ impl Default for PagePress {}
             planted(YES_PARENT, &[1])
         );
         let marks = "macro_rules! mint {\n    () => {\n        OwnerYes { _seal: YesSeal }\n    };\n}\n\
-                     use super::permission_gate::AdmissionSeal;\n\
+                     use super::owner_yes::YesSeal;\n\
                      const NOTE: &str = \"YesSeal\";\n\
                      // YesSeal\n";
         assert_eq!(
@@ -3051,7 +2905,7 @@ impl Default for PagePress {}
         }
     }
 
-    // Twins of the yes's inputs: the host, the Turn On… chain, the App's way into the gate and
+    // Twins of the gate's inputs: the host, the Turn On… chain, the App's way into the gate and
     // the gate itself, each fenced function named only in its callers.
 
     const HOST_TWIN: &str = "impl App {
@@ -3087,7 +2941,7 @@ impl Default for PagePress {}
 ";
     const ACCESS_TWIN: &str = "impl App {
     pub(crate) fn open_access_from_system_state(&mut self, access: Access, by_person: bool) -> bool {
-        self.turn_on_debugger_from_system_state(by_person)
+        by_person
     }
 }
 ";
@@ -3097,12 +2951,6 @@ impl Default for PagePress {}
             Wake::Status(s) => self.receive_system_state_status(s),
             Wake::Resolved => self.resolve_system_state_apply(),
         }
-    }
-    pub(crate) fn turn_on_debugger_from_system_state(&mut self, by_person: bool) -> bool {
-        self.admitted_by_press(by_person).is_some()
-    }
-    fn debugger_step_look(&self) -> bool {
-        self.admitted_access().is_some()
     }
 }
 ";
@@ -3125,12 +2973,6 @@ impl Default for PagePress {}
     pub(crate) fn observe_initial_setup_permissions(&mut self, policy: Option<Policy>) {
         self.workstation_setup.permissions.observe(policy);
     }
-    pub(crate) fn admitted_access(&self) -> Option<AdmittedAccess> {
-        self.workstation_setup.permissions.admitted(false)
-    }
-    pub(crate) fn admitted_by_press(&self, by_person: bool) -> Option<AdmittedAccess> {
-        self.workstation_setup.permissions.admitted(true)
-    }
 }
 ";
     const NATIVE_TWIN: &str = "impl App {
@@ -3143,7 +2985,7 @@ impl Default for PagePress {}
     }
 }
 ";
-    /// A file no fence names: it takes no yes's input.
+    /// A file no fence names: it takes no input of the gate's.
     const STRANGER: &str = "crates/aterm-gui/src/control.rs";
 
     /// The rule's spots over the inputs' twins, with `setup` as the gate's
@@ -3232,7 +3074,7 @@ impl Default for PagePress {}
             ),
             (
                 STRANGER,
-                "fn sneaky(app: &mut App) -> bool {\n    app.admitted_by_press(true).is_some()\n}\n",
+                "fn sneaky(app: &mut App) -> bool {\n    app.open_access_from_system_state(access, true)\n}\n",
                 &[2],
             ),
             (
@@ -3282,7 +3124,7 @@ impl Default for PagePress {}
                  self.workstation_setup.permissions.accepted();\n        \
                  let mut gate = PermissionGate::default();\n        \
                  gate.observe(Some(policy));\n        \
-                 PermissionGate::admitted(&gate, true);\n    }\n}\n",
+                 PermissionGate::take_press(&mut gate, 0);\n    }\n}\n",
                 &[3, 5, 6],
             ),
             (
@@ -3292,13 +3134,13 @@ impl Default for PagePress {}
             ),
             (
                 "crates/aterm-gui/src/control_testbed.rs",
-                "fn sneaky(app: &mut App) -> bool {\n    app.admitted_by_press(true).is_some()\n}\n",
+                "fn sneaky(app: &mut App) -> bool {\n    app.open_access_from_system_state(access, true)\n}\n",
                 &[2],
             ),
             (
                 STRANGER,
                 "#[cfg(test)]\nmod tests {\n    fn t(app: &mut App) {\n        \
-                 app.admitted_by_press(true);\n    }\n}\n",
+                 app.open_access_from_system_state(access, true);\n    }\n}\n",
                 &[],
             ),
         ];
@@ -3316,16 +3158,19 @@ impl Default for PagePress {}
             ),
             (
                 "crates/aterm-gui/src/control/tests.rs",
-                "fn t(app: &mut App) {\n    app.admitted_by_press(true);\n}\n",
+                "fn t(app: &mut App) {\n    app.open_access_from_system_state(access, true);\n}\n",
             ),
         ];
         assert_eq!(fenced(SETUP_TWIN, &declared), Vec::<String>::new());
         // Renamed: the fence's function is gone from its home, and the gate's
-        // `admitted` is now called from a function no fence names.
-        let renamed = SETUP_TWIN.replace("fn admitted_by_press", "fn admitted_by_click");
+        // `observe` is now called from a function no fence names.
+        let renamed = SETUP_TWIN.replace(
+            "fn observe_initial_setup_permissions",
+            "fn observe_initial_setup_perms",
+        );
         assert_eq!(
             fenced(&renamed, &[]),
-            [format!("{SETUP}:1"), format!("{SETUP}:24")]
+            [format!("{SETUP}:1"), format!("{SETUP}:18")]
         );
     }
 
@@ -3338,7 +3183,7 @@ impl Default for PagePress {}
     );
 
     /// Each sidestep of the fences is flagged at the lines named: a second `fn` named like an
-    /// allowed caller, which any file could call (G1–G3, spelled across lines or in a trait's
+    /// allowed caller, which any file could call (G1 and G2, spelled across lines or in a trait's
     /// impl too); a test-only file a shipped `#[path]` mounts again (G4); a gate transition taken
     /// as a value, a macro's argument or a one-line wrapper (G5); an `include!` in the gate's
     /// parent, or a macro whose body takes a transition (G6). An `include!` elsewhere and a macro
@@ -3376,21 +3221,6 @@ impl Default for PagePress {}
                     ),
                 ],
                 &[(HOST, 1)],
-            ),
-            (
-                "G3",
-                &[
-                    (
-                        GUI_LIB,
-                        "fn debugger_step_look(app: &App) -> Option<AdmittedAccess> {\n    \
-                         app.admitted_access()\n}\n",
-                    ),
-                    (
-                        STRANGER,
-                        "fn forge(app: &App) {\n    let _ = crate::debugger_step_look(app);\n}\n",
-                    ),
-                ],
-                &[(GUI_LIB, 1)],
             ),
             (
                 "G2 across lines: its call reads as no fn's",
@@ -3446,7 +3276,7 @@ impl Default for PagePress {}
                     ),
                     (
                         "crates/aterm-gui/src/control/tests.rs",
-                        "pub(crate) fn forge(app: &mut App) {\n    app.admitted_by_press(true);\n}\n",
+                        "pub(crate) fn forge(app: &mut App) {\n    app.open_access_from_system_state(access, true);\n}\n",
                     ),
                 ],
                 &[("crates/aterm-gui/src/control/tests.rs", 2)],
@@ -3645,9 +3475,9 @@ impl Default for PagePress {}
                 Flagged(&[2]),
             ),
             (
-                "P9 ptr::read duplicates a spent AdmittedAccess",
+                "P9 ptr::read duplicates a spent OwnerYes",
                 CALLER_FILE,
-                "pub(crate) fn twice(a: &AdmittedAccess) -> AdmittedAccess {\n    \
+                "pub(crate) fn twice(a: &OwnerYes) -> OwnerYes {\n    \
                  unsafe { std::ptr::read(a) }\n}\n",
                 Flagged(&[2]),
             ),
@@ -3687,24 +3517,6 @@ impl Default for PagePress {}
                 "type Granted = (OwnerYes);\npub(crate) fn sneaky() -> Granted {\n    \
                  Granted { _seal: YesSeal }\n}\n",
                 Flagged(&[1, 3]),
-            ),
-            (
-                "P13 a macro in the gate's old home",
-                GATE_PARENT,
-                "macro_rules! adm {\n    ($t:ident) => {\n        \
-                 $t { revision: 7, by: AdmittedBy::Window }\n    };\n}\n\
-                 fn from_poll() -> AdmittedAccess {\n    adm!(AdmittedAccess)\n}\n",
-                Refused(
-                    "cannot construct `AdmittedAccess` with struct literal syntax due to private fields; with every field named, E0451",
-                ),
-            ),
-            (
-                "P13 the macro in the gate's leaf",
-                GATE_LEAF,
-                "macro_rules! adm {\n    ($t:ident) => {\n        \
-                 $t { revision: 7, by: AdmittedBy::Window, _seal: AdmissionSeal }\n    };\n}\n\
-                 fn from_poll() -> AdmittedAccess {\n    adm!(AdmittedAccess)\n}\n",
-                Flagged(&[1, 3, 7]),
             ),
             (
                 "P14 `impl Clone` split over two lines (it builds nothing; `impl Copy` is E0204)",
@@ -3853,7 +3665,7 @@ impl Default for PagePress {}
             &BOOT_ID_DOOR,
             &[
                 ("crates/aterm-uds/src/process.rs", inline),
-                ("crates/aterm-acaffiene/src/instance.rs", by_const),
+                ("crates/aterm-acaffeine/src/instance.rs", by_const),
                 ("crates/aterm-x/src/mib.rs", by_mib),
                 ("crates/aterm-y/src/probe.rs", in_test),
                 ("crates/aterm-link/src/durability.rs", oracle),
@@ -3864,7 +3676,7 @@ impl Default for PagePress {}
         assert_eq!(
             spots(&found),
             [
-                "crates/aterm-acaffiene/src/instance.rs:1",
+                "crates/aterm-acaffeine/src/instance.rs:1",
                 "crates/aterm-uds/src/process.rs:4",
                 "crates/aterm-x/src/mib.rs:1",
                 "crates/aterm-y/src/probe.rs:5",

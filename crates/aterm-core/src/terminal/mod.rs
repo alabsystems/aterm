@@ -17,6 +17,7 @@ mod callback_setters;
 mod callbacks;
 mod checkpoint;
 mod checkpoint_canon;
+mod checkpoint_heap;
 mod checkpoint_holder;
 mod checkpoint_output;
 #[cfg(feature = "serde")]

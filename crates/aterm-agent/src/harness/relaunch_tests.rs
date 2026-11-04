@@ -631,8 +631,7 @@ fn an_exit_is_relaunched_only_where_the_relaunch_would_plan_it() {
 
 #[test]
 fn a_snapshot_follows_its_own_process_and_nothing_else() {
-    let home = std::env::temp_dir().join(format!("aterm-relaunch-follow-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&home);
+    let home = crate::supervise::ScratchDir::new("relaunch", "follow");
     std::fs::create_dir_all(home.join(".claude/sessions")).expect("home");
     let start = "Thu Sep 24 01:02:03 2026";
     let snap = Snapshot {
@@ -686,7 +685,6 @@ fn a_snapshot_follows_its_own_process_and_nothing_else() {
     assert_eq!(foreground(&snap, 4242), Foreground::Agent);
     assert_eq!(foreground(&snap, 4241), Foreground::Shell);
     assert_eq!(foreground(&snap, 5000), Foreground::Other);
-    let _ = std::fs::remove_dir_all(&home);
 }
 
 #[test]
@@ -2421,6 +2419,33 @@ fn an_account_move_over_another_restart_in_flight_is_not_tried() {
         word(&to("work"), "account:work-2", "adopted"),
         IN_FLIGHT_OTHER
     );
+}
+
+/// A record the restart asked supersedes but for its native move is carried, and the carry's
+/// words are the record's, never the restart asked ([`native_carried`]): its deferral, busy or dry
+/// run stands as it is, and anything else, the record's relaunch adopted, carried on, ended or
+/// failed, is [`NATIVE_CARRIED`], a deferral the loop asks again.
+#[test]
+fn a_native_records_carry_answers_for_the_record_never_the_restart_asked() {
+    for step in [
+        "wait:native-outcome",
+        "wait:resume",
+        "busy:another-sweep",
+        "would-resume:relaunched",
+    ] {
+        assert_eq!(native_carried(step.to_string()), step);
+    }
+    for step in [
+        "adopted",
+        "relaunched:4242",
+        "continued",
+        "done:fresh",
+        "done:resumed",
+        "failed:no-resume",
+        "failed:tab-taken",
+    ] {
+        assert_eq!(native_carried(step.to_string()), NATIVE_CARRIED, "{step}");
+    }
 }
 
 /// A relaunch with no process to read carries the machine's active account ([`cold_login`]): where two or more accounts are enrolled and `active` is one of them and proven, the login its roster row names (the empty value, the default login named, for the row with no directory).

@@ -258,6 +258,7 @@ fn measured(
     fixture: &Fixture,
     accepted: &Store,
     expected: fsx::FileStamp,
+    on_file: Option<usize>,
 ) -> (Option<fsx::FileStamp>, usize, usize) {
     LIVE.with(|live| live.set(0));
     PEAK.with(|peak| peak.set(0));
@@ -265,7 +266,7 @@ fn measured(
     let measuring = Measuring;
     let result = fixture
         .running()
-        .test_persist_records(NAME, accepted, Some(expected), Some(2));
+        .test_persist_records(NAME, accepted, Some(expected), on_file);
     let written = match result {
         Ok(written) => written,
         Err(error) => {
@@ -279,7 +280,7 @@ fn measured(
     (written, live, peak)
 }
 
-fn exercise(replaced: bool) {
+fn exercise(known_prefix: bool) {
     let fixture = Fixture::new();
     let prefix = Store::for_vault(NAME)
         .unwrap()
@@ -297,29 +298,23 @@ fn exercise(replaced: bool) {
     assert_eq!(fsx::stamp(&fixture.path), Some(warm));
     assert_eq!(std::fs::read(&fixture.path).unwrap(), fixture.prefix);
     expected = warm;
+    let on_file = known_prefix.then_some(2);
     for pass in 0..2 {
-        let (written, live, peak) = measured(&fixture, &prefix, expected);
+        let (written, live, peak) = measured(&fixture, &prefix, expected, on_file);
         assert_eq!(live, 0, "a repeated zero-tail write retained memory");
         expected = written.unwrap();
         assert_eq!(fsx::stamp(&fixture.path), Some(expected));
         assert_eq!(std::fs::read(&fixture.path).unwrap(), fixture.prefix);
-        println!("zero-tail fallback={replaced} pass={pass} live={live} peak={peak}");
-    }
-    if replaced {
-        fsx::write_atomic(&fixture.path, &fixture.prefix, 0o600).unwrap();
+        println!("zero-tail known_prefix={known_prefix} pass={pass} live={live} peak={peak}");
     }
     let before = fsx::stamp(&fixture.path).unwrap();
     assert_eq!(before.len, expected.len);
     assert_eq!(std::fs::read(&fixture.path).unwrap(), fixture.prefix);
-    assert_eq!(
-        (before.dev, before.ino) != (expected.dev, expected.ino),
-        replaced,
-        "the fallback case replaces the prefix by a different equal-length inode"
-    );
+    assert_eq!(before, expected);
 
     // The accepted Store, all signed payload owners, expected output and warm
     // mutex backing exist before counting. Measure only helper-owned scratch.
-    let (written, live, peak) = measured(&fixture, &fixture.accepted, expected);
+    let (written, live, peak) = measured(&fixture, &fixture.accepted, expected, on_file);
     assert_eq!(live, 0, "all measured persistence owners released");
 
     let written = written.expect("the file still has this write's identity");
@@ -327,8 +322,8 @@ fn exercise(replaced: bool) {
     assert_eq!(written.len, fixture.wire.len() as u64);
     assert_eq!(
         (written.dev, written.ino) != (before.dev, before.ino),
-        replaced,
-        "append retains the inode; a refused append falls back to whole replacement"
+        !known_prefix,
+        "append retains the inode; an unknown prefix requires a whole replacement"
     );
     let metadata = std::fs::symlink_metadata(&fixture.path).unwrap();
     assert!(metadata.file_type().is_file());
@@ -355,7 +350,7 @@ fn exercise(replaced: bool) {
     }
     fixture.assert_values(&reloaded);
     println!(
-        "server persistence fallback={replaced} complete={} waiting=1 prefix={} wire={} tail={} peak={peak} bound={BOUND}",
+        "server persistence known_prefix={known_prefix} complete={} waiting=1 prefix={} wire={} tail={} peak={peak} bound={BOUND}",
         VALUES + 3,
         fixture.prefix.len(),
         fixture.wire.len(),
@@ -369,10 +364,10 @@ fn exercise(replaced: bool) {
 
 #[test]
 fn a_large_accepted_tail_appends_with_bounded_persistence_scratch() {
-    exercise(false);
+    exercise(true);
 }
 
 #[test]
-fn a_stale_stamp_falls_back_to_a_bounded_whole_write() {
-    exercise(true);
+fn an_unknown_prefix_uses_a_bounded_whole_write() {
+    exercise(false);
 }

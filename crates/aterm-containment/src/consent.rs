@@ -829,7 +829,7 @@ fn read_plist_bytes(path: &Path) -> Option<Vec<u8>> {
     if !meta.is_file() || meta.len() > INFO_PLIST_MAX_BYTES {
         return None;
     }
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
     file.take(INFO_PLIST_MAX_BYTES + 1)
         .read_to_end(&mut bytes)
         .ok()?;
@@ -5116,7 +5116,7 @@ mod tests {
     #[test]
     fn a_bundles_signature_report_is_read_once_until_it_is_re_signed() {
         use std::os::unix::fs::PermissionsExt as _;
-        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_scratch_dir("sig-report");
         let bundle = |name: &str| {
             let root = dir.path().join(name);
             std::fs::create_dir_all(root.join("Contents/MacOS")).unwrap();
@@ -5382,7 +5382,7 @@ mod tests {
         );
         #[cfg(unix)]
         assert_eq!(read_plist_bytes(Path::new("/dev/null")), None, "a device");
-        let tmp = aterm_tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_scratch_dir("plist-bytes");
         let sized = |name: &str, len: u64| {
             let path = tmp.path().join(name);
             std::fs::File::create(&path).unwrap().set_len(len).unwrap();
@@ -5866,11 +5866,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_census_does_not_look_inside_a_protected_root() {
-        let dir = std::env::temp_dir()
-            .canonicalize()
-            .unwrap()
-            .join(format!("aterm-census-protected-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let scratch = crate::test_scratch_dir("census-prot");
+        let dir = scratch.path().canonicalize().unwrap();
         let documents = dir.join("Documents");
         let plist = "<plist><dict><key>CFBundleIdentifier</key><string>x</string></dict></plist>";
         let hidden = documents.join("x.app");
@@ -6006,17 +6003,13 @@ mod tests {
             bundle_identity(&spelled, &[spelled.join("Contents/Info.plist")]),
             None
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
     #[test]
     fn the_walk_stays_inside_the_bundles_own_contents() {
-        let dir = std::env::temp_dir()
-            .canonicalize()
-            .unwrap()
-            .join(format!("aterm-census-reach-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let scratch = crate::test_scratch_dir("census-reach");
+        let dir = scratch.path().canonicalize().unwrap();
         let apps = dir.join("Applications");
         std::fs::create_dir_all(&apps).unwrap();
         let lay = |at: &Path| {
@@ -6197,17 +6190,13 @@ mod tests {
         std::fs::write(full.join("Contents/c"), b"").unwrap();
         assert!(bundle_reaches_protected_on(&wide, &[], device_of, 3));
         assert!(bundle_reaches_protected_on(&full, &[], device_of, 3));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn the_walk_reads_the_plist_as_codesign_does() {
-        let dir = std::env::temp_dir()
-            .canonicalize()
-            .unwrap()
-            .join(format!("aterm-census-plist-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let scratch = crate::test_scratch_dir("census-plist");
+        let dir = scratch.path().canonicalize().unwrap();
         let refused = |app: &str, plist: &str| {
             let at = dir.join(app);
             std::fs::create_dir_all(at.join("Contents/MacOS")).unwrap();
@@ -6322,7 +6311,6 @@ mod tests {
             ),
             "UTF-8 declared"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -6343,11 +6331,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_binary_info_plist_answers_whose_bundle_it_is() {
-        let dir = std::env::temp_dir()
-            .canonicalize()
-            .unwrap()
-            .join(format!("aterm-census-binary-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let scratch = crate::test_scratch_dir("census-bin");
+        let dir = scratch.path().canonicalize().unwrap();
         let binary = |app: &str, id: &str| {
             let at = dir.join(app);
             std::fs::create_dir_all(at.join("Contents/MacOS")).unwrap();
@@ -6424,7 +6409,6 @@ mod tests {
         bplist.extend_from_slice(&39u64.to_be_bytes());
         std::fs::write(nul.join("Contents/Info.plist"), &bplist).unwrap();
         assert_eq!(read_candidate(&nul, "x", &[]), Candidate::NotOurs);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(target_os = "macos")]
@@ -6433,7 +6417,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_pipe_held_open_past_the_tool_cannot_outlast_the_ceiling() {
-        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_scratch_dir("pipe-ceiling");
         let gate = fifo_gate(dir.path());
         let _detector = gate_hang_detector(&gate);
         let armed = gate.clone();
@@ -6464,14 +6448,15 @@ mod tests {
     #[test]
     fn the_fda_probe_descriptor_is_close_on_exec_from_its_open() {
         use std::os::fd::AsRawFd as _;
-        let path = std::env::temp_dir().join(format!("aterm-fda-probe-{}", std::process::id()));
+        let scratch = crate::test_scratch_dir("fda-probe");
+        let path = scratch.path().join("fda-probe");
         std::fs::write(&path, b"").unwrap();
         let fd = imp::probe_descriptor(&path).expect("the probe opens a readable file");
         // SAFETY: F_GETFD only reads the flags of the descriptor `fd` owns.
         let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
         drop(fd);
         assert_eq!(imp::open_probe(&path), ProbeOutcome::Ok);
-        let _ = std::fs::remove_file(&path);
+        std::fs::remove_file(&path).unwrap();
         assert!(flags >= 0, "F_GETFD failed");
         assert_ne!(
             flags & libc::FD_CLOEXEC,
@@ -6514,7 +6499,8 @@ mod tests {
         ] {
             assert_eq!(parse_open_probe_line(garbage), None, "{garbage:?}");
         }
-        let missing = std::env::temp_dir().join(format!("aterm-open-verb-{}", std::process::id()));
+        let scratch = crate::test_scratch_dir("open-verb");
+        let missing = scratch.path().join("absent-open-verb");
         for args in [
             vec![],
             vec![missing.clone().into_os_string(), missing.into_os_string()],
@@ -6530,7 +6516,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_child_that_cannot_answer_leaves_the_open_to_this_process() {
-        let scratch = aterm_tempfile::tempdir().expect("owned probe scratch");
+        let scratch = crate::test_scratch_dir("open-child");
         let path = scratch.path().join("open-child");
         std::fs::write(&path, b"").unwrap();
         let missing = Path::new("/nonexistent/aterm.app/Contents/MacOS/aterm");
@@ -6586,7 +6572,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_walk_does_not_cross_into_another_volume() {
-        let scratch = aterm_tempfile::tempdir().expect("owned walk scratch");
+        let scratch = crate::test_scratch_dir("walk-vol");
         let bundle = scratch.path().canonicalize().unwrap().join("m.app");
         let mount = bundle.join("Contents/Vol");
         std::fs::create_dir_all(mount.join("inside")).unwrap();
@@ -6669,11 +6655,8 @@ mod tests {
 
     #[test]
     fn the_census_lists_through_the_protected_fence() {
-        let dir = std::env::temp_dir()
-            .canonicalize()
-            .unwrap()
-            .join(format!("aterm-census-in-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let scratch = crate::test_scratch_dir("census-in");
+        let dir = scratch.path().canonicalize().unwrap();
         let desktop = dir.join("Desktop");
         std::fs::create_dir_all(&desktop).unwrap();
         std::fs::write(desktop.join("notes.txt"), b"").unwrap();
@@ -6686,12 +6669,11 @@ mod tests {
             Enumeration::Complete,
             "the control: listed"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn the_census_never_reads_a_copy_inside_another_apps_container() {
-        let scratch = aterm_tempfile::tempdir().expect("owned census scratch");
+        let scratch = crate::test_scratch_dir("census-cont");
         let home = scratch.path().canonicalize().unwrap().join("home");
         let container_app =
             home.join("Library/Containers/com.other.App/Data/Applications/aterm.app");
@@ -6847,7 +6829,7 @@ mod tests {
 
     #[test]
     fn the_candidate_reader_tells_ours_from_not_a_bundle_from_a_hole() {
-        let tmp = aterm_tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_scratch_dir("cand-reader");
         let lay = |name: &str, id: &str| {
             let contents = tmp.path().join(name).join("Contents");
             std::fs::create_dir_all(&contents).unwrap();
@@ -7599,7 +7581,7 @@ mod tests {
 
     #[test]
     fn a_reset_subject_is_read_from_a_bundles_plist() {
-        let scratch = aterm_tempfile::tempdir().expect("subject scratch");
+        let scratch = crate::test_scratch_dir("subject");
         let root = scratch.path().join("Subject.app");
         let contents = root.join("Contents");
         std::fs::create_dir_all(&contents).expect("bundle contents");
@@ -8186,7 +8168,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_change_reader_that_lags_the_exit_still_reaches_the_head() {
-        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_scratch_dir("change-lag");
         let gate = fifo_gate(dir.path());
         let _detector = gate_hang_detector(&gate);
         let armed = gate.clone();
@@ -8228,7 +8210,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_change_reader_still_running_past_the_grace_leaves_an_empty_head() {
-        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_scratch_dir("change-grace");
         let gate = fifo_gate(dir.path());
         let _detector = gate_hang_detector(&gate);
         GRACE_POLL.with(|slot| {
@@ -8276,10 +8258,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_change_runner_names_a_missing_program() {
-        let missing = std::env::temp_dir().join(format!(
-            "aterm-devtools-missing-{}/DevToolsSecurity-stand-in",
-            std::process::id()
-        ));
+        let scratch = crate::test_scratch_dir("devtools-miss");
+        let missing = scratch.path().join("DevToolsSecurity-stand-in");
         let missing = missing.to_str().expect("utf-8 temp dir");
         let run =
             run_to_exit_keeping_heads(&[missing, "-enable"], |_| panic!("nothing was spawned"));
@@ -8288,8 +8268,7 @@ mod tests {
             run_to_exit_keeping_heads(&[], |_| panic!("nothing was spawned")),
             DevtoolsChangeRun::SpawnFailed
         );
-        let folder = std::env::temp_dir();
-        let folder = folder.to_str().expect("utf-8 temp dir");
+        let folder = scratch.path().to_str().expect("utf-8 temp dir");
         assert_eq!(
             run_to_exit_keeping_heads(&[folder], |_| panic!("nothing was spawned")),
             DevtoolsChangeRun::SpawnFailed,
@@ -9966,7 +9945,7 @@ mod tests {
     fn the_list_probe_opens_once_and_reads_in_process_without_spawning() {
         let bundled = p("/Applications/aterm.app/Contents/MacOS/aterm");
         let subject = "com.example.subject";
-        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_scratch_dir("list-open");
         let db = dir.path().join("TCC.db");
         std::fs::write(&db, db_of(&[db_row(subject, 0, 0, 7)])).expect("db");
         let mut opened: Vec<PathBuf> = Vec::new();
@@ -10042,7 +10021,7 @@ mod tests {
 
     #[test]
     fn a_list_read_that_meets_a_write_is_read_again() {
-        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_scratch_dir("list-retry");
         let db = dir.path().join("TCC.db");
         let subject = "com.example.subject";
         std::fs::write(&db, db_of(&[db_row(subject, 0, 2, 9)])).expect("db");
@@ -10079,7 +10058,7 @@ mod tests {
     #[cfg(all(target_os = "macos", debug_assertions))]
     #[test]
     fn the_list_read_never_locks_out_a_writer_with_no_busy_timeout() {
-        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_scratch_dir("list-nolock");
         let db = std::fs::canonicalize(dir.path())
             .expect("canonical")
             .join("TCC.db");
@@ -10282,7 +10261,7 @@ mod tests {
 
     #[test]
     fn the_bundle_id_is_read_off_the_bundle_and_never_under_a_protected_root() {
-        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_scratch_dir("bundle-id");
         let root = dir.path().join("x.app");
         std::fs::create_dir_all(root.join("Contents")).expect("bundle");
         std::fs::write(
@@ -10357,8 +10336,8 @@ mod tests {
             } => assert_eq!(u64::try_from(stdout.len()).ok(), Some(over)),
             other => panic!("read whole under the larger cap: {other:?}"),
         }
-        let missing =
-            std::env::temp_dir().join(format!("aterm-no-such-tool-{}", std::process::id()));
+        let dir = crate::test_scratch_dir("no-such-tool");
+        let missing = dir.path().join("aterm-no-such-tool");
         assert_eq!(
             run_bounded_exit(
                 missing.to_str().unwrap(),
@@ -10377,7 +10356,6 @@ mod tests {
             Some((false, String::new(), String::new()))
         );
 
-        let dir = aterm_tempfile::tempdir().expect("tempdir");
         let gate = fifo_gate(dir.path());
         let _detector = gate_hang_detector(&gate);
         let armed = gate.clone();
@@ -10483,7 +10461,7 @@ mod tests {
         );
         assert!(got.can_run());
         use std::os::unix::fs::PermissionsExt as _;
-        let scratch = aterm_tempfile::tempdir().expect("tempdir");
+        let scratch = crate::test_scratch_dir("tccutil-mode");
         let plain = scratch.path().join("tccutil");
         std::fs::write(&plain, b"").unwrap();
         std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).unwrap();

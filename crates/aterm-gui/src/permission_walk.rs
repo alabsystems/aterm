@@ -3,14 +3,11 @@
 
 //! The permission walk (`docs/DESIGN-macos-tcc-prompts-2026-08-30.md` §3.4a): one helper panel
 //! that takes the person through every macOS grant aterm still lacks, in [`Subject::ORDER`] —
-//! Full Disk Access, Developer Tools, Accessibility (only for the Messages and FaceTime
-//! sign-outs), then debugger access — each page opening its own System Settings deep link and
-//! turning to the next a moment after its switch reads on ([`crate::devtools_helper::DONE_FOR`]),
-//! or once the question macOS asks after it is gone.
-//! Debugger access has no page: the walk has System State's once-per-Mac debugger step look at
-//! once, and that step starts the change with the window's own admission at its own moment
-//! (`docs/DESIGN-system-state-2026-10-21.md` §6). The walk is no person's press on the row's
-//! `Turn On…`, so it never takes that door.
+//! Full Disk Access, Developer Tools, then Accessibility (only for the Messages and FaceTime
+//! sign-outs) — each page opening its own System Settings deep link and turning to the next a
+//! moment after its switch reads on ([`crate::devtools_helper::DONE_FOR`]), or once the question
+//! macOS asks after it is gone. Debugger access is no page of the walk's: setup's one early
+//! elevation turns developer mode on (`aterm_machines::root_steps`).
 //!
 //! * It starts by itself once, on a cold first launch or in an update's successor
 //!   ([`starts`], [`WalkLane::note_successor`]): no page aterm brought up before, System State in
@@ -28,13 +25,13 @@
 //!   alert, even one asked while nobody was there; or that step still to come once it alone has
 //!   held a ready walk for [`LOCAL_NETWORK_WAIT`] of unbroken looks and its own moment has not
 //!   come ([`App::waited_out_local_network`]), after which the walk goes first and the step, and
-//!   every step after it, the debugger's among them, asks once it is over: the one exception to
+//!   every step after it asks once it is over: the one exception to
 //!   the Local Network step going first. While it may still start and only the person's absence
 //!   holds it, System State's later steps wait with it ([`App::walk_waits_for_the_person`]), so
 //!   none takes its first page; the Local Network step does not.
 //!   `aterm ctl permissions walk now` (at most once a minute, [`VERB_AGAIN_AFTER`])
 //!   and the Permissions row's press start one; the verb sent while one is under way joins it
-//!   ([`WalkLane::join`]), its pages before the debugger's, and takes back a page the walk passed
+//!   ([`WalkLane::join`]) and takes back a page the walk passed
 //!   only as often as it may start one. A verb's ask its control lane gave up before the main
 //!   thread took it (the client answered `ERR late`, or gone) starts none
 //!   ([`App::take_permission_walk_ask`]).
@@ -118,7 +115,7 @@ pub(crate) const GRANT_POLL: Duration = Duration::from_millis(250);
 pub(crate) const VERB_AGAIN_AFTER: Duration = Duration::from_secs(60);
 
 /// How long a due page waits for the first reading of its grant (a launch's Full Disk Access
-/// probe, the debugger rule) before it opens, or is tried, without one.
+/// probe) before it opens, or is tried, without one.
 pub(crate) const UNREAD_WAIT: Duration = Duration::from_secs(3);
 
 /// The marker in `<state>` a walk under way leaves at System Settings' Quit & Reopen for the
@@ -148,18 +145,15 @@ pub(crate) enum Subject {
     DeveloperTools,
     /// Privacy & Security ▸ Accessibility: only the sign-outs need it.
     Accessibility,
-    /// `DevToolsSecurity -enable`, with macOS's administrator dialog.
-    Debugger,
 }
 
 impl Subject {
     /// The walk's order: Full Disk Access first, since without it the Developer Tools list
-    /// cannot be read back; the debugger last, since its dialog asks for a password.
-    pub(crate) const ORDER: [Self; 4] = [
+    /// cannot be read back.
+    pub(crate) const ORDER: [Self; 3] = [
         Self::FullDiskAccess,
         Self::DeveloperTools,
         Self::Accessibility,
-        Self::Debugger,
     ];
 
     /// The subject's word on the control verb and in aterm.log.
@@ -168,7 +162,6 @@ impl Subject {
             Self::FullDiskAccess => "fda",
             Self::DeveloperTools => "devtools",
             Self::Accessibility => "accessibility",
-            Self::Debugger => "debugger",
         }
     }
 
@@ -178,20 +171,16 @@ impl Subject {
             "fda" | "full-disk-access" => Some(Self::FullDiskAccess),
             "devtools" | "developer-tools" => Some(Self::DeveloperTools),
             "accessibility" => Some(Self::Accessibility),
-            "debugger" => Some(Self::Debugger),
             _ => None,
         }
     }
 
-    /// The helper panel's page for the subject; `None` for the debugger, which System State's
-    /// once-per-Mac step takes at its own moment, with macOS's administrator dialog as its one
-    /// gesture and nothing of aterm's raised (`docs/DESIGN-system-state-2026-10-21.md` §6).
-    pub(crate) const fn page(self) -> Option<Page> {
+    /// The helper panel's page for the subject.
+    pub(crate) const fn page(self) -> Page {
         match self {
-            Self::FullDiskAccess => Some(Page::FullDiskAccess),
-            Self::DeveloperTools => Some(Page::DeveloperTools),
-            Self::Accessibility => Some(Page::Accessibility),
-            Self::Debugger => None,
+            Self::FullDiskAccess => Page::FullDiskAccess,
+            Self::DeveloperTools => Page::DeveloperTools,
+            Self::Accessibility => Page::Accessibility,
         }
     }
 
@@ -202,7 +191,6 @@ impl Subject {
             Self::FullDiskAccess => Access::FullDiskAccess,
             Self::DeveloperTools => Access::DeveloperTools,
             Self::Accessibility => Access::Accessibility,
-            Self::Debugger => Access::Debugger,
         }
     }
 
@@ -211,7 +199,6 @@ impl Subject {
             Self::FullDiskAccess => 0,
             Self::DeveloperTools => 1,
             Self::Accessibility => 2,
-            Self::Debugger => 3,
         }
     }
 }
@@ -304,7 +291,7 @@ fn found(
 /// The subjects a walk takes: those `named`, in the order named, then the others in
 /// [`Subject::ORDER`]; each once, and only while `missing` reads it missing. Pure.
 pub(crate) fn subjects(named: &[Subject], missing: impl Fn(Subject) -> bool) -> Vec<Subject> {
-    let mut seen = [false; 4];
+    let mut seen = [false; Subject::ORDER.len()];
     named
         .iter()
         .chain(Subject::ORDER.iter())
@@ -354,7 +341,7 @@ fn read_reopen(text: &str) -> Option<Reopen> {
         .filter(|w| w.bytes().all(|b| b.is_ascii_digit()))?
         .parse::<u64>()
         .ok()?;
-    let mut seen = [false; 4];
+    let mut seen = [false; Subject::ORDER.len()];
     let subjects: Vec<Subject> = words
         .filter_map(Subject::parse)
         .filter(|subject| !std::mem::replace(&mut seen[subject.index()], true))
@@ -469,7 +456,7 @@ pub(crate) struct Walk {
     subjects: Vec<Subject>,
     /// The subjects asked for by name (a row's press, the control verb), by [`Subject::ORDER`]:
     /// their pages open without waiting for a first reading.
-    named: [bool; 4],
+    named: [bool; Subject::ORDER.len()],
     at: usize,
     step: Step,
     /// When the current page became due.
@@ -504,36 +491,17 @@ impl Walk {
     }
 
     /// Take `take` too, as a walk under way takes the control verb's ask: each subject the walk
-    /// has not still to show goes on after its last page, before a debugger still to come (the
-    /// current page when its step has not run: the debugger's never comes up, so a page taken
-    /// while the walk waits there goes before it), so the debugger's step stays last. On a walk
+    /// has not still to show goes on after its last page. On a walk
     /// that asks for a page by name, each subject of `named` (each of `take` when `named` names
     /// none) counts as asked for by name; a walk that asks for none (the first launch's) goes on
     /// from every Not now, and its new pages are its own. Returns the subjects that went on.
     pub(crate) fn take_also(&mut self, take: &[Subject], named: &[Subject]) -> Vec<Subject> {
         let names = self.named.contains(&true);
         let named = if named.is_empty() { take } else { named };
-        let from = if self.step == Step::Due {
-            self.at
-        } else {
-            self.at + 1
-        };
-        let mut before_debugger = self
-            .subjects
-            .iter()
-            .skip(from)
-            .position(|subject| *subject == Subject::Debugger)
-            .map(|at| from + at);
         let mut added = Vec::new();
         for subject in take {
             if !self.ahead().contains(subject) {
-                match before_debugger.as_mut() {
-                    Some(at) => {
-                        self.subjects.insert(*at, *subject);
-                        *at += 1;
-                    }
-                    None => self.subjects.push(*subject),
-                }
+                self.subjects.push(*subject);
                 added.push(*subject);
             }
             if names && named.contains(subject) {
@@ -596,7 +564,7 @@ impl Walk {
     /// The current page's place, 1-based, and the walk's length, counting only the pages the
     /// person sees: the panel's "1 of N". Its place counts the pages before it that came up; the
     /// length adds each later subject whose grant does not read `held` now, as the walk would
-    /// skip it at its turn ([`App::walk_reads_held`]), the debugger's step among them.
+    /// skip it at its turn ([`App::walk_reads_held`]).
     pub(crate) fn position(&self, held: impl Fn(Subject) -> bool) -> (usize, usize) {
         let at = self.shown + 1;
         let later = self
@@ -788,7 +756,7 @@ pub(crate) struct WalkLane {
     walk: Option<Walk>,
     /// Subjects a walk took in this process, by [`Subject::ORDER`]: a later walk that starts by
     /// itself takes only a subject none took (Accessibility, once the sign-outs say they need it).
-    walked: [bool; 4],
+    walked: [bool; Subject::ORDER.len()],
     /// Who started the walk under way, for aterm.log.
     by: &'static str,
     /// When the control verb last started a walk, or took back a page the walk under way passed
@@ -873,7 +841,7 @@ impl WalkLane {
         Self {
             reach,
             walk: None,
-            walked: [false; 4],
+            walked: [false; Subject::ORDER.len()],
             by: "",
             verb_started_at: None,
             yields: false,
@@ -1125,8 +1093,6 @@ enum Opened {
     /// It could not open, or the owner's Not now holds it back from the yielding walk; the walk
     /// goes on without it.
     Skip(&'static str),
-    /// Another step of aterm's takes it (the debugger: System State's step); the walk goes on.
-    Handed(&'static str),
 }
 
 impl App {
@@ -1500,7 +1466,7 @@ impl App {
         by: &'static str,
         now: Instant,
     ) -> Started {
-        self.start_walk_without(named, [false; 4], false, by, now)
+        self.start_walk_without(named, [false; Subject::ORDER.len()], false, by, now)
     }
 
     /// [`Self::start_permission_walk`] leaving out each subject `held_back` names (by
@@ -1520,7 +1486,7 @@ impl App {
     fn start_walk_without(
         &mut self,
         named: &[Subject],
-        held_back: [bool; 4],
+        held_back: [bool; Subject::ORDER.len()],
         verb: bool,
         by: &'static str,
         now: Instant,
@@ -1603,20 +1569,13 @@ impl App {
 
     /// Whether the walk takes `subject`: its grant does not read held, and, for one it was not
     /// asked for by name, the setup run wants it (Accessibility: System State's row offers it,
-    /// so the sign-outs need it; the debugger: under an approved revision). The debugger is
-    /// taken only while System State's once-per-Mac step is still to come, named or not: that
-    /// step is the walk's one way to it ([`Opened::Handed`]), so a walk never names a page it
-    /// would only skip. A debugger turned off by the person is never taken.
+    /// so the sign-outs need it).
     pub(crate) fn walk_missing(&mut self, subject: Subject, named: bool) -> bool {
         let wanted = match subject {
             Subject::FullDiskAccess | Subject::DeveloperTools => true,
             Subject::Accessibility => named || self.system_state_offers(Access::Accessibility),
-            Subject::Debugger => {
-                self.debugger_launch.queued() && (named || self.access_revision().is_some())
-            }
         };
-        let chosen_off = subject == Subject::Debugger && self.debugger_change.off_is_chosen();
-        wanted && !chosen_off && self.walk_held(subject) != Held::Yes
+        wanted && self.walk_held(subject) != Held::Yes
     }
 
     /// `aterm ctl permissions walk now [<subject>…]` (and `devtools hand-over now`): a walk as
@@ -1693,7 +1652,6 @@ impl App {
                     )
             }
             Subject::Accessibility => self.accessibility_declined_for_the_verb(),
-            Subject::Debugger => self.access_declined_here(Access::Debugger),
         }
     }
 
@@ -1729,7 +1687,7 @@ impl App {
 
     /// Whether `subject`'s grant reads held now.
     fn walk_held(&mut self, subject: Subject) -> Held {
-        use aterm_containment::consent::{DebuggerMode, FdaState, ProbeLabel};
+        use aterm_containment::consent::{FdaState, ProbeLabel};
         match subject {
             Subject::FullDiskAccess => {
                 let read = self.consent_panel_facts();
@@ -1764,23 +1722,13 @@ impl App {
                     Held::No
                 }
             }
-            Subject::Debugger => {
-                let row = self.consent.debugger(self.config.privacy_probe_gate());
-                if row.pending() {
-                    Held::Unread
-                } else if self.debugger_access_facts_from(row).probe.mode == DebuggerMode::Enabled {
-                    Held::Yes
-                } else {
-                    Held::No
-                }
-            }
         }
     }
 
     /// The walk's page place for a panel `origin` shows `page`: the walk's own page only.
     pub(crate) fn walk_step(&self, page: Page, origin: Origin) -> Option<(usize, usize)> {
         let walk = self.permission_walk.walk()?;
-        (origin == Origin::Walk && walk.current().and_then(Subject::page) == Some(page))
+        (origin == Origin::Walk && walk.current().map(Subject::page) == Some(page))
             .then(|| walk.position(|subject| self.walk_reads_held(subject)))
     }
 
@@ -1801,7 +1749,7 @@ impl App {
     /// judges it but starting no reading: the walk's count of the pages it will show
     /// ([`Walk::position`]), read at every turn while a page is up.
     pub(crate) fn walk_reads_held(&self, subject: Subject) -> bool {
-        use aterm_containment::consent::{DebuggerMode, FdaState, ProbeLabel};
+        use aterm_containment::consent::{FdaState, ProbeLabel};
         match subject {
             Subject::FullDiskAccess => {
                 let read = self.consent_panel_facts_cached();
@@ -1814,10 +1762,6 @@ impl App {
                 .reading()
                 .is_some_and(|reading| reading.grant == aterm_containment::DevToolGrant::Granted),
             Subject::Accessibility => (self.permission_walk.reach().ax_trusted)(),
-            Subject::Debugger => self
-                .consent
-                .debugger_cached(self.config.privacy_probe_gate())
-                .is_some_and(|row| !row.pending() && row.probe().mode == DebuggerMode::Enabled),
         }
     }
 
@@ -1849,7 +1793,7 @@ impl App {
         self.take_walk_close(now);
         if let Some(walk) = self.permission_walk.walk()
             && walk.step() == Step::Up
-            && let Some(page) = walk.current().and_then(Subject::page)
+            && let Some(page) = walk.current().map(Subject::page)
             && !self.devtools_helper.walk_page_alive(page)
         {
             // Its panel never came up (or went without a close the walk heard): the page in
@@ -1864,7 +1808,7 @@ impl App {
                 let next = walk.next().map(|subject| subject.access().name());
                 let up = walk
                     .current()
-                    .and_then(Subject::page)
+                    .map(Subject::page)
                     .filter(|_| walk.step() == Step::Up)
                     .map(|page| (page, walk.position(|subject| self.walk_reads_held(subject))));
                 self.devtools_helper.hold_for_walk(next);
@@ -1926,7 +1870,7 @@ impl App {
         let Some(walk) = self.permission_walk.walk_mut() else {
             return;
         };
-        if walk.current().and_then(Subject::page) != Some(page) || walk.step() != Step::Up {
+        if walk.current().map(Subject::page) != Some(page) || walk.step() != Step::Up {
             return;
         }
         match why {
@@ -2045,8 +1989,7 @@ impl App {
                     self.permission_walk.asked_automation = true;
                 }
             }
-            // The debugger is never up: System State's step takes it ([`Opened::Handed`]).
-            Some(Subject::DeveloperTools | Subject::Debugger) | None => {}
+            Some(Subject::DeveloperTools) | None => {}
         }
     }
 
@@ -2099,10 +2042,6 @@ impl App {
                     aterm_log::info!("permission walk: {} skipped ({why})", subject.word());
                     self.advance_walk(now);
                 }
-                Opened::Handed(to) => {
-                    aterm_log::info!("permission walk: {} handed to {to}", subject.word());
-                    self.advance_walk(now);
-                }
             }
         }
     }
@@ -2118,10 +2057,10 @@ impl App {
     /// for a quiet moment. The control verb's walk (one that yields) waits out a helper panel it
     /// did not bring up, wins the slot only while no other gesture of the window and no macOS
     /// dialog of this process is up ([`Self::reserve_walk_dialog`]) and then holds it for its
-    /// later pages (the debugger's hand lets it go), and skips a page the owner's Not now holds
+    /// later pages, and skips a page the owner's Not now holds
     /// back now ([`Self::declined_for_the_verb`]), as the verb sent now would: one said since the
     /// verb asked (on the panel the walk waited behind, say) holds it too. A walk that asked
-    /// macOS's Automation question opens no page, nor hands the debugger to its step, while that
+    /// macOS's Automation question opens no page while that
     /// question is out ([`WalkReach::automation_out`]): its next page waits for the person's
     /// answer rather than come up beside the alert.
     fn open_walk_page(&mut self, subject: Subject, now: Instant) -> Opened {
@@ -2137,7 +2076,7 @@ impl App {
             {
                 return Opened::Wait;
             }
-            if subject != Subject::Debugger && !self.permission_walk.slot_won {
+            if !self.permission_walk.slot_won {
                 if !self.reserve_walk_dialog(now) {
                     return Opened::Wait;
                 }
@@ -2147,7 +2086,7 @@ impl App {
                 return Opened::Skip("the owner's Not now holds it back from the control verb");
             }
         }
-        if subject != Subject::Debugger && !self.reserve_hand_over_dialog(Origin::Walk) {
+        if !self.reserve_hand_over_dialog(Origin::Walk) {
             return Opened::Wait;
         }
         match subject {
@@ -2185,25 +2124,6 @@ impl App {
                     Opened::Up
                 } else {
                     Opened::Skip("its panel could not be shown")
-                }
-            }
-            Subject::Debugger => {
-                // System State's once-per-Mac step is the debugger's way in for a walk: it
-                // spends the window's own admission as the yes and starts the change once its
-                // moment comes (System State in front, no page or dialog of aterm's up), so the
-                // panel and the walk's hold on the dialog slot go, and the step looks now
-                // instead of at its next look. The walk is no person's press on the row's
-                // `Turn On…` (`App::turn_on_debugger_from_system_state`), whose door a control
-                // client must never reach.
-                self.devtools_helper.hold_for_walk(None);
-                self.devtools_helper.release_held();
-                self.drop_access_dialog();
-                self.permission_walk.slot_won = false;
-                if self.debugger_launch.queued() {
-                    self.debugger_launch.look_later(now);
-                    Opened::Handed("System State's debugger step")
-                } else {
-                    Opened::Skip("System State's debugger step is not queued; its row stays")
                 }
             }
         }
@@ -2435,19 +2355,20 @@ mod tests {
     /// only while missing.
     #[test]
     fn named_subjects_lead_and_the_walk_continues_with_the_rest() {
-        use Subject::{Accessibility, Debugger, DeveloperTools, FullDiskAccess};
+        use Subject::{Accessibility, DeveloperTools, FullDiskAccess};
         assert_eq!(
             subjects(&[], |_| true),
-            vec![FullDiskAccess, DeveloperTools, Accessibility, Debugger]
+            vec![FullDiskAccess, DeveloperTools, Accessibility]
         );
         assert_eq!(
             subjects(&[DeveloperTools], |subject| subject != Accessibility),
-            vec![DeveloperTools, FullDiskAccess, Debugger],
+            vec![DeveloperTools, FullDiskAccess],
             "doctor's Developer Tools hand-over: Full Disk Access right after it"
         );
         assert_eq!(
-            subjects(&[Debugger, Debugger], |subject| subject == Debugger),
-            vec![Debugger]
+            subjects(&[Accessibility, Accessibility], |subject| subject
+                == Accessibility),
+            vec![Accessibility]
         );
         assert!(subjects(&[FullDiskAccess], |_| false).is_empty());
     }
@@ -2456,23 +2377,23 @@ mod tests {
     /// later one whose grant does not read held; a page skipped without coming up does not.
     #[test]
     fn a_walk_counts_its_pages_and_ends_after_the_last() {
-        use Subject::{Debugger, DeveloperTools, FullDiskAccess};
+        use Subject::{Accessibility, DeveloperTools, FullDiskAccess};
         let now = Instant::now();
         let none_held = |_| false;
-        let mut walk = Walk::new(vec![FullDiskAccess, Debugger], now).expect("two pages");
+        let mut walk = Walk::new(vec![FullDiskAccess, Accessibility], now).expect("two pages");
         assert_eq!(walk.position(none_held), (1, 2));
-        assert_eq!(walk.next(), Some(Debugger));
+        assert_eq!(walk.next(), Some(Accessibility));
         walk.opened();
         assert_eq!(walk.step(), Step::Up);
-        assert_eq!(walk.advance(now), Some(Debugger));
+        assert_eq!(walk.advance(now), Some(Accessibility));
         assert_eq!((walk.position(none_held), walk.step()), ((2, 2), Step::Due));
         assert_eq!(walk.next(), None);
         assert_eq!(walk.advance(now), None);
         assert_eq!(walk.advance(now), None, "stays over");
         assert!(Walk::new(Vec::new(), now).is_none());
 
-        let mut walk =
-            Walk::new(vec![FullDiskAccess, DeveloperTools, Debugger], now).expect("three pages");
+        let mut walk = Walk::new(vec![FullDiskAccess, DeveloperTools, Accessibility], now)
+            .expect("three pages");
         assert_eq!(
             walk.position(|subject| subject == DeveloperTools),
             (1, 2),
@@ -2516,19 +2437,19 @@ mod tests {
     /// junk.
     #[test]
     fn a_reopen_marker_reads_back_what_the_quit_wrote_and_nothing_else() {
-        use Subject::{Debugger, DeveloperTools, FullDiskAccess};
+        use Subject::{Accessibility, DeveloperTools, FullDiskAccess};
         let bundle = host_bundle("aterm (dev).app");
         let path = bundle.to_str().expect("a UTF-8 path");
-        let text = reopen_text(1_793_161_729, &[DeveloperTools, Debugger], path, MAC);
+        let text = reopen_text(1_793_161_729, &[DeveloperTools, Accessibility], path, MAC);
         assert_eq!(
             text,
-            format!("1793161729 devtools debugger\n{path}\n{MAC}\n")
+            format!("1793161729 devtools accessibility\n{path}\n{MAC}\n")
         );
         assert_eq!(
             read_reopen(&text),
             Some(Reopen {
                 at: 1_793_161_729,
-                subjects: vec![DeveloperTools, Debugger],
+                subjects: vec![DeveloperTools, Accessibility],
                 bundle: bundle.clone(),
                 mac: MAC.to_owned(),
             })
@@ -2564,13 +2485,13 @@ mod tests {
     /// writes none.
     #[test]
     fn a_reopen_marker_is_taken_once_and_only_by_its_bundle_on_its_mac_within_its_bound() {
-        use Subject::{Debugger, DeveloperTools, FullDiskAccess};
+        use Subject::{Accessibility, DeveloperTools, FullDiskAccess};
         const OTHER_MAC: &str = "8F2E6A41-0B3C-4D5E-A697-C8D9E0F1A2B3";
         let dir = aterm_tempfile::tempdir().expect("a scratch <state>");
         let state = dir.path();
         let marker = state.join(REOPEN_MARKER);
         let (bundle, other) = (host_bundle("aterm.app"), host_bundle("aterm (dev).app"));
-        let pages = [FullDiskAccess, DeveloperTools, Debugger];
+        let pages = [FullDiskAccess, DeveloperTools, Accessibility];
         let at = 1_793_161_750;
         let within = REOPEN_WITHIN.as_secs();
         let leave = || leave_reopen_in(state, at, &pages, &bundle, MAC).expect("the marker");

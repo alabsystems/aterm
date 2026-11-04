@@ -348,10 +348,23 @@ impl Worker {
         }
         self.tracked_before = tracked_now;
         let tracked = tracked_now && !self.denied;
-        let read = self
-            .file
-            .as_deref()
-            .and_then(|file| std::fs::read_to_string(file).ok());
+        let read = self.file.as_deref().and_then(|file| {
+            use std::io::Read as _;
+            const MAX_JUMPLIST_BYTES: u64 = 1024 * 1024;
+            let (opened, meta) = aterm_uds::regular_file::open(file).ok()?;
+            if meta.len() > MAX_JUMPLIST_BYTES {
+                return None;
+            }
+            let cap = usize::try_from(meta.len().min(MAX_JUMPLIST_BYTES))
+                .unwrap_or(0)
+                .saturating_add(1);
+            let mut text = String::with_capacity(cap);
+            opened
+                .take(MAX_JUMPLIST_BYTES + 1)
+                .read_to_string(&mut text)
+                .ok()?;
+            (text.len() as u64 <= MAX_JUMPLIST_BYTES).then_some(text)
+        });
         let mut list = match (&read, tracked) {
             (Some(text), true) => parse(text),
             _ => Vec::new(),

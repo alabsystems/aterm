@@ -616,6 +616,43 @@ impl Effective {
         self.reach.before(a, b)
     }
 
+    /// The evaluated log's index, for reads that take whole rows and frontiers from it. The tests'
+    /// all-pairs oracle answers [`Effective::before`] alone.
+    pub(super) const fn reach(&self) -> &Reach {
+        &self.reach
+    }
+
+    /// The items whose record (`index` of each) lies in no other item's record's past: the
+    /// newest, in `items`' order. Ties on one record stay together. It reads one row per newest
+    /// record ([`Reach::maximal`]), never a test of each pair; in the tests every call checks
+    /// itself against that test of each pair, read through [`Effective::before`].
+    ///
+    /// # Panics
+    /// An item's record is not indexed.
+    pub(super) fn newest<'t, T>(&self, items: &'t [T], index: impl Fn(&T) -> usize) -> Vec<&'t T> {
+        let mut set: Vec<usize> = items.iter().map(&index).collect();
+        set.sort_unstable();
+        set.dedup();
+        let newest = self.reach.maximal(&set);
+        let found: Vec<&T> = items
+            .iter()
+            .filter(|&item| newest.binary_search(&index(item)).is_ok())
+            .collect();
+        #[cfg(test)]
+        {
+            let pairwise = items.iter().filter(|&a| {
+                !items
+                    .iter()
+                    .any(|b| index(a) != index(b) && self.before(index(a), index(b)))
+            });
+            assert!(
+                found.iter().map(|&t| index(t)).eq(pairwise.map(&index)),
+                "the newest of a set disagree with a test of each pair"
+            );
+        }
+        found
+    }
+
     /// Whether record `index` is a keyed `Epoch`: it does not count, yet a counting `Put` or
     /// `Delete` depends on it (F21 rule 1).
     pub(super) fn keyed(&self, index: usize) -> bool {

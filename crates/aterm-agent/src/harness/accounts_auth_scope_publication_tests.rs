@@ -304,7 +304,28 @@ fn fresh_auth_publishes_when_the_observed_raw_identity_stays_the_same() {
 fn raw_identity_replacement_without_a_new_observation_retires_only_old_auth() {
     let fixture = Publication::new(true);
     let before = fixture.store.load(NOW).unwrap().0.accounts["work"].clone();
+    let raw = Roster::load(&fixture.path).unwrap();
+    fixture
+        .store
+        .transact_pool_logins_within(&[], &fixture.path, NOW, &mut None, |_, _, logins| {
+            admit_workflow(logins, "work")?;
+            Ok(Vec::new())
+        })
+        .unwrap();
     let logins = fixture.store.load_logins(NOW).unwrap().0;
+    let workflow = current_workflow(raw.row("work").unwrap(), &logins).unwrap();
+    let mut scoped = Event::new(NOW, Kind::SignIn, "work");
+    assert!(!workflow_event_matches(
+        raw.row("work").unwrap(),
+        &logins,
+        &scoped
+    ));
+    scoped.workflow = Some(workflow);
+    assert!(workflow_event_matches(
+        raw.row("work").unwrap(),
+        &logins,
+        &scoped
+    ));
     let ledger = std::fs::read(fixture.store.ledger_path()).unwrap();
     assert!(
         fixture
@@ -324,7 +345,16 @@ fn raw_identity_replacement_without_a_new_observation_retires_only_old_auth() {
         after.current_auth(records.roster.row("work").unwrap()),
         Auth::Unseen
     );
-    assert_eq!(records.logins, logins);
+    let row = records.raw_roster.row("work").unwrap();
+    assert!(!workflow_token_current(row, &records.logins, workflow));
+    assert!(!workflow_event_matches(row, &records.logins, &scoped));
+    let mut retained = records.logins.clone();
+    retained.workflow_clock = logins.workflow_clock;
+    retained.workflows = logins.workflows.clone();
+    assert_eq!(
+        retained, logins,
+        "only independent workflow custody changes"
+    );
     assert_eq!(std::fs::read(fixture.store.ledger_path()).unwrap(), ledger);
     assert_eq!(
         std::fs::read_to_string(&fixture.path).unwrap(),

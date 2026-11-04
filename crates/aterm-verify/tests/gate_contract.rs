@@ -1030,6 +1030,10 @@ fn the_test_binaries_run_as_cargo_recorded_them_two_at_a_time() {
     ctx.test_recorder = Some(PathBuf::from(env!("CARGO_BIN_EXE_aterm-verify")));
     ctx.test_jobs = 2;
     ctx.test_threads = Some(6);
+    // A held share of exactly two binaries' threads, so the pool runs two at a time on any host:
+    // unheld, the ceiling is the host's cores, and 2 x 6 does not fit a Mac with fewer than 12.
+    ctx.env.build_slot_held = Some("1".into());
+    ctx.env.cargo_build_jobs = Some("12".into());
     let spec = plan::plan(&ctx)
         .into_iter()
         .find(|s| s.id == StageId::Test)

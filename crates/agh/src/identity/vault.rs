@@ -1679,10 +1679,7 @@ mod tests {
         let read: Record = aterm_toml::from_str(forged).expect("the rows parse");
         assert_eq!(read.checked(), Record::default());
 
-        let root = aterm_tempfile::Builder::new()
-            .prefix("agh-vault-damaged-")
-            .tempdir()
-            .expect("a scratch root");
+        let root = crate::test_fixtures::scratch_dir("vault-damaged");
         let dirs = crate::config::Dirs::under(root.path());
         super::record_for_tests(&dirs, &[]).expect("the agh directory");
         for text in [forged, "[dev\n", "[later]\nfield = 1\n"] {
@@ -1736,10 +1733,7 @@ mod tests {
     /// file, for a profile named `dev` or `release`, and for a vault file as `--file`.
     #[test]
     fn the_seed_joins_the_vault_and_names_no_row() {
-        let root = aterm_tempfile::Builder::new()
-            .prefix("agh-vault-seed-")
-            .tempdir()
-            .expect("a scratch root");
+        let root = crate::test_fixtures::scratch_dir("vault-seed");
         let dirs = crate::config::Dirs::under(root.path());
         assert_eq!(super::seed(&dirs, "ext", None), None);
         let dev = Slot::Dev.path(&dirs.home);
@@ -1847,10 +1841,7 @@ mod tests {
     /// any case) is written.
     #[test]
     fn a_learned_login_never_overwrites_another_recorded_meanwhile() {
-        let root = aterm_tempfile::Builder::new()
-            .prefix("agh-vault-race-")
-            .tempdir()
-            .expect("a scratch root");
+        let root = crate::test_fixtures::scratch_dir("vault-race");
         let dirs = crate::config::Dirs::under(root.path());
         super::record_for_tests(&dirs, &[(Slot::Dev, "0123456789ab", "fixture-x")])
             .expect("the record");

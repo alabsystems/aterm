@@ -1910,13 +1910,23 @@ fn observe_transport(
 #[cfg(not(test))]
 fn addresses() -> std::result::Result<Vec<std::net::SocketAddr>, Status> {
     #[cfg(debug_assertions)]
-    if isolation::port()
-        .map_err(refusal("isolated attachment"))?
-        .is_some()
-    {
+    let isolated = isolation::port();
+    #[cfg(not(debug_assertions))]
+    let isolated = Ok(None);
+    usable_addresses(isolated, aterm_net::lan::Listener::candidates)
+}
+
+/// The runtime's candidates under `isolated`, the private attachment's setting: a port is
+/// loopback alone and never reads `lan`, an invalid setting refuses, and with none set they are
+/// `lan`'s IPv4 addresses (an unreadable `lan` is offline).
+fn usable_addresses(
+    isolated: crate::Result<Option<u16>>,
+    lan: impl FnOnce() -> std::io::Result<Vec<std::net::SocketAddr>>,
+) -> std::result::Result<Vec<std::net::SocketAddr>, Status> {
+    if isolated.map_err(refusal("isolated attachment"))?.is_some() {
         return Ok(vec![(std::net::Ipv4Addr::LOCALHOST, 0).into()]);
     }
-    aterm_net::lan::Listener::candidates()
+    lan()
         .map(|addresses| {
             addresses
                 .into_iter()

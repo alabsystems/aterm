@@ -314,10 +314,12 @@ fn owned_dir(path: &Path) -> io::Result<()> {
 }
 fn receipt_bytes(path: &Path) -> io::Result<Vec<u8>> {
     let mut file = crate::metadata_io::open_regular(path)?;
-    if fs::owned_file(&file)?.len() > RECEIPT_MAX as u64 {
+    let before = fs::owned_file(&file)?;
+    if before.len() > RECEIPT_MAX as u64 {
         return Err(invalid("local receipt is oversized"));
     }
-    let mut bytes = Vec::new();
+    let mut bytes =
+        Vec::with_capacity(usize::try_from(before.len().saturating_add(1)).unwrap_or(0));
     std::io::Read::by_ref(&mut file)
         .take(RECEIPT_MAX as u64 + 1)
         .read_to_end(&mut bytes)?;

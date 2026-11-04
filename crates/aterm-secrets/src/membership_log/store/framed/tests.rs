@@ -322,7 +322,9 @@ fn local_recovery_keeps_the_complete_history_within_its_store_budget() {
     let batch = Batch::get();
     let records = batch.whole();
     let wire = encode_records(&records);
-    assert!(super::super::decode_records(&wire).is_err());
+    assert!(
+        super::super::decode_records_bounded(&wire, crate::membership_log::LEGACY_RECORDS).is_err()
+    );
     // Only construction uses the raised ambient budget; recovery must use what the store kept.
     let empty = || RAISED.within(|| Store::with_compiled(None));
     let recovered = [

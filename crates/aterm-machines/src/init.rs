@@ -659,7 +659,7 @@ impl Base {
 }
 
 /// The store lock a run narrowed to `only` asks its base layer for, `lock` unless no item it
-/// selects touches the store: `--only base.clt` (System State's Command Line Tools tab, and a
+/// selects touches the store: `--only base.clt` (System State's Mac Setup tab, and a
 /// person's own run of it) selects Apple's Command Line Tools alone, which run once the lock is
 /// let go, so its base layer is composed as a read ([`BaseLock::Read`]) and never waits for an
 /// install pass that holds the store.
@@ -698,8 +698,8 @@ pub enum Decider {
     /// where macOS raises none, it looks as a typed `aterm init` there does
     /// ([`crate::init_secrets::Here::Remote`]). Rust in Spotlight searches no folder of the
     /// person's for build folders ([`crate::init_spotlight::Projects::Unread`]). Apple's Command
-    /// Line Tools ask for the Mac password at most once per build, sharing System State's Command
-    /// Line Tools tab's ask, and never under the person's Stop, read as they run
+    /// Line Tools ask for the Mac password at most once per build, sharing System State's Mac Setup
+    /// tab's ask, and never under the person's Stop, read as they run
     /// ([`Self::compose`]).
     Aterm,
 }
@@ -707,7 +707,7 @@ pub enum Decider {
 impl Decider {
     /// `base` as a run this one decided composes it: in a run aterm decided, `base.clt` asks for
     /// the Mac password at most once per build and never while the person's choices hold System
-    /// State's own Command Line Tools tab, held by what `unbidden` makes (this account's record
+    /// State's own Mac Setup tab, held by what `unbidden` makes (this account's record
     /// and a reader of the setup records' holds, [`crate::init_clt::Unbidden::here`], which
     /// `base.clt` reads as its probe runs and again right before it claims the ask, never here),
     /// and is deferred naming the person's step otherwise
@@ -1292,7 +1292,7 @@ fn held_row(id: &str, title: &str, line: String) -> ItemReport {
     }
 }
 
-/// Whether this run is System State's Command Line Tools tab's program: `--only base.clt` alone,
+/// Whether this run is System State's Mac Setup tab's program: `--only base.clt` alone,
 /// with [`aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB`] set (to `var`) and not empty
 /// ([`tab`]). Anywhere else, `aterm init --only base.clt` speaks as it always does.
 fn in_tab(var: Option<&std::ffi::OsStr>, options: &Options) -> bool {
@@ -1354,7 +1354,7 @@ fn tab_entry(options: &Options, host: &Host<'_>) -> u8 {
     })
 }
 
-/// System State's Command Line Tools tab's run of `aterm init --only base.clt` (design §3.3),
+/// System State's Mac Setup tab's run of `aterm init --only base.clt` (design §3.3),
 /// speaking through `out`: it waits for the window's go line
 /// ([`aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_GO`], read with echo off and kept when
 /// typed ahead of the read), which comes only once the tab landed, and else starts nothing,
@@ -10057,7 +10057,7 @@ mod tests {
         );
     }
 
-    /// What one run of the Command Line Tools tab's program did: its exit code, everything it
+    /// What one run of the Mac Setup tab's program did: its exit code, everything it
     /// wrote to the tab, and how many times it converged.
     struct TabRun {
         code: u8,
@@ -10282,8 +10282,8 @@ mod tests {
     }
 
     /// Every way the tab's install falls short, early ones included, ends on its one plain line
-    /// `The install did not finish: <reason>. Install… on System State tries again.` and its
-    /// class's exit (1, or a stop's and Apple's window closed's own): `sudo`'s own refusal, each
+    /// `Mac Setup did not finish: <reason>. Running aterm init in a terminal tries again.` and
+    /// its class's exit (1, or a stop's and Apple's window closed's own): `sudo`'s own refusal, each
     /// class the root half exits with, a signal, a `sudo` that never ran, a run outside the
     /// person's own login, and a refused converge.
     #[test]

@@ -185,7 +185,8 @@ fn probe(
     expected_requests: &[Endpoint],
 ) -> Observation {
     let peer = Peer::start(envelope, records);
-    let result = service_health::server(&peer.url(), requirement);
+    // The peer is this test's own, which answers: each read waits the hang detector.
+    let result = service_health::server_within(&peer.url(), requirement, HANG);
     // The actual network worker is joined before any result assertion.
     let traffic = peer.finish();
     assert!(

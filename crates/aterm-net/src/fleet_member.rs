@@ -3470,25 +3470,30 @@ fn lock_refused(dir: &Path, e: &io::Error) -> String {
 
 /// The membership write lock, `.fleet-peers.lock` beside the book
 /// ([`aterm_uds::private_file::PrivateLock`]): its refusals name `dir`, each time it is found
-/// held the test seam is told ([`found_held`]), and on macOS its holder runs at the default class
-/// at least while it holds it ([`ClassLift`]).
+/// held the test seam is told ([`found_held`]), and on macOS its taker runs at the default class
+/// at least from before it takes it until it lets it go ([`ClassLift`]).
 struct BookLock {
     /// Held for the guard's life: `PrivateLock`'s own `Drop` releases it.
     _held: aterm_uds::private_file::PrivateLock,
-    /// The holder's thread lifted while it holds the lock; dropped after `_held`, so its class
+    /// The taker's thread lifted before it took the lock; dropped after `_held`, so its class
     /// is put back once the lock is let go.
     #[cfg(target_os = "macos")]
     _lift: ClassLift,
 }
 
-/// The thread that holds the book's lock, lifted to the default class while it holds it where it
-/// had asked for less (utility, background: [`aterm_uds::qos::lift`]), and put back as the lock is
-/// let go on that thread (one let go on another thread leaves the class as it is). Each holder's
-/// read-modify-write is milliseconds of work, and a person's verb waits [`LOCK_WAIT`] at most for
-/// it: a holder at a class a loaded Mac starves of a core (an aterm window's member heartbeat, at
-/// utility) kept it for seconds and the verb was refused, the inversion `aterm-gui`'s fork lift
-/// prevents for a fork. No class a thread asks for lifts the band launchd holds the node job
-/// (`aterm node serve`) in: its heartbeat holds the lock at the band's priority still.
+/// The thread that takes the book's lock, lifted to the default class where it had asked for less
+/// (utility, background: [`aterm_uds::qos::lift`]) from before its take until it lets the lock
+/// go, and put back as the lock is let go on that thread (one let go on another thread leaves the
+/// class as it is) or as its take is refused. Each holder's read-modify-write is milliseconds of
+/// work, and a person's verb waits [`LOCK_WAIT`] at most for it: a holder at a class a loaded Mac
+/// starves of a core (an aterm window's member heartbeat, at utility) kept it for seconds and the
+/// verb was refused, the inversion `aterm-gui`'s fork lift prevents for a fork. The lift comes
+/// first, so no holder holds the lock at its own class for the moment between the take and the
+/// lift, where a thread at utility may wait seconds for a core and one at background minutes; the
+/// take's wait runs at the default class with it. The node job (`aterm node serve`) holds its own
+/// threads at utility one by one rather than in a launchd band, where none is lifted (a
+/// `Background` job runs every thread at priority 4, a `Standard` one clamps every thread at
+/// utility), so its heartbeat holds the lock at the default class too.
 #[cfg(target_os = "macos")]
 struct ClassLift(Option<(std::thread::ThreadId, aterm_uds::qos::Lifted)>);
 
@@ -3512,6 +3517,8 @@ impl Drop for ClassLift {
 
 impl BookLock {
     fn take(dir: &Path, within: Duration) -> io::Result<Self> {
+        #[cfg(target_os = "macos")]
+        let lift = ClassLift::up();
         let mut first = true;
         aterm_uds::private_file::PrivateLock::take_with(
             dir,
@@ -3526,7 +3533,7 @@ impl BookLock {
         .map(|held| Self {
             _held: held,
             #[cfg(target_os = "macos")]
-            _lift: ClassLift::up(),
+            _lift: lift,
         })
     }
 }

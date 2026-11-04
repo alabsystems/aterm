@@ -20,6 +20,8 @@ use aterm_types::control_socket;
 use aterm_types::control_verbs::{MAX_REQUEST_LINE, MAX_TASK_BYTES};
 use aterm_uds::CtlStream;
 
+#[cfg(unix)]
+pub mod allocation_monitor;
 /// The `aterm-askpass` role.
 pub mod askpass;
 pub use askpass::main_entry as askpass_main_entry;
@@ -3186,7 +3188,7 @@ const TOKEN_FILE_OPEN_FLAGS: i32 = 0x0000_0100 | 0x0000_0004; // O_NOFOLLOW | O_
     target_os = "openbsd",
     target_os = "dragonfly",
 ))]
-fn open_regular_token_file(path: &Path) -> io::Result<std::fs::File> {
+fn open_regular_token_file(path: &Path) -> io::Result<(std::fs::File, std::fs::Metadata)> {
     use std::os::unix::fs::OpenOptionsExt;
 
     let file = std::fs::OpenOptions::new()
@@ -3200,13 +3202,14 @@ fn open_regular_token_file(path: &Path) -> io::Result<std::fs::File> {
                 e
             }
         })?;
-    if !file.metadata()?.is_file() {
+    let meta = file.metadata()?;
+    if !meta.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "token path is not a regular file",
         ));
     }
-    Ok(file)
+    Ok((file, meta))
 }
 
 #[cfg(not(any(
@@ -3227,7 +3230,7 @@ fn open_regular_token_file(path: &Path) -> io::Result<std::fs::File> {
     target_os = "openbsd",
     target_os = "dragonfly",
 )))]
-fn open_regular_token_file(path: &Path) -> io::Result<std::fs::File> {
+fn open_regular_token_file(path: &Path) -> io::Result<(std::fs::File, std::fs::Metadata)> {
     if !std::fs::symlink_metadata(path)?.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -3235,25 +3238,26 @@ fn open_regular_token_file(path: &Path) -> io::Result<std::fs::File> {
         ));
     }
     let file = std::fs::File::open(path)?;
-    if !file.metadata()?.is_file() {
+    let meta = file.metadata()?;
+    if !meta.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "token path changed away from a regular file",
         ));
     }
-    Ok(file)
+    Ok((file, meta))
 }
 
 /// Read a control capability token without following a final symlink or ever allocating beyond the token-file bound.
 pub fn read_control_token_file(path: &Path) -> io::Result<String> {
-    let file = open_regular_token_file(path)?;
-    if file.metadata()?.len() > MAX_CONTROL_TOKEN_FILE_BYTES {
+    let (file, meta) = open_regular_token_file(path)?;
+    if meta.len() > MAX_CONTROL_TOKEN_FILE_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "token file exceeds the 256-byte bound",
         ));
     }
-    let mut bytes = Vec::with_capacity(MAX_CONTROL_TOKEN_FILE_BYTES as usize);
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
     file.take(MAX_CONTROL_TOKEN_FILE_BYTES + 1)
         .read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_CONTROL_TOKEN_FILE_BYTES {
@@ -3292,8 +3296,7 @@ pub(crate) fn read_bounded_regular_utf8(
     path: &Path,
     max_bytes: u64,
 ) -> io::Result<(String, Option<std::time::SystemTime>)> {
-    let file = open_regular_token_file(path)?;
-    let meta = file.metadata()?;
+    let (file, meta) = open_regular_token_file(path)?;
     if meta.len() > max_bytes {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -3301,7 +3304,7 @@ pub(crate) fn read_bounded_regular_utf8(
         ));
     }
     let written = meta.modified().ok();
-    let cap = usize::try_from(max_bytes.min(64 * 1024)).unwrap_or(64 * 1024);
+    let cap = usize::try_from(meta.len().min(64 * 1024).saturating_add(1)).unwrap_or(64 * 1024 + 1);
     let mut bytes = Vec::with_capacity(cap);
     file.take(max_bytes.saturating_add(1))
         .read_to_end(&mut bytes)?;
@@ -5948,6 +5951,28 @@ fn not_asked_again_line(old: u32, pid: u32, request_parts: &[String]) -> String 
         redial::not_asked_again_note(request_parts),
         redial::EXIT_REPLACED
     )
+}
+
+/// Create a `.ubd`-quiet `.noindex` scratch directory for `aterm-ctl` unit tests, bounded on Unix
+/// under `/tmp` so socket paths inside `rv/` or `aterm-<u32>.sock` stay strictly below BSD `SUN_LEN`.
+#[cfg(test)]
+pub(crate) fn test_scratch_dir(tag: &str) -> aterm_tempfile::TempDir {
+    let mut end = tag.len().min(12);
+    while end > 0 && !tag.is_char_boundary(end) {
+        end -= 1;
+    }
+    let short = &tag[..end];
+    let builder = aterm_tempfile::Builder::new()
+        .prefix(&format!("at-ctl-{short}-"))
+        .suffix(".noindex");
+    #[cfg(unix)]
+    {
+        builder.tempdir_in("/tmp").expect("ctl scratch dir")
+    }
+    #[cfg(not(unix))]
+    {
+        builder.tempdir().expect("ctl scratch dir")
+    }
 }
 
 #[cfg(test)]

@@ -520,12 +520,16 @@ fn script_exec_target(p: &Path, len: u64) -> Hop {
     if file.read_exact(&mut magic).is_err() || magic != *b"#!" {
         return Hop::Binary;
     }
-    let mut text = String::from("#!");
-    if len > MAX_STORE_SHIM_BYTES
-        || file
-            .take(MAX_STORE_SHIM_BYTES)
-            .read_to_string(&mut text)
-            .is_err()
+    if len > MAX_STORE_SHIM_BYTES {
+        return Hop::Opaque;
+    }
+    let mut text =
+        String::with_capacity(usize::try_from(len.saturating_add(1)).unwrap_or(0).max(2));
+    text.push_str("#!");
+    if file
+        .take(MAX_STORE_SHIM_BYTES)
+        .read_to_string(&mut text)
+        .is_err()
     {
         return Hop::Opaque;
     }
@@ -1030,10 +1034,11 @@ fn unreached_store_note(bin: &str) -> String {
 #[cfg_attr(trust_verify, trust::skip)]
 fn is_pending_stub(cand: &Path) -> bool {
     use std::io::Read as _;
-    let Some((file, _)) = open_regular_nonblock(cand, true) else {
+    let Some((file, len)) = open_regular_nonblock(cand, true) else {
         return false;
     };
-    let mut head = Vec::new();
+    let cap = usize::try_from(len.min(PENDING_STUB_HEAD).saturating_add(1)).unwrap_or(0);
+    let mut head = Vec::with_capacity(cap);
     if file.take(PENDING_STUB_HEAD).read_to_end(&mut head).is_err() {
         return false;
     }
@@ -1567,6 +1572,50 @@ pub fn dead_actions_agree(
     Ok(interp_dead)
 }
 
+/// The actions that fire in no configuration with no mutant on.
+fn committed_dead(configs: &[Model]) -> Vec<&'static str> {
+    let Some(m) = configs.first() else {
+        return Vec::new();
+    };
+    let mut dead: BTreeSet<&'static str> = m.actions.iter().map(|a| a.name).collect();
+    for config in configs {
+        let fired = interp::fired_actions(&interp::with_buggy(config, 0));
+        dead.retain(|a| !fired.contains(a));
+    }
+    dead.into_iter().collect()
+}
+
+/// Each mutant of `configs`: every dial of the model under each configuration.
+fn mutants_of(configs: &[Model]) -> Vec<Model> {
+    let Some(m) = configs.first() else {
+        return Vec::new();
+    };
+    configs
+        .iter()
+        .flat_map(|config| {
+            m.mutant_dials()
+                .into_iter()
+                .map(|dial| interp::with_buggy(config, dial))
+        })
+        .collect()
+}
+
+/// The audit's answer where `dead` needs no mutant walked to give it.
+fn audit_needs_no_walk(m: &Model, dead: &[&'static str]) -> Option<Result<usize, String>> {
+    if dead.is_empty() {
+        return Some(Ok(0));
+    }
+    if !m.consts.iter().any(|(n, v)| *n == "Buggy" && *v == 0) {
+        let dead: BTreeSet<&str> = dead.iter().copied().collect();
+        return Some(Err(format!(
+            "{}: dead action(s) {dead:?} in a model with no committed `Buggy = 0` dial — there \
+             is no catch config under which they could be negative controls; REAL vacuity",
+            m.name
+        )));
+    }
+    None
+}
+
 /// Whether the actions of a model that never fire with no mutant on are negative controls rather than vacuity.
 pub fn audit_dead_negative_controls(configs: &[Model]) -> Result<usize, String> {
     let Some(m) = configs.first() else {
@@ -1579,64 +1628,50 @@ pub fn audit_dead_negative_controls(configs: &[Model]) -> Result<usize, String> 
             m.name
         ));
     }
-    let mut dead: BTreeSet<&'static str> = m.actions.iter().map(|a| a.name).collect();
-    for config in configs {
-        let fired = interp::fired_actions(&interp::with_buggy(config, 0));
-        dead.retain(|a| !fired.contains(a));
+    let dead = committed_dead(configs);
+    if let Some(answer) = audit_needs_no_walk(m, &dead) {
+        return answer;
     }
-    if dead.is_empty() {
-        return Ok(0);
-    }
-    if !m.consts.iter().any(|(n, v)| *n == "Buggy" && *v == 0) {
-        return Err(format!(
-            "{}: dead action(s) {dead:?} in a model with no committed `Buggy = 0` dial — there \
-             is no catch config under which they could be negative controls; REAL vacuity",
-            m.name
-        ));
-    }
-    let mutants: Vec<Model> = configs
-        .iter()
-        .flat_map(|config| {
-            m.mutant_dials()
-                .into_iter()
-                .map(|dial| interp::with_buggy(config, dial))
-        })
-        .collect();
-    let verdicts: Mutex<(BTreeSet<&'static str>, BTreeSet<&'static str>)> = Mutex::default();
-    let open = || -> Vec<&'static str> {
-        let held = verdicts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        dead.difference(&held.0).copied().collect()
-    };
-    crate::check::each(&mutants, |mutant| {
-        let open = open();
-        if open.is_empty() {
-            return;
-        }
-        let steps = interp::violation_steps(mutant, &open);
-        let mut held = verdicts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (stepped, fires_lawfully) = &mut *held;
-        for (d, verdict) in open.into_iter().zip(steps) {
-            match verdict {
-                Some(true) => stepped.insert(d),
-                Some(false) => fires_lawfully.insert(d),
-                None => false,
-            };
-        }
-    });
-    let (stepped, fires_lawfully) = verdicts
-        .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mutants = mutants_of(configs);
+    let steps = crate::check::each(&mutants, |mutant| interp::violation_steps(mutant, &dead));
+    audit_dead(m, &dead, &mutants, &steps)
+}
+
+/// [`audit_dead_negative_controls`] of the actions `dead` under `mutants`, given each mutant's
+/// [`interp::violation_steps`] of them.
+fn audit_dead(
+    m: &Model,
+    dead: &[&'static str],
+    mutants: &[Model],
+    steps: &[Vec<Option<bool>>],
+) -> Result<usize, String> {
+    let any_says = |k: usize, verdict: bool| steps.iter().any(|row| row[k] == Some(verdict));
     let fired_under: Vec<std::sync::OnceLock<BTreeSet<&'static str>>> =
         mutants.iter().map(|_| std::sync::OnceLock::new()).collect();
     let baseline_of: Vec<std::sync::OnceLock<Result<usize, (interp::State, &'static str)>>> =
         mutants.iter().map(|_| std::sync::OnceLock::new()).collect();
-    let unstepped: Vec<&'static str> = dead.difference(&stepped).copied().collect();
-    let isolations = crate::check::each(&unstepped, |&d| -> Result<(), String> {
-        if !fires_lawfully.contains(d)
+    let baseline = |at: usize| {
+        baseline_of[at].get_or_init(|| {
+            let mut baseline = mutants[at].clone();
+            baseline.actions.retain(|a| !dead.contains(&a.name));
+            interp::bmc(&baseline)
+        })
+    };
+    let alone = |at: usize, d: &'static str| {
+        let mut alone = mutants[at].clone();
+        alone
+            .actions
+            .retain(|a| !dead.contains(&a.name) || a.name == d);
+        alone
+    };
+    let unstepped: Vec<(usize, &'static str)> = dead
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|&(k, _)| !any_says(k, true))
+        .collect();
+    let isolations = crate::check::each(&unstepped, |&(k, d)| -> Result<(), String> {
+        if !any_says(k, false)
             && !mutants.iter().zip(&fired_under).any(|(mutant, fired)| {
                 fired
                     .get_or_init(|| interp::fired_actions(mutant))
@@ -1650,23 +1685,27 @@ pub fn audit_dead_negative_controls(configs: &[Model]) -> Result<usize, String> 
                 m.name
             ));
         }
+        // Only a mutant that fires `d` from a lawful state can isolate it. A walk of `alone` stops
+        // at its first violation, so it expands lawful states of the whole mutant alone: where `d`
+        // has no successor from any of those (a `None` verdict) it never fires, `alone` walks the
+        // baseline's space, and the baseline must hold to count at all. So these go first, and the
+        // walks below, which read every mutant, say what no isolation found means.
+        let isolated = (0..mutants.len()).any(|at| {
+            steps[at][k].is_some()
+                && baseline(at).is_ok()
+                && interp::bmc_fired(&alone(at, d)).0.is_err()
+        });
+        if isolated {
+            return Ok(());
+        }
         let (mut unsafe_baseline, mut any_safe, mut fires_alone) = (None, false, false);
-        let isolated = mutants.iter().zip(&baseline_of).any(|(mutant, baseline)| {
-            let baseline = baseline.get_or_init(|| {
-                let mut baseline = mutant.clone();
-                baseline.actions.retain(|a| !dead.contains(a.name));
-                interp::bmc(&baseline)
-            });
-            if let Err(broken) = baseline {
+        let isolated = (0..mutants.len()).any(|at| {
+            if let Err(broken) = baseline(at) {
                 unsafe_baseline.get_or_insert_with(|| broken.clone());
                 return false;
             }
             any_safe = true;
-            let mut alone = mutant.clone();
-            alone
-                .actions
-                .retain(|a| !dead.contains(a.name) || a.name == d);
-            let (verdict, fired) = interp::bmc_fired(&alone);
+            let (verdict, fired) = interp::bmc_fired(&alone(at, d));
             fires_alone |= fired.contains(d);
             verdict.is_err()
         });
@@ -2591,19 +2630,17 @@ pub fn sweep_faults(configs: &[Model]) -> Vec<String> {
             ));
         }
     }
-    let mutants: Vec<Model> = configs
-        .iter()
-        .flat_map(|config| {
-            m.mutant_dials()
-                .into_iter()
-                .map(|dial| interp::with_buggy(config, dial))
-        })
-        .collect();
-    let caught: BTreeSet<&'static str> =
-        crate::check::each(&mutants, interp::violated_within_budget)
+    let mutants = mutants_of(configs);
+    // One walk of each mutant answers both questions asked of it below: the laws it breaks and,
+    // where the audit will read them, whether each dead action is a violation step.
+    let dead = committed_dead(configs);
+    let audited = audit_needs_no_walk(m, &dead);
+    let watched: &[&'static str] = if audited.is_none() { &dead } else { &[] };
+    let (caught, steps): (Vec<_>, Vec<_>) =
+        crate::check::each(&mutants, |mutant| interp::mutant_report(mutant, watched))
             .into_iter()
-            .flatten()
-            .collect();
+            .unzip();
+    let caught: BTreeSet<&'static str> = caught.into_iter().flatten().collect();
     for inv in &m.invariants {
         match (inv.kind, caught.contains(inv.name)) {
             (InvariantKind::Claim, false) => faults.push(format!(
@@ -2619,7 +2656,7 @@ pub fn sweep_faults(configs: &[Model]) -> Vec<String> {
             _ => {}
         }
     }
-    if let Err(why) = audit_dead_negative_controls(configs) {
+    if let Err(why) = audited.unwrap_or_else(|| audit_dead(m, &dead, &mutants, &steps)) {
         faults.push(why);
     }
     faults

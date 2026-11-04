@@ -529,7 +529,20 @@ impl Files for RealFiles {
         if !std::fs::metadata(path).is_ok_and(|m| head_is_local(&m)) {
             return None;
         }
+        #[cfg(unix)]
+        let mut file = {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+                .open(path)
+                .ok()?
+        };
+        #[cfg(not(unix))]
         let mut file = std::fs::File::open(path).ok()?;
+        if !file.metadata().is_ok_and(|m| head_is_local(&m)) {
+            return None;
+        }
         let mut buf = [0u8; SHEBANG_MAX];
         let mut n = 0;
         while n < buf.len() {

@@ -2,6 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
+use crate::harness::accounts_overlay::model_provider;
 use std::cell::RefCell;
 
 #[test]
@@ -351,12 +352,7 @@ pub(crate) fn launch_transition(
             next.insert("phase", 1);
         }
         "Finish" => {
-            let cli = match state["provider"] {
-                1 => Cli::Codex,
-                2 => Cli::Grok,
-                3 => Cli::Kimi,
-                _ => unreachable!(),
-            };
+            let cli = model_provider(state["provider"]);
             let (returned, wrote) = run_case(cli, state["off"] == 1, state["case"]);
             next.insert("phase", 2);
             next.insert("returned", i64::from(returned));

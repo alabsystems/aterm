@@ -128,7 +128,6 @@ fn comps_of(path: &Path) -> Vec<String> {
     abs_components(&path.to_string_lossy()).expect("an absolute path")
 }
 
-#[cfg(unix)]
 fn real_dir(tree: &aterm_tempfile::TempDir) -> PathBuf {
     std::fs::canonicalize(tree.path()).expect("the test's temp dir resolves")
 }
@@ -242,7 +241,9 @@ fn a_look_left_out_refuses_the_next_at_once_until_it_ends() {
 
 /// The rm circuit breaker's whole proof through the live probe: with the disk answering, an rm
 /// inside a scratch root resolves where the disk leads it (the negative control); with the disk
-/// not answering, the same line escalates within the bound instead of hanging the loop.
+/// not answering, the same line escalates within the bound instead of hanging the loop. Unix
+/// only, where the breaker places a path (`abs_components`: a `/`-rooted one); off Unix
+/// `an_rm_off_unix_is_refused_before_the_disk_is_asked` holds that no rm is proved.
 #[cfg(unix)]
 #[test]
 fn an_rm_escalates_when_the_disk_does_not_answer_and_resolves_when_it_does() {
@@ -281,22 +282,41 @@ fn an_rm_escalates_when_the_disk_does_not_answer_and_resolves_when_it_does() {
     );
 }
 
+/// Off Unix the rm circuit breaker places no path (`abs_components` reads a `/`-rooted one
+/// alone, and a session stands on a drive): no scratch root is set up there, and an rm of a
+/// folder inside the test's own temp dir, quoted as drawn, is refused for the session's cwd
+/// before the disk is asked, so no look starts and nothing is proved.
 #[cfg(not(unix))]
 #[test]
-fn an_rm_on_a_non_unix_temp_root_has_no_unix_scratch_root() {
+fn an_rm_off_unix_is_refused_before_the_disk_is_asked() {
     let tree = aterm_tempfile::tempdir().expect("the test's temp dir");
+    let root = real_dir(&tree);
+    std::fs::create_dir(root.join("out")).expect("the rm's folder");
+    std::fs::create_dir(root.join("work")).expect("the session's folder");
     assert!(
-        ScratchRoot::dir(tree.path()).is_none(),
-        "ScratchRoot::dir proves only /-rooted Unix paths"
+        ScratchRoot::dir(&root).is_none(),
+        "off Unix no scratch root is placed: {}",
+        root.display()
     );
-    let refused = resolve_rm_line(
-        "rm -rf /tmp/out",
-        &RmScope {
-            cwd: tree.path(),
-            home: None,
-            roots: &[],
-            probe: &LiveProbe,
-        },
+    let line = format!("rm -rf '{}/out'", root.display());
+    let gate = LookGate::shut();
+    gate.open();
+    let held = Arc::clone(&gate);
+    let refused = on_own_thread(Some(gate), LOOK_BOUND, move || {
+        let cwd = root.join("work");
+        resolve_rm_line(
+            &line,
+            &RmScope {
+                cwd: &cwd,
+                home: Some(root.as_path()),
+                roots: &[],
+                probe: &LiveProbe,
+            },
+        )
+    });
+    assert_eq!(
+        refused,
+        Err("the session cwd is not an absolute path".to_string())
     );
-    assert!(refused.is_err(), "{refused:?}");
+    assert_eq!(held.looks(), 0, "no look started");
 }

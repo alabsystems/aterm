@@ -12,9 +12,10 @@ mod exclusions;
 mod generator;
 mod resizes;
 
+use astream_term::screen::Underline;
 use caps::Caps;
 use corpus::{CORPUS, Case};
-use engines::{Astream, Aterm, Snap};
+use engines::{Astream, Aterm, Paint, Snap};
 use exclusions::{EXCLUSIONS, Triage};
 use std::fmt::Write as _;
 
@@ -209,7 +210,11 @@ fn the_written_answers_see_text_cursor_rendition_and_buffer() {
             cursor.cursor.1 - 1
         };
         let mut ink = good.clone();
-        ink.cells[0].ink.underline = !ink.cells[0].ink.underline;
+        ink.cells[0].ink.underline = if ink.cells[0].ink.underline == Underline::None {
+            Underline::Single
+        } else {
+            Underline::None
+        };
         let mut buffer = good.clone();
         buffer.alt_screen = !buffer.alt_screen;
         let mut wrap = good.clone();
@@ -395,6 +400,60 @@ fn the_comparison_sees_text_cursor_colour_and_visibility() {
         a.snap().first_difference(&wide).is_none(),
         "and the two agree on a wide glyph"
     );
+}
+
+/// The comparison sees the underline's style and colour, each one apart (a negative control for
+/// `engines.rs`'s decoding of aterm's underline bits and extras): the engines agree on every
+/// style and on a palette and a 24-bit colour, every one differs from the others and from the
+/// plain screen, and an aterm answer mutated to a neighbouring style or colour is reported as a
+/// divergence at its cell.
+#[test]
+fn the_comparison_sees_the_underline_style_and_colour() {
+    let both = |sgr: &str| {
+        let bytes = format!("\x1b[{sgr}mab");
+        let mut a = Astream::new(6, 2);
+        a.feed(bytes.as_bytes());
+        let mut t = Aterm::new(6, 2);
+        t.feed(bytes.as_bytes());
+        (a.snap(), t.snap())
+    };
+    let mut seen = vec![both("0").1];
+    for (sgr, style, ul) in [
+        ("4", Underline::Single, Paint::Default),
+        ("21", Underline::Double, Paint::Default),
+        ("4:3", Underline::Curly, Paint::Default),
+        ("4:4", Underline::Dotted, Paint::Default),
+        ("4:5", Underline::Dashed, Paint::Default),
+        ("58;5;9", Underline::None, Paint::Indexed(9)),
+        ("4:3;58:2::1:2:3", Underline::Curly, Paint::Rgb(1, 2, 3)),
+    ] {
+        let (a, t) = both(sgr);
+        assert_eq!(a.first_difference(&t), None, "the engines agree on {sgr}");
+        assert_eq!(
+            (t.cells[0].ink.underline, t.cells[0].ink.ul),
+            (style, ul),
+            "{sgr}"
+        );
+        assert!(
+            seen.iter()
+                .all(|other| other.first_difference(&t).is_some()),
+            "{sgr} reads as another program"
+        );
+        seen.push(t);
+    }
+    // aterm drawing curly where the fold says dotted, and a neighbouring palette colour.
+    let (a, mut t) = both("4:4;58;5;9");
+    t.cells[1].ink.underline = Underline::Curly;
+    let what = a
+        .first_difference(&t)
+        .expect("a curly underline for a dotted one is reported");
+    assert!(what.starts_with("cell (0,1):"), "{what}");
+    let (a, mut t) = both("4:4;58;5;9");
+    t.cells[0].ink.ul = Paint::Indexed(10);
+    let what = a
+        .first_difference(&t)
+        .expect("another underline colour is reported");
+    assert!(what.starts_with("cell (0,0):"), "{what}");
 }
 
 /// The fold measures every code point as aterm's write path does: the columns a lone glyph

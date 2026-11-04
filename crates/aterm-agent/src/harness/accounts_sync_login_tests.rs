@@ -6,7 +6,7 @@
 //! record as signed out and to be signed in, an account no row lists gets a row of its own, and
 //! local discovery reads transcripts of any size, line by line, adding what it finds to a fleet
 //! discovery made and never to one a vault, a sheet or a URL wrote. Every fixture email is
-//! `example.test`.
+//! synthetic.
 
 use std::sync::{Arc, Mutex};
 
@@ -338,8 +338,9 @@ fn a_default_login_moved_onto_a_signed_out_row_makes_that_rows_login_now() {
         "{:?}",
         binding.sign_in_attempt
     );
+    let raw = Roster::load(&desk.roster()).unwrap();
     assert!(
-        accounts::failing_sign_ins(&moved, &state, &logins, NOW + 60).is_empty(),
+        accounts::failing_sign_ins(&moved, &raw, &state, &logins, NOW + 60).is_empty(),
         "no row shows a failed sign-in"
     );
     let next = auto_renew_candidates(&moved, &state, &logins, NOW + 60);
@@ -1466,4 +1467,63 @@ fn a_roster_with_no_source_is_not_synced_for_a_moved_default_login() {
         &rediscovery,
     ));
     assert_eq!(fs::read_to_string(desk.roster()).unwrap(), hand);
+}
+
+/// A RENAMED ROW FOLLOWS THE DEFAULT LOGIN: discovery still lists the account under its old label,
+/// and the row a person renamed is that account, so the login moves to it. So does the row that was
+/// on the default login, which leaves it for a directory of its own. No sync is refused, and no two
+/// rows are on that login.
+#[test]
+fn a_renamed_row_follows_the_default_login() {
+    for rename_default in [false, true] {
+        let desk = Desk::new("m27");
+        desk.default_login("main@example.com");
+        let dir = |name: &str| {
+            let dir = desk.store().logins_dir().join(name);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(".credentials.json"), "opaque fixture").unwrap();
+            dir.to_str().unwrap().to_owned()
+        };
+        let mut rows = vec![
+            Row {
+                label: "main".into(),
+                email: Some("main@example.com".into()),
+                ..Row::default()
+            },
+            Row {
+                label: "zeta".into(),
+                dir: Some(dir("zeta")),
+                email: Some("zeta@example.com".into()),
+                ..Row::default()
+            },
+        ];
+        let save = |rows: &[Row]| {
+            fs::write(
+                desk.roster(),
+                format_roster_toml(&Roster {
+                    rows: rows.to_vec(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        };
+        save(&rows);
+        sync_accounts_for_init(&desk.home, &desk.state, &desk.roster(), NOW).expect("discovered");
+        let renamed = if rename_default { "owner" } else { "renamed" };
+        rows[usize::from(!rename_default)].label = renamed.into();
+        save(&rows);
+        sync_accounts_for_init(&desk.home, &desk.state, &desk.roster(), NOW).expect("renamed");
+        desk.default_login("zeta@example.com");
+        sync_accounts_for_init(&desk.home, &desk.state, &desk.roster(), NOW).expect("followed");
+        let raw = Roster::load(&desk.roster()).unwrap();
+        let on_login: Vec<&str> = raw
+            .rows
+            .iter()
+            .filter(|row| row.dir.is_none())
+            .map(|row| row.label.as_str())
+            .collect();
+        let zeta = if rename_default { "zeta" } else { "renamed" };
+        assert_eq!(on_login, [zeta], "{raw:?}");
+        assert!(raw.row(renamed).is_some(), "{raw:?}");
+    }
 }

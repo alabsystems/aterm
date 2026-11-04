@@ -3,8 +3,6 @@
 
 //! The SAME-BOX TREND LEDGER and the machine identity it is keyed by.
 
-use std::process::Command;
-
 use super::LaneRun;
 use super::floors::golden_dir;
 
@@ -78,7 +76,7 @@ fn slug(s: &str) -> String {
 
 fn platform_uuid() -> Option<String> {
     if cfg!(target_os = "macos") {
-        let out = Command::new(aterm_uds::os_path!("ioreg"))
+        let out = aterm_uds::spawnfd::command(aterm_uds::os_path!("ioreg"))
             .args(["-rd1", "-c", "IOPlatformExpertDevice"])
             .output()
             .ok()?;
@@ -92,7 +90,7 @@ fn platform_uuid() -> Option<String> {
         return Some(rest[..close].to_string());
     }
     if cfg!(target_os = "windows") {
-        let out = Command::new("reg")
+        let out = aterm_uds::spawnfd::command("reg")
             .args([
                 "query",
                 r"HKLM\SOFTWARE\Microsoft\Cryptography",
@@ -126,7 +124,7 @@ fn platform_fingerprint() -> Option<String> {
 }
 
 fn hostname() -> String {
-    Command::new(aterm_uds::os_path!("hostname"))
+    aterm_uds::spawnfd::command(aterm_uds::os_path!("hostname"))
         .output()
         .ok()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
@@ -136,7 +134,7 @@ fn hostname() -> String {
 
 fn machine_shape() -> String {
     let chip = if cfg!(target_os = "macos") {
-        Command::new(aterm_uds::os_path!("sysctl"))
+        aterm_uds::spawnfd::command(aterm_uds::os_path!("sysctl"))
             .args(["-n", "machdep.cpu.brand_string"])
             .output()
             .ok()
@@ -676,11 +674,45 @@ pub(crate) fn gate_trend(
     recorded: &[&str],
     tree: &str,
 ) -> LaneRun {
-    let path = trend_path();
-    let me = machine_id();
-    let aliases = crate::read_regular_text(boxes_path()).unwrap_or_default();
-    let ledger = crate::read_regular_text(&path).unwrap_or_default();
-    let judgment = judge_trend(&ledger, &aliases, &me, samples);
+    gate_trend_at(
+        &trend_path(),
+        &boxes_path(),
+        &machine_id(),
+        samples,
+        lanes_ok,
+        recorded,
+        tree,
+    )
+}
+
+fn gate_trend_at(
+    path: &std::path::Path,
+    aliases_path: &std::path::Path,
+    me: &MachineId,
+    samples: &[TrendSample],
+    lanes_ok: bool,
+    recorded: &[&str],
+    tree: &str,
+) -> LaneRun {
+    let aliases = match read_trend_input(aliases_path) {
+        Ok(text) => text,
+        Err(error) => {
+            return LaneRun::fail(format!(
+                "cannot read trend aliases {}: {error}",
+                aliases_path.display()
+            ));
+        }
+    };
+    let ledger = match read_trend_input(path) {
+        Ok(text) => text,
+        Err(error) => {
+            return LaneRun::fail(format!(
+                "cannot read trend ledger {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    let judgment = judge_trend(&ledger, &aliases, me, samples);
     let append = may_append(lanes_ok, &judgment, recorded);
     let TrendJudgment {
         breaches,
@@ -695,7 +727,7 @@ pub(crate) fn gate_trend(
         eprintln!(
             "  trend: NOTE — this machine is not named in {}; its rows are keyed `{bx}`.\n         \
              Add:  {bx}\t{}\t<what this box is>",
-            boxes_path().display(),
+            aliases_path.display(),
             me.identities.first().map_or("host:?", String::as_str)
         );
     }
@@ -706,12 +738,12 @@ pub(crate) fn gate_trend(
                 "  trend: NOTE — ledger rows keyed `{token}` are claimed by no row of {} and \
                  were measured on the chip of box `{claimed}`: a renamed machine looks like \
                  this. Claim `{token}` for `{claimed}` there, or note why it is another machine.",
-                boxes_path().display()
+                aliases_path.display()
             ),
             None => eprintln!(
                 "  trend: NOTE — ledger rows keyed `{token}` are claimed by no row of {}; \
                  they anchor nothing until some box declares them.",
-                boxes_path().display()
+                aliases_path.display()
             ),
         }
     }
@@ -723,7 +755,7 @@ pub(crate) fn gate_trend(
              box; those rows were DROPPED from the reference window rather than compared \
              against. Fix the claim — do not widen it.",
             chip_of(&me.shape),
-            boxes_path().display()
+            aliases_path.display()
         );
     }
 
@@ -760,7 +792,7 @@ pub(crate) fn gate_trend(
             "  trend: SKIP — no metric had comparable same-box history on {bx}; nothing was \
              judged (seed run, not a pass). If this machine measured before \
              under another name, claim that name for `{bx}` in {}.",
-            boxes_path().display()
+            aliases_path.display()
         );
         run = LaneRun::not_judged("seed run, no comparable same-box history");
     } else if trend_ok {
@@ -813,15 +845,21 @@ pub(crate) fn gate_trend(
         } else {
             ledger
         };
-        text.push_str(&trend_rows(
-            &utc_date(),
-            &measured_tree(tree, &head_sha()),
-            &me,
-            samples,
-            recorded,
-        ));
-        if let Err(e) = std::fs::write(&path, &text) {
-            eprintln!("  trend: could not append ledger {}: {e}", path.display());
+        append_trend_rows(
+            &mut text,
+            &trend_rows(
+                &utc_date(),
+                &measured_tree(tree, &head_sha()),
+                me,
+                samples,
+                recorded,
+            ),
+        );
+        if let Err(e) = std::fs::write(path, &text) {
+            run.add_failure(format!(
+                "could not append trend ledger {}: {e}",
+                path.display()
+            ));
         } else {
             eprintln!(
                 "  trend: appended {} row(s) -> {}",
@@ -833,6 +871,20 @@ pub(crate) fn gate_trend(
         eprintln!("  trend: not appended — only a healthy run joins the ledger.");
     }
     run
+}
+
+fn read_trend_input(path: &std::path::Path) -> std::io::Result<String> {
+    match crate::read_regular_text(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        result => result,
+    }
+}
+
+fn append_trend_rows(text: &mut String, rows: &str) {
+    if !rows.is_empty() && !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(rows);
 }
 
 #[cfg(test)]
@@ -854,6 +906,100 @@ mod tests {
 
     fn rows_for(date: &str, sha: &str, key: &str, samples: &[TrendSample]) -> String {
         trend_rows(date, sha, &box_id(key), samples, &[])
+    }
+
+    #[test]
+    fn failed_trend_publication_is_a_failing_lane() {
+        let world = aterm_tempfile::tempdir().unwrap();
+        let aliases = world.path().join("boxes.tsv");
+        let me = box_id("m21");
+        let samples = [sample("throughput", "median_mbps", 1000.0)];
+        let writable = world.path().join("trend.tsv");
+        let seeded = gate_trend_at(&writable, &aliases, &me, &samples, true, &[], "test-tree");
+        assert!(matches!(seeded.status, super::super::Status::NotJudged(_)));
+        assert_eq!(
+            trend_ledger_rows(&std::fs::read_to_string(&writable).unwrap()).len(),
+            1
+        );
+        let unavailable = world.path().join("missing-parent").join("trend.tsv");
+        let failed = gate_trend_at(
+            &unavailable,
+            &aliases,
+            &me,
+            &samples,
+            true,
+            &[],
+            "test-tree",
+        );
+        assert!(!unavailable.exists());
+        assert!(matches!(failed.status, super::super::Status::Fail(_)));
+        assert_eq!(super::super::verdict(&[("trend", &failed, 0.0)]).1, 1);
+    }
+
+    #[test]
+    fn unavailable_trend_inputs_do_not_replace_existing_history() {
+        let world = aterm_tempfile::tempdir().unwrap();
+        let path = world.path().join("trend.tsv");
+        let aliases = world.path().join("boxes.tsv");
+        let me = box_id("m21");
+        let samples = [sample("throughput", "median_mbps", 1000.0)];
+        // The real gate can seed an absent ledger and then retain its valid history.
+        gate_trend_at(&path, &aliases, &me, &samples, true, &[], "test-tree");
+        let first = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(trend_ledger_rows(&first).len(), 1);
+        gate_trend_at(&path, &aliases, &me, &samples, true, &[], "test-tree");
+        let second = std::fs::read_to_string(&path).unwrap();
+        assert!(second.starts_with(&first));
+        assert_eq!(trend_ledger_rows(&second).len(), 2);
+        let corrupt = [0xff, 0xfe];
+        std::fs::write(&path, corrupt).unwrap();
+        let run = gate_trend_at(&path, &aliases, &me, &samples, true, &[], "test-tree");
+        assert_eq!(std::fs::read(&path).unwrap(), corrupt);
+        assert!(matches!(run.status, super::super::Status::Fail(_)));
+        std::fs::write(&path, &second).unwrap();
+        std::fs::write(&aliases, corrupt).unwrap();
+        let run = gate_trend_at(&path, &aliases, &me, &samples, true, &[], "test-tree");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), second);
+        assert!(matches!(run.status, super::super::Status::Fail(_)));
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(&aliases).unwrap();
+            let target = world.path().join("history.tsv");
+            std::fs::rename(&path, &target).unwrap();
+            std::os::unix::fs::symlink(&target, &path).unwrap();
+            let run = gate_trend_at(&path, &aliases, &me, &samples, true, &[], "test-tree");
+            let appended = std::fs::read_to_string(&target).unwrap();
+            assert!(appended.starts_with(&second));
+            assert_eq!(trend_ledger_rows(&appended).len(), 3);
+            assert!(matches!(run.status, super::super::Status::Pass));
+            std::fs::write(&target, corrupt).unwrap();
+            let run = gate_trend_at(&path, &aliases, &me, &samples, true, &[], "test-tree");
+            assert_eq!(std::fs::read(&target).unwrap(), corrupt);
+            assert!(matches!(run.status, super::super::Status::Fail(_)));
+        }
+    }
+
+    #[test]
+    fn appending_preserves_an_unterminated_final_ledger_row() {
+        let samples = [sample("throughput", "median_mbps", 1000.0)];
+        let first = rows_for("2026-11-03", "before", "m21", &samples);
+        let next = rows_for("2026-11-04", "after", "m21", &samples);
+        let mut empty = String::new();
+        append_trend_rows(&mut empty, &next);
+        assert_eq!(empty, next);
+        for initial in [first.clone(), first.trim_end_matches('\n').to_string()] {
+            let mut ledger = initial;
+            assert_eq!(trend_ledger_rows(&ledger).len(), 1);
+            append_trend_rows(&mut ledger, &next);
+            let (rows, dropped) = trend_ledger_rows_counted(&ledger);
+            assert!(dropped.is_empty());
+            assert_eq!(rows.len(), 2);
+            assert!(rows.iter().all(|row| row.shape == "Test-Chip-8c"));
+            let judgment = judged(&ledger, "m21", &samples);
+            assert!(judgment.conflicts.is_empty());
+            assert!(judgment.breaches.is_empty());
+            assert!(judgment.skipped.is_empty());
+        }
     }
 
     fn sample(lane: &'static str, metric: &str, value: f64) -> TrendSample {

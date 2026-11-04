@@ -61,3 +61,32 @@ pub(crate) fn test_document_store() -> amacs::store::DocumentStore {
     let authority = unsafe { aterm_cap::Authority::root_authority() };
     amacs::store::DocumentStore::new(authority.grant(aterm_cap::Tier::Trusted))
 }
+
+/// Creates a `.noindex` scratch directory for tests with a short UTF-8-safe prefix.
+#[cfg(test)]
+pub(crate) fn test_scratch_dir(tag: &str) -> aterm_tempfile::TempDir {
+    let end = tag.floor_char_boundary(24);
+    let prefix = format!("amacs-files-{}-", &tag[..end]);
+    aterm_tempfile::Builder::new()
+        .prefix(&prefix)
+        .suffix(".noindex")
+        .tempdir()
+        .expect("create .noindex scratch dir")
+}
+
+#[cfg(test)]
+mod tests {
+    /// NEGATIVE CONTROL: multi-byte UTF-8 tags straddling byte 24 must truncate at a valid char
+    /// boundary without panicking and preserve the `.noindex` Spotlight-exclusion suffix.
+    #[test]
+    fn test_scratch_dir_truncates_utf8_tags_and_preserves_noindex_suffix() {
+        let dir = crate::test_scratch_dir("aaaaaaaaaaaaaaaaaaaaaaaé-extra-tail");
+        let name = dir
+            .path()
+            .file_name()
+            .and_then(|os| os.to_str())
+            .expect("scratch dir name is UTF-8");
+        assert!(name.starts_with("amacs-files-aaaaaaaaaaaaaaaaaaaaaaa-"));
+        assert!(name.ends_with(".noindex"));
+    }
+}

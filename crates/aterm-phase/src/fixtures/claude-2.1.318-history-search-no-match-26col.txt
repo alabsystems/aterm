@@ -1,0 +1,51 @@
+# claude-code 2.1.318 · MEASURED 2026-11-04, `aterm ctl text` of a private headless aterm (26x50, aterm 0.154.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · Claude Code's prompt-history search (ctrl+r) open at a turn end in a 26-column window, query zzq, matching nothing, over an empty composer; the search's label wraps in its own column beside the query, within its words: `no matc`, then `hing`, then `prompt:`, each at the label's indent · cursor=21,13
+           Claude Code
+           v2.1.318
+ ▐▛███▛█   Opus 5.5
+▝▜██████▀  API Usage
+ ▝▝   ▝▝   Billing
+           /…/tmp/at.lab0/
+           proj
+
+
+❯ please read the readme
+
+⏺ Hi! I am the local lab
+  stub, not a model.
+  (reply 1)
+
+✻ Cooked for 0s · done
+  9:49 AM
+
+──────────────────────────
+❯
+──────────────────────────
+  no matc zz… ⏵⏵ auto
+  hing
+  prompt:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

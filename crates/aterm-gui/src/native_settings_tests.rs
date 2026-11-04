@@ -3242,12 +3242,15 @@ fn owner_confirms_with_mints_a_yes_only_from_the_alert() {
     };
     assert_eq!(ask(unshown), OwnerAnswer::NotAsked);
     assert!(
-        !quiet.lock().unwrap().quiet_now(),
+        !quiet.lock().unwrap().is_quiet_now_for_test(),
         "nobody asked is no decline"
     );
     assert_eq!(ask(yes), OwnerAnswer::yes_for_test(), "the alert's yes");
     assert_eq!(ask(no), OwnerAnswer::No);
-    assert!(quiet.lock().unwrap().quiet_now(), "a no quiets the block");
+    assert!(
+        quiet.lock().unwrap().is_quiet_now_for_test(),
+        "a no quiets the block"
+    );
     assert_eq!(ASKED.load(Ordering::Acquire), 3);
     assert_eq!(ask(yes), OwnerAnswer::Quiet, "quieted: not asked");
     assert_eq!(ASKED.load(Ordering::Acquire), 3, "no alert while quiet");
@@ -3262,69 +3265,6 @@ fn owner_confirms_with_mints_a_yes_only_from_the_alert() {
         OwnerAnswer::Quiet
     );
     assert_eq!(ASKED.load(Ordering::Acquire), 3);
-}
-
-#[test]
-fn a_debugger_alert_answered_on_the_page_settles_the_step() {
-    use aterm_containment::consent::{DebuggerMember, DebuggerMode, SelfHardening};
-    fn yes(_title: &str, _body: &str, _proceed: &str) -> Option<bool> {
-        Some(true)
-    }
-    fn no(_title: &str, _body: &str, _proceed: &str) -> Option<bool> {
-        Some(false)
-    }
-    fn unshown(_title: &str, _body: &str, _proceed: &str) -> Option<bool> {
-        None
-    }
-    let press = |action, mode, confirm: fn(&str, &str, &str) -> Option<bool>, quiet: bool| {
-        let shared = SharedOwnerQuiet::default();
-        if quiet {
-            shared.lock().unwrap().note_decline();
-        }
-        let (mut runtime, instance, view) = setup();
-        {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
-                unreachable!();
-            };
-            state.navigate(SettingsRoute::Security);
-            state.replace_macos_access(debugger_access(debugger_facts(
-                mode,
-                DebuggerMember::Admin,
-                SelfHardening::Hardened,
-            )));
-            state.arm_consent_gestures(ConsentGestures {
-                confirm: ConfirmArm::StandIn(confirm),
-                ..ConsentGestures::inert()
-            });
-            state.arm_owner_quiet(std::sync::Arc::clone(&shared));
-        }
-        press_debugger(&mut runtime, instance, view, action);
-        shared.lock().unwrap().debugger_answered()
-    };
-    let (on, off) = (DebuggerMode::Disabled, DebuggerMode::Enabled);
-    assert!(press(MACOS_ACCESS_DEBUGGER_ON, on, yes, false), "a yes");
-    assert!(press(MACOS_ACCESS_DEBUGGER_ON, on, no, false), "a no");
-    assert!(
-        press(MACOS_ACCESS_DEBUGGER_OFF, off, yes, false),
-        "a yes to off"
-    );
-    assert!(
-        press(MACOS_ACCESS_DEBUGGER_OFF, off, no, false),
-        "a no to off"
-    );
-    assert!(
-        !press(MACOS_ACCESS_DEBUGGER_ON, on, unshown, false),
-        "nobody saw it"
-    );
-    assert!(!press(MACOS_ACCESS_DEBUGGER_ON, on, yes, true), "quieted");
-    assert!(
-        !press(MACOS_ACCESS_DEBUGGER_ON, off, yes, false),
-        "a press the row refuses"
-    );
-    let shared = SharedOwnerQuiet::default();
-    shared.lock().unwrap().note_debugger_answered();
-    shared.lock().unwrap().settle_confirmed();
-    assert!(shared.lock().unwrap().debugger_answered(), "never settled");
 }
 
 #[test]

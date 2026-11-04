@@ -210,17 +210,18 @@ pub fn case_collision_message(other: &Path, id: &str) -> String {
 /// The reason, as text, when the file is missing, not regular, unreadable or over the bound.
 pub fn read_bounded(path: &Path) -> Result<Vec<u8>, String> {
     let too_large = |bytes: usize| ImportError::TooLarge { bytes }.to_string();
-    let file = crate::fs_restricted::open_regular_nonblock(path).map_err(|e| e.to_string())?;
-    let open_meta = file.metadata().map_err(|e| e.to_string())?;
-    if !open_meta.is_file() {
-        return Err("not a regular file".to_string());
-    }
+    let (file, open_meta) =
+        crate::fs_restricted::open_regular_nonblock_with_meta(path).map_err(|e| e.to_string())?;
     if open_meta.len() > MAX_IMPORT_BYTES as u64 {
         return Err(too_large(
             usize::try_from(open_meta.len()).unwrap_or(usize::MAX),
         ));
     }
-    let mut bytes = Vec::new();
+    let cap = usize::try_from(open_meta.len())
+        .unwrap_or(0)
+        .min(MAX_IMPORT_BYTES)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(cap);
     file.take(MAX_IMPORT_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|e| e.to_string())?;

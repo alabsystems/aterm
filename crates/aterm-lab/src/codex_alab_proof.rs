@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `codex-alab-proof`: the codex-alab native harness, end to end (its contract, `alab/CONTRACT.md` §9.3, and Autopilot Cruise / Land, the owner's its §5 ports), against the REAL package in a private headless aterm sandboxed to one loopback port where the lab answers as the model ([`crate::codex_rig`], [`crate::codex_alab_model`]): no key, no account, no byte off the machine, nothing of the owner's touched. `--upgrade-package` selects another package for the handoff; `--upgrade-only` runs only that lane.
+//! `codex-alab-proof`: the codex-alab native harness, end to end (its contract, `alab/CONTRACT.md` §9.3, and Autopilot Cruise / Land, the owner's its §5 ports), against the REAL package in a private headless aterm sandboxed to one loopback port where the lab answers as the model ([`crate::codex_rig`], [`crate::codex_alab_model`]): no key, no account, no byte off the machine, nothing of the owner's touched. `--upgrade-package` selects another package for the handoff; `--upgrade-only` runs only that lane; `--terminals-only` runs only the background terminals leg (survey `bg=` from codex-alab's own record, `codex_alab_terminals_proof.rs`).
 
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -9,6 +9,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aterm_agent::harness::acts::RULE_UPGRADE;
+use aterm_agent::harness::codex_shown;
+use aterm_agent::harness::codex_steps::Gate;
 use aterm_agent::supervise::policy::turn_end::{RULE_LAND_CHECK, RULE_LEFT, says_done};
 use aterm_uds::spawnfd::Stdio;
 
@@ -19,8 +21,12 @@ use crate::codex_alab_model::{
 };
 use crate::codex_rig;
 
+#[path = "codex_boxes.rs"]
+mod boxes;
 #[path = "codex_alab_policy_proof.rs"]
 mod policy_proof;
+#[path = "codex_alab_terminals_proof.rs"]
+mod terminals_proof;
 #[path = "codex_alab_upgrade_proof.rs"]
 mod upgrade_proof;
 #[path = "codex_alab_window_proof.rs"]
@@ -31,6 +37,7 @@ use crate::pyjson::J;
 use crate::screen::{composer_row, field};
 use crate::stop::{self, Stopped};
 use crate::{Fail, LAB, Res};
+pub use boxes::cmd_codex_boxes;
 
 const LANDED: &str = "landed@v1";
 
@@ -130,19 +137,24 @@ enum Folder {
 
 const NOTES: &str = "notes.txt";
 
-/// How a leg [`legs`] and `autopilot-captures` both open starts: its prompt, its folder and the
-/// Autopilot its tab is set to before codex starts (`None`: the default, Cruise).
+/// How a leg [`legs`] and `autopilot-captures` both open starts: its prompt, its folder, the
+/// Autopilot its tab is set to before codex starts (`None`: the default, Cruise) and the sandbox
+/// its codex runs commands under, whoever opens it ([`Proof::open_leg`]).
 #[derive(Clone, Copy)]
 struct Opening {
     prompt: &'static str,
     folder: Folder,
     autopilot: Option<&'static str>,
+    sandbox: CodexSandbox,
 }
 
 /// The legs whose scenes `autopilot-captures` shows ([`Proof::open_leg`]): `land` (landing, then
 /// its nudges), `reland` (a clean defense: landed), `off` (Autopilot Off on its first turn),
 /// `needs` (a `NEEDS YOU:` need) and `continue` (Cruise). The model answers each by its name
-/// ([`model::answerer`]).
+/// ([`model::answerer`]). `continue` runs under the jail alone: its continuation's failing command
+/// must really exit 3, and codex's own sandbox cannot apply inside the instance's jail, where its
+/// 71 says `Operation not permitted`, which codex's denial check reads as a denial and asks to
+/// escalate ([`CodexSandbox`]). The others run no command, or escalate each.
 const OPENINGS: [(&str, Opening); 5] = [
     (
         "land",
@@ -150,6 +162,7 @@ const OPENINGS: [(&str, Opening); 5] = [
             prompt: "Land the work.",
             folder: Folder::Plain,
             autopilot: Some("land"),
+            sandbox: CodexSandbox::WorkspaceWrite,
         },
     ),
     (
@@ -158,6 +171,7 @@ const OPENINGS: [(&str, Opening); 5] = [
             prompt: "Land the work.",
             folder: Folder::Plain,
             autopilot: Some("land"),
+            sandbox: CodexSandbox::WorkspaceWrite,
         },
     ),
     (
@@ -166,6 +180,7 @@ const OPENINGS: [(&str, Opening); 5] = [
             prompt: "Write a plan, then stop.",
             folder: Folder::Scratch,
             autopilot: None,
+            sandbox: CodexSandbox::WorkspaceWrite,
         },
     ),
     (
@@ -174,6 +189,7 @@ const OPENINGS: [(&str, Opening); 5] = [
             prompt: "Build the release.",
             folder: Folder::Scratch,
             autopilot: None,
+            sandbox: CodexSandbox::WorkspaceWrite,
         },
     ),
     (
@@ -182,6 +198,7 @@ const OPENINGS: [(&str, Opening); 5] = [
             prompt: "Write a plan, then stop.",
             folder: Folder::Scratch,
             autopilot: None,
+            sandbox: CodexSandbox::Jail,
         },
     ),
 ];
@@ -350,6 +367,69 @@ fn rollout_holds(measured: bool, said: &TapSaid, turns: &[String]) -> bool {
             .any(|l| from_rollout(l) && l.contains(" conf=exact "));
         said.word == "partial" && opened && theirs && reached && !exact
     }
+}
+
+/// What the aterm under test reads of the gated rollout reads for `build` (gaps 20, 25), as a run
+/// expecting `expect` ([`Proof::expect`]) has it: none on a run expecting `partial`; on one
+/// expecting `bound`, what `steps` (the checkout's step testdata) shows of it now, since
+/// codex-measure's run 2 runs an aterm rebuilt after the reductions were written, which this lab
+/// binary predates; with no expectation, the lab's compiled `CODEX_SHOWN`, since aterm was built
+/// from the same tree.
+fn gated_for(expect: Option<bool>, build: Option<&str>, steps: &Path) -> Gate {
+    match expect {
+        Some(false) => Gate::NONE,
+        Some(true) => build.map_or(Gate::NONE, |b| {
+            Gate::from_words(&codex_shown::shown_in(steps, b))
+        }),
+        None => Gate::of(build),
+    }
+}
+
+/// The continue leg's `log kinds=turn` lines hold what `gate` reads: with the exit read, a turn
+/// closes ` errs=1 ` (the continuation's failed command); with the harness read, a turn is
+/// amended ` turn_by=harness ` and, with both, that same turn is the one closing ` errs=1 `;
+/// without a read, no line carries its key (` errs=`, ` turn_by=`). `cause=` is reported, never
+/// required: the act that typed the turn comes on its own amend once the pair settles (a later
+/// rollout read, the pair wake, or the run's end), which can be after the proof reads the log.
+/// # Errors
+/// What the lines lack, or hold that the gate does not read.
+fn gated_holds(gate: Gate, turns: &[String]) -> Result<(), String> {
+    let node_of = |l: &String, op: &str| {
+        let mut t = l.split(' ');
+        (t.nth(1) == Some(op)).then(|| t.next().unwrap_or("").to_string())
+    };
+    let failed: Vec<String> = turns
+        .iter()
+        .filter(|l| l.contains(" errs=1 "))
+        .filter_map(|l| node_of(l, "close"))
+        .collect();
+    let harnessed: Vec<String> = turns
+        .iter()
+        .filter(|l| l.contains(" turn_by=harness "))
+        .filter_map(|l| node_of(l, "amend"))
+        .collect();
+    if gate.exit {
+        if failed.is_empty() {
+            return Err("no turn closes errs=1".to_string());
+        }
+    } else if turns.iter().any(|l| l.contains(" errs=")) {
+        return Err("a turn counts errs= on a build whose exit read is off".to_string());
+    }
+    if gate.autopilot {
+        if harnessed.is_empty() {
+            return Err("no turn is amended turn_by=harness".to_string());
+        }
+    } else if turns.iter().any(|l| l.contains(" turn_by=")) {
+        return Err("a turn names turn_by= on a build whose harness read is off".to_string());
+    }
+    if gate.exit && gate.autopilot && !harnessed.iter().any(|n| failed.contains(n)) {
+        return Err(format!(
+            "the harness turn ({}) is not the one closing errs=1 ({})",
+            harnessed.join(","),
+            failed.join(",")
+        ));
+    }
+    Ok(())
 }
 
 /// Land's contradiction among a leg's request tags ([`model::contradiction_tag`]):
@@ -678,7 +758,7 @@ fn continued_quiet(rows: &[J], reply: Option<ReplyWrite>, now_ms: i64) -> Result
             tags.push(str_of(row, "tag"));
         }
     }
-    if tags != ["continue:person", "continue:continue"] {
+    if tags != ["continue:person", "continue:fail", "continue:continue"] {
         return Err(format!("the model asked: {}", tags.join(" ")));
     }
     Ok(())
@@ -885,6 +965,9 @@ pub(crate) struct Proof {
     took: Option<Duration>,
     /// The bus the Autopilot Off step's mail rides.
     fabric: Fabric,
+    /// The sandbox each leg's codex runs its commands under, from the next leg on, but for an
+    /// [`OPENINGS`] leg, which runs under its own ([`Proof::open_leg`]).
+    sandbox: CodexSandbox,
     /// The scratch world (kept), said when the rig is dropped.
     _world: World,
     /// [`PROOF_LOCK`], released when the rig drops.
@@ -1117,12 +1200,16 @@ impl Proof {
         self.start_leg(name, Some(prompt), extra, folder, autopilot)
     }
 
-    /// The leg `name` of [`OPENINGS`], opened as it says.
+    /// The leg `name` of [`OPENINGS`], opened as it says, its sandbox for this leg alone: the
+    /// legs opened after it run under the proof's own again.
     fn open_leg(&mut self, name: &'static str) -> Result<Leg, Fail> {
-        let Some((_, o)) = OPENINGS.iter().find(|(n, _)| *n == name) else {
+        let Some(&(_, o)) = OPENINGS.iter().find(|(n, _)| *n == name) else {
             return Err(Fail::die(format!("codex-alab-proof: no leg named {name}")));
         };
-        self.spawn_leg(name, o.prompt, "", o.folder, o.autopilot)
+        let proofs = std::mem::replace(&mut self.sandbox, o.sandbox);
+        let leg = self.spawn_leg(name, o.prompt, "", o.folder, o.autopilot);
+        self.sandbox = proofs;
+        leg
     }
 
     /// `autopilot-captures`' codex-alab rig: the proof's own ([`start`]) on `aterm` (else the
@@ -1279,7 +1366,7 @@ impl Proof {
             self.lay_folder(&dir, &proj, folder)?;
             std::fs::write(
                 home.join("config.toml"),
-                codex_config(self.port, &proj, &home, extra),
+                codex_config(self.port, &proj, &home, self.sandbox, extra),
             )
             .map_err(io)?;
             Ok((proj, auth_path))
@@ -1361,7 +1448,7 @@ impl Proof {
             self.lay_folder(&dir, &proj, Folder::Plain)?;
             std::fs::write(
                 home.join("config.toml"),
-                codex_config(self.port, &proj, &home, ""),
+                codex_config(self.port, &proj, &home, self.sandbox, ""),
             )
             .map_err(io)?;
             Ok(proj)
@@ -1727,6 +1814,7 @@ impl Proof {
                 r.get("u_full")
                     .and_then(J::as_str)
                     .is_some_and(|u| u.contains(KEEP_GOING))
+                    && str_of(r, "tool_output") == "null"
             })
             .count();
         self.check(
@@ -1734,6 +1822,19 @@ impl Proof {
                 "continue: the continuation sent aterm's Cruise words (`keep going`) once (x{keep})"
             ),
             replied && keep == 1,
+        );
+        let ran = self
+            .requests("continue")
+            .iter()
+            .any(|r| str_of(r, "tag") == "continue:continue" && str_of(r, "tool_output") != "null");
+        let acts = self.read_acts(&leg.sid);
+        self.check(
+            &format!(
+                "continue: the continuation's command ran in the jail and asked nothing (its output reached the model; no approve-all@v1; acts: {})",
+                acts.as_ref()
+                    .map_or_else(|why| format!("unread: {why}"), |a| a.join(" "))
+            ),
+            ran && acts.is_ok_and(|a| !a.iter().any(|x| x == "approve-all@v1")),
         );
         let reply = self.await_reply(leg, "continue", Duration::from_secs(60))?;
         if let Some(reply) = reply {
@@ -1767,7 +1868,7 @@ impl Proof {
             "approval: the approved command ran (ran.txt) and its output went back to the model",
             ran.contains("approved-run") && ran_back,
         );
-        Ok(())
+        self.claimed_boxes_hold(leg, None)
     }
 
     /// A box nobody answers is a need: the approval leg's box under Autopilot Off, where
@@ -1866,7 +1967,7 @@ impl Proof {
             ),
             boxed && sent.code == 0 && cleared,
         );
-        Ok(())
+        self.claimed_boxes_hold(leg, Some(1))
     }
 
     fn question_leg(&mut self, leg: &Leg) -> Result<(), Stopped> {
@@ -1895,7 +1996,7 @@ impl Proof {
             ),
             land_answer && asked && acts.is_ok_and(|acts| !acts.iter().any(|a| a == "answer@v1")),
         );
-        Ok(())
+        self.claimed_boxes_hold(leg, None)
     }
 
     fn rollout_build(leg: &Leg) -> Option<String> {
@@ -1914,6 +2015,11 @@ impl Proof {
         for leg in legs {
             let build = Self::rollout_build(leg);
             let measured = expects_bound(self.expect, build.as_deref(), CODEX_MEASURED_BUILDS);
+            let gate = gated_for(
+                self.expect,
+                build.as_deref(),
+                &crate::paths::paths().repo.join(crate::measure::STEPS),
+            );
             let turns = || -> Result<Vec<String>, String> {
                 let asked = format!("@{} log kinds=turn", leg.sid);
                 let r = reading(&asked, self.on(&leg.sid, &["log", "kinds=turn"]))?;
@@ -1965,6 +2071,20 @@ impl Proof {
                                 println!("    {line}");
                             }
                             self.check(&fence, rollout_holds(measured, &to, &got));
+                            if name == "continue" {
+                                let verdict = gated_holds(gate, &got);
+                                self.check(
+                                    &format!(
+                                        "continue: the continuation reads as its build's gated reads say (exit={}, harness={}): {}",
+                                        gate.exit,
+                                        gate.autopilot,
+                                        verdict.as_ref().map_or_else(Clone::clone, |()| {
+                                            "held".to_string()
+                                        })
+                                    ),
+                                    verdict.is_ok(),
+                                );
+                            }
                         }
                         Err(why) => {
                             self.check(&format!("{fence}: its log unread ({why})"), false);
@@ -3561,7 +3681,29 @@ fn journal_path(home: &Path) -> PathBuf {
     home.join(JOURNAL_DIR).join("codex-tui.log")
 }
 
-fn codex_config(port: u16, proj: &Path, home: &Path, extra: &str) -> String {
+/// The sandbox a leg's codex runs its commands under (`sandbox_mode`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CodexSandbox {
+    /// codex's own `workspace-write`. Inside the instance's jail ([`codex_rig::jail_policy`]) its
+    /// `sandbox-exec` cannot apply (macOS refuses a sandbox inside a sandbox), so every command
+    /// it runs sandboxed exits 71 at once with `sandbox_apply: Operation not permitted`; only an
+    /// escalated command runs. The legs that run no command, or escalate each, keep it.
+    WorkspaceWrite,
+    /// `danger-full-access`: the jail alone fences the commands (no network but the fake
+    /// model's port, the owner's homes denied), for a leg whose commands must really run.
+    Jail,
+}
+
+impl CodexSandbox {
+    const fn mode(self) -> &'static str {
+        match self {
+            Self::WorkspaceWrite => "workspace-write",
+            Self::Jail => "danger-full-access",
+        }
+    }
+}
+
+fn codex_config(port: u16, proj: &Path, home: &Path, sandbox: CodexSandbox, extra: &str) -> String {
     let p = proj.to_string_lossy();
     let mut trusted = vec![p.to_string()];
     if let Some(short) = p.strip_prefix("/private") {
@@ -3574,7 +3716,7 @@ fn codex_config(port: u16, proj: &Path, home: &Path, extra: &str) -> String {
     format!(
         "# aterm-lab codex-alab-proof: codex talks only to the lab's model on 127.0.0.1:{port}\n\
          model_provider = \"lab\"\nmodel = \"gpt-5.5\"\napproval_policy = \"on-request\"\n\
-         sandbox_mode = \"workspace-write\"\ncheck_for_update_on_startup = false\n\
+         sandbox_mode = \"{sandbox}\"\ncheck_for_update_on_startup = false\n\
          cli_auth_credentials_store = \"file\"\nmcp_oauth_credentials_store = \"file\"\n\
          log_dir = \"{log}\"\n\n\
          [analytics]\nenabled = false\n\n[feedback]\nenabled = false\n\n\
@@ -3584,6 +3726,7 @@ fn codex_config(port: u16, proj: &Path, home: &Path, extra: &str) -> String {
          stream_max_retries = 0\nstream_idle_timeout_ms = 300000\n\n{projects}\n{extra}",
         log = home.join(JOURNAL_DIR).display(),
         key = crate::stub::LAB_CODEX_KEY,
+        sandbox = sandbox.mode(),
     )
 }
 
@@ -3639,7 +3782,8 @@ pub(crate) fn proof_lock(path: &Path, limit: Duration) -> Result<crate::aos_lear
     })
 }
 
-/// `codex-alab-proof [--package DIR] [--upgrade-package DIR] [--aterm PATH] [--keep] [--expect-rollout bound|partial] [--policy-only|--upgrade-only|--raw-upgrade-only|--window-only]`.
+/// `codex-alab-proof [--package DIR] [--upgrade-package DIR] [--aterm PATH] [--keep] [--expect-rollout bound|partial] [--policy-only|--terminals-only|--upgrade-only|--raw-upgrade-only|--window-only]`
+/// (`--terminals-only`: the background terminals leg alone, about 1 min).
 /// # Errors
 /// Usage, a run that could not start, or an interrupt.
 pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
@@ -3647,6 +3791,7 @@ pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
     let mut a = args.to_vec();
     let keep = instance::take_flag(&mut a, "--keep");
     let policy_only = instance::take_flag(&mut a, "--policy-only");
+    let terminals_only = instance::take_flag(&mut a, "--terminals-only");
     let upgrade_only = instance::take_flag(&mut a, "--upgrade-only");
     let raw_upgrade_only = instance::take_flag(&mut a, "--raw-upgrade-only");
     let window_only = instance::take_flag(&mut a, "--window-only");
@@ -3659,12 +3804,25 @@ pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
             "codex-alab-proof: --policy-only cannot be combined with upgrade options",
         ));
     }
+    if terminals_only
+        && (policy_only || upgrade_only || raw_upgrade_only || upgrade_given.is_some())
+    {
+        return Err(Fail::usage(
+            "codex-alab-proof: --terminals-only cannot be combined with --policy-only or upgrade options",
+        ));
+    }
     if upgrade_only && raw_upgrade_only {
         return Err(Fail::usage(
             "codex-alab-proof: choose one upgrade-only mode",
         ));
     }
-    if window_only && (policy_only || upgrade_only || raw_upgrade_only || upgrade_given.is_some()) {
+    if window_only
+        && (policy_only
+            || terminals_only
+            || upgrade_only
+            || raw_upgrade_only
+            || upgrade_given.is_some())
+    {
         return Err(Fail::usage(
             "codex-alab-proof: --window-only cannot be combined with another lane or upgrade options",
         ));
@@ -3725,6 +3883,8 @@ pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
         upgrade_proof::legs(&mut proof, &pkg_a, &pkg_b)
     } else if policy_only {
         policy_proof::legs(&mut proof, &pkg_a)
+    } else if terminals_only {
+        terminals_proof::legs(&mut proof, &pkg_a)
     } else if window_only {
         window_proof::legs(&mut proof, &pkg_a)
     } else {
@@ -3939,6 +4099,7 @@ fn start(
         fences: Vec::new(),
         took: None,
         fabric,
+        sandbox: CodexSandbox::WorkspaceWrite,
         _world: world,
         _lock: lock,
     })
@@ -4407,30 +4568,40 @@ try sh -c 'echo x > "$1/new-$2"' _ "$W" "$TAG"
         };
         let asked = vec![
             row(1, 0, "continue:person"),
-            row(2, 120_000, "continue:continue"),
+            row(2, 120_000, "continue:fail"),
+            row(3, 125_000, "continue:continue"),
         ];
-        let sent = response(2, 190_000, 200);
+        let sent = response(3, 190_000, 200);
         let initial = with_replies(asked.clone(), std::slice::from_ref(&sent));
         let seen = observe_reply(&initial, "continue:continue", 200_000);
         assert!(seen.is_some());
         let until = 205_000;
         let mut later = initial.clone();
-        later.push(row(3, 370_000, "continue:defend+repo"));
+        later.push(row(4, 370_000, "continue:defend+repo"));
         assert_eq!(continued_quiet(&later, seen, 500_000), Ok(()));
         assert_eq!(continued_quiet(&initial, seen, until), Ok(()));
         for extra_at in [191_000, until] {
             let mut spin = initial.clone();
-            spin.push(row(3, extra_at, "continue:defend+repo"));
+            spin.push(row(4, extra_at, "continue:defend+repo"));
             assert!(continued_quiet(&spin, seen, 500_000).is_err(), "{extra_at}");
         }
         assert!(continued_quiet(&initial, seen, until - 1).is_err());
         assert!(continued_quiet(&initial[..1], seen, 500_000).is_err());
+        let unfailed: Vec<J> = initial
+            .iter()
+            .filter(|r| str_of(r, "tag") != "continue:fail")
+            .cloned()
+            .collect();
+        assert!(
+            continued_quiet(&unfailed, seen, 500_000).is_err(),
+            "the continuation's failing command is part of its quiet turn"
+        );
         assert_eq!(observe_reply(&initial, "continue:continue", 189_999), None);
         for replies in [
             vec![],
-            vec![response(3, 190_000, 200)],
-            vec![response(2, 190_000, 429)],
-            vec![response(2, 119_999, 200)],
+            vec![response(4, 190_000, 200)],
+            vec![response(3, 190_000, 429)],
+            vec![response(3, 124_999, 200)],
             vec![sent.clone(), sent],
         ] {
             let rows = with_replies(asked.clone(), &replies);
@@ -4439,15 +4610,124 @@ try sh -c 'echo x > "$1/new-$2"' _ "$W" "$TAG"
             assert!(continued_quiet(&rows, seen, i64::MAX).is_err());
         }
         let mut retried = asked;
-        retried.push(row(3, 195_000, "continue:continue"));
-        let rows = with_replies(retried, &[response(3, 196_000, 200)]);
+        retried.push(row(4, 195_000, "continue:continue"));
+        let rows = with_replies(retried, &[response(4, 196_000, 200)]);
         assert_eq!(observe_reply(&rows, "continue:continue", 500_000), None);
         let duplicate = vec![
-            row(2, 120_000, "continue:continue"),
-            row(2, 120_000, "continue:continue"),
+            row(3, 125_000, "continue:continue"),
+            row(3, 125_000, "continue:continue"),
         ];
-        let rows = with_replies(duplicate, &[response(2, 190_000, 200)]);
+        let rows = with_replies(duplicate, &[response(3, 190_000, 200)]);
         assert_eq!(observe_reply(&rows, "continue:continue", 500_000), None);
+    }
+
+    /// P1'S CHECK (gaps 20, 25): the continue leg's turn lines hold what the build's gate reads,
+    /// and nothing it does not; `cause=` is never needed.
+    #[test]
+    fn the_gated_reads_hold_as_the_build_reads_them() {
+        let l = |s: &str| s.to_string();
+        let open1 = l("4 open t1 turn by=- src=transcript conf=exact t=1");
+        let open2 = l("7 open t2 turn by=- src=transcript conf=exact t=2");
+        let amend2 = l("8 amend t2 turn turn_by=harness by=vendor src=transcript conf=exact t=2");
+        let amend1 = l("5 amend t1 turn turn_by=harness by=vendor src=transcript conf=exact t=1");
+        let close1 = l("6 close t1 turn out=done steps=1 src=transcript conf=exact t=1");
+        let failed2 = l("9 close t2 turn out=done steps=2 errs=1 src=transcript conf=exact t=3");
+        let both = [
+            open1.clone(),
+            close1.clone(),
+            open2.clone(),
+            amend2.clone(),
+            failed2.clone(),
+        ];
+        assert_eq!(gated_holds(Gate::ALL, &both), Ok(()));
+        let apart = [
+            open1.clone(),
+            amend1,
+            close1.clone(),
+            open2.clone(),
+            failed2.clone(),
+        ];
+        assert!(
+            gated_holds(Gate::ALL, &apart).is_err(),
+            "two different turns"
+        );
+        let exit = Gate {
+            exit: true,
+            autopilot: false,
+        };
+        let failed = [
+            open1.clone(),
+            close1.clone(),
+            open2.clone(),
+            failed2.clone(),
+        ];
+        assert_eq!(gated_holds(exit, &failed), Ok(()));
+        assert!(
+            gated_holds(exit, &both).is_err(),
+            "a turn_by= line its gate does not read"
+        );
+        assert!(
+            gated_holds(exit, &[open1.clone(), close1.clone()]).is_err(),
+            "no errs=1"
+        );
+        assert!(gated_holds(Gate::ALL, &failed).is_err(), "no harness amend");
+        let quiet = [
+            open1.clone(),
+            close1,
+            open2,
+            l("9 close t2 turn out=done steps=2 t=3"),
+        ];
+        assert_eq!(gated_holds(Gate::NONE, &quiet), Ok(()));
+        for line in [failed2, amend2] {
+            let mut said = quiet.to_vec();
+            said.push(line.clone());
+            assert!(gated_holds(Gate::NONE, &said).is_err(), "{line}");
+        }
+        assert!(
+            both.iter().chain(&failed).all(|l| !l.contains(" cause=")),
+            "no case names a cause"
+        );
+    }
+
+    /// P1'S GATE: a run expecting `partial` reads none; one expecting `bound` reads what the
+    /// checkout's step testdata shows now (not the lab's compiled table, which predates a new
+    /// measurement); one with no expectation reads the compiled `CODEX_SHOWN`.
+    #[test]
+    fn the_proof_reads_a_bound_builds_gate_from_the_checkout() {
+        use aterm_agent::harness::codex_steps::CODEX_MEASURED_BUILDS;
+        let measured = CODEX_MEASURED_BUILDS
+            .last()
+            .copied()
+            .expect("a measured build");
+        let scratch = aterm_tempfile::tempdir().expect("a scratch steps dir");
+        let fresh = "0.999.0-dev.1+gabc";
+        std::fs::write(
+            scratch.path().join("codex-alab-0.999.0-dev.1-continue.jsonl"),
+            format!(
+                "# codex {fresh} · lab reduce\n{}\n",
+                r#"{"type":"event_msg","payload":{"type":"task_started","turn_attribution":{"turn_trigger":"alab_autopilot"}}}"#
+            ),
+        )
+        .expect("the planted reduction");
+        for build in [Some(fresh), Some(measured), None] {
+            assert_eq!(gated_for(Some(false), build, scratch.path()), Gate::NONE);
+            assert_eq!(gated_for(None, build, scratch.path()), Gate::of(build));
+        }
+        assert_eq!(
+            gated_for(Some(true), Some(fresh), scratch.path()),
+            Gate {
+                exit: false,
+                autopilot: true
+            },
+            "the checkout's new reduction, which no compiled table holds"
+        );
+        assert_eq!(Gate::of(Some(fresh)), Gate::NONE);
+        assert_eq!(
+            gated_for(Some(true), Some(measured), scratch.path()),
+            Gate::NONE,
+            "a build the scratch steps dir holds nothing of"
+        );
+        assert_eq!(gated_for(Some(true), None, scratch.path()), Gate::NONE);
     }
 
     #[test]
@@ -4513,7 +4793,13 @@ try sh -c 'echo x > "$1/new-$2"' _ "$W" "$TAG"
     #[test]
     fn a_legs_journal_is_the_file_its_config_logs_to_and_no_start_removes_it() {
         let home = Path::new("/s/legs/exchange/codex-home");
-        let config = codex_config(1234, Path::new("/s/legs/exchange/proj"), home, "");
+        let config = codex_config(
+            1234,
+            Path::new("/s/legs/exchange/proj"),
+            home,
+            CodexSandbox::WorkspaceWrite,
+            "",
+        );
         let dir = config
             .lines()
             .find_map(|l| l.strip_prefix("log_dir = "))
@@ -4525,6 +4811,21 @@ try sh -c 'echo x > "$1/new-$2"' _ "$W" "$TAG"
         let removed = home.join("log").join("codex-tui.log");
         assert_ne!(journal_path(home), removed);
         assert_eq!(home.join("log").join("codex-tui.log"), removed);
+    }
+
+    /// A LEG'S CODEX RUNS UNDER THE SANDBOX ITS LANE CHOSE: workspace-write, codex's own, unless
+    /// the lane takes the jail's fence alone (danger-full-access), and exactly one mode either way.
+    #[test]
+    fn a_legs_config_names_the_sandbox_its_lane_chose() {
+        let modes = |sandbox| {
+            codex_config(1234, Path::new("/p"), Path::new("/h"), sandbox, "")
+                .lines()
+                .filter_map(|l| l.strip_prefix("sandbox_mode = "))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(modes(CodexSandbox::WorkspaceWrite), ["\"workspace-write\""]);
+        assert_eq!(modes(CodexSandbox::Jail), ["\"danger-full-access\""]);
     }
 
     #[test]

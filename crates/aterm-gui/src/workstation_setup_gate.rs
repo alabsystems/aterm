@@ -3,22 +3,13 @@
 
 //! The window's own admission, in a leaf module of its own (`workstation_setup::permission_gate`):
 //! the gate ([`PermissionGate`]) that reads who touched System State and which plan revision the
-//! window's own Apply admitted, and the token it alone mints ([`AdmittedAccess`]).
+//! window's own Apply admitted.
 //!
-//! The compiler holds the token to its door. `AdmittedAccess` is a braced struct whose fields are
-//! private to this module, one of them of a private type (`AdmissionSeal`) that is neither
-//! `Clone`, `Copy` nor `Default`, and the gate's fields are private too. A private field is
-//! visible only in its module and that module's children, and this module has none, so nothing
-//! outside this file (`workstation_setup` included) can build or copy an admission in safe Rust,
-//! or set the gate's record of the window's own admission but through its transitions.
-//!
-//! The aterm-census guard `devtools-door` holds this file to that shape: no `mod`, no macro
-//! defined here and none invoked but by an extern-prelude path (`::std::matches!`), no alias, glob
-//! import, `unsafe`, trait impl for the token, or attribute that could expand into code, and an
-//! `AdmissionSeal` value only inside `PermissionGate::admitted` and the test mint. Outside this
-//! file no line may name `AdmissionSeal` (a macro body that did would expand here with this
-//! file's privacy), and the census flags the unsafe reads that could forge an admission, which
-//! no type can stop.
+//! The gate's fields are private to this module, and this module has no children, so nothing
+//! outside this file (`workstation_setup` included) can set the gate's record of the window's own
+//! admission but through its transitions, which are `pub(super)`: callable from
+//! `workstation_setup` alone. The aterm-census guard `devtools-door` holds those transitions to
+//! their one App caller each there.
 
 use super::{AdmittedBy, PagePress};
 
@@ -28,57 +19,8 @@ enum PermissionHold {
     None,
     Decision,
     FreshStatus,
-    /// Stop withdraws automatic work locally. Only a later person's own
-    /// row press may still use an otherwise known admitted policy.
-    Stopped {
-        person: bool,
-    },
-}
-
-/// The standing yes (design §6): proof that this window itself admitted a setup plan with its
-/// Permissions group, and of which revision. Only [`PermissionGate::admitted`] makes one, for the
-/// window's own admission (its automatic answer to the startup offer, or a person's press on the
-/// page) or for a person's press on a row's own button. A control client's `act` or `key`, a
-/// status poll and a hand-edited plan record never make one: only the window's own Apply sets the
-/// gate's record of its admission ([`PermissionGate::observe`] after
-/// [`PermissionGate::accepted`]).
-///
-/// `crate::native_settings::OwnerYes::from_admitted` spends one as the yes a debugger-access
-/// change needs.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct AdmittedAccess {
-    revision: u64,
-    by: AdmittedBy,
-    _seal: AdmissionSeal,
-}
-
-/// What makes an [`AdmittedAccess`] one admission: private to this file, and neither `Clone`,
-/// `Copy` nor `Default`.
-#[derive(Debug, PartialEq, Eq)]
-struct AdmissionSeal;
-
-impl AdmittedAccess {
-    /// The setup plan revision the admission is of: the access record's key
-    /// (`aterm_types::macos_setup::access_record`).
-    pub(crate) const fn revision(&self) -> u64 {
-        self.revision
-    }
-
-    /// Who the admission came from.
-    pub(crate) const fn by(&self) -> AdmittedBy {
-        self.by
-    }
-
-    /// A token minted outside the gate (test-only).
-    #[cfg(test)]
-    #[cfg(unix)]
-    pub(crate) const fn for_test(revision: u64) -> Self {
-        Self {
-            revision,
-            by: AdmittedBy::Window,
-            _seal: AdmissionSeal,
-        }
-    }
+    /// Stop withdraws automatic work locally.
+    Stopped,
 }
 
 /// What the window saw of who touched System State since its previous action
@@ -135,9 +77,9 @@ impl PermissionGate {
 
     pub(super) fn hold(&mut self) {
         // An unanswered offer or refused intent cannot withdraw the earlier
-        // Stop. The new decision also keeps a person's row override held.
-        self.hold = if ::std::matches!(self.hold, PermissionHold::Stopped { .. }) {
-            PermissionHold::Stopped { person: false }
+        // Stop.
+        self.hold = if ::std::matches!(self.hold, PermissionHold::Stopped) {
+            PermissionHold::Stopped
         } else {
             PermissionHold::Decision
         };
@@ -148,11 +90,7 @@ impl PermissionGate {
     }
 
     pub(super) fn stop(&mut self) {
-        let person = ::std::matches!(
-            self.hold,
-            PermissionHold::None | PermissionHold::Stopped { person: true }
-        ) && self.policy.is_some_and(|policy| policy.allowed);
-        self.hold = PermissionHold::Stopped { person };
+        self.hold = PermissionHold::Stopped;
         self.own = None;
         self.accepted_by = None;
     }
@@ -174,14 +112,14 @@ impl PermissionGate {
     /// A person's press on the page's offer asked for macOS's grants: the status read after its
     /// record releases them with this press as the window's own admission. A Stop stays a Stop.
     pub(super) fn person_asked(&mut self) {
-        if !::std::matches!(self.hold, PermissionHold::Stopped { .. }) {
+        if !::std::matches!(self.hold, PermissionHold::Stopped) {
             self.accepted_by = Some(AdmittedBy::Person);
             self.hold = PermissionHold::FreshStatus;
         }
     }
 
     pub(super) fn await_fresh_status(&mut self) {
-        if !::std::matches!(self.hold, PermissionHold::Stopped { .. }) {
+        if !::std::matches!(self.hold, PermissionHold::Stopped) {
             self.hold = PermissionHold::FreshStatus;
         }
     }
@@ -276,35 +214,5 @@ impl PermissionGate {
     /// Whether this revision has an explicit person's permission choice.
     pub(super) fn person_admission_stands(&self) -> bool {
         self.own_admission_stands() && self.own.is_some_and(|(by, _)| by == AdmittedBy::Person)
-    }
-
-    /// The explicit permission choice, or a person's press on that permission's own
-    /// button while its plan stands. Automatic admission never creates this capability.
-    pub(super) fn admitted(&self, person_press: bool) -> Option<AdmittedAccess> {
-        let stopped_press = person_press
-            && ::std::matches!(self.hold, PermissionHold::Stopped { person: true })
-            && self.policy.is_some_and(|policy| policy.allowed);
-        if !self.allowed() && !stopped_press {
-            return None;
-        }
-        let policy = self.policy?;
-        if person_press {
-            return Some(AdmittedAccess {
-                revision: policy.revision,
-                by: AdmittedBy::Person,
-                _seal: AdmissionSeal,
-            });
-        }
-        let (by, revision) = self.own?;
-        // An automatic setup decision cannot authorize an OS permission prompt.
-        // Keep that capability tied to an explicit person's choice.
-        if by != AdmittedBy::Person {
-            return None;
-        }
-        (revision == policy.revision).then_some(AdmittedAccess {
-            revision,
-            by,
-            _seal: AdmissionSeal,
-        })
     }
 }

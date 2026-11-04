@@ -146,7 +146,7 @@ fn read_claim_record(path: &Path) -> Option<String> {
             return None;
         }
     }
-    let mut text = String::new();
+    let mut text = String::with_capacity(18);
     file.take(17).read_to_string(&mut text).ok()?;
     (text.len() <= 16).then_some(text)
 }

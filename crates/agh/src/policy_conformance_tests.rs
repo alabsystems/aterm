@@ -164,10 +164,7 @@ struct World {
 /// The canonical agh.toml with the grant, and with `relread` the release profile at the head of
 /// the release owner's read chain, read back by `config::load` (origin `File`).
 fn world(dev: bool, rel: bool, relread: bool) -> World {
-    let root = aterm_tempfile::Builder::new()
-        .prefix("agh-wall-")
-        .tempdir()
-        .expect("a scratch root");
+    let root = crate::test_fixtures::scratch_dir("wall");
     let base = root.path();
     let mut text = crate::test_fixtures::canonical_text(base);
     if relread {
@@ -214,10 +211,7 @@ fn world(dev: bool, rel: bool, relread: bool) -> World {
 /// `relread` names, so it builds the same world either way.
 fn vault_world(dev: bool, rel: bool, relread: bool) -> World {
     let _ = relread;
-    let root = aterm_tempfile::Builder::new()
-        .prefix("agh-wall-vault-")
-        .tempdir()
-        .expect("a scratch root");
+    let root = crate::test_fixtures::scratch_dir("wall-vault");
     let dirs = Dirs::under(root.path());
     std::fs::create_dir_all(&dirs.home).expect("the home");
     aterm_uds::private_file::create_private_dir(&dirs.home.join(".secrets"))

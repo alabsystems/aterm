@@ -65,6 +65,7 @@ impl Broker {
     fn without_token() -> Broker {
         let dir = aterm_tempfile::Builder::new()
             .prefix("agh-n")
+            .suffix(".noindex")
             .tempdir_in("/tmp")
             .expect("a scratch directory under /tmp");
         let sock = dir.path().join("aterm-4242.sock");
@@ -77,9 +78,10 @@ impl Broker {
         }
     }
 
-    /// The notifier of `SID` on this socket.
+    /// The notifier of `SID` on this socket, each phase bounded by the hang detector: this
+    /// broker answers, so a serve thread a loaded machine runs late is no timeout.
     fn notifier(&self) -> SessionNotifier {
-        SessionNotifier::at_socket(&self.sock, SID)
+        SessionNotifier::at_socket(&self.sock, SID).with_bound_for_tests(HANG)
     }
 
     /// Accept one connection on a thread: record each line, answer nothing to the first
@@ -264,6 +266,7 @@ fn a_bad_token_is_failed() {
 fn no_socket_is_failed() {
     let dir = aterm_tempfile::Builder::new()
         .prefix("agh-n")
+        .suffix(".noindex")
         .tempdir_in("/tmp")
         .expect("a scratch directory under /tmp");
     let sock = dir.path().join("aterm-4242.sock");
@@ -394,6 +397,7 @@ fn no_session_and_mux_are_skipped() {
     // `no-socket` and never reaches a running aterm's.
     let dir = aterm_tempfile::Builder::new()
         .prefix("agh-n")
+        .suffix(".noindex")
         .tempdir_in("/tmp")
         .expect("a scratch directory under /tmp");
     let dead = dir.path().join("aterm-4242.sock");
@@ -422,7 +426,9 @@ fn a_tab_shaped_env_posts() {
     for env in envs {
         let broker = Broker::new();
         let handle = broker.serve(vec![line(CONNECTED), line("OK 18")], false);
-        let notifier = SessionNotifier::from_env(&env).with_socket_for_tests(&broker.sock);
+        let notifier = SessionNotifier::from_env(&env)
+            .with_socket_for_tests(&broker.sock)
+            .with_bound_for_tests(HANG);
         assert_eq!(
             post(&notifier, &notice()),
             Posted::Sent("18".into()),
@@ -972,6 +978,7 @@ fn a_failed_post_keeps_exit_zero() {
     let cli = Cli::new("notify-cli-failed");
     let dir = aterm_tempfile::Builder::new()
         .prefix("agh-n")
+        .suffix(".noindex")
         .tempdir_in("/tmp")
         .expect("a scratch directory under /tmp");
     let sock = dir.path().join("aterm-4242.sock");

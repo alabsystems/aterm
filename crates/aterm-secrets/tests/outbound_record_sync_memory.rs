@@ -586,6 +586,8 @@ impl Fixture {
 
 #[test]
 fn ciphertext_sync_has_bounded_gross_allocations_for_none_whole_and_large_past() {
+    // Every server it reads is its own on loopback, which answers.
+    let _answering = client::ServersAnswering::within(HANG);
     let mut measured = Vec::new();
     {
         let full = Fixture::new(false);

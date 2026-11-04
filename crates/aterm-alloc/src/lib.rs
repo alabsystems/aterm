@@ -12,6 +12,7 @@ extern crate alloc;
 extern crate std;
 
 mod array_vec;
+pub mod heap;
 mod small_vec;
 
 pub use array_vec::{

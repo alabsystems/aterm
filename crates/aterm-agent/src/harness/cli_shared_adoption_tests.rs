@@ -374,11 +374,13 @@ fn run_with_provider(
     )
 }
 
+#[cfg(unix)]
 struct FirstResult {
     calls: AtomicUsize,
     unknown: bool,
     suspend: Option<Arc<Approval>>,
 }
+#[cfg(unix)]
 impl shared_provider::Provider for FirstResult {
     fn execute(
         &self,
@@ -881,9 +883,15 @@ fn revoked_wrong_identity_and_disabled_adoptions_never_publish_a_row() {
     assert_eq!(host.calls.load(Ordering::SeqCst), 0);
 }
 
+/// Unix only, where aterm links the headless opener a first adoption needs before it records an
+/// attempt to recover (`opener_link`); off Unix it is refused before it consumes anything, as
+/// `automatic_shared_adoption_refuses_where_aterm_links_no_opener` holds.
+#[cfg(unix)]
 #[path = "cli_shared_adoption_recovery_tests.rs"]
 mod recovery;
 
+/// Unix only, for [`recovery`]'s reason: each case starts from a recorded first attempt.
+#[cfg(unix)]
 #[path = "cli_shared_adoption_staging_tests.rs"]
 mod staging;
 

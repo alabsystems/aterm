@@ -13,7 +13,11 @@
 //! of that, a producer whose records must land in strict send order has to keep at most
 //! **one** write in flight per sender (`Bridge::settle_sender`).
 //!
-//! When `OpenOptions::sticky_batch_refusal` is `true`, the broker maintains a bounded
+//! When `OpenOptions::sticky_batch_refusal` is `true`, the broker OFFERS the fence, and a
+//! connection that asks for it (`Request::FenceGaps`) is fenced for the rest of its life. A
+//! connection that never asks is served as above: a client that predates the ask lifts no
+//! fence either, so a refusal it does not retry next would fence everything it writes after
+//! it. For the connections that asked, the broker maintains a bounded
 //! per-`(conn_id, producer_id)` [`StickyFenceTable`]:
 //! - Whenever a `Publish` or `ProcessAndProduce` for `(conn_id, producer_id, seq)` is
 //!   refused (either op-level during staging, or batch-wide on commit/quorum failure),
@@ -25,6 +29,14 @@
 //!   performs after a refusal) is **admitted**, and once its batch commits, the fence on
 //!   `(conn_id, producer_id)` clears automatically so pipelined successors behind the
 //!   retry commit in order. Reconnecting also starts with a fresh `conn_id`.
+//! - A producer that will not send the refused write again next (one refused for good, or
+//!   a write it gives up) lifts every fence its connection holds with
+//!   `Request::ClearGapFences` once it has read the answer to every write it sent: the
+//!   broker answers it after every write sent before it ([`StickyFenceTable::drop_conn`],
+//!   as a close does), so the lift reaches none of them.
+//! - Every `Hello` answered while the option is on says so (`REQUEST_GAP_FENCES` in its
+//!   request set), so a producer reads whether it may ask before it keeps several writes in
+//!   flight that a refused one must hold back.
 
 use std::collections::HashMap;
 
@@ -229,12 +241,6 @@ impl StickyFenceTable {
             }
         }
         self.overflow_fenced_conns = kept;
-    }
-
-    /// Clear all active fences (e.g. when toggling `set_sticky_batch_refusal(false)`).
-    pub fn clear(&mut self) {
-        self.entries.clear();
-        self.overflow_fenced_conns.clear();
     }
 }
 

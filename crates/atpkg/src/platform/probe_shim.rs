@@ -412,11 +412,11 @@ fn physical_file(path: &Path) -> Option<PathBuf> {
 }
 
 fn read_head(path: &Path) -> Option<Vec<u8>> {
-    let file = crate::metadata_io::open_regular(path).ok()?;
-    let mut bytes = Vec::new();
-    file.take(u64::try_from(MAX_SHIM_BYTES + 1).ok()?)
-        .read_to_end(&mut bytes)
-        .ok()?;
+    let (file, meta) = crate::metadata_io::open_regular_with_meta(path).ok()?;
+    let max = u64::try_from(MAX_SHIM_BYTES + 1).ok()?;
+    let mut bytes =
+        Vec::with_capacity(usize::try_from(meta.len().min(max).saturating_add(1)).unwrap_or(0));
+    file.take(max).read_to_end(&mut bytes).ok()?;
     Some(bytes)
 }
 

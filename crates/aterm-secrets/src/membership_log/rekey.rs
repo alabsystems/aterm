@@ -220,27 +220,11 @@ impl Log {
     /// (module docs).
     #[must_use]
     pub fn rekey_dues(&self) -> Vec<RekeyDue> {
-        let effective = self.effective();
-        let membership = self.membership();
-        let mut epochs: BTreeMap<&EpochAudience, Vec<usize>> = BTreeMap::new();
-        let mut wrapped: BTreeMap<RecordId, BTreeSet<Recipient>> = BTreeMap::new();
-        for (i, record) in self.order.iter().enumerate().skip(1) {
-            if !effective.counts(i) {
-                continue;
-            }
-            match record.body() {
-                Body::Epoch { audience, .. } => epochs.entry(audience).or_default().push(i),
-                Body::Wrap {
-                    epoch, recipient, ..
-                } => {
-                    wrapped.entry(*epoch).or_default().insert(*recipient);
-                }
-                _ => {}
-            }
-        }
-        if epochs.is_empty() {
+        let cache = self.epochs();
+        if cache.audiences().is_empty() {
             return Vec::new();
         }
+        let membership = self.membership_ref();
         let removed = self.removed_recipients();
         let seats = self.seat_recipients();
         let keyed: Vec<super::Keyed> = self
@@ -249,15 +233,16 @@ impl Log {
             .filter(|k| !k.covered && k.holders.iter().any(|h| membership.contains(h)))
             .collect();
         let mut dues = Vec::new();
-        for (audience, list) in epochs {
-            let newest_at: Vec<usize> = list
-                .iter()
-                .copied()
-                .filter(|&a| !list.iter().any(|&b| a != b && effective.before(a, b)))
-                .collect();
+        for (audience, sealed) in cache.audiences() {
+            let newest_at = &sealed.newest;
             let mut newest: Vec<RecordId> =
                 newest_at.iter().map(|&i| *self.order[i].id()).collect();
             newest.sort_unstable();
+            // The recipients each newest epoch's counting `Wrap`s name: all a due reads of them.
+            let wrapped: BTreeMap<RecordId, BTreeSet<Recipient>> = newest
+                .iter()
+                .filter_map(|id| Some((*id, cache.wraps().get(id)?.keys().copied().collect())))
+                .collect();
             let wraps_removed = |r: &Recipient| {
                 removed.contains(r)
                     && newest
@@ -467,10 +452,7 @@ impl Log {
         }
         let empty = BTreeSet::new();
         let mut held: Option<BTreeSet<Recipient>> = None;
-        for &b in &before {
-            if before.iter().any(|&c| b != c && effective.before(b, c)) {
-                continue;
-            }
+        for &b in effective.newest(&before, |&b| b) {
             let set = wraps_of.get(self.order[b].id()).unwrap_or(&empty);
             held = Some(match held {
                 None => set.clone(),
@@ -503,7 +485,7 @@ impl Log {
         if pending.is_empty() {
             return pending;
         }
-        let membership = self.membership();
+        let membership = self.membership_ref();
         let seated: BTreeSet<Recipient> = membership
             .members()
             .values()
@@ -546,7 +528,7 @@ impl Log {
             return pending;
         }
         let removed = self.removed_recipients();
-        let membership = self.membership();
+        let membership = self.membership_ref();
         // Every recipient in flight is bound by one of these seats.
         let seats: BTreeSet<Recipient> = membership
             .members()
@@ -562,21 +544,10 @@ impl Log {
     /// The causally newest counting epochs of `audience`, by id.
     #[must_use]
     pub fn newest_epochs(&self, audience: &EpochAudience) -> Vec<RecordId> {
-        let effective = self.effective();
-        let list: Vec<usize> = self
-            .order
+        let mut newest: Vec<RecordId> = self
+            .epochs()
+            .newest(audience)
             .iter()
-            .enumerate()
-            .skip(1)
-            .filter(|&(i, record)| {
-                effective.counts(i)
-                    && matches!(record.body(), Body::Epoch { audience: aud, .. } if aud == audience)
-            })
-            .map(|(i, _)| i)
-            .collect();
-        let mut newest: Vec<RecordId> = list
-            .iter()
-            .filter(|&&a| !list.iter().any(|&b| a != b && effective.before(a, b)))
             .map(|&i| *self.order[i].id())
             .collect();
         newest.sort_unstable();

@@ -27,7 +27,7 @@ impl Rng {
 /// Mac's records at sequence one give), a merge of up to 64 earlier records, or a step that also
 /// follows one earlier record. Each record's parents are sorted and distinct, as a signed
 /// record's are.
-fn random_parents(seed: u64) -> Vec<Vec<usize>> {
+pub(in crate::membership_log) fn random_parents(seed: u64) -> Vec<Vec<usize>> {
     let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
     let n = 1 + rng.below(320);
     let mut parents = vec![Vec::new()];
@@ -75,7 +75,7 @@ pub(in crate::membership_log) fn walked(parents: &[Vec<usize>]) -> Vec<Vec<bool>
         .collect()
 }
 
-fn indexed(parents: &[Vec<usize>]) -> Reach {
+pub(in crate::membership_log) fn indexed(parents: &[Vec<usize>]) -> Reach {
     let mut reach = Reach::default();
     for incoming in parents {
         reach.push(incoming.iter().copied());
@@ -280,4 +280,188 @@ fn a_closure_reads_one_row_for_each_root_no_other_root_follows() {
         uncovered > 200,
         "some histories had several roots no other followed"
     );
+}
+
+/// The newest of `set` by testing each pair against the walk's pasts.
+fn newest_walked(past: &[Vec<bool>], set: &[usize]) -> Vec<usize> {
+    set.iter()
+        .copied()
+        .filter(|&a| !set.iter().any(|&b| past[b][a]))
+        .collect()
+}
+
+/// A random set of distinct records of `n`, ascending.
+fn random_set(rng: &mut Rng, n: usize, most: usize) -> Vec<usize> {
+    let mut set: Vec<usize> = (0..1 + rng.below(most)).map(|_| rng.below(n)).collect();
+    set.sort_unstable();
+    set.dedup();
+    set
+}
+
+/// The newest of a set are what testing each pair against a depth-first walk keeps, on 200
+/// seeded histories with sets of up to 80 records, and finding them costs a bit test per record
+/// and, per newest record, its row from the lowest record's word on.
+/// NEGATIVE CONTROL: keeping a record a newer one's row already holds keeps records the walk
+/// puts in another's past.
+#[test]
+fn the_newest_of_a_set_match_a_depth_first_walk() {
+    let mut newest_seen = 0;
+    for mutant in [None, Some(Mutant::KeepCovered)] {
+        let mut wrong = 0;
+        for seed in 1..=200 {
+            let parents = random_parents(seed);
+            let past = walked(&parents);
+            let reach = indexed(&parents);
+            let mut rng = Rng(seed);
+            for _ in 0..8 {
+                let set = random_set(&mut rng, parents.len(), 80);
+                let want = newest_walked(&past, &set);
+                MUTANT.set(mutant);
+                WORK.set(Work::default());
+                let got = reach.maximal(&set);
+                let work = WORK.get();
+                MUTANT.set(None);
+                wrong += usize::from(got != want);
+                if mutant.is_none() {
+                    newest_seen += want.len();
+                    let base = set[0] / 64;
+                    let rows: usize = want
+                        .iter()
+                        .map(|&m| m.div_ceil(64).saturating_sub(base))
+                        .sum();
+                    assert_eq!(work.bits, set.len(), "seed {seed}");
+                    assert_eq!(work.words, rows, "seed {seed}");
+                }
+            }
+        }
+        match mutant {
+            None => assert_eq!(wrong, 0, "the newest are exact"),
+            Some(mutant) => assert!(wrong > 0, "{mutant:?} goes unnoticed"),
+        }
+    }
+    assert!(newest_seen > 1_600, "sets had several newest records");
+}
+
+/// Each grouped record's frontier, by the walk: the records of its group in its strict past
+/// that lie in no other such record's past, as positions within the group.
+fn frontier_walked(past: &[Vec<bool>], group: &[usize], position: usize) -> Vec<usize> {
+    let x = group[position];
+    let below: Vec<usize> = (0..position).filter(|&j| past[x][group[j]]).collect();
+    below
+        .iter()
+        .copied()
+        .filter(|&j| !below.iter().any(|&other| past[group[other]][group[j]]))
+        .collect()
+}
+
+/// Up to six groups over a random history's records past the genesis, some large enough to be
+/// read through a mask, the rest left out.
+fn random_groups(rng: &mut Rng, n: usize) -> Vec<Vec<usize>> {
+    let count = 1 + rng.below(6);
+    let mut groups = vec![Vec::new(); count];
+    let share = 1 + rng.below(4);
+    for x in 1..n {
+        if rng.below(4) < share {
+            groups[rng.below(count)].push(x);
+        }
+    }
+    groups
+}
+
+/// How many frontiers the pass hands out on `parents` with `groups` differ from the walk's, and
+/// whether it handed them out in record order, each grouped record once.
+fn frontier_disagreements(parents: &[Vec<usize>], groups: &[Vec<usize>]) -> (usize, usize) {
+    let past = walked(parents);
+    let reach = indexed(parents);
+    let mut visited = Vec::new();
+    let mut wrong = 0;
+    reach.frontiers(
+        groups,
+        |x| parents[x].iter().copied(),
+        |g, position, frontier| {
+            visited.push(groups[g][position]);
+            wrong +=
+                usize::from(frontier.positions() != frontier_walked(&past, &groups[g], position));
+        },
+    );
+    let mut every: Vec<usize> = groups.iter().flatten().copied().collect();
+    every.sort_unstable();
+    assert_eq!(visited, every, "each grouped record once, in record order");
+    (wrong, visited.len())
+}
+
+/// The pass hands each grouped record the frontier a depth-first walk gives, in record order, on
+/// 200 seeded histories with up to six groups each (masked groups of 64 records or more and
+/// bit-tested smaller ones), and on a fork of 300 records under one root that one merge tree
+/// joins and 300 more follow.
+/// NEGATIVE CONTROLS: a frontier that ignores what the parents dominate, or a dominated set that
+/// leaves out the records of a grouped record's own group in its past, disagree with the walk.
+#[test]
+fn every_frontier_matches_a_depth_first_walk() {
+    let mut cases: Vec<_> = (1..=200)
+        .map(|seed| {
+            let parents = random_parents(seed);
+            let groups = random_groups(&mut Rng(seed ^ 0x5eed), parents.len());
+            (parents, groups)
+        })
+        .collect();
+    let (fan, ops) = fanned(300, 300);
+    cases.push((fan, vec![ops]));
+    assert!(
+        cases
+            .iter()
+            .any(|(_, groups)| groups.iter().any(|g| g.len() >= 64)),
+        "some group is masked"
+    );
+    for mutant in [
+        None,
+        Some(Mutant::IgnoreParents),
+        Some(Mutant::OmitOwnGroup),
+    ] {
+        let mut wrong = 0;
+        let mut visited = 0;
+        for (parents, groups) in &cases {
+            MUTANT.set(mutant);
+            let (bad, seen) = frontier_disagreements(parents, groups);
+            MUTANT.set(None);
+            wrong += bad;
+            visited += seen;
+        }
+        assert!(visited > 10_000, "the groups held records");
+        match mutant {
+            None => assert_eq!(wrong, 0, "every frontier is exact"),
+            Some(mutant) => assert!(wrong > 0, "{mutant:?} goes unnoticed"),
+        }
+    }
+}
+
+/// A root, `lower` records that each follow it alone (forks, as one Mac's records at one
+/// sequence are), merges of up to 64 of them that end in one record, and `upper` records that
+/// each follow that one: the history every one of `upper` sees all of `lower` in, and the
+/// grouped records (`lower` then `upper`).
+pub(in crate::membership_log) fn fanned(
+    lower: usize,
+    upper: usize,
+) -> (Vec<Vec<usize>>, Vec<usize>) {
+    let mut parents: Vec<Vec<usize>> = vec![Vec::new()];
+    let mut ops = Vec::new();
+    for _ in 0..lower {
+        ops.push(parents.len());
+        parents.push(vec![0]);
+    }
+    let mut level: Vec<usize> = ops.clone();
+    while level.len() > 1 {
+        let mut next = Vec::new();
+        for chunk in level.chunks(64) {
+            next.push(parents.len());
+            parents.push(chunk.to_vec());
+        }
+        level = next;
+    }
+    let top = level[0];
+    for _ in 0..upper {
+        ops.push(parents.len());
+        parents.push(vec![top]);
+    }
+    (parents, ops)
 }

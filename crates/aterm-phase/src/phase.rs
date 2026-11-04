@@ -13,7 +13,7 @@ use crate::wall::{Placement, Wall, WallKind, classify_wall};
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 10, "0.10");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 11, "0.11");
 
 /// The worker's phase.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -295,7 +295,13 @@ fn carried_row(rows: &[String], top: usize) -> Option<usize> {
 /// `idle-after-limit-and-model-switch.txt`), each followed there by a done row; where no done row
 /// is drawn after it (`showTurnDuration` off), the waiting row stays the first glyph row above the
 /// composer and would name the ended work for as long as it stood. A wait for a background agent
-/// or other work never ends here: no completion row of theirs is measured.
+/// or other work never ends here. An agent's completion row is measured (`⏺ Agent "…" finished ·
+/// 3m 20s`, 2.1.304's agents-panel captures), but the wait's count does not follow it: an agent
+/// that says it waits on its own background work (`⏺ Agent "…" is waiting on its own background
+/// work`) leaves the count and finishes later, so its finished row stands under `Waiting for 1
+/// background agent to finish` while the one agent counted still runs
+/// (`claude-2.1.304-agents-panel-long-bash-4m57s-120col.txt`). No completion row of other work is
+/// measured.
 fn waited_out(text: &str, below: &[String]) -> bool {
     let Some(waited) = workflows_waited(text) else {
         return false;
@@ -401,19 +407,14 @@ fn counts_work(row: &str) -> bool {
     const WORK: [&str; 7] = [
         "shell", "monitor", "task", "agent", "workflow", "session", "team",
     ];
-    row.split("   ")
-        .flat_map(|part| part.split(" · "))
-        .flat_map(|item| item.split(", "))
-        .any(|item| {
-            let item = crate::text::trim(item);
-            let item = item.strip_prefix("◇ ").unwrap_or(item);
-            let digits = item.chars().take_while(char::is_ascii_digit).count();
-            digits > 0
-                && item[digits..]
-                    .strip_prefix(' ')
-                    .and_then(|label| label.rsplit(' ').next())
-                    .is_some_and(|noun| WORK.contains(&noun.strip_suffix('s').unwrap_or(noun)))
-        })
+    row_items(row).any(|item| {
+        let digits = item.chars().take_while(char::is_ascii_digit).count();
+        digits > 0
+            && item[digits..]
+                .strip_prefix(' ')
+                .and_then(|label| label.rsplit(' ').next())
+                .is_some_and(|noun| WORK.contains(&noun.strip_suffix('s').unwrap_or(noun)))
+    })
 }
 
 /// The rules of [`busy_signal`] that are the agent's own background work with its turn over (a dynamic workflow, a background agent or other task it waits for, a shell or a monitor it left running, a workflow's progress line), never a live turn's (a spinner, `esc to interrupt`, `Still working`, a foreground command's `ctrl+b to run in background`).
@@ -559,21 +560,38 @@ pub fn shells_running(rows: &[String]) -> Option<u32> {
     let counted = status
         .into_iter()
         .chain(footer.iter().map(String::as_str))
-        .flat_map(|row| row.split("   "))
-        .flat_map(|part| part.split(" · "))
-        .flat_map(|item| item.split(", "))
-        .filter_map(shell_count)
+        .flat_map(row_items)
+        .filter_map(|item| item_count(item, "shell"))
         .max();
     Some(counted.unwrap_or(0))
 }
 
-/// One footer or status item's shell count.
-fn shell_count(item: &str) -> Option<u32> {
-    let item = crate::text::trim(item);
-    let item = item.strip_prefix("◇ ").unwrap_or(item);
+/// THE ITEMS A FOOTER OR STATUS ROW DRAWS: its ` · ` items, the parts of each between runs of
+/// three spaces and the counts a pill joins with `, ` (`· 1 shell, 1 monitor ·` on 2.1.283,
+/// `claude-2.1.283-wall-session-wrapup-waiting-measured.txt`; `· 13 shells, 3 monitors` on
+/// 2.1.316, `claude-2.1.316-waiting-agents-and-workflows-turn-over-panel.txt`), each trimmed and
+/// without the `·` of a row that opens or ends on one or its leading `◇ `. The one item reader
+/// of [`footer_count`], [`shells_running`] and [`counts_work`].
+fn row_items(row: &str) -> impl Iterator<Item = &str> {
+    row.split(" · ")
+        .flat_map(|item| item.split("   "))
+        .flat_map(|part| part.split(", "))
+        .map(|item| {
+            let item = crate::text::trim(item);
+            let item = item.strip_prefix("· ").unwrap_or(item);
+            let item = item.strip_suffix(" ·").unwrap_or(item);
+            item.strip_prefix("◇ ").unwrap_or(item)
+        })
+}
+
+/// The count one item ([`row_items`]) names of `noun`: `N <noun>` or `N <noun>s`, alone or
+/// followed by ` still running`.
+fn item_count(item: &str, noun: &str) -> Option<u32> {
     let item = item.strip_suffix(" still running").unwrap_or(item);
-    let (count, noun) = item.split_once(' ')?;
-    if !matches!(noun, "shell" | "shells") || !count.bytes().all(|b| b.is_ascii_digit()) {
+    let (count, named) = item.split_once(' ')?;
+    if named.strip_suffix('s').unwrap_or(named) != noun
+        || !count.bytes().all(|b| b.is_ascii_digit())
+    {
         return None;
     }
     count.parse().ok()
@@ -668,12 +686,14 @@ pub fn work_running(rows: &[String]) -> Option<&'static str> {
 }
 
 /// A SHELL OR A MONITOR THE TURN LEFT RUNNING, read off each place the screen names one, in
-/// [`busy_signal`]'s words and order ([`LEFT_RUNNING_RULES`]: the status row's `N shell(s) still
-/// running`, a footer row's `N shell(s)`, the status row's `N monitor(s) still running`, a footer
-/// row's `N monitor(s)`), whatever rule [`busy_signal`] reads first: its one rule can be a footer
+/// [`busy_signal`]'s words and order (the status row's `N shell(s) still running`, a footer row's
+/// `N shell(s)`, the status row's `N monitor(s) still running`, a footer row's `N monitor(s)`:
+/// those of its [`BACKGROUND_RULES`] that the process table names too), whatever rule
+/// [`busy_signal`] reads first: its one rule can be a footer
 /// workflow progress row's, which outlives its workflow and comes ahead of a monitor in either
-/// place and of a shell a later footer row counts. `None` with no composer frame or a message
-/// submitted under the status row ([`background_wait`]'s bounds).
+/// place and of a shell a later footer row counts. The one reading of what the turn left that
+/// [`work_running`], [`turn_over_background`] and [`work_left`] share. `None` with no composer
+/// frame or a message submitted under the status row ([`background_wait`]'s bounds).
 fn shell_or_monitor_left(rows: &[String]) -> Option<&'static str> {
     let frame = composer_frame(rows)?;
     if turn_just_begun(rows) {
@@ -720,27 +740,29 @@ fn left_in_process(row: &str) -> bool {
     })
 }
 
-/// The [`BACKGROUND_RULES`] of a SHELL or a monitor the turn left running.
-const LEFT_RUNNING_RULES: &[&str] = &[
-    "a shell still running",
-    "a shell running",
-    "a monitor still running",
-    "a monitor running",
-];
-
-/// The turn is over, and what runs on is a SHELL or a monitor it left.
+/// THE TURN IS OVER, AND WHAT RUNS ON IS A SHELL OR A MONITOR IT LEFT: a done row speaks for the
+/// turn ([`turn_over`]), the agent's own background work keeps the screen busy with no live turn's
+/// rule read ahead of it ([`background_wait`]), and the status row or the footer names a shell or
+/// a monitor ([`shell_or_monitor_left`], wherever the screen names one). Not [`busy_signal`]'s
+/// first rule alone: a workflow's progress row, which 2.1.304 leaves drawn after its workflow
+/// ended (`claude-2.1.304-agents-panel-workflow-done-3m20s-120col.txt`), comes ahead of a
+/// monitor's rule in either place, and read so a monitor running under it was no break of the
+/// agent's own background work where the host offers its fact, for as long as the row stood.
 #[must_use]
 pub fn turn_over_background(rows: &[String]) -> bool {
-    turn_over(rows) && background_wait(rows).is_some_and(|rule| LEFT_RUNNING_RULES.contains(&rule))
+    turn_over(rows) && background_wait(rows).is_some() && shell_or_monitor_left(rows).is_some()
 }
 
-/// THE WORK THE TURN LEFT RUNNING, AS THE SCREEN NAMES IT: the [`LEFT_RUNNING_RULES`] rule where
-/// the turn rests over the agent's own background work ([`background_rest`]), a done row ended
-/// it, and that row names no work of Claude Code's own process ([`left_in_process`]). The title
-/// rests over a shell or a monitor as it does over a screen no reader names, so these words are
-/// what tells the two apart. `None` elsewhere: the title runs while a background agent or a
-/// workflow does, its turn over; a footer's progress row outlives its workflow; and no done row,
-/// an active `/goal` or a wall says nothing of what the turn left.
+/// THE WORK THE TURN LEFT RUNNING, AS THE SCREEN NAMES IT: a shell or a monitor, in
+/// [`busy_signal`]'s words, wherever the status row or the footer names it
+/// ([`shell_or_monitor_left`]), where the turn rests over the agent's own background work
+/// ([`background_rest`]), a done row ended it, and that row names no work of Claude Code's own
+/// process ([`left_in_process`]). The title rests over a shell or a monitor as it does over a
+/// screen no reader names, so these words are what tells the two apart. `None` elsewhere: the
+/// title runs while a background agent or a workflow does, its turn over; a footer's progress row
+/// outlives its workflow, so it alone names nothing the turn left (and its rule, which
+/// [`busy_signal`] reads ahead of a monitor's, hides none); and no done row, an active `/goal` or a
+/// wall says nothing of what the turn left.
 #[must_use]
 pub fn work_left(rows: &[String]) -> Option<&'static str> {
     background_rest(rows)?;
@@ -748,7 +770,7 @@ pub fn work_left(rows: &[String]) -> Option<&'static str> {
     if !is_done_row(&line) || left_in_process(&line) {
         return None;
     }
-    background_wait(rows).filter(|rule| LEFT_RUNNING_RULES.contains(rule))
+    shell_or_monitor_left(rows)
 }
 
 /// Who opened the turn drawn last, read up from the composer's top rule.
@@ -838,28 +860,10 @@ fn still_running(row: &str, noun: &str) -> bool {
             || number_then(row, "", &format!(" {noun}s still running")))
 }
 
-/// `N <noun>` or `N <noun>s` as one footer item.
+/// `N <noun>` or `N <noun>s` as one item of a footer row ([`row_items`]), a pill's joined
+/// counts among them.
 fn footer_count(row: &str, noun: &str) -> bool {
-    let t = crate::text::trim_end(row);
-    t.match_indices(noun).any(|(at, _)| {
-        let Some(before) = t[..at].strip_suffix(' ') else {
-            return false;
-        };
-        let digits = before
-            .chars()
-            .rev()
-            .take_while(char::is_ascii_digit)
-            .count();
-        let lead = &before[..before.len() - digits];
-        let after = &t[at + noun.len()..];
-        let after = after.strip_prefix('s').unwrap_or(after);
-        digits > 0
-            && (lead.ends_with("· ") || crate::text::trim(lead).is_empty())
-            && (after.is_empty()
-                || after.starts_with(" ·")
-                || after.starts_with("  ")
-                || after.starts_with(" still running"))
-    })
+    row_items(row).any(|item| item_count(item, noun).is_some())
 }
 
 /// A workflow's progress line under the footer.
@@ -1983,12 +1987,6 @@ pub fn composer_text(rows: &[String]) -> Option<String> {
     )
 }
 
-/// Whether the cursor sits inside the composer's typed text.
-#[must_use]
-pub const fn cursor_inside_text(cursor: Option<(usize, usize)>, caret: usize) -> bool {
-    matches!(cursor, Some((row, col)) if row == caret && col > 2)
-}
-
 /// The composer's rows: the caret row's index.
 pub fn composer_draft(rows: &[String]) -> Option<(usize, Vec<String>)> {
     let caret = composer_index(rows)?;
@@ -2002,6 +2000,81 @@ pub fn composer_draft(rows: &[String]) -> Option<(usize, Vec<String>)> {
             .map(|r| crate::text::trim(r).to_string()),
     );
     Some((caret, lines))
+}
+
+/// WHETHER CLAUDE CODE'S PROMPT-HISTORY SEARCH (Ctrl-R) IS OPEN: a row of the footer, the rows under
+/// the composer's bottom rule down to the first blank one, opens with its words, `search prompts:`
+/// or, its query matching nothing, `no matching prompt:`. Measured on 2.1.318
+/// (`claude-2.1.318-history-search*`): they head the mode row, in place of `-- INSERT --` in vim
+/// mode, which is the footer's first row, or its second under a status line
+/// (`claude-2.1.318-history-search-under-statusline`); the composer's row shows the old prompt the
+/// search matched, plain as typed text, or what stood there before it (nothing, or a grey
+/// suggestion), the cursor stands after the query on the search's row, keys type into the query, and
+/// Enter sends the match. In a narrow window the label wraps in its own column beside the query
+/// ([`search_label_at`]), each row at the label's indent: by whole words at 60 and 44 columns
+/// (`search` / `prompts:`, `no matching` / `prompt:`) and at 34 (`no` / `matching` / `prompt:`), and
+/// within its words at 26 (`searc` / `h pro` / `mpts:`) and 22 (`sear` / `ch` / `prom` / `pts:`)
+/// (`claude-2.1.318-history-search{,-no-match}-{60,44,26}col`, `-no-match-34col`, `-22col`). Only
+/// the footer is read: a person's draft is drawn between the rules (a row after its first indented,
+/// so never a rule), and the transcript above them.
+#[must_use]
+pub fn history_search(rows: &[String]) -> bool {
+    composer_frame(rows).is_some_and(|f| {
+        let footer: Vec<&str> = rows
+            .iter()
+            .skip(f.bottom + 1)
+            .take_while(|row| !row.trim().is_empty())
+            .map(String::as_str)
+            .collect();
+        (0..footer.len()).any(|at| {
+            [
+                crate::anchor!("history.search"),
+                crate::anchor!("history.no_match"),
+            ]
+            .into_iter()
+            .any(|label| search_label_at(&footer[at..], label))
+        })
+    })
+}
+
+/// Whether the search's `label` is spelled from `rows[0]` on: its letters, the spaces between its
+/// words aside, are the leading words of `rows[0]` and of each row after it at the same indent, each
+/// row giving at least one, until none is owed ([`label_spelled`]). Wrapped in its own column, the
+/// label leaves a row by a whole word or, its column narrower than a word, within one; the words
+/// after its part on a row (the query, the mode) are read only where they could still be the
+/// label's, and every split is tried, so a query that starts with the label's next letters (`p`)
+/// does not hide it.
+fn search_label_at(rows: &[&str], label: &str) -> bool {
+    let letters: String = label.split_whitespace().collect();
+    rows.first()
+        .is_some_and(|first| label_spelled(rows, &letters, indent_of(first)))
+}
+
+/// Whether `owed` is spelled by the leading words of `rows[0]`, then, where it is not yet whole, by
+/// those of the rows after it, each at the indent `at` and giving at least one word.
+fn label_spelled(rows: &[&str], owed: &str, at: usize) -> bool {
+    let Some((row, below)) = rows.split_first() else {
+        return false;
+    };
+    if indent_of(row) != at {
+        return false;
+    }
+    let mut rest = owed;
+    for word in row.split_whitespace() {
+        let Some(after) = rest.strip_prefix(word) else {
+            return false;
+        };
+        rest = after;
+        if rest.is_empty() || label_spelled(below, rest, at) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The bytes of `row`'s leading whitespace.
+fn indent_of(row: &str) -> usize {
+    row.len() - crate::text::trim_start(row).len()
 }
 
 /// Whether the composer's text is Claude Code's dim placeholder suggestion rather than typed input.
@@ -3100,6 +3173,131 @@ mod tests {
         r
     }
 
+    /// CLAUDE CODE'S PROMPT-HISTORY SEARCH IS READ ON THE FOOTER ALONE (measured on 2.1.318): open
+    /// over its match, over nothing and over a grey suggestion, under a status line, where it heads
+    /// the footer's second row, in vim mode, where it takes the mode's row, and in windows of 60, 44,
+    /// 34, 26 and 22 columns, where its label wraps in its own column, by whole words or within
+    /// them. A wrapped label is read only whole and leading its row: its rest gone, at another
+    /// indent, other words in its place, a row between, or another word before it, and it is
+    /// closed; a query that starts with its next letters (`p`, `prompts`) leaves it open. The same
+    /// screen with its footer row back is closed, and the search's words are read nowhere else: on a
+    /// person's draft's first row or a later one, in the transcript, or past the footer's end.
+    /// NEGATIVE CONTROLS: `history_search` reading the footer's first row alone, and the status
+    /// line's screen reads the search closed; reading the words on any row, and a draft's later row
+    /// reads it open; the label read only whole on one row (`fcf2daa1f8`'s parent), and every
+    /// narrow screen reads closed; read by whole words (`fcf2daa1f8`), and the 26 and 22 column
+    /// screens read closed; skipping a word that is not the label's, and a label after another word
+    /// reads open; taking a row's words greedily, no split tried again, and the query `p` hides it.
+    #[test]
+    fn the_history_search_is_read_on_the_footer_alone() {
+        use crate::prompt::fixtures::{
+            HISTORY_SEARCH_2_1_318, HISTORY_SEARCH_22COL_2_1_318, HISTORY_SEARCH_26COL_2_1_318,
+            HISTORY_SEARCH_44COL_2_1_318, HISTORY_SEARCH_60COL_2_1_318,
+            HISTORY_SEARCH_NO_MATCH_2_1_318, HISTORY_SEARCH_NO_MATCH_26COL_2_1_318,
+            HISTORY_SEARCH_NO_MATCH_34COL_2_1_318, HISTORY_SEARCH_NO_MATCH_44COL_2_1_318,
+            HISTORY_SEARCH_NO_MATCH_60COL_2_1_318, HISTORY_SEARCH_OVER_SUGGESTION_2_1_318,
+            HISTORY_SEARCH_UNDER_STATUSLINE_2_1_318, screen as fx,
+        };
+        let open = fx(HISTORY_SEARCH_2_1_318);
+        for (name, rows) in [
+            ("its match", open.clone()),
+            ("nothing", fx(HISTORY_SEARCH_NO_MATCH_2_1_318)),
+            ("a suggestion", fx(HISTORY_SEARCH_OVER_SUGGESTION_2_1_318)),
+            ("a status line", fx(HISTORY_SEARCH_UNDER_STATUSLINE_2_1_318)),
+            ("its match, 60 columns", fx(HISTORY_SEARCH_60COL_2_1_318)),
+            (
+                "nothing, 60 columns",
+                fx(HISTORY_SEARCH_NO_MATCH_60COL_2_1_318),
+            ),
+            ("its match, 44 columns", fx(HISTORY_SEARCH_44COL_2_1_318)),
+            (
+                "nothing, 44 columns",
+                fx(HISTORY_SEARCH_NO_MATCH_44COL_2_1_318),
+            ),
+            (
+                "nothing, 34 columns",
+                fx(HISTORY_SEARCH_NO_MATCH_34COL_2_1_318),
+            ),
+            ("its match, 26 columns", fx(HISTORY_SEARCH_26COL_2_1_318)),
+            (
+                "nothing, 26 columns",
+                fx(HISTORY_SEARCH_NO_MATCH_26COL_2_1_318),
+            ),
+            ("its match, 22 columns", fx(HISTORY_SEARCH_22COL_2_1_318)),
+        ] {
+            assert!(history_search(&rows), "over {name}: {rows:#?}");
+        }
+        // A narrow window's wrapped label is read only whole: its rest leads the next footer row at
+        // the same indent.
+        let narrow = fx(HISTORY_SEARCH_NO_MATCH_44COL_2_1_318);
+        let rest = composer_bottom(&narrow).expect("the frame") + 2;
+        assert_eq!(narrow[rest].trim(), "prompt:", "{narrow:#?}");
+        for (name, row) in [
+            ("its rest gone", ""),
+            ("its rest elsewhere", "    prompt:"),
+            ("other words", "  history:"),
+        ] {
+            let mut rows = narrow.clone();
+            rows[rest] = row.to_string();
+            assert!(!history_search(&rows), "{name}: {rows:#?}");
+        }
+        let mut between = narrow.clone();
+        between.insert(rest, "  history:".to_string());
+        assert!(!history_search(&between), "a row between: {between:#?}");
+        // Its first part leads its row: after another word it is not the search's.
+        let mut led = narrow.clone();
+        led[rest - 1] = "  ⏵⏵ no matching zzq".to_string();
+        assert!(!history_search(&led), "after another word: {led:#?}");
+        let mut led = open.clone();
+        let mode = composer_bottom(&led).expect("the frame") + 1;
+        led[mode] = format!("  lab {}", led[mode].trim_start());
+        assert!(!history_search(&led), "after another word, whole: {led:#?}");
+        // A query that starts with the label's next letters is the query's: every split is tried.
+        let wrapped = fx(HISTORY_SEARCH_60COL_2_1_318);
+        let first = composer_bottom(&wrapped).expect("the frame") + 1;
+        assert!(wrapped[first].starts_with("  search "), "{wrapped:#?}");
+        for query in ["p", "prompts", "prompts:"] {
+            let mut rows = wrapped.clone();
+            rows[first] = format!("  search  {query}  ⏵⏵ auto mode on");
+            assert!(history_search(&rows), "query {query:?}: {rows:#?}");
+        }
+        let caret = composer_index(&open).expect("the composer");
+        let footer = composer_bottom(&open).expect("the frame") + 1;
+        let with = |at: usize, row: &str| {
+            let mut rows = open.clone();
+            rows[at] = row.to_string();
+            rows
+        };
+        // Vim mode's, measured (2.1.318, `editorMode: vim`): the search takes the mode's row.
+        assert!(history_search(&with(
+            footer,
+            "  search prompts: read  ⏵⏵ auto mode on (shift+tab to cycle)"
+        )));
+        let closed = with(footer, "  ⏵⏵ auto mode on (shift+tab to cycle)");
+        let words = "search prompts: readme";
+        let mut later_row = closed.clone();
+        later_row.insert(caret + 1, format!("  {words}"));
+        let mut past_footer = closed.clone();
+        past_footer.splice(
+            footer + 1..footer + 1,
+            [String::new(), format!("  {words}")],
+        );
+        let mut said = closed.clone();
+        said[caret - 2] = format!("⏺ {words}");
+        let mut drafted = closed.clone();
+        drafted[caret] = format!("❯ {words}");
+        for (name, rows) in [
+            ("closed", closed),
+            ("a draft's first row", drafted),
+            ("a draft's later row", later_row),
+            ("the transcript", said),
+            ("past the footer's end", past_footer),
+        ] {
+            assert!(composer_frame(&rows).is_some(), "{name}: {rows:#?}");
+            assert!(!history_search(&rows), "{name}: {rows:#?}");
+        }
+    }
+
     /// Shell mode's box has a `!` caret, so it has no composer frame, and its footer opens with
     /// vim's `-- INSERT --` as the composer's does: `prompt_box_bottom` finds its bottom rule.
     /// Where a composer frame is on the screen, it is the composer's.
@@ -4119,6 +4317,61 @@ mod tests {
         }
     }
 
+    /// A JOINED PILL COUNTS EACH WORK IT JOINS: Claude Code joins its counts into one footer item
+    /// (`· 1 shell, 1 monitor ·` on 2.1.283,
+    /// `claude-2.1.283-wall-session-wrapup-waiting-measured.txt`; `· 13 shells, 3 monitors` on
+    /// 2.1.316, `claude-2.1.316-waiting-agents-and-workflows-turn-over-panel.txt`), and the footer
+    /// read neither noun of it: where the footer is the one place a turn's work is read (its done
+    /// row under an idle compaction's notice), a turn that left a shell and a monitor read as
+    /// having left nothing, while the same screen counting `1 shell` alone left a shell. The
+    /// control: a pill of work Claude Code runs in its own process names no shell or monitor.
+    #[test]
+    fn a_joined_pill_counts_each_work_it_joins() {
+        let (measured, done) = compacted_over_a_shell("✻ Worked for 23s");
+        let footer = measured
+            .iter()
+            .rposition(|r| r.starts_with("  ⏵⏵ bypass permissions on"))
+            .expect("the mode row");
+        let pill = |done_row: &str, mode_row: &str| {
+            let mut rows = measured.clone();
+            rows[done] = format!("✻ Worked for 23s · done 4:57 PM · {done_row}");
+            rows[footer] = format!("  ⏵⏵ bypass permissions on · {mode_row}");
+            rows
+        };
+        let both = pill("1 shell, 1 monitor still running", "1 shell, 1 monitor");
+        assert_eq!(
+            busy_signal(&both).map(|b| (b.zone, b.rule, b.soft)),
+            Some((Zone::Footer, "a shell running", false))
+        );
+        for (name, rows, rule) in [
+            ("a shell and a monitor", both, "a shell running"),
+            (
+                "the 2.1.316 counts",
+                pill(
+                    "13 shells, 3 monitors still running",
+                    "13 shells, 3 monitors",
+                ),
+                "a shell running",
+            ),
+            (
+                "a monitor joined after other work",
+                pill("1 monitor still running", "1 task, 1 monitor"),
+                "a monitor running",
+            ),
+        ] {
+            assert_eq!(work_running(&rows), Some(rule), "{name}");
+            assert!(turn_over_background(&rows), "{name}");
+            assert_eq!(work_left(&rows), Some(rule), "{name}");
+        }
+        let own = pill("1 agent, 1 workflow still running", "1 agent, 1 workflow");
+        assert_eq!(
+            busy_signal(&own).map(|b| b.rule),
+            Some("background work running")
+        );
+        assert_eq!(shell_or_monitor_left(&own), None);
+        assert!(!turn_over_background(&own));
+    }
+
     /// A COMPACTION UNDER ANOTHER IS NO TURN EITHER: a second idle compaction drawn under the first
     /// (with or without its own restored task) leaves the done row above both the turn's end, the
     /// shell it names the work the turn left, and the agent's reply its last words. The control:
@@ -4324,6 +4577,56 @@ mod tests {
             None,
             "a progress row outlives its work"
         );
+    }
+
+    /// WHAT A TURN LEFT IS READ WHEREVER THE SCREEN NAMES IT, WHATEVER RULE COMES FIRST
+    /// ([`turn_over_background`], [`work_left`], both by [`shell_or_monitor_left`]): a monitor
+    /// still running, named by the done row or counted by the footer, under a workflow's progress
+    /// row its workflow outlived (2.1.304 leaves it drawn at its full bar,
+    /// `claude-2.1.304-agents-panel-workflow-done-3m20s-120col.txt`), whose footer rule
+    /// [`busy_signal`] reads ahead of a monitor's in either place. Both read that reader's one
+    /// rule before, `a workflow running`, so the turn read as over no shell or monitor: the
+    /// host's fact owed at such a break was never offered there, and the stall canary named it a
+    /// screen this build does not read. The progress row alone names nothing the turn left.
+    #[test]
+    fn what_a_turn_left_under_a_progress_row_its_workflow_outlived_is_read_where_named() {
+        let outlived = crate::prompt::fixtures::screen(include_str!(
+            "fixtures/claude-2.1.304-agents-panel-workflow-done-3m20s-120col.txt"
+        ));
+        assert!(
+            !turn_over_background(&outlived),
+            "nothing the turn left runs"
+        );
+        assert_eq!(work_left(&outlived), None);
+        let done_at = outlived
+            .iter()
+            .position(|r| r.starts_with("✻ Brewed for 3m 20s"))
+            .expect("the done row");
+        let footer_at = outlived
+            .iter()
+            .position(|r| r.starts_with("  ⏵⏵ bypass permissions on"))
+            .expect("the footer");
+        let mut monitored = outlived.clone();
+        monitored[done_at].push_str(" · 1 monitor still running");
+        let mut counted = outlived.clone();
+        counted[footer_at] =
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle) · 1 monitor".to_string();
+        for (name, rows, rule) in [
+            (
+                "the done row's monitor",
+                &monitored,
+                "a monitor still running",
+            ),
+            ("the footer's monitor", &counted, "a monitor running"),
+        ] {
+            assert_eq!(
+                background_wait(rows),
+                Some("a workflow running"),
+                "{name}: the reader's one rule"
+            );
+            assert!(turn_over_background(rows), "{name}");
+            assert_eq!(work_left(rows), Some(rule), "{name}");
+        }
     }
 
     #[test]
@@ -5883,6 +6186,39 @@ mod tests {
         }
     }
 
+    /// A WAIT FOR A BACKGROUND AGENT STANDS OVER AN AGENT'S FINISHED ROW ITS COUNT DOES NOT NAME
+    /// (measured on 2.1.304, `claude-2.1.304-agents-panel-long-bash-4m57s-120col.txt`): a
+    /// background agent's completion row is measured (`⏺ Agent "…" finished · 3m 20s`, the wake
+    /// it opens a turn with, as a workflow's `completed` row is), but it does not answer the wait's
+    /// count. There, `Waiting for 1 background agent to finish` is carried above the wake of
+    /// `bg probe`, an agent the count had already let go when it said it waits on its own
+    /// background work, while `long probe`, the one the wait counts, still runs (the agents panel
+    /// draws it at `4m 57s`). One finished row under a wait for one agent is no proof that the
+    /// agent it waits for ended, so the wait stays work a restart in place would end, unlike a
+    /// wait for workflows alone ([`waited_out`]).
+    #[test]
+    fn a_wait_for_a_background_agent_stands_over_a_finished_row_its_count_does_not_name() {
+        let measured = crate::prompt::fixtures::screen(include_str!(
+            "fixtures/claude-2.1.304-agents-panel-long-bash-4m57s-120col.txt"
+        ));
+        assert!(
+            measured
+                .iter()
+                .any(|r| r.starts_with("⏺ Agent \"bg probe\" finished")),
+            "the finished row"
+        );
+        assert!(
+            measured
+                .iter()
+                .any(|r| r.starts_with("  ◯ general-purpose  long probe")),
+            "the agent the wait counts, still running"
+        );
+        const LEFT: &str = "background work still running";
+        assert_eq!(in_process_work(&measured), Some(LEFT), "{measured:#?}");
+        assert_eq!(work_running(&measured), Some(LEFT));
+        assert!(carried_wait_alone(&measured));
+    }
+
     /// [`in_process_work`] reads the work Claude Code runs in its own process off its status
     /// row's own words, whatever rule [`busy_signal`] reads first: a workflow's progress row and
     /// a shell count under the footer come ahead of the wait carried above a wake and of a done
@@ -5990,8 +6326,9 @@ mod tests {
         assert_eq!(side, "", "the waiting row's panel text as captured");
         let width = head.chars().count();
         // The status row drawn beside the panel, `side` after the rule; `quiet` swaps the
-        // captured footer (its agents panel's workflow rows, a rule of their own that reads
-        // first) for a bare one, so the status row is all that reads.
+        // captured footer (its mode row's shell count, then its agents panel's workflow rows,
+        // rules of their own that read first) for a bare one, so the status row is all that
+        // reads.
         let beside = |text: &str, side: &str, quiet: bool| {
             let mut s = panel.clone();
             s[at] = format!("{text:<width$}│{side}");
@@ -6014,7 +6351,7 @@ mod tests {
         let mixed = "✻ Brewed for 6m 7s · done 10:07 AM · 2 agents, 1 shell still running";
         for side in ["", DIFF] {
             for (status, full_first, quiet_first) in [
-                (agents, "a workflow running", LEFT),
+                (agents, "a shell running", LEFT),
                 (mixed, "a shell still running", "a shell still running"),
             ] {
                 let full = beside(status, side, false);
@@ -7610,34 +7947,6 @@ mod tests {
                 reset: None,
             }
         );
-    }
-
-    #[test]
-    fn the_cursor_only_proves_text_it_stands_inside() {
-        let caret = 55;
-        assert!(cursor_inside_text(Some((55, 9)), caret));
-        assert!(cursor_inside_text(Some((55, 3)), caret));
-        assert!(
-            !cursor_inside_text(Some((55, 0)), caret),
-            "the caret glyph itself"
-        );
-        assert!(
-            !cursor_inside_text(Some((55, 1)), caret),
-            "the space after the caret"
-        );
-        assert!(
-            !cursor_inside_text(Some((55, 2)), caret),
-            "a placeholder's place"
-        );
-        assert!(
-            !cursor_inside_text(Some((56, 2)), caret),
-            "the rule below a displaced grid"
-        );
-        assert!(
-            !cursor_inside_text(Some((56, 9)), caret),
-            "another row says nothing"
-        );
-        assert!(!cursor_inside_text(None, caret));
     }
 
     #[test]

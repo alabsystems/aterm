@@ -950,11 +950,12 @@ fn tail_lines(path: &Path, read_bytes: u64) -> Vec<String> {
 
 fn read_tail_lines(path: &Path, read_bytes: u64) -> io::Result<Vec<String>> {
     use std::io::{Read as _, Seek as _, SeekFrom};
-    let mut file = crate::metadata_io::open_regular(path)?;
-    let len = file.metadata()?.len();
+    let (mut file, meta) = crate::metadata_io::open_regular_with_meta(path)?;
+    let len = meta.len();
     let start = len.saturating_sub(read_bytes);
     file.seek(SeekFrom::Start(start))?;
-    let mut bytes = Vec::new();
+    let want = (len - start).min(read_bytes);
+    let mut bytes = Vec::with_capacity(usize::try_from(want.saturating_add(1)).unwrap_or(0));
     file.take(read_bytes).read_to_end(&mut bytes)?;
     let text = String::from_utf8_lossy(&bytes);
     let mut lines: Vec<String> = text.split('\n').map(str::to_string).collect();

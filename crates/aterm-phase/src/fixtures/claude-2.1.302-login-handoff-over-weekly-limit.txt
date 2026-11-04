@@ -18,7 +18,7 @@ pushed)" completed · 2h 1m 12s
 
 ✻ Waiting for 2 dynamic workflows to finish
 
-⏺ Dynamic workflow "aCaffiene lane: fix the two review lows, merge main (move its new sweeps), check, push to main, clean up" completed · 8h 27m 5s
+⏺ Dynamic workflow "aCaffeine lane: fix the two review lows, merge main (move its new sweeps), check, push to main, clean up" completed · 8h 27m 5s
 
 ⏺ Dynamic workflow "Swap fix round 5: fix its own T8 regression, the unreadable-dir refusal and the two test gaps; focused review; land (renewal-binding medium is pre-existing
 and goes to a follow-up lane)" completed · 1h 19m 7s

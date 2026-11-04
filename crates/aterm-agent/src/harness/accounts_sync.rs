@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use aterm_json::{Map, Value};
 
 use super::accounts::{self, Class, Cli, Roster, Row};
+use super::accounts_step::Step;
 use super::cli::{ACCOUNTS_OWN_LABEL, Env};
 use super::upgrade;
 use crate::ai::connector::{Flow, Region, RowKeys};
@@ -1529,6 +1530,8 @@ pub(crate) fn capture_current_review(
             let home = store
                 .user_home()
                 .ok_or("the Codex review home is unavailable")?;
+            let sync =
+                roster_path.map(|roster| super::accounts_pool::SyncHere { store, roster, now });
             super::accounts_pool::launch_observed(
                 (cli, false, mode),
                 &records.roster,
@@ -1536,7 +1539,7 @@ pub(crate) fn capture_current_review(
                 &enrolled,
                 program.or(Some(Path::new("codex"))),
                 now,
-                home,
+                (home, sync),
             )?
             .or_else(|| records.roster.row_for_login(None))
         } else {
@@ -2408,13 +2411,16 @@ pub fn find_transcript_walls_by_email(
 }
 
 fn read_file_tail(path: &Path, max_bytes: u64) -> Option<String> {
-    let mut f = fs::File::open(path).ok()?;
-    let len = f.metadata().ok()?.len();
+    let (mut f, meta) = aterm_uds::regular_file::open(path).ok()?;
+    let len = meta.len();
     if len > max_bytes {
         let _ = f.seek(SeekFrom::Start(len - max_bytes)).ok()?;
     }
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf).ok()?;
+    let read_len = len.min(max_bytes);
+    let mut buf = Vec::with_capacity(usize::try_from(read_len).unwrap_or(0).saturating_add(1));
+    f.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut buf)
+        .ok()?;
     let text = String::from_utf8_lossy(&buf);
     if len > max_bytes {
         Some(
@@ -3991,7 +3997,12 @@ fn read_local_text_bounded(
             "local account source exceeds the byte limit",
         ));
     }
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.len())
+            .unwrap_or(0)
+            .min(max_bytes)
+            .saturating_add(1),
+    );
     file.take((max_bytes as u64).saturating_add(1))
         .read_to_end(&mut bytes)?;
     decode_source_text_bounded(bytes, &path.to_string_lossy(), max_bytes)
@@ -4323,9 +4334,8 @@ pub struct DefaultLogin {
     /// The row on the default login, which now names the address, and the row of that address the
     /// sync folded into it, which held no login or record.
     pub merged: Option<(String, String)>,
-    /// The row on the default login, and the row of its address, which holds a login or a record
-    /// of its own, so both stay.
-    pub twin: Option<(String, String)>,
+    /// The row on the default login, the row of its address, and what keeps them both.
+    pub twin: Option<(String, String, TwinKept)>,
     /// The row that took the default login, the one of the address it names.
     pub reassigned: Option<String>,
     /// The row still on the default login though that login names another address, and the row's
@@ -4360,7 +4370,20 @@ impl DefaultLogin {
             "twin_merged".to_owned(),
             pair(&self.merged, ("row", "merged")),
         );
-        o.insert("twin".to_owned(), pair(&self.twin, ("row", "twin")));
+        o.insert(
+            "twin".to_owned(),
+            self.twin.as_ref().map_or(Value::Null, |(row, twin, kept)| {
+                let mut m = Map::new();
+                m.insert("row".to_owned(), Value::from(row.clone()));
+                m.insert("twin".to_owned(), Value::from(twin.clone()));
+                m.insert("kept".to_owned(), Value::from(kept.as_str().to_owned()));
+                Value::Object(m)
+            }),
+        );
+        o.insert(
+            "own_row".to_owned(),
+            self.reassigned.clone().map_or(Value::Null, Value::from),
+        );
         o.insert(
             "default_login_moved_off".to_owned(),
             pair(&self.moved_off, ("row", "email")),
@@ -4371,7 +4394,7 @@ impl DefaultLogin {
         );
     }
 
-    fn write_lines(&self, out: &mut dyn Write) {
+    fn write_lines(&self, program: Option<&Path>, out: &mut dyn Write) {
         let address = self.address.as_deref().unwrap_or("another account");
         if let Some((row, merged)) = &self.merged {
             let _ = writeln!(
@@ -4380,43 +4403,227 @@ impl DefaultLogin {
                  it held no login or record, so `{row}` now stands for both"
             );
         }
-        if let Some((row, twin)) = &self.twin {
+        if let Some((row, twin, kept)) = &self.twin {
             let _ = writeln!(
                 out,
-                "one account: `{row}` on the default login and `{twin}` are both {address}; \
-                 `{twin}` holds a login or a record of its own, so both stay, and no weekly \
-                 limit moves a session between them"
+                "one account: `{row}` on the default login and `{twin}` are both {address}; {}, \
+                 so both stay, and no weekly limit moves a session between them",
+                kept.words(row, twin)
             );
         }
         if let (Some((row, email)), None) = (&self.moved_off, &self.refused) {
             let _ = writeln!(
                 out,
                 "default login: it names {address}, and `{row}` on it is {email}: no launch takes \
-                 `{row}` until that login names {email} again (`codex login`)"
+                 `{row}` until that login names {email} again (`{}`)",
+                super::accounts_pool::default_row_sign_in_step(Cli::Codex, row, program)
             );
         }
     }
 
     /// Why the sync did not follow the login to the row of its address, in the words of its error
     /// line, with the step every such refusal leaves.
-    fn refusal_words(&self) -> Option<String> {
+    fn refusal_words(&self, program: Option<&Path>) -> Option<String> {
         let why = self.refused.as_deref()?;
         Some(match (&self.moved_off, &self.address) {
             (Some((row, email)), Some(address)) => format!(
                 "the default login names {address}, and `{row}` stays on it, so no launch takes \
-                 `{row}` until that login names {email} again (`codex login`): {why}"
+                 `{row}` until that login names {email} again (`{}`): {why}",
+                super::accounts_pool::default_row_sign_in_step(Cli::Codex, row, program)
             ),
             _ => why.to_owned(),
         })
     }
 }
 
+/// What keeps both rows of one account listed twice beside the default login
+/// ([`default_twin_verdict`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TwinKept {
+    /// The twin holds a login in its directory, or a record under its label.
+    TwinHolds,
+    /// A renewal's completion on this Mac names the twin, or the place they are kept could not be
+    /// read, so nothing shows the twin owns nothing ([`local_checkpoint_holds_twin`]).
+    TwinCheckpoint,
+    /// The twin is held for another Mac or under shared custody.
+    TwinHeld,
+    /// The row on the default login is held for another Mac or under shared custody.
+    RowHeld,
+    /// The source gives the row on the default login's label another address.
+    SourceNamesRow,
+    /// The row on the default login is known signed out, which makes the login a stale one.
+    RowSignedOut,
+    /// No sync of this pool reads a source here, or none it can resolve this machine in.
+    NoSync,
+}
+
+impl TwinKept {
+    /// The word a sync's and a report's `--json` give it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TwinHolds => "twin-holds",
+            Self::TwinCheckpoint => "twin-checkpoint",
+            Self::TwinHeld => "twin-held",
+            Self::RowHeld => "row-held",
+            Self::SourceNamesRow => "source-names-row",
+            Self::RowSignedOut => "row-signed-out",
+            Self::NoSync => "no-sync",
+        }
+    }
+
+    /// Why both rows stay, in a receipt's or a report's words.
+    #[must_use]
+    pub fn words(self, row: &str, twin: &str) -> String {
+        match self {
+            Self::TwinHolds => format!("`{twin}` holds a login or a record of its own"),
+            Self::TwinCheckpoint => {
+                format!("a renewal on this Mac may have completed for `{twin}`")
+            }
+            Self::TwinHeld => format!("`{twin}` is another Mac's or in shared custody"),
+            Self::RowHeld => format!("`{row}` is another Mac's or in shared custody"),
+            Self::SourceNamesRow => format!("the source gives `{row}` another address"),
+            Self::RowSignedOut => format!("`{row}` is known signed out"),
+            Self::NoSync => "no sync reads a source here".to_owned(),
+        }
+    }
+}
+
+/// THE ONE RULE of whether a sync folds `twin` into `own`, the row on the default login, whose login
+/// names `login`, on `fleet`, the source that sync reads: `Ok` where it does, else what keeps both.
+/// [`merge_default_twin`] acts on it and the report's `one account:` names that sync by it, each on
+/// the rows as that sync's source leaves them ([`rows_under_source`]). A source is read for what it
+/// says of `own`'s label; a row known signed out holds a stale login.
+fn default_twin_verdict(
+    cli: Cli,
+    (own, twin): (&Row, &Row),
+    login: &str,
+    fleet: &FleetRoster,
+    (state, logins, store): (&accounts::State, &accounts::Logins, &accounts::Store),
+    now: i64,
+) -> Result<(), TwinKept> {
+    default_row_may_name(own, login, fleet, (state, logins), now)?;
+    if !row_free_here(twin, logins) {
+        return Err(TwinKept::TwinHeld);
+    }
+    if twin
+        .dir
+        .as_deref()
+        .is_none_or(|dir| accounts::login_made(Path::new(dir)))
+        || accounts::label_is_retained(state, logins, &twin.label)
+    {
+        return Err(TwinKept::TwinHolds);
+    }
+    if local_checkpoint_holds_twin(cli, store, twin, now) {
+        return Err(TwinKept::TwinCheckpoint);
+    }
+    Ok(())
+}
+
+/// Whether `own`, the row on the default login, may take the address that login names, or what
+/// keeps it from that: it is free here, the source gives its label no other, and it is not known
+/// signed out, which would make the login a stale one.
+fn default_row_may_name(
+    own: &Row,
+    login: &str,
+    fleet: &FleetRoster,
+    (state, logins): (&accounts::State, &accounts::Logins),
+    now: i64,
+) -> Result<(), TwinKept> {
+    if !row_free_here(own, logins) {
+        return Err(TwinKept::RowHeld);
+    }
+    if fleet.accounts.iter().any(|account| {
+        account.label == own.label && !accounts::email_matches(&account.email, login)
+    }) {
+        return Err(TwinKept::SourceNamesRow);
+    }
+    if accounts::condition(own, state, true, now) == accounts::Condition::SignedOut {
+        return Err(TwinKept::RowSignedOut);
+    }
+    Ok(())
+}
+
+/// `rows` as a sync of `cli` from this source leaves their holds and orders before it reads them
+/// for anything else; whether any changed. A pool file names each row's holder; under the lab nothing
+/// limits who runs an account, so a hold an old pool file set goes, and a row the lab knows takes its
+/// derived order. Any other source changes none.
+fn rows_under_source(
+    cli: Cli,
+    fleet: &FleetRoster,
+    pool_ctx: Option<&PoolSyncCtx>,
+    rows: &mut [Row],
+) -> bool {
+    let mut changed = false;
+    if let Some(ctx) = pool_ctx {
+        for row in rows {
+            if row.email.is_some() || row.identity_email.is_some() {
+                let want = ctx.holder_for_row(cli, row);
+                if row.held_by != want {
+                    row.held_by = want;
+                    changed = true;
+                }
+            }
+        }
+    } else if fleet.alab.is_some() {
+        let lab = super::alab_roster::current();
+        for row in rows {
+            changed |= row.held_by.take().is_some();
+            if let Some(class) = lab
+                .as_deref()
+                .and_then(|lab| Some(lab.class_of(lab.account_of(cli, row)?)))
+                .filter(|class| *class != row.class)
+            {
+                row.class = class;
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+/// What a sync of `cli` with no source named would do with the row on the default login `own` and
+/// its twin, the rows of `roster`, on the records as they stand, reading what that sync reads
+/// ([`load_cli_fleet_source`], fetching nothing) and writing nothing: the report's `one account:`.
+pub(super) fn sync_twin_verdict(
+    cli: Cli,
+    env: &Env,
+    (own, twin, login): (&str, &str, &str),
+    roster: &Roster,
+    (state, logins): (&accounts::State, &accounts::Logins),
+    now: i64,
+) -> Result<(), TwinKept> {
+    let home = env.home.as_deref().ok_or(TwinKept::NoSync)?;
+    let no_network = |_: &Env, _: &str| Err("a report fetches no source".to_owned());
+    let (fleet, pool_ctx, machine) = load_cli_fleet_source(cli, env, home, None, None, &no_network)
+        .ok()
+        .flatten()
+        .ok_or(TwinKept::NoSync)?;
+    // A sync of a roster that stands refuses where no machine resolves.
+    machine.ok_or(TwinKept::NoSync)?;
+    let mut rows = roster.rows.clone();
+    rows_under_source(cli, &fleet.roster, pool_ctx.as_ref(), &mut rows);
+    let rows = accounts::bound(&Roster { rows }, logins);
+    let (Some(own), Some(twin)) = (rows.row(own), rows.row(twin)) else {
+        return Err(TwinKept::NoSync);
+    };
+    let store = env.accounts_store_for(cli).ok_or(TwinKept::NoSync)?;
+    default_twin_verdict(
+        cli,
+        (own, twin),
+        login,
+        &fleet.roster,
+        (state, logins, &store),
+        now,
+    )
+}
+
 /// Where the row on the default login names no address and another row names the one that login
 /// names (Codex's `auth.json` under a file store, [`accounts::default_login_address`]: no keyring
-/// is read and no CLI runs), one account is listed twice. The row a person called something keeps
-/// its label and takes the address; the other is dropped where it holds no login or record, else
-/// both stay and the receipt says so. A row the sync would add for that account is never added. A
-/// row held for another Mac, under shared custody or bound to a directory elsewhere is left as it
+/// is read and no CLI runs), one account is listed twice. A fold keeps the default row's label,
+/// assigns the address and removes the matching row or proposal. Where policy or local state
+/// prevents folding, both stay and the receipt says so.
+/// A row held for another Mac, under shared custody or bound to a directory elsewhere is left as it
 /// is, as is every row where nothing can be read. A default row that names another address is
 /// [`reassign_codex_default`]'s.
 fn merge_default_twin(
@@ -4441,7 +4648,7 @@ fn merge_default_twin(
     let Some(own) = bound.row_for_login(None) else {
         return Ok(follow);
     };
-    if !row_free_here(own, &logins) || own.expected_identity_email().is_some() {
+    if own.expected_identity_email().is_some() {
         return Ok(follow);
     }
     let holds = |row: &Row| {
@@ -4450,22 +4657,41 @@ fn merge_default_twin(
     };
     let mut state = store.load(now)?.0;
     store.hydrate_auth_contexts(&mut state, &bound);
-    let may_name = default_row_may_name(own, &login, fleet, &state, now);
     let own_label = own.label.clone();
     if let Some(twin) = new.iter().find(|row| holds(row)).cloned() {
-        if may_name {
-            new.retain(|row| row.label != twin.label);
-            added.retain(|label| *label != twin.label);
-            name_row(kept, &own_label, &login);
-            follow.merged = Some((own_label, twin.label));
+        // A row this sync would add holds nothing yet but a local completion of its label.
+        let verdict =
+            default_row_may_name(own, &login, fleet, (&state, &logins), now).and_then(|()| {
+                if local_checkpoint_holds_twin(cli, store, &twin, now) {
+                    Err(TwinKept::TwinCheckpoint)
+                } else {
+                    Ok(())
+                }
+            });
+        match verdict {
+            Ok(()) => {
+                new.retain(|row| row.label != twin.label);
+                added.retain(|label| *label != twin.label);
+                name_row(kept, &own_label, &login);
+                follow.merged = Some((own_label, twin.label));
+            }
+            Err(why) => follow.twin = Some((own_label, twin.label, why)),
         }
     } else if let Some(twin) = bound.rows.iter().find(|row| holds(row)).cloned() {
-        if may_name && twin_holds_nothing(&twin, &state, &logins) {
-            name_row(kept, &own_label, &login);
-            kept.retain(|row| row.label != twin.label);
-            follow.merged = Some((own_label, twin.label));
-        } else {
-            follow.twin = Some((own_label, twin.label));
+        match default_twin_verdict(
+            cli,
+            (own, &twin),
+            &login,
+            fleet,
+            (&state, &logins, store),
+            now,
+        ) {
+            Ok(()) => {
+                name_row(kept, &own_label, &login);
+                kept.retain(|row| row.label != twin.label);
+                follow.merged = Some((own_label, twin.label));
+            }
+            Err(why) => follow.twin = Some((own_label, twin.label, why)),
         }
     }
     Ok(follow)
@@ -4483,56 +4709,147 @@ fn row_free_here(row: &Row, logins: &accounts::Logins) -> bool {
     row.held_by.is_none() && matches!(logins.shared.required(row), Ok(None))
 }
 
-/// Whether the row on the default login may take the address that login names: the source gives
-/// its label no other, and it is not known signed out, which would make the login a stale one.
-fn default_row_may_name(
-    own: &Row,
-    login: &str,
-    fleet: &FleetRoster,
-    state: &accounts::State,
+/// A local completion retains its actual checked owner, not the requested directory prefix.
+/// This is only a retention decision: recovery still checks parent, identity and custody.
+fn local_checkpoint_holds_twin(cli: Cli, store: &accounts::Store, twin: &Row, now: i64) -> bool {
+    match local_renewal_checkpoints(cli, store, now) {
+        Ok(scan) => scan.holds_twin(cli, twin),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        // An unreadable local root cannot establish that the row owns nothing.
+        Err(_) => true,
+    }
+}
+
+struct LocalRenewalCheckpoint {
+    prefix: String,
+    sequence: u64,
+    dir: PathBuf,
+    actual_dir: PathBuf,
+    proof: accounts::RenewalCheckpoint,
+}
+
+struct LocalRenewalScan {
+    checkpoints: Vec<LocalRenewalCheckpoint>,
+    /// All entries and candidate I/O were available; absent or invalid proofs remain complete.
+    complete: bool,
+}
+
+impl LocalRenewalScan {
+    fn holds_twin(&self, cli: Cli, twin: &Row) -> bool {
+        !self.complete
+            || self.checkpoints.iter().any(|candidate| {
+                candidate.proof.label == twin.label
+                    && accounts::checkpoint_identity_matches(cli, twin, &candidate.proof)
+            })
+    }
+}
+
+fn staged_login_present(cli: Cli, dir: &Path) -> bool {
+    staged_login_present_checked(cli, dir).unwrap_or(false)
+}
+
+fn staged_login_present_checked(cli: Cli, dir: &Path) -> std::io::Result<bool> {
+    if cli == Cli::Claude {
+        return accounts::login_made_checked(dir);
+    }
+    let mut unavailable = None;
+    for file in cli.connector().stores {
+        match fs::metadata(dir.join(file)) {
+            Ok(metadata) if metadata.is_file() => return Ok(true),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => unavailable = Some(error),
+        }
+    }
+    unavailable.map_or(Ok(false), Err)
+}
+
+/// Decode the same completed local work for retention and recovery. No provider is queried.
+fn local_renewal_checkpoints(
+    cli: Cli,
+    store: &accounts::Store,
     now: i64,
-) -> bool {
-    !fleet.accounts.iter().any(|account| {
-        account.label == own.label && !accounts::email_matches(&account.email, login)
-    }) && accounts::condition(own, state, true, now) != accounts::Condition::SignedOut
+) -> std::io::Result<LocalRenewalScan> {
+    Ok(decode_local_renewal_checkpoints(
+        cli,
+        fs::read_dir(store.logins_dir())?,
+        std::fs::DirEntry::file_type,
+        |dir, actual| accounts::read_renewal_checkpoint_checked_for(cli, dir, actual, now),
+    ))
 }
 
-/// Whether dropping `twin`, a row bound as `logins` say, loses nothing: no login in its directory,
-/// no other Mac's hold or shared custody, and no record under its label, a directory bound
-/// elsewhere among them.
-fn twin_holds_nothing(twin: &Row, state: &accounts::State, logins: &accounts::Logins) -> bool {
-    twin.dir
-        .as_deref()
-        .is_some_and(|dir| !accounts::login_made(Path::new(dir)))
-        && row_free_here(twin, logins)
-        && !accounts::label_is_retained(state, logins, &twin.label)
-}
-
-/// What a sync reads for `cli` where no source is named, for what it would do to the rows here
-/// ([`default_twin_folds`]). `None` where nothing is there to read or it cannot be read, so a sync
-/// does nothing a report could name; it never fetches.
-pub(super) fn sync_source_here(cli: Cli, env: &Env) -> Option<FleetRoster> {
-    let home = env.home.as_deref()?;
-    let no_network = |_: &Env, _: &str| Err("a report fetches no source".to_owned());
-    load_cli_fleet_source(cli, env, home, None, None, &no_network)
-        .ok()
-        .flatten()
-        .map(|(fleet, _, _)| fleet.roster)
-}
-
-/// Whether a sync from `fleet` folds `twin` into `own`, the row on the default login, whose login
-/// names `login`, as [`merge_default_twin`] does on the records as they stand (`logins` binds both
-/// rows).
-pub(super) fn default_twin_folds(
-    (own, twin): (&Row, &Row),
-    login: &str,
-    fleet: &FleetRoster,
-    (state, logins): (&accounts::State, &accounts::Logins),
-    now: i64,
-) -> bool {
-    row_free_here(own, logins)
-        && default_row_may_name(own, login, fleet, state, now)
-        && twin_holds_nothing(twin, state, logins)
+fn decode_local_renewal_checkpoints(
+    cli: Cli,
+    entries: impl IntoIterator<Item = std::io::Result<std::fs::DirEntry>>,
+    entry_type: impl Fn(&std::fs::DirEntry) -> std::io::Result<std::fs::FileType>,
+    checkpoint_read: impl Fn(&Path, &Path) -> std::io::Result<Option<accounts::RenewalCheckpoint>>,
+) -> LocalRenewalScan {
+    let mut complete = true;
+    let checkpoints = entries
+        .into_iter()
+        .filter_map(|entry| {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    complete = false;
+                    return None;
+                }
+            };
+            let name = entry.file_name().into_string().ok()?;
+            let (prefix, suffix) = name.rsplit_once('+')?;
+            if prefix.is_empty() || suffix.is_empty() || !suffix.bytes().all(|b| b.is_ascii_digit())
+            {
+                return None;
+            }
+            let sequence = suffix.parse().ok()?;
+            let kind = match entry_type(&entry) {
+                Ok(kind) => kind,
+                Err(_) => {
+                    complete = false;
+                    return None;
+                }
+            };
+            if !kind.is_dir() {
+                return None;
+            }
+            let dir = entry.path();
+            match staged_login_present_checked(cli, &dir) {
+                Ok(true) => {}
+                Ok(false) => return None,
+                Err(_) => {
+                    complete = false;
+                    return None;
+                }
+            }
+            let actual_dir = match fs::canonicalize(&dir) {
+                Ok(dir) => dir,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+                Err(_) => {
+                    complete = false;
+                    return None;
+                }
+            };
+            // A vendor profile alone is only a hint. A valid completed check names the owner.
+            let proof = match checkpoint_read(&dir, &actual_dir) {
+                Ok(proof) => proof?,
+                Err(_) => {
+                    complete = false;
+                    return None;
+                }
+            };
+            Some(LocalRenewalCheckpoint {
+                prefix: prefix.into(),
+                sequence,
+                dir,
+                actual_dir,
+                proof,
+            })
+        })
+        .collect();
+    LocalRenewalScan {
+        checkpoints,
+        complete,
+    }
 }
 
 /// What a sync did to rows it kept, so its receipt can name each: a hold it cleared or set, and an
@@ -5102,11 +5419,20 @@ pub(super) fn compose_roster(
 /// one follows them. A row's login directory is the build's: where the default login moved, it
 /// follows the account ([`default_relocation`]).
 fn keep_discovered_rows(mut roster: Roster, existing: &Roster) -> Roster {
+    // Each row a person renamed, and where the build puts its account's login where that is the
+    // default login's own place or the row left it: any other directory stays the row's.
+    let mut followed: Vec<(String, Option<String>)> = Vec::new();
     roster.rows.retain(|row| {
-        !existing
+        let renamed = existing
             .rows
             .iter()
-            .any(|prev| prev.label != row.label && same_account(prev, row))
+            .find(|prev| prev.label != row.label && same_account(prev, row));
+        if let Some(prev) = renamed
+            && (row.dir.is_none() || prev.dir.is_none())
+        {
+            followed.push((prev.label.clone(), row.dir.clone()));
+        }
+        renamed.is_none()
     });
     for prev in &existing.rows {
         match roster.rows.iter_mut().find(|row| row.label == prev.label) {
@@ -5118,7 +5444,13 @@ fn keep_discovered_rows(mut roster: Roster, existing: &Roster) -> Roster {
                 row.was.clone_from(&prev.was);
             }
             Some(_) => {}
-            None => roster.rows.push(prev.clone()),
+            None => {
+                let mut kept = prev.clone();
+                if let Some((_, dir)) = followed.iter().find(|(label, _)| *label == prev.label) {
+                    kept.dir.clone_from(dir);
+                }
+                roster.rows.push(kept);
+            }
         }
     }
     roster.rows.sort_by_key(|row| {
@@ -6345,10 +6677,11 @@ fn write_sync_report(
         if !needs_renew.is_empty() {
             let _ = writeln!(
                 out,
-                "not signed in yet: {}; aterm signs them in by itself (`aterm harness accounts` \
-                 shows each one's last attempt, `aterm harness accounts renew {}` runs it now)",
+                "not signed in yet: {}; aterm signs them in by itself (`{}` shows each one's \
+                 last attempt, `{}` runs it now)",
                 needs_renew.join(", "),
-                needs_renew.join(" ")
+                Step::Report(Cli::Claude),
+                Step::Renew(Cli::Claude, needs_renew.join(" "))
             );
         }
     }
@@ -8560,9 +8893,11 @@ fn resync_with(
                 done.synced = true;
                 done.changed |= synced.changed;
             }
-            Ok(CliSync::NoSourceDefaultLogin(login)) => {
-                done.changed |= login.reassigned.is_some();
+            Ok(CliSync::NoSourceDefaultLogin(login)) if login.reassigned.is_some() => {
+                done.synced = true;
+                done.changed = true;
             }
+            Ok(CliSync::NoSourceDefaultLogin(_)) => {}
             Ok(
                 CliSync::Off | CliSync::Left { .. } | CliSync::NoSource | CliSync::Unlisted { .. },
             ) => {}
@@ -9290,34 +9625,9 @@ fn sync_cli_with_replan(
                 _ => kept.push(acct.label.clone()),
             }
         }
-        let mut held_changed = false;
         let mut merged_existing = existing.rows.clone();
-        if let Some(ctx) = &pool_ctx {
-            for row in &mut merged_existing {
-                if row.email.is_some() || row.identity_email.is_some() {
-                    let want = ctx.holder_for_row(cli, row);
-                    if row.held_by != want {
-                        row.held_by = want;
-                        held_changed = true;
-                    }
-                }
-            }
-        } else if fleet.roster.alab.is_some() {
-            // Under the lab nothing limits who runs an account: a hold an old pool file set
-            // would otherwise outlive its source. A row the lab knows takes its derived order.
-            let lab = super::alab_roster::current();
-            for row in &mut merged_existing {
-                held_changed |= row.held_by.take().is_some();
-                if let Some(class) = lab
-                    .as_deref()
-                    .and_then(|lab| Some(lab.class_of(lab.account_of(cli, row)?)))
-                    .filter(|class| *class != row.class)
-                {
-                    row.class = class;
-                    held_changed = true;
-                }
-            }
-        }
+        let mut held_changed =
+            rows_under_source(cli, &fleet.roster, pool_ctx.as_ref(), &mut merged_existing);
         let default_login = merge_default_twin(
             cli,
             &fleet.roster,
@@ -9505,7 +9815,7 @@ fn follow_default_login(
         }
         Ok(None) => None,
         Err(why) => {
-            follow.refused = Some(why);
+            follow.refused = Some(format!("{why}; no row moved"));
             None
         }
     }
@@ -9528,6 +9838,11 @@ fn note_moved_off(follow: &mut DefaultLogin, store: &accounts::Store, rows: Vec<
 
 /// A sync with no fleet to read ([`CliSync::NoSource`]): where this Mac's default login names an
 /// address and it keeps a roster, what comes of following that login, which reads no source.
+/// A roster that stands and does not parse fails this sync as it fails one with a source, whatever
+/// the default login names, so a setup's or doctor's account step does not turn on that login.
+///
+/// # Errors
+/// The roster that stands is refused, or its target or records cannot be read.
 fn sync_without_source(
     cli: Cli,
     (env, store): (&Env, &accounts::Store),
@@ -9535,33 +9850,39 @@ fn sync_without_source(
     ladder: &[Duration],
     now: i64,
 ) -> Result<CliSync, String> {
+    if !roster_path.is_file() {
+        return Ok(CliSync::NoSource);
+    }
+    let (write_to, _) = super::cli::roster_target(roster_path)?;
+    let existing = accounts::roster_text(&write_to)?.map_or(Ok(Vec::new()), |text| {
+        Roster::parse_for(cli, &text)
+            .map(|roster| roster.rows)
+            .map_err(|why| {
+                format!(
+                    "the roster at {} is refused: {why}; the roster is unchanged",
+                    roster_path.display()
+                )
+            })
+    })?;
     let address = store
         .user_home()
         .and_then(|home| accounts::default_login_address(cli, home));
-    if address.is_none() || !roster_path.is_file() {
+    if address.is_none() {
         return Ok(CliSync::NoSource);
     }
     let mut follow = DefaultLogin {
         address,
         ..DefaultLogin::default()
     };
-    let (write_to, _) = super::cli::roster_target(roster_path)?;
-    let rows = match follow_default_login(
+    let rows = follow_default_login(
         cli,
         (env, store),
         (roster_path, &write_to),
         ladder,
         &mut follow,
-    ) {
-        Some(roster) => roster.rows,
-        None => accounts::roster_text(&write_to)?.map_or(Ok(Vec::new()), |text| {
-            Roster::parse_for(cli, &text).map(|roster| roster.rows)
-        })?,
-    };
+    )
+    .map_or(existing, |roster| roster.rows);
     note_moved_off(&mut follow, store, rows, now);
-    if follow.reassigned.is_some() {
-        let _ = store.touch_wake();
-    }
     Ok(if follow.stands() {
         CliSync::NoSourceDefaultLogin(Box::new(follow))
     } else {
@@ -9569,48 +9890,119 @@ fn sync_without_source(
     })
 }
 
-/// Whether a row displaced from the default login may take `dir`, its managed login directory: it
-/// holds nothing, or it is a directory the row left (`was`, [`accounts::Binding::was`]) whose login
-/// names the row's `email`, which it takes back with nothing lost. Anything else stays where it is.
-fn displaced_dir_admits(dir: &str, was: &[Option<String>], email: &str) -> Result<bool, String> {
-    let home = Path::new(dir);
-    match std::fs::read_dir(home) {
-        Ok(mut entries) => match entries.next() {
-            None => Ok(true),
-            Some(entry) => {
-                entry.map_err(|e| e.to_string())?;
-                Ok(accounts::lists_directory(was, dir)?
-                    && crate::ai::facts::codex_file_store(home)
-                    && super::codex_app_login::read_account_email(home)
-                        .is_some_and(|named| accounts::email_matches(&named, email)))
+/// What keeps a row displaced from the default login out of its managed login directory
+/// ([`displaced_dir_refusal`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DisplacedDir {
+    /// Its login names another account, here this address.
+    NamesAnother(String),
+    /// Its login names the row's own account, in a directory the row's binding never left.
+    OwnNeverLeft,
+    /// A login file is there, and it names no address aterm can read.
+    Unreadable,
+    /// Its `config.toml` keeps logins in the OS keyring, so no file says whose it holds.
+    KeyringStore,
+    /// Files are there, none of them a login or aterm's own bookkeeping.
+    OtherFiles,
+}
+
+impl DisplacedDir {
+    /// The refusal's words for `row`, whose address is `email`, and what ends it. A login that names
+    /// the row is the row's, so a person is not told to move it away.
+    fn words(&self, row: &str, email: &str, dir: &str) -> String {
+        let away = "move that directory away and sync again";
+        match self {
+            Self::NamesAnother(address) => format!(
+                "`{row}`'s managed directory {dir} holds the login of {address}, another account: \
+                 {away}"
+            ),
+            Self::OwnNeverLeft => format!(
+                "`{row}`'s managed directory {dir} holds a login of {email}, `{row}`'s own, in a \
+                 directory no record says `{row}` left, so aterm does not take it on the login's \
+                 word: a sign-in of `{row}` on the default login ends this"
+            ),
+            Self::Unreadable => format!(
+                "`{row}`'s managed directory {dir} holds a login that names no address aterm can \
+                 read: {away}"
+            ),
+            Self::KeyringStore => format!(
+                "`{row}`'s managed directory {dir} keeps its logins in the OS keyring, so no file \
+                 says whose it holds: {away}"
+            ),
+            Self::OtherFiles => {
+                format!("`{row}`'s managed directory {dir} holds files that are no login: {away}")
             }
-        },
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
-        Err(error) => Err(error.to_string()),
+        }
     }
 }
 
-/// Reassign a named default login only after observing another uniquely declared account.
-/// This changes login locations, not account identity, provider authority or existing sessions.
-/// The sync receipt publishes the roster and binding fences together; no credential is copied.
-fn reassign_codex_default(
+/// Why a row displaced from the default login may not take `dir`, its managed login directory, or
+/// `None` where it may: it holds nothing but aterm's own bookkeeping ([`accounts::login_made`]'s
+/// rule), or it is a directory the row left (`was`, [`accounts::Binding::was`]) whose login names
+/// the row's `email`, which it takes back with nothing lost. Anything else stays where it is.
+fn displaced_dir_refusal(
+    dir: &str,
+    was: &[Option<String>],
+    email: &str,
+) -> Result<Option<DisplacedDir>, String> {
+    let home = Path::new(dir);
+    let entries = match std::fs::read_dir(home) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        files.push(entry.map_err(|e| e.to_string())?.file_name());
+    }
+    if files.iter().all(|name| accounts::login_bookkeeping(name)) {
+        return Ok(None);
+    }
+    if !crate::ai::facts::codex_file_store(home) {
+        return Ok(Some(DisplacedDir::KeyringStore));
+    }
+    match super::codex_app_login::read_account_email(home) {
+        Some(named) if !accounts::email_matches(&named, email) => {
+            Ok(Some(DisplacedDir::NamesAnother(named)))
+        }
+        Some(_) if accounts::lists_directory(was, dir)? => Ok(None),
+        Some(_) => Ok(Some(DisplacedDir::OwnNeverLeft)),
+        None if home.join("auth.json").exists() => Ok(Some(DisplacedDir::Unreadable)),
+        None => Ok(Some(DisplacedDir::OtherFiles)),
+    }
+}
+
+/// What a sync with no source named does with the row on the default login, on the records as they
+/// stand, by the rules that sync acts on ([`reassign_codex_default`]), writing nothing and taking no
+/// lock: what a surface asks before it names that sync.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DefaultMove {
+    /// It moves the row off that login, to the row of the account that login names.
+    Moves,
+    /// It leaves the row there: the login names the row's own account, or one no row holds.
+    Stays,
+    /// It refuses to move the row, in these words.
+    Refused(String),
+}
+
+/// A default login that names another account than its row, and the row of that account, by what
+/// a sync reads before it takes a lock ([`default_move_asked`]).
+struct MoveAsked<'a> {
+    from: &'a Row,
+    to: &'a Row,
+    expected: &'a str,
+    home: PathBuf,
+    email: String,
+    policy: CodexCompletionSource,
+}
+
+/// [`MoveAsked`] of `roster` and the default login: `None` where no such move is asked. A row or a
+/// source that keeps the move from being made is the refusal.
+fn default_move_asked<'r>(
     env: &Env,
     store: &accounts::Store,
-    configured: &Path,
-    path: &Path,
-    ladder: &[Duration],
-    before_publish: impl FnOnce(),
-) -> Result<Option<(Roster, String)>, String> {
-    let (target, mode) = super::cli::roster_target(configured)?;
-    if target != path {
-        return Err(
-            "the configured roster target changed before Codex reassignment; no row moved".into(),
-        );
-    }
-    let Some(text) = accounts::roster_text(path)? else {
-        return Ok(None);
-    };
-    let roster = Roster::parse_for(Cli::Codex, &text)?;
+    roster: &'r Roster,
+) -> Result<Option<MoveAsked<'r>>, String> {
     let Some(from) = roster.row_for_login(None) else {
         return Ok(None);
     };
@@ -9638,29 +10030,180 @@ fn reassign_codex_default(
         return Ok(None);
     };
     if candidates.next().is_some() {
-        return Err(
-            "the default Codex login matches multiple declared accounts; no row moved".into(),
-        );
+        return Err("the default Codex login matches multiple declared accounts".into());
     }
     if from.held_by.is_some() || to.held_by.is_some() {
-        return Err("the default Codex reassignment includes a held account; no row moved".into());
+        return Err("the default Codex reassignment includes a held account".into());
     }
     super::codex_app_login::check_login_identity(&home, Some(&email)).map_err(|e| e.to_string())?;
     let policy = codex_completion_source(env, to)?;
     if policy.held_by.is_some() {
-        return Err("the source holds the default Codex account; no row moved".into());
+        return Err("the source holds the default Codex account".into());
     }
     if let Some(fleet) = &policy.fleet {
         let mut declared = fleet.roster.accounts.iter().filter(|account| {
             account.label == to.label && fleet_matches_identity(Cli::Codex, to, account)
         });
         if declared.next().is_none() || declared.next().is_some() {
-            return Err(
-                "the source does not uniquely declare the default Codex account; no row moved"
-                    .into(),
-            );
+            return Err("the source does not uniquely declare the default Codex account".into());
         }
     }
+    Ok(Some(MoveAsked {
+        from,
+        to,
+        expected,
+        home,
+        email,
+        policy,
+    }))
+}
+
+/// Where the records let [`MoveAsked`] go: the displaced row's directory, whether its binding
+/// already keeps one elsewhere, what its binding left, and the roster after the move.
+struct MoveAdmitted {
+    independent: Option<String>,
+    directory: String,
+    left: Vec<Option<String>>,
+    updated: Roster,
+}
+
+/// [`MoveAdmitted`] of `asked` under `logins`, or why the records refuse it.
+fn default_move_admitted(
+    store: &accounts::Store,
+    roster: &Roster,
+    asked: &MoveAsked<'_>,
+    logins: &accounts::Logins,
+) -> Result<MoveAdmitted, String> {
+    let MoveAsked {
+        from,
+        to,
+        expected,
+        home,
+        ..
+    } = asked;
+    let mut updated = roster.clone();
+    let independent = logins
+        .get(&from.label)
+        .and_then(|binding| binding.dir.clone());
+    let directory = independent
+        .clone()
+        .or_else(|| {
+            store
+                .login_dir(&from.label)
+                .and_then(|path| path.to_str().map(str::to_owned))
+        })
+        .ok_or("the displaced account has no managed login location")?;
+    if accounts::retained_directory_owner(logins, &roster.rows, &from.label, &directory)?.is_some()
+        || accounts::shared_staging_retained(logins, &directory)?
+    {
+        return Err("the displaced account's directory has another owner".into());
+    }
+    if accounts::naming_row(
+        std::iter::once(&Row {
+            dir: Some(directory.clone()),
+            ..Row::default()
+        }),
+        home.to_str().ok_or("the default Codex home is not UTF-8")?,
+    )?
+    .is_some()
+    {
+        return Err("the displaced account's directory aliases the default login".into());
+    }
+    let left: Vec<Option<String>> = logins
+        .get(&from.label)
+        .map(|binding| binding.was.clone())
+        .unwrap_or_default();
+    if independent.is_none()
+        && let Some(refusal) = displaced_dir_refusal(&directory, &left, expected)?
+    {
+        return Err(refusal.words(&from.label, expected, &directory));
+    }
+    updated
+        .rows
+        .iter_mut()
+        .find(|row| row.label == from.label)
+        .ok_or("the displaced account left the roster")?
+        .dir = Some(directory.clone());
+    updated
+        .rows
+        .iter_mut()
+        .find(|row| row.label == to.label)
+        .ok_or("the default account left the roster")?
+        .dir = None;
+    if accounts::retained_directory_owner(
+        logins,
+        &updated.rows,
+        &to.label,
+        home.to_str().ok_or("the default Codex home is not UTF-8")?,
+    )?
+    .is_some()
+        || accounts::shared_staging_retained(
+            logins,
+            home.to_str().ok_or("the default Codex home is not UTF-8")?,
+        )?
+    {
+        return Err("the default Codex directory has another retained owner".into());
+    }
+    Ok(MoveAdmitted {
+        independent,
+        directory,
+        left,
+        updated,
+    })
+}
+
+/// [`DefaultMove`] of the pool `sync` names, as a sync with no source named would read it.
+#[must_use]
+pub fn default_move_verdict(sync: super::accounts_pool::SyncHere<'_>) -> DefaultMove {
+    let (store, roster_path) = (sync.store, sync.roster);
+    if store.cli() != Cli::Codex {
+        return DefaultMove::Stays;
+    }
+    let (Some(home), Some(state)) = (store.user_home(), store.dir.parent()) else {
+        return DefaultMove::Stays;
+    };
+    let env = quiet_env(home, state, &config_beside(roster_path), sync.now);
+    let verdict = || -> Result<DefaultMove, String> {
+        let (path, _) = super::cli::roster_target(roster_path)?;
+        let Some(text) = accounts::roster_text(&path)? else {
+            return Ok(DefaultMove::Stays);
+        };
+        let roster = Roster::parse_for(Cli::Codex, &text)?;
+        let Some(asked) = default_move_asked(&env, store, &roster)? else {
+            return Ok(DefaultMove::Stays);
+        };
+        let (logins, note) = store.load_logins(sync.now)?;
+        if note.is_some() {
+            return Err("account records could not be read consistently".into());
+        }
+        default_move_admitted(store, &roster, &asked, &logins)?;
+        Ok(DefaultMove::Moves)
+    };
+    verdict().unwrap_or_else(DefaultMove::Refused)
+}
+
+/// Reassign a named default login only after observing another uniquely declared account.
+/// This changes login locations, not account identity, provider authority or existing sessions.
+/// The sync receipt publishes the roster and binding fences together; no credential is copied.
+fn reassign_codex_default(
+    env: &Env,
+    store: &accounts::Store,
+    configured: &Path,
+    path: &Path,
+    ladder: &[Duration],
+    before_publish: impl FnOnce(),
+) -> Result<Option<(Roster, String)>, String> {
+    let (target, mode) = super::cli::roster_target(configured)?;
+    if target != path {
+        return Err("the configured roster target changed before Codex reassignment".into());
+    }
+    let Some(text) = accounts::roster_text(path)? else {
+        return Ok(None);
+    };
+    let roster = Roster::parse_for(Cli::Codex, &text)?;
+    let Some(asked) = default_move_asked(env, store, &roster)? else {
+        return Ok(None);
+    };
     let config = env
         .config
         .as_deref()
@@ -9674,85 +10217,32 @@ fn reassign_codex_default(
         .acquire_within(ladder)
         .map_err(|e| e.to_string())?
         .ok_or(accounts::LOCK_HELD)?;
-    let _auth = super::codex_app_login::AuthLock::try_take(&home.join("auth.json"))
+    let _auth = super::codex_app_login::AuthLock::try_take(&asked.home.join("auth.json"))
         .map_err(|e| e.to_string())?
-        .ok_or("the default Codex login is being changed; no row moved")?;
+        .ok_or("the default Codex login is being changed")?;
     let (mut state, state_note) = store.load(env.now)?;
     let (logins, logins_note) = store.load_logins(env.now)?;
     if state_note.is_some() || logins_note.is_some() {
-        return Err("account records could not be read consistently; no row moved".into());
+        return Err("account records could not be read consistently".into());
     }
     // The transaction applies this same machine-name normalization before its edit.
     if let Ok(machine) = store.machine_id(&state.machine) {
         state.machine = machine;
     }
-    let mut updated = roster.clone();
-    let independent = logins
-        .get(&from.label)
-        .and_then(|binding| binding.dir.clone());
-    let directory = independent
-        .clone()
-        .or_else(|| {
-            store
-                .login_dir(&from.label)
-                .and_then(|path| path.to_str().map(str::to_owned))
-        })
-        .ok_or("the displaced account has no managed login location")?;
-    if accounts::retained_directory_owner(&logins, &roster.rows, &from.label, &directory)?.is_some()
-        || accounts::shared_staging_retained(&logins, &directory)?
-    {
-        return Err("the displaced account's directory has another owner; no row moved".into());
-    }
-    if accounts::naming_row(
-        std::iter::once(&Row {
-            dir: Some(directory.clone()),
-            ..Row::default()
-        }),
-        home.to_str().ok_or("the default Codex home is not UTF-8")?,
-    )?
-    .is_some()
-    {
-        return Err(
-            "the displaced account's directory aliases the default login; no row moved".into(),
-        );
-    }
-    let left: Vec<Option<String>> = logins
-        .get(&from.label)
-        .map(|binding| binding.was.clone())
-        .unwrap_or_default();
-    if independent.is_none() && !displaced_dir_admits(&directory, &left, expected)? {
-        return Err(format!(
-            "`{}`'s managed directory {directory} holds a login that is not its own; no row moved: \
-             move that directory away and sync again",
-            from.label
-        ));
-    }
-    updated
-        .rows
-        .iter_mut()
-        .find(|row| row.label == from.label)
-        .unwrap()
-        .dir = Some(directory.clone());
-    updated
-        .rows
-        .iter_mut()
-        .find(|row| row.label == to.label)
-        .unwrap()
-        .dir = None;
-    if accounts::retained_directory_owner(
-        &logins,
-        &updated.rows,
-        &to.label,
-        home.to_str().ok_or("the default Codex home is not UTF-8")?,
-    )?
-    .is_some()
-        || accounts::shared_staging_retained(
-            &logins,
-            home.to_str().ok_or("the default Codex home is not UTF-8")?,
-        )?
-    {
-        return Err("the default Codex directory has another retained owner; no row moved".into());
-    }
+    let MoveAdmitted {
+        independent,
+        directory,
+        left,
+        updated,
+    } = default_move_admitted(store, &roster, &asked, &logins)?;
+    let MoveAsked {
+        from,
+        to,
+        expected,
+        home,
+        email,
+        policy,
+    } = asked;
     let next_text = accounts::append_rows_for(Cli::Codex, "", &updated.rows)?;
     before_publish();
     let recheck = || -> Result<(), String> {
@@ -9764,9 +10254,7 @@ fn reassign_codex_default(
                 .is_some_and(|now| accounts::email_matches(&now, &email))
             || codex_completion_source(env, to)? != policy
         {
-            return Err(
-                "Codex account identity or policy changed before reassignment; no row moved".into(),
-            );
+            return Err("Codex account identity or policy changed before reassignment".into());
         }
         if accounts::retained_directory_owner(&logins, &roster.rows, &from.label, &directory)?
             .is_some()
@@ -9783,10 +10271,10 @@ fn reassign_codex_default(
                 home.to_str().ok_or("the default Codex home is not UTF-8")?,
             )?
         {
-            return Err("Codex login directory ownership changed; no row moved".into());
+            return Err("Codex login directory ownership changed".into());
         }
-        if independent.is_none() && !displaced_dir_admits(&directory, &left, expected)? {
-            return Err("the displaced account's directory became occupied; no row moved".into());
+        if independent.is_none() && displaced_dir_refusal(&directory, &left, expected)?.is_some() {
+            return Err("the displaced account's directory became occupied".into());
         }
         super::codex_app_login::check_login_identity(&home, Some(&email)).map_err(|e| e.to_string())
     };
@@ -9803,9 +10291,7 @@ fn reassign_codex_default(
         },
         |current, bindings| {
             if *current != state || *bindings != logins {
-                return Err(
-                    "account custody changed before Codex reassignment; no row moved".into(),
-                );
+                return Err("account custody changed before Codex reassignment".into());
             }
             recheck()?;
             for label in [&from.label, &to.label] {
@@ -9989,23 +10475,23 @@ pub fn account_alias_admission_environment() {}
 /// ([`sync_cli_with`]).
 pub fn run_cli_accounts_sync(
     cli: Cli,
-    env: &Env,
+    (env, program): (&Env, Option<&Path>),
     (source, machine_override, json): (Option<&str>, Option<&str>, bool),
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
     run_cli_accounts_sync_with(
         cli,
-        env,
+        (env, program),
         (source, machine_override, json),
         (out, err),
         &fetch_source_text,
     )
 }
 
-fn run_cli_accounts_sync_with(
+pub(super) fn run_cli_accounts_sync_with(
     cli: Cli,
-    env: &Env,
+    (env, program): (&Env, Option<&Path>),
     (source, machine_override, json): (Option<&str>, Option<&str>, bool),
     (out, err): (&mut dyn Write, &mut dyn Write),
     fetch: &Fetch<'_>,
@@ -10057,9 +10543,9 @@ fn run_cli_accounts_sync_with(
                 err,
                 "aterm harness accounts sync {flag}: nothing was read: this machine keeps no \
                  {product} roster ({file}) and no source was named; name one (`aterm harness \
-                 accounts sync {flag} ~/.secrets/{}`), or list an account (`aterm harness \
-                 accounts add <label> {flag}`)",
-                cli_fleet_file(cli)
+                 accounts sync {flag} ~/.secrets/{}`), or list an account (`{}`)",
+                cli_fleet_file(cli),
+                Step::Add { cli, email: None }
             );
             return ExitCode::FAILURE;
         }
@@ -10072,7 +10558,7 @@ fn run_cli_accounts_sync_with(
             return ExitCode::FAILURE;
         }
         Ok(CliSync::NoSourceDefaultLogin(login)) => {
-            return no_source_default_login_receipt(cli, &login, json, (out, err));
+            return no_source_default_login_receipt(cli, &login, (program, json), (out, err));
         }
         Ok(CliSync::Unlisted {
             machine,
@@ -10137,12 +10623,16 @@ fn run_cli_accounts_sync_with(
         synced.rows_changed.put_json(&mut o);
         o.insert("label_clashes".to_owned(), clashes_json(&synced.clashes));
         synced.default_login.put_json(&mut o);
+        // A first sync's own row names no move of the default login, so it stands beside one.
+        if let Some(own) = &synced.own_row {
+            o.insert("own_row".to_owned(), Value::from(own.clone()));
+        }
         let _ = writeln!(
             out,
             "{}",
             aterm_json::to_string(&Value::Object(o)).unwrap_or_default()
         );
-        return write_default_refusal(&synced.default_login, &flag, err);
+        return write_default_refusal(&synced.default_login, program, &flag, err);
     }
     let elsewhere = if synced.source == super::alab_roster::SOURCE {
         "the lab prefers here"
@@ -10164,7 +10654,7 @@ fn run_cli_accounts_sync_with(
     let _ = writeln!(out, "source: {}", synced.source);
     synced.rows_changed.write_lines(out);
     write_clash_lines(&synced.clashes, out);
-    synced.default_login.write_lines(out);
+    synced.default_login.write_lines(program, out);
     if synced.prefers_none {
         let _ = writeln!(
             out,
@@ -10203,29 +10693,28 @@ fn run_cli_accounts_sync_with(
         let _ = writeln!(
             out,
             "not signed in yet: {}; {switch} keeps aterm's unattended sign-ins off here \
-             (`aterm harness accounts renew {} {flag}` runs one now)",
+             (`{}` runs one now)",
             unsigned.join(", "),
-            unsigned.join(" ")
+            Step::Renew(cli, unsigned.join(" "))
         );
     } else if !unsigned.is_empty() && cli.renews_headlessly() {
         let _ = writeln!(
             out,
             "not signed in yet: {}; aterm signs one in by itself once a session needs it \
-             (`aterm harness accounts renew {} {flag}` runs that now)",
+             (`{}` runs that now)",
             unsigned.join(", "),
-            unsigned.join(" ")
+            Step::Renew(cli, unsigned.join(" "))
         );
     } else if !unsigned.is_empty() {
         let _ = writeln!(
             out,
             "not signed in yet: {}; {product}'s sign-in page answers aterm's headless browser \
-             with a block page, so a person signs each in: `aterm harness accounts {} <label> \
-             {flag}`",
+             with a block page, so a person signs each in: `{}`",
             synced.added.join(", "),
-            cli.sign_in_verb(true)
+            Step::sign_in(cli, Step::CHOSEN_LABEL, true)
         );
     }
-    write_default_refusal(&synced.default_login, &flag, err)
+    write_default_refusal(&synced.default_login, program, &flag, err)
 }
 
 /// What a sync of `cli` found no source in, in its error line's words.
@@ -10241,8 +10730,13 @@ fn nothing_to_read_words(cli: Cli) -> String {
 
 /// The error line of a sync that could not follow the default login, and its exit code; success
 /// where none stands.
-fn write_default_refusal(login: &DefaultLogin, flag: &str, err: &mut dyn Write) -> ExitCode {
-    let Some(words) = login.refusal_words() else {
+fn write_default_refusal(
+    login: &DefaultLogin,
+    program: Option<&Path>,
+    flag: &str,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let Some(words) = login.refusal_words(program) else {
         return ExitCode::SUCCESS;
     };
     let _ = writeln!(err, "aterm harness accounts sync {flag}: {words}");
@@ -10255,7 +10749,7 @@ fn write_default_refusal(login: &DefaultLogin, flag: &str, err: &mut dyn Write) 
 fn no_source_default_login_receipt(
     cli: Cli,
     login: &DefaultLogin,
-    json: bool,
+    (program, json): (Option<&Path>, bool),
     (out, err): (&mut dyn Write, &mut dyn Write),
 ) -> ExitCode {
     let flag = format!("--cli {}", cli.id());
@@ -10266,10 +10760,6 @@ fn no_source_default_login_receipt(
         o.insert("kind".to_owned(), Value::from("accounts-sync".to_owned()));
         o.insert("cli".to_owned(), Value::from(cli.id().to_owned()));
         o.insert("source".to_owned(), Value::Null);
-        o.insert(
-            "own_row".to_owned(),
-            login.reassigned.clone().map_or(Value::Null, Value::from),
-        );
         login.put_json(&mut o);
         let _ = writeln!(
             out,
@@ -10280,13 +10770,16 @@ fn no_source_default_login_receipt(
         if let Some(row) = &login.reassigned {
             let _ = writeln!(out, "on this machine's own login: {row}");
         }
-        login.write_lines(out);
+        login.write_lines(program, out);
         // With no source in the way, a row of the login's address is all a sync needs.
         if let (Some(address), Some(_), None) = (&login.address, &login.moved_off, &login.refused) {
             let _ = writeln!(
                 out,
-                "or list that account, and a sync moves the login to it: `aterm harness accounts \
-                 add <label> {flag} --email {address}`"
+                "or list that account, and a sync moves the login to it: `{}`",
+                Step::Add {
+                    cli,
+                    email: Some(address.clone()),
+                }
             );
         }
     }
@@ -10297,7 +10790,7 @@ fn no_source_default_login_receipt(
         );
         return ExitCode::SUCCESS;
     }
-    let _ = write_default_refusal(login, &flag, err);
+    let _ = write_default_refusal(login, program, &flag, err);
     let _ = writeln!(err, "aterm harness accounts sync {flag}: {nothing}");
     ExitCode::FAILURE
 }
@@ -10812,7 +11305,7 @@ struct AutoRenewGuard {
     bot_checked: BTreeMap<String, Instant>,
     /// The newest `(at, same_second_count)` signed-in `accounts browser` window event already used
     /// to lift a row's background hold once.
-    browser_unparked: BTreeMap<String, (i64, usize)>,
+    browser_unparked: BTreeMap<String, (Option<accounts::WorkflowToken>, i64, usize)>,
     /// The automatic sign-in ladder's backoffs and vault clock ([`super::sign_in_ladder::Ladder`]).
     ladder: super::sign_in_ladder::Ladder,
     /// The default row and the sign-out on record the default login's one check last ran for
@@ -10834,6 +11327,7 @@ struct LoginOwner {
     success_generation: Option<(u64, u64)>,
     diagnostic: Option<LoginDiagnostic>,
     identity: Option<LoginIdentity>,
+    workflow: Option<accounts::WorkflowToken>,
 }
 
 impl LoginOwner {
@@ -10847,6 +11341,7 @@ impl LoginOwner {
             success_generation: None,
             diagnostic: None,
             identity: None,
+            workflow: None,
         }
     }
 
@@ -10866,6 +11361,11 @@ impl LoginOwner {
 
     fn for_row(mut self, row: &accounts::Row) -> Self {
         self.identity = Some(LoginIdentity::of(row));
+        self
+    }
+
+    fn for_workflow(mut self, raw: &accounts::Row, logins: &accounts::Logins) -> Self {
+        self.workflow = accounts::current_workflow(raw, logins);
         self
     }
 
@@ -11059,7 +11559,8 @@ fn login_activity_of(
         let next = now.saturating_add(i64::try_from(seconds).unwrap_or(i64::MAX));
         let row = activity_row(&mut rows, owner);
         row.observed_at = row.observed_at.max(owner.observed_at);
-        row.next_at = Some(row.next_at.map_or(next, |held| held.min(next)));
+        // With unchanged inputs, every hold on this captured account must clear.
+        row.next_at = Some(row.next_at.map_or(next, |held| held.max(next)));
         if let Some(diagnostic) = &owner.diagnostic
             && row
                 .diagnostic
@@ -11201,6 +11702,175 @@ fn note_published_login(
     if !activity.is_empty() || !ladder.is_empty() {
         login_activity_moved();
     }
+}
+
+/// Withdraw superseded retries and expire current person holds, preserving active and newer claims.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountWorkflowRuntime",
+        action = "Read",
+        project = "aterm_agent::harness::accounts_sync::workflow_runtime_tests::runtime_transition"
+    )
+)]
+fn reconcile_workflow_retries(
+    guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
+    store: &accounts::Store,
+    cli: Cli,
+    roster_path: &Path,
+    captured: (&accounts::Row, &accounts::Row, &accounts::Logins),
+    now: i64,
+) {
+    reconcile_workflow_retries_with_read(guard, store, cli, roster_path, captured, now, || {});
+}
+
+fn reconcile_workflow_retries_with_read(
+    guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
+    store: &accounts::Store,
+    cli: Cli,
+    roster_path: &Path,
+    (raw, row, logins): (&accounts::Row, &accounts::Row, &accounts::Logins),
+    now: i64,
+    after_read: impl FnOnce(),
+) {
+    let claims = LoginClaims::capture(guard);
+    let Ok(records) = store.read_account_records(Some(roster_path), now) else {
+        return;
+    };
+    after_read();
+    if records.raw_roster.row(&raw.label) != Some(raw)
+        || records.roster.row(&raw.label) != Some(row)
+        || accounts::current_workflow(raw, logins).is_none_or(|captured| {
+            !accounts::workflow_token_current(raw, &records.logins, captured)
+        })
+    {
+        return;
+    }
+    let logins = &records.logins;
+    let stale = |owner: &LoginOwner| {
+        owner.matches(store, cli)
+            && owner.label == raw.label
+            && owner.workflow.is_some_and(|token| {
+                !accounts::workflow_token_current(raw, logins, token)
+                    || owner
+                        .identity
+                        .as_ref()
+                        .is_some_and(|identity| identity.row != *row)
+            })
+    };
+    let mut state = guard
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if state.in_flight {
+        return;
+    }
+    let activity: Vec<_> = state
+        .activity_owners
+        .iter()
+        .filter(|(key, owner)| {
+            stale(owner)
+                && claims
+                    .activity
+                    .get(*key)
+                    .is_some_and(|before| std::sync::Arc::ptr_eq(&before.token, &owner.token))
+        })
+        .map(|(key, _)| key.clone())
+        .collect();
+    let ladder: Vec<_> = state
+        .ladder_owners
+        .iter()
+        .filter(|(key, owner)| {
+            stale(owner)
+                && claims
+                    .ladder
+                    .get(*key)
+                    .is_some_and(|before| std::sync::Arc::ptr_eq(&before.token, &owner.token))
+        })
+        .map(|(key, _)| key.clone())
+        .collect();
+    for key in &activity {
+        state.last_attempt.remove(key);
+        state.parked.remove(key);
+        state.bot_checked.remove(key);
+        state.browser_unparked.remove(key);
+        state.activity_owners.remove(key);
+    }
+    for key in &ladder {
+        state.ladder.signed_in(key);
+        state.ladder_owners.remove(key);
+    }
+    // Sleep can advance the task's wall clock while leaving Instant's person hold young.
+    // Only its still-current, pre-read owner may release that hold; bot and retry clocks remain.
+    let expired: Vec<_> = if accounts::current_sign_in_task(raw, logins)
+        .is_some_and(|task| now.saturating_sub(task.at) >= PERSON_BACKOFF_SECS)
+    {
+        state
+            .activity_owners
+            .iter()
+            .filter(|(key, owner)| {
+                state.parked.contains_key(*key)
+                    && owner.matches(store, cli)
+                    && owner.label == raw.label
+                    && owner
+                        .identity
+                        .as_ref()
+                        .is_some_and(|identity| identity.row == *row)
+                    && owner
+                        .workflow
+                        .is_some_and(|token| accounts::workflow_token_current(raw, logins, token))
+                    && claims
+                        .activity
+                        .get(*key)
+                        .is_some_and(|before| std::sync::Arc::ptr_eq(&before.token, &owner.token))
+            })
+            .map(|(key, _)| key.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    for key in &expired {
+        state.parked.remove(key);
+    }
+    drop(state);
+    if !activity.is_empty() || !ladder.is_empty() || !expired.is_empty() {
+        login_activity_moved();
+    }
+}
+
+/// Admit an externally edited policy before capturing its new workflow for a retry.
+fn prepare_retry_workflow(
+    store: &accounts::Store,
+    roster_path: &Path,
+    raw: &accounts::Row,
+    row: &accounts::Row,
+    observed: &accounts::Logins,
+    now: i64,
+) -> Result<Option<accounts::AccountRecords>, String> {
+    if accounts::current_workflow(raw, observed).is_some() {
+        return Ok(None);
+    }
+    let parent = accounts::RenewalParent::capture(observed, &raw.label);
+    store.transact_pool_logins_within(&[], roster_path, now, &mut None, |current, _, logins| {
+        if current.row(&raw.label) != Some(raw)
+            || accounts::bound(current, logins).row(&raw.label) != Some(row)
+        {
+            return Err("sign-in workflow changed before retry admission".into());
+        }
+        parent.require_current(logins, &raw.label)?;
+        accounts::admit_workflow(logins, &raw.label)?;
+        Ok(Vec::new())
+    })?;
+    let records = store
+        .read_account_records(Some(roster_path), now)
+        .map_err(|why| format!("{why:?}"))?;
+    if records.raw_roster.row(&raw.label) != Some(raw)
+        || records.roster.row(&raw.label) != Some(row)
+        || !parent.matches(&records.logins, &raw.label)
+        || accounts::current_workflow(raw, &records.logins).is_none()
+    {
+        return Err("sign-in workflow changed during retry admission".into());
+    }
+    Ok(Some(records))
 }
 
 /// Replayed and remote-process publications remain observable in the committed
@@ -11564,7 +12234,7 @@ mod login_activity_tests {
                 if let Some(owner) = owner(ladder) {
                     state.ladder_owners.insert("key".into(), owner);
                 }
-                state.browser_unparked.insert("key".into(), (42, 1));
+                state.browser_unparked.insert("key".into(), (None, 42, 1));
                 state.active_login = Some(ActiveLogin {
                     owner: LoginOwner::new(&store, Cli::Claude, "row", 900),
                     route: Some("profile".into()),
@@ -11602,7 +12272,7 @@ mod login_activity_tests {
                     "{activity}/{ladder}"
                 );
                 assert!(state.in_flight);
-                assert_eq!(state.browser_unparked.get("key"), Some(&(42, 1)));
+                assert_eq!(state.browser_unparked.get("key"), Some(&(None, 42, 1)));
                 assert!(std::sync::Arc::ptr_eq(
                     &state.active_login.as_ref().unwrap().token,
                     &token
@@ -11754,17 +12424,26 @@ fn is_person_stop_why(why: &str) -> bool {
     why.ends_with(" needs-sign-in") || why.ends_with(" needs-you") || why.ends_with(" hung")
 }
 
+#[cfg(test)]
 fn browser_window_signed_in_token(
     store: &accounts::Store,
     label: &str,
     since_at: i64,
+) -> Option<(i64, usize)> {
+    browser_window_token_where(store, since_at, |event| event.account == label)
+}
+
+fn browser_window_token_where(
+    store: &accounts::Store,
+    since_at: i64,
+    applies: impl Fn(&accounts::Event) -> bool,
 ) -> Option<(i64, usize)> {
     let events = store.tail_validated(accounts::LEDGER_KEEP_ROWS).ok()?;
     let mut last_at: Option<i64> = None;
     let mut same_at_count = 0usize;
     let mut satisfied: Option<(i64, usize)> = None;
     for event in events {
-        if event.account != label {
+        if !applies(&event) {
             continue;
         }
         if event.kind == accounts::Kind::WrongAccount {
@@ -11790,6 +12469,21 @@ fn browser_window_signed_in_token(
     satisfied
 }
 
+fn workflow_browser_window_token(
+    store: &accounts::Store,
+    raw: &accounts::Row,
+    logins: &accounts::Logins,
+    since_at: i64,
+) -> Option<(i64, usize)> {
+    accounts::current_workflow(raw, logins)?;
+    browser_window_token_where(store, since_at, |event| {
+        (event.account == raw.label
+            && (event.kind == accounts::Kind::WrongAccount
+                || (event.kind == accounts::Kind::SignIn && event.why.is_empty())))
+            || accounts::workflow_event_matches(raw, logins, event)
+    })
+}
+
 /// Whether the row's trusted browser profile may be tried for a fresh Claude login.
 /// A wrong-account renewal rejects it until a later successful browser window is on record.
 /// This permits another provider identity check and changes no authentication or login state.
@@ -11805,16 +12499,16 @@ fn browser_window_signed_in_token(
 pub(crate) fn claude_browser_profile_ready(
     store: &accounts::Store,
     logins: &accounts::Logins,
-    label: &str,
-    email: Option<&str>,
+    raw: &accounts::Row,
 ) -> bool {
+    let (label, email) = (raw.label.as_str(), raw.email.as_deref());
     if !super::headless_oauth::has_browser_profile(&store.dir, label, email) {
         return false;
     }
     let Some(wrong_at) = logins.get(label).and_then(|binding| binding.wrong_at) else {
         return true;
     };
-    browser_window_signed_in_token(store, label, wrong_at).is_some_and(|(at, _)| at > wrong_at)
+    workflow_browser_window_token(store, raw, logins, wrong_at).is_some_and(|(at, _)| at > wrong_at)
 }
 
 /// Fixture choices for browser-profile trust and ordered account history.
@@ -11835,10 +12529,27 @@ pub fn account_browser_rehabilitation_environment() {}
 /// ended; `None` once a later sign-in end, signed-in `accounts browser` window, renewal or
 /// wrong account is on record, or the ledger cannot be read. It holds the row's background
 /// renewal across a restart of aterm, which forgets [`AutoRenewGuard::bot_checked`].
-pub(crate) fn bot_check_on_record_at(store: &accounts::Store, label: &str) -> Option<i64> {
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountWorkflowRuntime",
+        action = "Read",
+        project = "aterm_agent::harness::accounts_sync::workflow_runtime_tests::runtime_transition"
+    )
+)]
+pub(crate) fn bot_check_on_record_at(
+    store: &accounts::Store,
+    raw: &accounts::Row,
+    logins: &accounts::Logins,
+) -> Option<i64> {
     let events = store.tail(accounts::LEDGER_KEEP_ROWS).ok()?;
     let newest = events.iter().rev().find(|event| {
-        event.account == label
+        (event.account == raw.label
+            && matches!(
+                event.kind,
+                accounts::Kind::Renewed | accounts::Kind::SignedIn | accounts::Kind::WrongAccount
+            )
+            || accounts::workflow_event_matches(raw, logins, event))
             && match event.kind {
                 accounts::Kind::SignIn => {
                     !event.why.contains(" window ") || is_signed_in_browser_window_why(&event.why)
@@ -11859,11 +12570,11 @@ pub(crate) fn bot_check_on_record_at(store: &accounts::Store, label: &str) -> Op
 pub(crate) fn unaddressed_sign_in_task_at(
     store: &accounts::Store,
     logins: &accounts::Logins,
-    label: &str,
+    raw: &accounts::Row,
 ) -> Option<i64> {
-    let task = logins.get(label).and_then(|b| b.sign_in_task)?;
+    let task = accounts::current_sign_in_task(raw, logins)?;
     if task.action == accounts::SignInAction::Browser
-        && browser_window_signed_in_token(store, label, task.at).is_some()
+        && workflow_browser_window_token(store, raw, logins, task.at).is_some()
     {
         return None;
     }
@@ -11874,15 +12585,88 @@ fn reconcile_browser_window_unpark(
     state: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
     key: &str,
     token: Option<(i64, usize)>,
+    raw: &accounts::Row,
+    logins: &accounts::Logins,
+    (store, cli, roster_path): (&accounts::Store, Cli, &Path),
+) {
+    reconcile_browser_window_unpark_with_read(
+        state,
+        key,
+        token,
+        raw,
+        logins,
+        (store, cli, roster_path),
+        || {},
+    );
+}
+
+fn reconcile_browser_window_unpark_with_read(
+    state: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
+    key: &str,
+    token: Option<(i64, usize)>,
+    raw: &accounts::Row,
+    logins: &accounts::Logins,
+    (store, cli, roster_path): (&accounts::Store, Cli, &Path),
+    after_read: impl FnOnce(),
 ) {
     let Some(token) = token else {
         return;
     };
+    let Some(workflow) = accounts::current_workflow(raw, logins) else {
+        return;
+    };
+    let claims = LoginClaims::capture(state);
+    let Ok(records) =
+        store.read_account_records(Some(roster_path), crate::supervise::limit::unix_now())
+    else {
+        return;
+    };
+    after_read();
+    if records.raw_roster.row(&raw.label) != Some(raw)
+        || !accounts::workflow_token_current(raw, &records.logins, workflow)
+    {
+        return;
+    }
+    let logins = &records.logins;
     let mut guard = state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if guard.browser_unparked.get(key).copied() != Some(token) {
-        guard.browser_unparked.insert(key.to_owned(), token);
+    let owns = guard.activity_owners.get(key).is_some_and(|owner| {
+        owner.matches(store, cli)
+            && claims
+                .activity
+                .get(key)
+                .is_some_and(|before| std::sync::Arc::ptr_eq(&before.token, &owner.token))
+    });
+    let same_claim = match (guard.activity_owners.get(key), claims.activity.get(key)) {
+        (Some(owner), Some(before)) => std::sync::Arc::ptr_eq(&before.token, &owner.token),
+        (None, None) => true,
+        _ => false,
+    };
+    let foreign = guard
+        .activity_owners
+        .get(key)
+        .into_iter()
+        .chain(guard.ladder_owners.get(key))
+        .any(|owner| !owner.matches(store, cli));
+    let held = guard.last_attempt.contains_key(key)
+        || guard.parked.contains_key(key)
+        || guard.bot_checked.contains_key(key);
+    if guard.in_flight || !same_claim || foreign || (held && !owns) {
+        return;
+    }
+    let used = guard
+        .browser_unparked
+        .get(key)
+        .is_some_and(|(workflow, at, count)| {
+            (*at, *count) == token
+                && workflow.is_some_and(|held| accounts::workflow_token_current(raw, logins, held))
+        });
+    if !used {
+        guard.browser_unparked.insert(
+            key.to_owned(),
+            (accounts::current_workflow(raw, logins), token.0, token.1),
+        );
         guard.parked.remove(key);
         guard.bot_checked.remove(key);
         guard.last_attempt.remove(key);
@@ -11894,16 +12678,26 @@ fn reconcile_browser_window_unpark(
 /// since `now`, and one that met Cloudflare's bot check ([`super::cli::Renewal::BotCheck`])
 /// holds it as long, asking no one; a contended lock leaves any hold as it was; any other end
 /// lifts both.
+#[cfg(test)]
 fn note_background_end(
     state: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
     label: &str,
     renewal: super::cli::Renewal,
     now: Instant,
 ) {
-    use super::cli::Renewal;
     let mut guard = state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    apply_background_end(&mut guard, label, renewal, now);
+}
+
+fn apply_background_end(
+    guard: &mut AutoRenewGuard,
+    label: &str,
+    renewal: super::cli::Renewal,
+    now: Instant,
+) {
+    use super::cli::Renewal;
     match renewal {
         Renewal::NeedsPerson => {
             guard.parked.insert(label.to_owned(), now);
@@ -11930,11 +12724,29 @@ fn note_vendor_renewal_end(
     store: &accounts::Store,
     cli: Cli,
     (key, label): (&str, &str),
+    (roster_path, raw, observed): (&Path, &accounts::Row, &accounts::Logins),
     renewal: super::cli::Renewal,
 ) {
-    note_background_end(guard, key, renewal, Instant::now());
     if renewal == super::cli::Renewal::Renewed {
         note_published_login(guard, claims, store, cli, label);
+    } else if let Some(token) = accounts::current_workflow(raw, observed)
+        && let Ok(records) =
+            store.read_account_records(Some(roster_path), crate::supervise::limit::unix_now())
+        && let Some(current) = records.raw_roster.row(label)
+        && accounts::workflow_token_current(current, &records.logins, token)
+    {
+        let mut state = guard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.activity_owners.get(key).is_some_and(|owner| {
+            owner.matches(store, cli)
+                && claims
+                    .activity
+                    .get(key)
+                    .is_some_and(|before| std::sync::Arc::ptr_eq(&before.token, &owner.token))
+        }) {
+            apply_background_end(&mut state, key, renewal, Instant::now());
+        }
     }
 }
 
@@ -12154,13 +12966,15 @@ impl AutoRenewPermit {
         store: &accounts::Store,
         cli: Cli,
         row: &accounts::Row,
+        raw: &accounts::Row,
         now: i64,
         logins: &accounts::Logins,
     ) {
         self.attribute_owner(
             LoginOwner::new(store, cli, &row.label, now)
                 .observing(logins)
-                .for_row(row),
+                .for_row(row)
+                .for_workflow(raw, logins),
         );
     }
 
@@ -12677,10 +13491,12 @@ fn rank_renewal_candidates(
     }
     tiered.sort_by_key(|(tier, row)| {
         let task_at = match store {
-            Some(store) => unaddressed_sign_in_task_at(store, logins, &row.label),
-            None => logins
-                .get(&row.label)
-                .and_then(|b| b.sign_in_task.map(|t| t.at)),
+            Some(store) => file_roster
+                .row(&row.label)
+                .and_then(|raw| unaddressed_sign_in_task_at(store, logins, raw)),
+            None => file_roster
+                .row(&row.label)
+                .and_then(|raw| accounts::current_sign_in_task(raw, logins).map(|task| task.at)),
         };
         (
             *tier,
@@ -13272,56 +14088,10 @@ fn recover_interrupted_staging_renewals_checked(
     {
         note_observed_publications(renew_guard, claims.clone(), store, cli, &logins);
     }
-    let Ok(entries) = fs::read_dir(store.logins_dir()) else {
+    let Ok(scan) = local_renewal_checkpoints(cli, store, now) else {
         return any_recovered;
     };
-    struct Candidate {
-        prefix: String,
-        sequence: u64,
-        dir: PathBuf,
-        actual_dir: PathBuf,
-        proof: accounts::RenewalCheckpoint,
-    }
-    let has_required_login = |dir: &Path| {
-        if cli == Cli::Claude {
-            accounts::login_made(dir)
-        } else {
-            cli.connector()
-                .stores
-                .iter()
-                .any(|store_file| dir.join(store_file).is_file())
-        }
-    };
-    let mut candidates: Vec<Candidate> = entries
-        .flatten()
-        .filter_map(|entry| {
-            if !entry.file_type().is_ok_and(|ft| ft.is_dir()) {
-                return None;
-            }
-            let name = entry.file_name().into_string().ok()?;
-            let (prefix, suffix) = name.rsplit_once('+')?;
-            if prefix.is_empty() || suffix.is_empty() || !suffix.bytes().all(|b| b.is_ascii_digit())
-            {
-                return None;
-            }
-            let sequence = suffix.parse().ok()?;
-            let dir = entry.path();
-            if !has_required_login(&dir) {
-                return None;
-            }
-            let actual_dir = fs::canonicalize(&dir).ok()?;
-            // A vendor profile is only a local hint. Without the result of the
-            // check immediately after fresh sign-in, preserve this work unadopted.
-            let proof = accounts::read_renewal_checkpoint_for(cli, &dir, &actual_dir, now)?;
-            Some(Candidate {
-                prefix: prefix.to_owned(),
-                sequence,
-                dir,
-                actual_dir,
-                proof,
-            })
-        })
-        .collect();
+    let mut candidates = scan.checkpoints;
     if candidates.is_empty() {
         return any_recovered;
     }
@@ -13359,7 +14129,7 @@ fn recover_interrupted_staging_renewals_checked(
     });
 
     let mut recovered_labels = BTreeSet::new();
-    for Candidate {
+    for LocalRenewalCheckpoint {
         dir,
         actual_dir,
         proof,
@@ -13386,7 +14156,7 @@ fn recover_interrupted_staging_renewals_checked(
                     // A prior candidate's transaction or this writer wait may outlive
                     // the refreshed proof. Keep the selected path and proof together.
                     if fs::canonicalize(&dir).ok().as_ref() != Some(&actual_dir)
-                        || !has_required_login(&actual_dir)
+                        || !staged_login_present(cli, &actual_dir)
                         || accounts::read_renewal_checkpoint_for(cli, &dir, &actual_dir, now)
                             .as_ref()
                             != Some(&proof)
@@ -13602,7 +14372,34 @@ fn auto_renew_next_account(
     } else {
         BTreeSet::new()
     };
-    for (tier, next_row) in candidates.tiered {
+    for (_, planned_row) in candidates.tiered {
+        // A previous row's route observation can create a binding. Start each
+        // independent background attempt from current eligibility and custody.
+        let Ok(mut current) = read_renewal_candidates(Cli::Claude, &store, roster_path, now) else {
+            return recovered;
+        };
+        if current.records.raw_roster.row(&planned_row.label)
+            != candidates.records.raw_roster.row(&planned_row.label)
+        {
+            continue;
+        }
+        if fx.shared.authority.is_some() {
+            current.tiered = rank_renewal_candidates(
+                Cli::Claude,
+                Some(&store),
+                &current.records.raw_roster,
+                &current.records.state,
+                &current.records.logins,
+                now,
+            );
+        }
+        let Some((tier, next_row)) = current
+            .tiered
+            .into_iter()
+            .find(|(_, row)| row.label == planned_row.label)
+        else {
+            continue;
+        };
         if tier >= UNNEEDED_TIER
             && next_row
                 .email
@@ -13616,8 +14413,8 @@ fn auto_renew_next_account(
             home,
             state_dir,
             roster_path,
-            candidates.records.raw_roster.clone(),
-            &candidates.records.logins,
+            current.records.raw_roster,
+            &current.records.logins,
             next_row,
             (None, false),
             now,
@@ -14296,6 +15093,7 @@ fn ladder_read(
     home: &Path,
     store: &accounts::Store,
     logins: &accounts::Logins,
+    raw: &accounts::Row,
     row: &accounts::Row,
     ctx: &LadderCtx<'_>,
 ) -> super::sign_in_ladder::Read {
@@ -14303,7 +15101,7 @@ fn ladder_read(
     let email = row.email.as_deref();
     let profile = if !super::headless_oauth::has_browser_profile(&store.dir, &row.label, email) {
         Profile::None
-    } else if claude_browser_profile_ready(store, logins, &row.label, email) {
+    } else if claude_browser_profile_ready(store, logins, raw) {
         Profile::Ready
     } else {
         Profile::WrongAccount
@@ -14369,11 +15167,30 @@ fn ladder_route_in_context(
     }
     // Another row's route observation can insert a binding and advance the global
     // counter. Capture this probe separately; its publication still checks the parent.
-    let Ok((logins, _)) = store.load_logins(now) else {
+    let Ok(mut records) = store.read_account_records(Some(&ctx.roster_path), now) else {
         return LadderStep::Held;
     };
-    let logins = &logins;
-    let mut read = ladder_read(home, store, logins, row, ctx);
+    let Some(raw) = records.raw_roster.row(&row.label).cloned() else {
+        return LadderStep::Held;
+    };
+    if records.roster.row(&row.label) != Some(row) {
+        return LadderStep::Held;
+    }
+    match prepare_retry_workflow(store, &ctx.roster_path, &raw, row, &records.logins, now) {
+        Ok(Some(current)) => records = current,
+        Ok(None) => {}
+        Err(_) => return LadderStep::Held,
+    }
+    let logins = &records.logins;
+    reconcile_workflow_retries(
+        renew_guard,
+        store,
+        Cli::Claude,
+        &ctx.roster_path,
+        (&raw, row, logins),
+        now,
+    );
+    let mut read = ladder_read(home, store, logins, &raw, row, ctx);
     let observed_vault = if read.route().is_none() {
         vault_input(home)
     } else {
@@ -14460,7 +15277,7 @@ fn ladder_route_in_context(
             return LadderStep::Held;
         }
         if vault.wrote_files() {
-            read = ladder_read(home, store, logins, row, ctx);
+            read = ladder_read(home, store, logins, &raw, row, ctx);
             inputs = inputs_of(
                 &read,
                 if read.route().is_none() {
@@ -14509,7 +15326,8 @@ fn ladder_route_in_context(
             row.label.clone(),
             LoginOwner::new(store, Cli::Claude, &row.label, now)
                 .observing(logins)
-                .for_row(row),
+                .for_row(row)
+                .for_workflow(&raw, logins),
         );
         wait
     };
@@ -14619,6 +15437,8 @@ fn with_current_attempt(
     edit: impl FnOnce(&mut accounts::Logins) -> Vec<accounts::Event>,
 ) -> Result<Vec<accounts::Event>, String> {
     let parent = accounts::RenewalParent::capture(observed, &row.label);
+    let workflow = accounts::captured_workflow(observed, &row.label)
+        .ok_or("automatic sign-in has no admitted workflow custody")?;
     store.transact_pool_logins_within(
         &accounts::LOCK_LADDER,
         roster_path,
@@ -14632,6 +15452,13 @@ fn with_current_attempt(
                 ));
             }
             parent.require_current(current, &row.label)?;
+            if !raw
+                .row(&row.label)
+                .is_some_and(|raw| accounts::workflow_token_current(raw, current, workflow))
+            {
+                return Err("automatic sign-in workflow changed; nothing recorded".into());
+            }
+            accounts::admit_workflow(current, &row.label)?;
             Ok(edit(current))
         },
     )
@@ -14785,6 +15612,23 @@ fn spawn_row_renewal(
     if let Err(why) = store.check_signin_state(now) {
         return RenewalDispatch::store_refusal(&why);
     }
+    let Some(raw_workflow) = file_roster.row(&next_row.label).cloned() else {
+        return RenewalDispatch::Failed;
+    };
+    let refreshed =
+        match prepare_retry_workflow(&store, roster_path, &raw_workflow, &next_row, logins, now) {
+            Ok(records) => records,
+            Err(why) => return RenewalDispatch::store_refusal(&why),
+        };
+    let logins = refreshed.as_ref().map_or(logins, |records| &records.logins);
+    reconcile_workflow_retries(
+        renew_guard,
+        &store,
+        cli,
+        roster_path,
+        (&raw_workflow, &next_row, logins),
+        now,
+    );
     if next_row.email.is_none() && cli != Cli::Kimi {
         return RenewalDispatch::Failed;
     }
@@ -14853,61 +15697,58 @@ fn spawn_row_renewal(
     let mut mailbox_dir = resolve_mailbox_dir_with(&reads.var, Some(home), &store);
     // The automatic ladder ([`ladder_route`]) decides an upkeep's renewal and records how it
     // ends; a person's own choice (a pin request, a click) takes the routes it always took.
-    let (has_mailbox, has_headless_profile, unattended) =
-        match ladder.filter(|_| pin_request.is_none()) {
-            Some(ctx) => match if let Some(preparation) = shared_preparation.as_ref() {
-                ladder_route_in_context(
-                    home,
-                    &store,
-                    (&next_row, Some(preparation)),
-                    now,
-                    renew_guard,
-                    ctx,
-                    &Instant::now,
+    let (has_mailbox, has_headless_profile, unattended) = match ladder
+        .filter(|_| pin_request.is_none())
+    {
+        Some(ctx) => match if let Some(preparation) = shared_preparation.as_ref() {
+            ladder_route_in_context(
+                home,
+                &store,
+                (&next_row, Some(preparation)),
+                now,
+                renew_guard,
+                ctx,
+                &Instant::now,
+            )
+        } else {
+            ladder_route(home, &store, &next_row, now, renew_guard, ctx)
+        } {
+            LadderStep::Go {
+                route,
+                read,
+                inputs,
+            } => {
+                mailbox_dir = resolve_mailbox_dir_with(&reads.var, Some(home), &store);
+                (
+                    route == super::sign_in_ladder::Route::Mailbox,
+                    route == super::sign_in_ladder::Route::Profile,
+                    Some((route, read, inputs, std::sync::Arc::clone(&ctx.log))),
                 )
-            } else {
-                ladder_route(home, &store, &next_row, now, renew_guard, ctx)
-            } {
-                LadderStep::Go {
-                    route,
-                    read,
-                    inputs,
-                } => {
-                    mailbox_dir = resolve_mailbox_dir_with(&reads.var, Some(home), &store);
-                    (
-                        route == super::sign_in_ladder::Route::Mailbox,
-                        route == super::sign_in_ladder::Route::Profile,
-                        Some((route, read, inputs, std::sync::Arc::clone(&ctx.log))),
-                    )
-                }
-                LadderStep::Held => return RenewalDispatch::Held,
-                LadderStep::NoRoute => return RenewalDispatch::Failed,
-            },
-            None => {
-                let has_mailbox = mailbox_dir.is_some()
-                    || has_configured_mailbox_for_row_with(
-                        &reads.var,
-                        Some(home),
-                        &store,
-                        Some(&next_row.label),
-                        next_row.email.as_deref(),
-                    );
-                let has_headless_profile = claude_browser_profile_ready(
-                    &store,
-                    logins,
-                    &next_row.label,
-                    next_row.email.as_deref(),
-                ) && reads.has_browser(home);
-                if !allow_default_browser
-                    && next_row.browser.is_none()
-                    && !has_mailbox
-                    && !has_headless_profile
-                {
-                    return RenewalDispatch::Failed;
-                }
-                (has_mailbox, has_headless_profile, None)
             }
-        };
+            LadderStep::Held => return RenewalDispatch::Held,
+            LadderStep::NoRoute => return RenewalDispatch::Failed,
+        },
+        None => {
+            let has_mailbox = mailbox_dir.is_some()
+                || has_configured_mailbox_for_row_with(
+                    &reads.var,
+                    Some(home),
+                    &store,
+                    Some(&next_row.label),
+                    next_row.email.as_deref(),
+                );
+            let has_headless_profile = claude_browser_profile_ready(&store, logins, &raw_workflow)
+                && reads.has_browser(home);
+            if !allow_default_browser
+                && next_row.browser.is_none()
+                && !has_mailbox
+                && !has_headless_profile
+            {
+                return RenewalDispatch::Failed;
+            }
+            (has_mailbox, has_headless_profile, None)
+        }
+    };
     let next_label = next_row.label.clone();
     let next_email = match next_row.email.clone() {
         Some(email) => email,
@@ -14923,9 +15764,7 @@ fn spawn_row_renewal(
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .and_then(|d| i64::try_from(d.as_secs()).ok())
             .is_some_and(|mtime_s| mtime_s > wrong_at);
-        if !mailbox_updated_since
-            && !claude_browser_profile_ready(&store, logins, &next_label, next_row.email.as_deref())
-        {
+        if !mailbox_updated_since && !claude_browser_profile_ready(&store, logins, &raw_workflow) {
             return RenewalDispatch::Held;
         }
     }
@@ -14940,7 +15779,10 @@ fn spawn_row_renewal(
     reconcile_browser_window_unpark(
         renew_guard,
         &next_label,
-        browser_window_signed_in_token(&store, &next_label, 0),
+        workflow_browser_window_token(&store, &raw_workflow, logins, 0),
+        &raw_workflow,
+        logins,
+        (&store, cli, roster_path),
     );
     let Some(mut permit) = AutoRenewPermit::claim_with_context(
         renew_guard,
@@ -14953,7 +15795,7 @@ fn spawn_row_renewal(
         return RenewalDispatch::Held;
     };
     permit.wake_pending = Some(state_dir.to_path_buf());
-    permit.attribute_row(&store, cli, &next_row, now, logins);
+    permit.attribute_row(&store, cli, &next_row, &raw_workflow, now, logins);
     let home_owned = home.to_path_buf();
     let state_owned = state_dir.to_path_buf();
     let roster_owned = roster_path.to_path_buf();
@@ -15331,6 +16173,7 @@ fn spawn_row_renewal(
                         next_label.clone(),
                         LoginOwner::new(&store, cli, &next_label, now_done)
                             .for_row(&next_row)
+                            .for_workflow(&raw_workflow, &captured_logins)
                             .observing(
                                 attempt_snapshot
                                     .borrow()
@@ -15431,13 +16274,40 @@ fn spawn_vendor_renewal_with(
     if let Err(why) = store.check_signin_state(now) {
         return RenewalDispatch::store_refusal(&why);
     }
+    let Some(raw_workflow) = file_roster.row(&next_row.label).cloned() else {
+        return RenewalDispatch::Failed;
+    };
+    let refreshed =
+        match prepare_retry_workflow(&store, roster_path, &raw_workflow, &next_row, logins, now) {
+            Ok(records) => records,
+            Err(why) => return RenewalDispatch::store_refusal(&why),
+        };
+    let logins = refreshed.as_ref().map_or(logins, |records| &records.logins);
+    reconcile_workflow_retries(
+        renew_guard,
+        &store,
+        cli,
+        roster_path,
+        (&raw_workflow, &next_row, logins),
+        now,
+    );
     if !cli.renews_headlessly() {
         return RenewalDispatch::Failed;
     }
     let reads = guard_reads(renew_guard);
+    // Existing native grants use first-party refresh, without entering the
+    // browser route that an earlier attempt may have stopped on. The worker
+    // still checks current policy, custody and canonical identity before use.
+    #[cfg(unix)]
+    let native_profile = cli == Cli::Kimi
+        && next_row.expected_identity_email().is_some()
+        && super::cli::pool_kimi::profile(&store, &next_row, logins)
+            .is_ok_and(|profile| profile.is_some());
+    #[cfg(not(unix))]
+    let native_profile = false;
     if next_row.email.is_none() && cli != Cli::Kimi
         || cli.accounts().signin.as_ref().is_none()
-        || !reads.has_browser(home)
+        || (!native_profile && !reads.has_browser(home))
     {
         return RenewalDispatch::Failed;
     }
@@ -15455,11 +16325,15 @@ fn spawn_vendor_renewal_with(
             return RenewalDispatch::Held;
         }
     }
-    let existing_binding = logins.get(&next_row.label);
-    let browser_token = match existing_binding.and_then(|b| b.sign_in_task) {
+    let current_task = if native_profile {
+        None
+    } else {
+        accounts::current_sign_in_task(&raw_workflow, logins)
+    };
+    let browser_token = match current_task {
         Some(task) => {
             let token = (task.action == accounts::SignInAction::Browser)
-                .then(|| browser_window_signed_in_token(&store, &next_row.label, task.at))
+                .then(|| workflow_browser_window_token(&store, &raw_workflow, logins, task.at))
                 .flatten();
             if pin_request.is_none()
                 && token.is_none()
@@ -15469,12 +16343,13 @@ fn spawn_vendor_renewal_with(
             }
             token
         }
-        None => browser_window_signed_in_token(&store, &next_row.label, 0),
+        None => workflow_browser_window_token(&store, &raw_workflow, logins, 0),
     };
     // A bot check on record holds the row as long as a stop for a person, across a restart
     // too, where the guard's own hold is gone; it notes no task and asks nobody (design R-13).
     if pin_request.is_none()
-        && bot_check_on_record_at(&store, &next_row.label)
+        && !native_profile
+        && bot_check_on_record_at(&store, &raw_workflow, logins)
             .is_some_and(|at| now.saturating_sub(at) < PERSON_BACKOFF_SECS)
     {
         return RenewalDispatch::Held;
@@ -15484,30 +16359,14 @@ fn spawn_vendor_renewal_with(
         Err(disposition) => return disposition,
     }
     let key = format!("{}:{}", cli.id(), next_row.label);
-    if let Some(binding) = existing_binding {
-        if let Some(task) = binding.sign_in_task {
-            if browser_token.is_some() {
-                reconcile_browser_window_unpark(renew_guard, &key, browser_token);
-            } else if now.saturating_sub(task.at) >= PERSON_BACKOFF_SECS {
-                renew_guard
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .parked
-                    .remove(&key);
-            }
-        } else {
-            let mut guard = renew_guard
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if guard.parked.remove(&key).is_some() {
-                guard.last_attempt.remove(&key);
-            }
-            drop(guard);
-            reconcile_browser_window_unpark(renew_guard, &key, browser_token);
-        }
-    } else {
-        reconcile_browser_window_unpark(renew_guard, &key, browser_token);
-    }
+    reconcile_browser_window_unpark(
+        renew_guard,
+        &key,
+        browser_token,
+        &raw_workflow,
+        logins,
+        (&store, cli, roster_path),
+    );
     let Some(mut permit) = AutoRenewPermit::claim_with_mailbox(
         renew_guard,
         &key,
@@ -15518,7 +16377,7 @@ fn spawn_vendor_renewal_with(
         return RenewalDispatch::Held;
     };
     permit.wake_pending = Some(state_dir.to_path_buf());
-    permit.attribute_row(&store, cli, &next_row, now, logins);
+    permit.attribute_row(&store, cli, &next_row, &raw_workflow, now, logins);
     let own_dir = file_roster.row(&next_row.label).and_then(|r| r.dir.clone());
     let roster_path = roster_path.to_path_buf();
     let parker = std::sync::Arc::clone(renew_guard);
@@ -15560,6 +16419,7 @@ fn spawn_vendor_renewal_with(
                 &store,
                 cli,
                 (&key, &next_row.label),
+                (&roster_path, &raw_workflow, &captured_logins),
                 renewal,
             );
             if let Some(request) = &pin_request {
@@ -16369,6 +17229,21 @@ pub fn account_recovery_identity_environment() {}
 #[path = "accounts_recovery_policy_tests.rs"]
 mod recovery_policy_tests;
 
+#[cfg(test)]
+#[path = "accounts_workflow_runtime_tests.rs"]
+mod workflow_runtime_tests;
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountWorkflowRuntime",
+        action = "AnotherCase",
+        reason = "The native fixture selects fresh and retained guards, completion custody and replacement."
+    )
+)]
+#[doc(hidden)]
+pub fn account_workflow_runtime_environment() {}
+
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::spec_unmodeled(
@@ -16423,7 +17298,9 @@ mod review_observation_tests;
 #[path = "accounts_recovery_lock_tests.rs"]
 mod recovery_lock_tests;
 
-#[cfg(test)]
+// For shared adoption's recovery model, which runs only where aterm links the headless opener a
+// first adoption needs (Unix).
+#[cfg(all(test, unix))]
 pub(crate) use recovery_lock_tests::{
     shared_checkpoint_alias_observation, shared_checkpoint_observation,
 };
@@ -16881,7 +17758,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
     #[test]
     fn builds_machine_roster_adopting_current_default_profile_email() {
         let fleet = parse_accounting_csv(SAMPLE_CSV, "sample.csv").expect("valid csv");
-        let tmp = std::env::temp_dir().join(format!("aterm-sync-test-{}", std::process::id()));
+        let tmp = crate::supervise::ScratchDir::new("sync", "roster");
         let store = accounts::Store::at(&tmp);
 
         let roster =
@@ -16911,6 +17788,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
 
         let owned = aterm_tempfile::Builder::new()
             .prefix("aterm-sync-publication-")
+            .suffix(".noindex")
             .tempdir()
             .expect("exclusive owned files");
         let root = owned.path();
@@ -18436,8 +19314,13 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         // route on the machine. Each successor's attempt is an error on record naming every
         // route it tried, never a silent failure, and written once however often it is tried.
         let (logins, _) = store.load_logins(now).unwrap();
-        let tried: Vec<(String, accounts::SignInAttempt)> =
-            accounts::failing_sign_ins(&file_roster, &store.load(now).unwrap().0, &logins, now);
+        let tried: Vec<(String, accounts::SignInAttempt)> = accounts::failing_sign_ins(
+            &file_roster,
+            &file_roster,
+            &store.load(now).unwrap().0,
+            &logins,
+            now,
+        );
         assert!(!tried.is_empty(), "the successors' attempts are on record");
         for (label, attempt) in &tried {
             assert_eq!(
@@ -18489,7 +19372,14 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         assert_eq!(
             sign_ins(),
             tried.len(),
-            "an unchanged failure is not written again"
+            "an unchanged failure is not written again; first={tried:?}, ledger={:?}",
+            store
+                .tail(100)
+                .unwrap()
+                .into_iter()
+                .filter(|event| event.kind == accounts::Kind::SignIn)
+                .map(|event| (event.account, event.why, event.workflow))
+                .collect::<Vec<_>>()
         );
         assert_eq!(
             no_route_lines(),
@@ -20463,17 +21353,35 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             fs::write(w.roster(), format_roster_toml(&raw).unwrap()).unwrap();
             let renew = || {
                 store
-                    .transact_logins(UPKEEP_NOW, &mut None, |state, logins| {
-                        Ok(accounts::note_renewed(
-                            state,
-                            logins,
-                            "main",
-                            path.to_str(),
-                            path.to_str().unwrap(),
-                            None,
-                            UPKEEP_NOW,
-                        ))
-                    })
+                    .transact_pool_logins_within(
+                        &[],
+                        &w.roster(),
+                        UPKEEP_NOW,
+                        &mut None,
+                        |_, state, logins| {
+                            Ok(accounts::note_renewed(
+                                state,
+                                logins,
+                                "main",
+                                path.to_str(),
+                                path.to_str().unwrap(),
+                                None,
+                                UPKEEP_NOW,
+                            ))
+                        },
+                    )
+                    .unwrap();
+                store
+                    .transact_pool_logins_within(
+                        &[],
+                        &w.roster(),
+                        UPKEEP_NOW,
+                        &mut None,
+                        |_, _, logins| {
+                            accounts::admit_workflow(logins, "main")?;
+                            Ok(Vec::new())
+                        },
+                    )
                     .unwrap()
             };
             renew();

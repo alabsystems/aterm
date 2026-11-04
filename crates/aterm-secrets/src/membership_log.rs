@@ -42,6 +42,7 @@ use std::sync::{Arc, OnceLock};
 pub mod admission;
 pub mod budgets;
 pub mod entries;
+mod epochs;
 mod eval;
 pub mod genesis;
 #[cfg(unix)]
@@ -66,7 +67,9 @@ pub use eval::{Member, Membership, NodeStanding, Quorum, Removal, Undo};
 pub use genesis::Proof;
 pub use payload::Payload;
 pub use rekey::{RekeyDue, Turn, audience_tag, secure_twins};
-pub use store::{MAX_RECORDS_STREAM, Store, decode_records, encode_records};
+pub use store::{
+    MAX_RECORDS_STREAM, Store, decode_records, decode_records_bounded, encode_records,
+};
 
 #[cfg(any(test, debug_assertions))]
 static RECORD_DECODE_ATTEMPTS: std::sync::atomic::AtomicUsize =
@@ -172,8 +175,6 @@ const SIGNING_DOMAIN: &[u8] = b"aterm/members/record/1\0";
 pub const MAX_RECORD: usize = crate::text::MAX_VALUE + 64 * 1024;
 /// The most records waiting for a missing parent that a [`Log`] or [`Store`] keeps.
 pub const MAX_WAITING: usize = 4096;
-#[cfg(unix)]
-const _: () = assert!(MAX_WAITING == crate::commons::journal::MAX_NODES);
 /// The longest host name a record carries, in bytes.
 pub const MAX_NAME: usize = 64;
 /// The longest membership label, in bytes: `m` and five digits ([`is_label`]).
@@ -1419,6 +1420,10 @@ pub struct Log {
     /// evaluation reads: `hold` lets it go only when it holds a weighed record, since a record of
     /// another kind changes nothing it weighed. Clones share it until one holds a weighed record.
     weighing: Arc<OnceLock<eval::Weighing>>,
+    /// What the counting epochs and wraps say and the verdicts taken from them ([`epochs`]):
+    /// `hold` lets it go only when it holds an `Epoch`, a `Wrap` or a weighed record, since
+    /// nothing it read changes otherwise. Clones share it until one holds such a record.
+    epochs: Arc<OnceLock<epochs::Epochs>>,
 }
 
 /// What seats one Mac in a log: the genesis binding it as a founder, the held `Admit`s another Mac
@@ -1465,7 +1470,7 @@ impl Log {
                 seats.entry(member).or_default().founder = true;
             }
         }
-        let counts = RecordCounts::of(genesis.kind());
+        let counts = budgets::counted(genesis.kind());
         Ok(Self {
             order: vec![genesis],
             held,
@@ -1480,6 +1485,7 @@ impl Log {
             membership: Arc::default(),
             effective: Arc::default(),
             weighing: Arc::default(),
+            epochs: Arc::default(),
         })
     }
 
@@ -1730,6 +1736,22 @@ impl Log {
             project = "aterm_secrets::membership_log::tests::membership_transition"
         )
     )]
+    #[cfg_attr(
+        all(unix, any(test, debug_assertions)),
+        aterm_spec_anchor::refines(
+            machine = "SwarmRecordsCapacity",
+            action = "AddWeighed",
+            project = "aterm_secrets::client::readmit::tests::records_capacity_transition"
+        )
+    )]
+    #[cfg_attr(
+        all(unix, any(test, debug_assertions)),
+        aterm_spec_anchor::refines(
+            machine = "SwarmRecordsCapacity",
+            action = "AddKeyed",
+            project = "aterm_secrets::client::readmit::tests::records_capacity_transition"
+        )
+    )]
     pub fn insert(&mut self, record: Record) -> Result<Inserted> {
         if record.kind() == Kind::Genesis {
             return if record.id == *self.network() {
@@ -1768,7 +1790,7 @@ impl Log {
             self.wait(record);
             return Ok(Inserted::Waiting);
         }
-        if let Some(budget) = self.passed_by(RecordCounts::of(record.kind()), record.bytes().len())
+        if let Some(budget) = self.passed_by(budgets::counted(record.kind()), record.bytes().len())
         {
             return Err(Error::of_kind(
                 crate::ErrorKind::MembershipCapacity,
@@ -1812,7 +1834,7 @@ impl Log {
         Ok(())
     }
 
-    /// Membership as this log says it: the pure evaluator of §3.2.
+    /// An owned membership snapshot as this log says it: the pure evaluator of §3.2.
     #[cfg_attr(
         all(unix, any(test, debug_assertions)),
         aterm_spec_anchor::refines(
@@ -1830,14 +1852,24 @@ impl Log {
         )
     )]
     pub fn membership(&self) -> Membership {
+        self.membership_ref().clone()
+    }
+
+    /// Borrow this immutable prefix's evaluation for graph queries that retain no snapshot.
+    fn membership_ref(&self) -> &Membership {
         self.membership
             .get_or_init(|| eval::evaluate_with(self.history(), self.weighing()))
-            .clone()
     }
 
     fn effective(&self) -> &eval::Effective {
         self.effective
             .get_or_init(|| eval::effective_records(self.history(), self.weighing()))
+    }
+
+    /// What the counting epochs and wraps say, read once while no `Epoch`, `Wrap` or weighed
+    /// record arrives.
+    fn epochs(&self) -> &epochs::Epochs {
+        self.epochs.get_or_init(|| epochs::Epochs::of(self))
     }
 
     /// The quorum weighing of the held records, weighed once while no weighed record arrives.
@@ -2091,6 +2123,9 @@ impl Log {
         if record.kind().weighed() && !carried {
             self.weighing = Arc::default();
         }
+        if epochs::resets(record.kind()) {
+            self.epochs = Arc::default();
+        }
         let at = self.order.len();
         self.reach
             .push(record.parents().iter().map(|parent| self.held[parent]));
@@ -2099,7 +2134,7 @@ impl Log {
         }
         self.held.insert(record.id, at);
         self.held_bytes = self.held_bytes.saturating_add(record.bytes().len());
-        self.counts = self.counts.plus(RecordCounts::of(record.kind()));
+        self.counts = self.counts.plus(budgets::counted(record.kind()));
         self.order.push(record);
     }
 
@@ -2149,7 +2184,7 @@ impl Log {
                 };
                 self.unwaited(&record);
                 if self
-                    .passed_by(RecordCounts::of(record.kind()), record.bytes().len())
+                    .passed_by(budgets::counted(record.kind()), record.bytes().len())
                     .is_none()
                     && self.check_against_parents(&record).is_ok()
                 {

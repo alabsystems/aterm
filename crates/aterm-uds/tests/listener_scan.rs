@@ -63,7 +63,11 @@ fn a_scan_whose_connection_waits_on_the_spawn_lock_still_names_the_broker() {
         .expect("the creation holds the spawn lock");
     let scan = {
         let path = path.clone();
-        std::thread::spawn(move || aterm_uds::holders::scan_listener_holders(&path, &[]))
+        // The broker is this test's own and serves: its connection waits a hang detector, never
+        // the scan's 10 s.
+        std::thread::spawn(move || {
+            aterm_uds::holders::scan_listener_holders_within(&path, &[], HANG)
+        })
     };
     let started = Instant::now();
     while !(seam::exclusive_waiters() > 0 && seam::exclusive_holder() == Some(holder)) {

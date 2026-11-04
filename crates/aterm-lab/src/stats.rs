@@ -348,24 +348,65 @@ pub fn debug_log(run: &Run) -> PathBuf {
     run.w.join("claude-debug.log")
 }
 
+/// The head of a forever tab's own debug log's name ([`chain_debug_log`]).
+const CHAIN_DEBUG_HEAD: &str = "claude-debug-";
+
+/// Where the Claude Code a forever lab launches in `chain`'s tab writes its debug log: a file of
+/// the chain's own beside [`debug_log`], so each start's `[REPL:mount]` and its terminal's replies
+/// line up against that one tab's `status input=` reads (ATERM-KI-1101-4).
+#[must_use]
+pub fn chain_debug_log(run: &Run, chain: &str) -> PathBuf {
+    run.w.join(format!("{CHAIN_DEBUG_HEAD}{chain}.log"))
+}
+
+/// Every chain's debug log in `run`'s scratch ([`chain_debug_log`]), with its chain, by name.
+#[must_use]
+pub fn chain_debug_logs(run: &Run) -> Vec<(String, PathBuf)> {
+    let Ok(Some(entries)) = crate::sys::scratch_dir(&run.w) else {
+        return Vec::new();
+    };
+    let mut logs: Vec<(String, PathBuf)> = entries
+        .into_iter()
+        .filter(|(_, kind)| *kind == crate::sys::EntryKind::File)
+        .filter_map(|(name, _)| {
+            let name = name.to_str()?;
+            let chain = name.strip_prefix(CHAIN_DEBUG_HEAD)?.strip_suffix(".log")?;
+            (!chain.is_empty()).then(|| (chain.to_string(), run.w.join(name)))
+        })
+        .collect();
+    logs.sort();
+    logs
+}
+
 /// Default egrep pattern for `debuglog`.
 pub const DEBUG_DEFAULT: &str = "(?i)fetchUtilization|oauth/usage|usage data|usage:|oauth.profile|claude_cli|bootstrap|juniper|cedar|gateway-usage|failed to fetch|http\\.fetch|event logging";
 
-/// `debuglog [tag] [egrep]`: filter lines from Claude Code's debug log.
+/// `debuglog [tag] [egrep]`: filter lines from Claude Code's debug logs: `claude --debug-log`'s,
+/// then each forever tab's ([`chain_debug_log`]), its lines led by `[<chain>] `.
 pub fn cmd_debuglog(args: &[String]) -> Res {
     let (run, a) = lab(args)?;
     let pat = a.first().map_or(DEBUG_DEFAULT, String::as_str);
     let re = aterm_regex::Regex::new(pat).map_err(|e| Fail::die(format!("debuglog: {e}")))?;
-    let text = scratch_text(&debug_log(&run));
-    if text.is_empty() {
+    let logs = std::iter::once((String::new(), debug_log(&run)))
+        .chain(
+            chain_debug_logs(&run)
+                .into_iter()
+                .map(|(chain, p)| (format!("[{chain}] "), p)),
+        )
+        .map(|(lead, p)| (lead, scratch_text(&p)))
+        .filter(|(_, text)| !text.is_empty())
+        .collect::<Vec<_>>();
+    if logs.is_empty() {
         return Err(Fail::die(format!(
-            "no debug log at {} (launch with {LAB} claude {} --debug-log)",
+            "no debug log at {} (launch with {LAB} claude {} --debug-log), and no forever tab's",
             debug_log(&run).display(),
             run.tag
         )));
     }
-    for l in text.lines().filter(|l| re.is_match(l)) {
-        println!("{}", scrub(&run, l));
+    for (lead, text) in &logs {
+        for l in text.lines().filter(|l| re.is_match(l)) {
+            println!("{lead}{}", scrub(&run, l));
+        }
     }
     Ok(0)
 }

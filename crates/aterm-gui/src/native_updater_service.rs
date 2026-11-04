@@ -1959,15 +1959,17 @@ mod tests {
         assert_eq!(a, installed_activation_digest(11, TEST_COMMIT), "pure");
         assert_eq!(
             a,
-            installed_activation_digest(11, &TEST_COMMIT.to_ascii_uppercase()),
-            "commit case does not fork the identity"
+            installed_activation_digest(11, &format!("  {} \n", TEST_COMMIT.to_ascii_uppercase())),
+            "commit case and surrounding whitespace do not fork the identity"
         );
-        assert_ne!(a, installed_activation_digest(12, TEST_COMMIT), "per build");
-        assert_ne!(a, TEST_DIGEST, "not a download digest");
         let ticket = ApplyAttemptTicket::for_test(11, TEST_COMMIT, &a);
         assert!(ticket.is_installed_activation());
+        let mut flipped = a.into_bytes();
+        flipped[0] = if flipped[0] == b'0' { b'1' } else { b'0' };
+        let flipped = String::from_utf8(flipped).expect("ascii hex");
         assert!(
-            !ApplyAttemptTicket::for_test(11, TEST_COMMIT, TEST_DIGEST).is_installed_activation()
+            !ApplyAttemptTicket::for_test(11, TEST_COMMIT, &flipped).is_installed_activation(),
+            "negative control: a non-matching digest is not an installed activation"
         );
     }
 

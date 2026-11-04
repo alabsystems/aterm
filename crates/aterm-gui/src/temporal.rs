@@ -54,12 +54,35 @@ const IDLE_RELIEF_FLOOR_BYTES: usize = 1024 * 1024;
 /// Freed history bytes accumulated during multi-pane pool shedding before mid-flood relief.
 const POOL_RELIEF_MID_FLOOD_BYTES: usize = 16 * 1024 * 1024;
 
-/// An in-memory replay keyframe: its [`TerminalCheckpoint`] paired with the transient engine state no checkpoint carries ([`ReplayCarry`]).
+/// An in-memory replay keyframe: its [`TerminalCheckpoint`] paired with the transient engine state no checkpoint carries ([`ReplayCarry`]), and the bytes retaining it costs ([`Self::charge`]).
 #[derive(Clone, Debug)]
 pub(crate) struct ReplayKeyframe {
     pub(crate) checkpoint: Arc<TerminalCheckpoint>,
     pub(crate) carry: Arc<ReplayCarry>,
     pub(crate) recorded_config: Option<Option<Arc<TerminalConfig>>>,
+    charge: usize,
+}
+
+impl ReplayKeyframe {
+    /// A keyframe of `checkpoint` and `carry`, charged once for all it holds.
+    fn new(checkpoint: Arc<TerminalCheckpoint>, carry: Arc<ReplayCarry>) -> Self {
+        let charge = std::mem::size_of::<RetainedKeyframe>()
+            .saturating_add(charge_of(&checkpoint))
+            .saturating_add(ARC_HEADER)
+            .saturating_add(carry.memory_used())
+            .saturating_add(carry.retained_image_bytes());
+        Self {
+            checkpoint,
+            carry,
+            recorded_config: None,
+            charge,
+        }
+    }
+
+    /// The bytes retaining this keyframe holds against the recording's budget: its slot, its checkpoint and its carry whole, and every image payload the carry keeps alive (a payload several keyframes share is charged to each); the replay config it shares with the recorder is not charged.
+    pub(crate) const fn charge(&self) -> usize {
+        self.charge
+    }
 }
 
 impl std::ops::Deref for ReplayKeyframe {
@@ -78,11 +101,7 @@ impl From<TerminalCheckpoint> for ReplayKeyframe {
 
 impl From<Arc<TerminalCheckpoint>> for ReplayKeyframe {
     fn from(checkpoint: Arc<TerminalCheckpoint>) -> Self {
-        Self {
-            checkpoint,
-            carry: Arc::new(ReplayCarry::default()),
-            recorded_config: None,
-        }
+        Self::new(checkpoint, Arc::new(ReplayCarry::default()))
     }
 }
 
@@ -204,11 +223,10 @@ pub(crate) fn keyframe_of(term: &Terminal, max_history: usize) -> Option<ReplayK
         .shell_integration_nonce_in_use()
         .map(ShellIntegrationNonce);
     checkpoint.shell_integration_rev = term.shell_integration_rev().map(str::to_owned);
-    Some(ReplayKeyframe {
-        checkpoint: Arc::new(checkpoint),
-        carry: Arc::new(term.capture_replay_carry()),
-        recorded_config: None,
-    })
+    Some(ReplayKeyframe::new(
+        Arc::new(checkpoint),
+        Arc::new(term.capture_replay_carry()),
+    ))
 }
 
 /// A message on its way to a recorder, with the recording generation it was sent in ([`TemporalRecorder::forget`]) and the bytes it holds ([`TemporalMsg::weight`]).
@@ -281,13 +299,11 @@ const MIN_QUEUE_BYTES: usize = 1024 * 1024;
 const POOL_QUEUE_SHARE: usize = 4;
 
 impl TemporalMsg {
-    /// The bytes this message holds while queued: a slice and its reply, a checkpoint's grids.
+    /// The bytes this message holds while queued: a slice and its reply, a keyframe's or a witness's charge.
     fn weight(&self) -> usize {
         match self {
             Self::RawIn(input) => input.charge(),
-            Self::Keyframe(k) | Self::LiveKeyframe(k, _) => {
-                charge_of(&k.checkpoint).saturating_add(k.carry.retained_image_bytes())
-            }
+            Self::Keyframe(k) | Self::LiveKeyframe(k, _) => k.charge(),
             Self::Witness(c) => charge_of(c),
             Self::Reply
             | Self::Resize { .. }
@@ -1571,6 +1587,8 @@ struct Witnessed {
     ts: Ticks,
     screen: Digest,
     state: WitnessState,
+    /// What its snapshot was charged when stored ([`charge_of`]), refunded once a fold judges it.
+    snapshot_charge: usize,
 }
 
 enum WitnessState {
@@ -1580,9 +1598,9 @@ enum WitnessState {
 }
 
 impl Witnessed {
-    fn charge(&self) -> usize {
+    const fn charge(&self) -> usize {
         match &self.state {
-            WitnessState::Pending(live) => charge_of(live),
+            WitnessState::Pending(_) => self.snapshot_charge,
             WitnessState::Matched | WitnessState::Diverged => 0,
         }
     }
@@ -1608,8 +1626,12 @@ pub(crate) struct Fold {
     pub(crate) judged: Judged,
 }
 
+/// The bytes an `Arc`'s counts add to the value it holds.
+const ARC_HEADER: usize = 2 * std::mem::size_of::<usize>();
+
+/// The bytes a checkpoint held in an `Arc` costs: the whole of it ([`TerminalCheckpoint::memory_used`]) and the `Arc`'s counts.
 fn charge_of(checkpoint: &TerminalCheckpoint) -> usize {
-    checkpoint.grid.len() + checkpoint.alt_grid.as_ref().map_or(0, Vec::len)
+    checkpoint.memory_used().saturating_add(ARC_HEADER)
 }
 
 impl TemporalRecorder {
@@ -1945,6 +1967,7 @@ impl TemporalRecorder {
             ts,
             screen: screen_digest(&live),
             state: WitnessState::Pending(live),
+            snapshot_charge: charge,
         });
         self.due()
     }
@@ -1975,10 +1998,10 @@ impl TemporalRecorder {
             let Some(w) = self.witness_mut(id) else {
                 continue;
             };
-            let WitnessState::Pending(live) = &w.state else {
+            let charge = w.charge();
+            if !matches!(w.state, WitnessState::Pending(_)) {
                 continue;
-            };
-            let charge = charge_of(live);
+            }
             w.state = if matched {
                 WitnessState::Matched
             } else {
@@ -2047,13 +2070,50 @@ impl TemporalRecorder {
     fn chain_witnesses(&self, base: Seq) -> impl Iterator<Item = &Witnessed> {
         let end = self
             .keyframes
-            .iter()
-            .find(|kf| kf.seq > base)
+            .get(self.keyframe_after(base))
             .map(|kf| kf.seq);
         self.witnesses
-            .iter()
-            .skip_while(move |w| w.seq <= base)
+            .range(self.witnesses_after(base)..)
             .take_while(move |w| end.is_none_or(|end| w.seq < end))
+    }
+
+    /// The index of the first retained keyframe after spine event `seq`, or `keyframes.len()` when none is: the keyframes are in seq order.
+    fn keyframe_after(&self, seq: Seq) -> usize {
+        #[cfg(test)]
+        if lookup_scan::linear() {
+            return self
+                .keyframes
+                .iter()
+                .position(|kf| kf.seq > seq)
+                .unwrap_or(self.keyframes.len());
+        }
+        self.keyframes.partition_point(|kf| kf.seq <= seq)
+    }
+
+    /// The retained keyframe spine event `seq` records, if it is retained.
+    fn keyframe_at(&self, seq: Seq) -> Option<&RetainedKeyframe> {
+        #[cfg(test)]
+        if lookup_scan::linear() {
+            return self.keyframes.iter().find(|kf| kf.seq == seq);
+        }
+        let idx = self
+            .keyframes
+            .binary_search_by_key(&seq, |kf| kf.seq)
+            .ok()?;
+        self.keyframes.get(idx)
+    }
+
+    /// The index of the first witness after spine event `seq`, or `witnesses.len()` when none is: the witnesses are in seq order.
+    fn witnesses_after(&self, seq: Seq) -> usize {
+        #[cfg(test)]
+        if lookup_scan::linear() {
+            return self
+                .witnesses
+                .iter()
+                .position(|w| w.seq > seq)
+                .unwrap_or(self.witnesses.len());
+        }
+        self.witnesses.partition_point(|w| w.seq <= seq)
     }
 
     /// The seq of the last slice, resize or host step after `base` that a replay to `at` folds ([`Self::plan`]), or `base` when it folds none.
@@ -2151,8 +2211,7 @@ impl TemporalRecorder {
             freed_keyframe = prev_charge;
             command |= prev.command;
         }
-        let retained_bytes =
-            charge_of(&keyframe.checkpoint).saturating_add(keyframe.carry.retained_image_bytes());
+        let retained_bytes = keyframe.charge;
         let keyframe = RetainedKeyframe {
             #[cfg(test)]
             id,
@@ -2175,9 +2234,6 @@ impl TemporalRecorder {
         self.bytes_since_keyframe = 0;
         self.ends_mid_sequence = false;
         self.chain_diverged = false;
-        while self.keyframes.len() > MAX_KEYFRAMES {
-            self.pop_keyframe();
-        }
         self.enforce_budget();
         self.pack_older_chains();
         if freed_keyframe > 0 {
@@ -2672,8 +2728,14 @@ impl TemporalRecorder {
         }
     }
 
+    /// The retained keyframe of greatest seq whose tick is at or before `at`: the keyframes' ticks never fall in seq order (temporal-spine-monotone).
     fn base_keyframe(&self, at: Ticks) -> Option<&RetainedKeyframe> {
-        self.keyframes.iter().rev().find(|kf| kf.ts <= at)
+        #[cfg(test)]
+        if lookup_scan::linear() {
+            return self.keyframes.iter().rev().find(|kf| kf.ts <= at);
+        }
+        let after = self.keyframes.partition_point(|kf| kf.ts <= at);
+        self.keyframes.get(after.checked_sub(1)?)
     }
 
     fn plan(&self, at: Ticks) -> Option<ReplayPlan> {
@@ -2689,8 +2751,7 @@ impl TemporalRecorder {
         let mut steps = Vec::new();
         let next = self
             .keyframes
-            .iter()
-            .find(|kf| kf.seq > base.seq)
+            .get(self.keyframe_after(base.seq))
             .map(|kf| kf.seq);
         for ev in self.log.live_after(base.seq) {
             if ev.ts > at || next.is_some_and(|next| ev.seq >= next) {
@@ -2750,11 +2811,20 @@ impl TemporalRecorder {
     pub(crate) fn chain_before(&self, at: Ticks) -> Option<ReplayPlan> {
         let oldest = self.oldest_replayable()?.seq;
         let last = self.base_keyframe(at)?.seq;
+        #[cfg(test)]
+        if lookup_scan::linear() {
+            let before = self
+                .keyframes
+                .iter()
+                .rev()
+                .find(|kf| kf.seq >= oldest && kf.seq < last)?;
+            return self.plan_from(before, Ticks(u64::MAX));
+        }
+        // `last` is retained, so the keyframe before it sits two below the first index after it.
         let before = self
             .keyframes
-            .iter()
-            .rev()
-            .find(|kf| kf.seq >= oldest && kf.seq < last)?;
+            .get(self.keyframe_after(last).checked_sub(2)?)
+            .filter(|kf| kf.seq >= oldest)?;
         self.plan_from(before, Ticks(u64::MAX))
     }
 
@@ -2774,19 +2844,34 @@ impl TemporalRecorder {
     /// Whether a judged witness contradicts the replay at each of `instants` (ascending), as [`Self::fidelity_at`] reads them: from the first slice that brings a diverged witness into cover to the chain's end.
     #[must_use]
     pub(crate) fn contradicted(&self, instants: &[RewindInstant]) -> Vec<bool> {
-        let from: Vec<(Ticks, Option<Ticks>)> = self
-            .keyframes
-            .iter()
-            .map(|kf| (kf.ts, self.diverged_from(kf)))
-            .collect();
+        #[cfg(test)]
+        if lookup_scan::linear() {
+            return instants
+                .iter()
+                .map(|i| {
+                    self.base_keyframe(i.at)
+                        .and_then(|kf| self.diverged_from(kf))
+                        .is_some_and(|f| i.at >= f)
+                })
+                .collect();
+        }
+        // One cursor over the keyframes, as the instants ascend: each chain's verdict is read once.
+        let mut after = 0;
+        let mut from = None;
         instants
             .iter()
             .map(|i| {
-                from.iter()
-                    .rev()
-                    .find(|(ts, _)| *ts <= i.at)
-                    .and_then(|(_, f)| *f)
-                    .is_some_and(|f| i.at >= f)
+                let was = after;
+                while self.keyframes.get(after).is_some_and(|kf| kf.ts <= i.at) {
+                    after += 1;
+                }
+                if after != was {
+                    from = self
+                        .keyframes
+                        .get(after - 1)
+                        .and_then(|kf| self.diverged_from(kf));
+                }
+                from.is_some_and(|f| i.at >= f)
             })
             .collect()
     }
@@ -2866,7 +2951,7 @@ impl TemporalRecorder {
                     _ => continue,
                 },
                 Op::Keyframe(_) => {
-                    let Some(kf) = self.keyframes.iter().find(|kf| kf.seq == ev.seq) else {
+                    let Some(kf) = self.keyframe_at(ev.seq) else {
                         continue;
                     };
                     let marks = Some(SliceMarks {
@@ -2936,8 +3021,7 @@ impl TemporalRecorder {
         for kf in kept {
             let end = self
                 .keyframes
-                .iter()
-                .find(|next| next.seq > kf.seq)
+                .get(self.keyframe_after(kf.seq))
                 .map_or(to, |next| next.ts);
             let mut before = kf.ts;
             for w in self.chain_witnesses(kf.seq) {
@@ -2975,8 +3059,7 @@ impl TemporalRecorder {
                 }
                 Op::Resize { rows, cols } => events.push((t, Exported::Resize { rows, cols })),
                 Op::Keyframe(_) => {
-                    let live = self.keyframes.iter().find(|kf| kf.seq == ev.seq);
-                    if let Some(kf) = live.filter(|kf| !kf.replayed) {
+                    if let Some(kf) = self.keyframe_at(ev.seq).filter(|kf| !kf.replayed) {
                         events.push((t, Exported::Screen(kf.checkpoint.clone())));
                     }
                 }
@@ -3177,7 +3260,7 @@ struct RetainedKeyframe {
     command: bool,
     /// Whether unshared small slices in this completed chain were packed into slabs.
     packed: bool,
-    /// Immutable checkpoint and carry payload bytes, charged once when the keyframe is retained.
+    /// What the keyframe was charged when retained ([`ReplayKeyframe::charge`]), refunded when it goes.
     retained_bytes: usize,
     checkpoint: Arc<TerminalCheckpoint>,
     /// The in-process transient state no checkpoint carries ([`ReplayCarry`]).
@@ -3919,6 +4002,35 @@ pub(crate) mod replay_clock {
     }
 }
 
+/// Test-only switch the keyframe and witness lookups read: the linear scans they replaced, the reference a test compares the sorted lookups with.
+#[cfg(test)]
+pub(crate) mod lookup_scan {
+    use std::cell::Cell;
+
+    thread_local! {
+        static LINEAR: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Puts the lookups back on their sorted search when dropped.
+    pub(crate) struct Linear;
+
+    impl Drop for Linear {
+        fn drop(&mut self) {
+            LINEAR.with(|l| l.set(false));
+        }
+    }
+
+    /// Look keyframes and witnesses up by linear scan on this thread until the returned guard drops.
+    pub(crate) fn scan_linearly() -> Linear {
+        LINEAR.with(|l| l.set(true));
+        Linear
+    }
+
+    pub(super) fn linear() -> bool {
+        LINEAR.with(Cell::get)
+    }
+}
+
 #[cfg(test)]
 mod resync_probe {
     use std::cell::Cell;
@@ -3955,8 +4067,6 @@ const WITNESS_BYTES: usize = 256 * 1024;
 
 /// Time since the last witness after which the next slice at parser ground takes one.
 const WITNESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
-
-const MAX_KEYFRAMES: usize = 4;
 
 #[cfg(test)]
 mod tests {
@@ -4326,10 +4436,19 @@ mod tests {
             found,
             "the recent sentinel is reconstructable after a 4x-budget flood"
         );
+        // Every chain but the newest ran at least the byte interval, so the budget holds at most
+        // one more keyframe than it holds intervals.
+        let interval = (r.budget / 4).max(MIN_REKEY_BYTES);
         assert!(
-            (2..=MAX_KEYFRAMES).contains(&r.keyframe_count()),
-            "re-keyframing minted fresh keyframes, at most {MAX_KEYFRAMES} kept: {}",
+            (2..=r.budget / interval + 1).contains(&r.keyframe_count()),
+            "re-keyframing minted fresh keyframes, at most {} kept: {}",
+            r.budget / interval + 1,
             r.keyframe_count()
+        );
+        assert_eq!(
+            r.oldest_replayable().map(|kf| kf.seq),
+            r.keyframes.front().map(|kf| kf.seq),
+            "every kept keyframe replays"
         );
         assert!(r.used <= r.budget, "used={} past the budget", r.used);
     }
@@ -4443,8 +4562,8 @@ mod tests {
             }
             t
         };
-        let keyframe = seeded().checkpoint();
-        let charge = keyframe.grid.len() + keyframe.alt_grid.as_ref().map_or(0, Vec::len);
+        let keyframe = ReplayKeyframe::from(seeded().checkpoint());
+        let charge = keyframe.charge();
         let budget = charge * 5 / 4;
         let interval = (budget / 4).max(MIN_REKEY_BYTES);
         assert!(
@@ -4487,8 +4606,9 @@ mod tests {
 
     #[test]
     fn the_budget_loses_the_oldest_window_first_and_says_where_replay_starts() {
+        // Each slice is charged what a keyframe is, so the budget holds five of either.
         let blank = Terminal::new(4, 10).checkpoint();
-        let c = blank.grid.len() + blank.alt_grid.as_ref().map_or(0, Vec::len);
+        let c = ReplayKeyframe::from(blank.clone()).charge();
         assert!(6 * c < MIN_REKEY_BYTES, "REACH: no re-keyframe is due");
         let oldest = |r: &TemporalRecorder| r.oldest_replayable().map(|kf| kf.id);
         let mut r = TemporalRecorder::with_budget(5 * c + c / 2);
@@ -7667,11 +7787,6 @@ mod tests {
             r.keyframes[1].carry.retained_image_bytes() >= 24,
             "minted keyframe retains Kitty image and chunk bytes"
         );
-        assert!(
-            r.keyframes[1].charge() > charge_of(&r.keyframes[1].checkpoint),
-            "keyframe charge includes retained Kitty payload bytes"
-        );
-
         // Chain 1 (after the rekey): complete m=0 chunk, place by I=42 and i=8, animate, delete.
         step(
             &mut live,
@@ -7699,7 +7814,6 @@ mod tests {
 
         // Budget shedding: a keyframe holding Kitty payload bytes counts against the recorder
         // budget and is evicted when a newer keyframe pushes `used` past `budget`.
-        let mut small = TemporalRecorder::with_budget(16 * 1024);
         let mut img_term = Terminal::new(4, 20);
         let raw = vec![0xABu8; 80 * 30 * 4];
         let b64 = aterm_codec::base64::encode(&raw).expect("base64");
@@ -7708,19 +7822,37 @@ mod tests {
         let kf_heavy = keyframe_of(&img_term, usize::MAX).expect("heavy keyframe");
         let heavy_img_bytes = kf_heavy.carry.retained_image_bytes();
         assert_eq!(heavy_img_bytes, raw.len());
+
+        // The charge holds the payload once: a keyframe of the same engine with the image deleted
+        // charges its bytes less, give or take the store's bookkeeping, not twice them or none.
+        img_term.process(b"\x1b_Ga=d,d=A\x1b\\");
+        let bare = keyframe_of(&img_term, usize::MAX).expect("bare keyframe");
+        assert_eq!(
+            bare.carry.retained_image_bytes(),
+            0,
+            "REACH: the image is gone"
+        );
+        let lighter = kf_heavy.charge().abs_diff(bare.charge());
+        assert!(
+            kf_heavy.charge() > bare.charge() && lighter.abs_diff(raw.len()) <= 1024,
+            "deleting a {} B image takes {lighter} B off the keyframe's charge ({} B to {} B)",
+            raw.len(),
+            kf_heavy.charge(),
+            bare.charge()
+        );
+
+        // Store a second 9,600-byte Kitty image on a new keyframe, under a budget each keyframe
+        // fits alone and both together exceed.
+        let raw2 = vec![0xCDu8; 80 * 30 * 4];
+        let b64_2 = aterm_codec::base64::encode(&raw2).expect("base64 2");
+        img_term.process(format!("\x1b_Ga=t,f=32,s=80,v=30,i=2;{b64_2}\x1b\\").as_bytes());
+        let kf_heavy_2 = keyframe_of(&img_term, usize::MAX).expect("second keyframe");
+        assert_eq!(kf_heavy_2.carry.retained_image_bytes(), raw2.len());
+        let (one, two) = (kf_heavy.charge(), kf_heavy_2.charge());
+        let mut small = TemporalRecorder::with_budget(one.max(two) + one.min(two) / 2);
         small.record_keyframe(kf_heavy);
         assert!(small.used > raw.len());
         assert_eq!(small.keyframe_count(), 1);
-
-        // Replace image 1 with a second 9,600-byte Kitty image on a new keyframe so each keyframe
-        // fits under 16 KiB alone, while both together (> 19.2 KiB) exceed 16 KiB.
-        let raw2 = vec![0xCDu8; 80 * 30 * 4];
-        let b64_2 = aterm_codec::base64::encode(&raw2).expect("base64 2");
-        img_term.process(
-            format!("\x1b_Ga=d,d=A\x1b\\\x1b_Ga=t,f=32,s=80,v=30,i=2;{b64_2}\x1b\\").as_bytes(),
-        );
-        let kf_heavy_2 = keyframe_of(&img_term, usize::MAX).expect("second keyframe");
-        assert_eq!(kf_heavy_2.carry.retained_image_bytes(), raw2.len());
         small.record_keyframe(kf_heavy_2);
         assert!(
             small.used <= small.budget,
@@ -7997,6 +8129,487 @@ mod tests {
                 .expect("check");
             assert_eq!(round.verdict, Verdict::Pass);
         }
+    }
+
+    /// The recording [`five_non_adjacent_live_read_stretches_keep_every_chain_the_budget_holds`] makes under `budget`: a seed and its chain, then five live host reads each followed by output and a witness, so no two live keyframes coalesce and every chain takes a witness. Returns the recorder, the live engine, and the recorder's `used` before any fold judged a witness.
+    fn five_live_read_stretches(
+        budget: usize,
+        reads: &[String],
+    ) -> (TemporalRecorder, Terminal, usize) {
+        use aterm_core::terminal::{ClipboardAccess, ClipboardOperation};
+
+        let mut live = Terminal::new(8, 40);
+        live.set_kitty_file_resolver(|_, path| {
+            (path == "/secret/host/photo.raw").then(|| vec![0x11, 0x22, 0x33, 0xff])
+        });
+        live.authorize_clipboard_access(ClipboardAccess::Query);
+        live.set_clipboard_callback(|op| match op {
+            ClipboardOperation::Query { .. } => Some("secret-clipboard-token".to_string()),
+            _ => None,
+        });
+        let mut r = TemporalRecorder::with_budget(budget);
+        r.freeze_now_for_test(Some(Ticks(10)));
+        r.record_keyframe(keyframe_of(&live, usize::MAX).expect("seed"));
+        r.spine_watermark().seed(SpinePre::take(&live));
+        let (tx, rx) = queue(128);
+        let mut mark = SpineMark::attach(r.spine_watermark());
+        let mut step = |live: &mut Terminal, r: &mut TemporalRecorder, bytes: &[u8], ms: u64| {
+            let pre = SpinePre::take(live);
+            live.process_at(bytes, clock(ms));
+            let reply = live.take_response().map(Arc::<[u8]>::from);
+            let replied = reply.is_some();
+            mark.record(
+                &tx,
+                pre,
+                live,
+                InputSlice::at(bytes, clock(ms)).replying(reply),
+            );
+            if replied {
+                mark.reply(&tx);
+            }
+            r.freeze_now_for_test(Some(Ticks(ms)));
+            drain(&rx, r);
+        };
+        step(&mut live, &mut r, b"before every stretch\r\n", 100);
+        step(&mut live, &mut r, b"seed chain\r\n", 1_200);
+        for (k, read) in (1u64..).zip(reads) {
+            let at = 2_000 * k;
+            step(&mut live, &mut r, read.as_bytes(), at);
+            step(
+                &mut live,
+                &mut r,
+                format!("after stretch {k}\r\n").as_bytes(),
+                at + 100,
+            );
+            step(
+                &mut live,
+                &mut r,
+                format!("witness {k}\r\n").as_bytes(),
+                at + 1_200,
+            );
+        }
+        let used = r.used;
+        (r, live, used)
+    }
+
+    /// Five runs of live host reads (two Kitty file transmits, two OSC 52 queries, a Kitty file frame load), each with output and a witness between them, project five live keyframes; the recording keeps all six chains while its byte budget holds them, so Rewind reaches the seed. Under half the bytes the oldest chains go first, and the newest still replays the live screen.
+    #[test]
+    fn five_non_adjacent_live_read_stretches_keep_every_chain_the_budget_holds() {
+        use aterm_aos::contract::Verdict;
+        use aterm_aos_pane::{PaneCode, trace::PaneTrace};
+
+        let secret_path = "/secret/host/photo.raw";
+        let secret_path_b64 = aterm_codec::base64::encode(secret_path.as_bytes()).expect("b64");
+        let secret_clip = "secret-clipboard-token";
+        let secret_clip_b64 = aterm_codec::base64::encode(secret_clip.as_bytes()).expect("b64");
+        let reads = [
+            format!("\x1b_Gi=1,a=T,t=f,f=32,s=1,v=1;{secret_path_b64}\x1b\\"),
+            "\x1b]52;c;?\x07".to_string(),
+            format!("\x1b_Gi=1,a=f,t=f,f=32,s=1,v=1,z=40;{secret_path_b64}\x1b\\"),
+            format!("\x1b_Gi=2,a=T,t=f,f=32,s=1,v=1;{secret_path_b64}\x1b\\"),
+            "\x1b]52;c;?\x07".to_string(),
+        ];
+
+        let (mut r, live, used) = five_live_read_stretches(DEFAULT_BUDGET_BYTES, &reads);
+        assert_eq!(
+            live.host_io_ordinal(),
+            5,
+            "REACH: every read went to the host"
+        );
+        assert_eq!(r.keyframe_count(), 6, "the seed and five live keyframes");
+        assert_eq!(
+            r.reachable_from(),
+            Some(Ticks(10)),
+            "Rewind reaches the seed"
+        );
+        assert!(used <= r.budget, "used={used} past the budget");
+        let before = r.plan(Ticks(100)).expect("the seed's chain").fold().term;
+        assert_eq!(
+            before.row_text(0).as_deref().map(str::trim_end),
+            Some("before every stretch")
+        );
+        assert_eq!(r.rewind_instants().first().map(|i| i.at), Some(Ticks(10)));
+        let ticks: Vec<Ticks> = r.keyframes.iter().map(|kf| kf.ts).collect();
+        for plan in r.chain_plans(r.latest_tick()) {
+            r.judge(plan.fold().judged);
+        }
+        assert_eq!(
+            (r.witnessed(), r.diverged()),
+            (6, 0),
+            "every chain's witness matched its replay"
+        );
+        let latest = r.plan(r.latest_tick()).expect("latest").fold().term;
+        assert_eq!(latest.checkpoint_visible(), live.checkpoint_visible());
+        let chains = r.pane_chains().expect("chains");
+        assert_eq!(chains.len(), 6);
+        let lacks = |hay: &[u8], needle: &[u8]| !hay.windows(needle.len()).any(|w| w == needle);
+        for (idx, chain) in chains.iter().enumerate() {
+            assert_eq!(
+                chain.check(PaneCode::ThisBuild, "test").verdict,
+                Verdict::Pass,
+                "chain {idx}"
+            );
+            let bytes = chain
+                .trace(PaneCode::ThisBuild, "test")
+                .expect("trace")
+                .encode();
+            for secret in [
+                secret_path.as_bytes(),
+                secret_path_b64.as_bytes(),
+                secret_clip.as_bytes(),
+                secret_clip_b64.as_bytes(),
+            ] {
+                assert!(lacks(&bytes, secret), "chain {idx} carries a secret");
+            }
+            let round = PaneTrace::decode(&bytes)
+                .expect("decode")
+                .check(clock(0), "test")
+                .expect("check");
+            assert_eq!(round.verdict, Verdict::Pass, "chain {idx} round trip");
+        }
+        assert!(r.used <= r.budget);
+
+        // Negative control: half the bytes keep only the newest chains, oldest gone first.
+        let (r, live, _) = five_live_read_stretches(used / 2, &reads);
+        let kept: Vec<Ticks> = r.keyframes.iter().map(|kf| kf.ts).collect();
+        assert!(
+            (1..ticks.len()).contains(&kept.len()),
+            "half the bytes kept {} of {} keyframes",
+            kept.len(),
+            ticks.len()
+        );
+        assert!(ticks.ends_with(&kept), "kept {kept:?} of {ticks:?}");
+        assert_eq!(r.reachable_from(), kept.first().copied());
+        assert!(kept[0] > Ticks(10), "the seed went first");
+        assert!(r.plan(Ticks(100)).is_none(), "the seed's chain is gone");
+        let latest = r.plan(r.latest_tick()).expect("latest").fold().term;
+        assert_eq!(latest.checkpoint_visible(), live.checkpoint_visible());
+        assert!(r.used <= r.budget, "used={} past {}", r.used, r.budget);
+    }
+
+    /// A keyframe is charged what dropping it frees, within a quarter and a kilobyte over, for a fresh shell, a full history, one dense with shell marks, a styled alternate-screen TUI, a production terminal's policy, a stored Kitty image (whose shared payload the live store keeps) and an in-flight transfer; a witness's snapshot the same. The rule before (a checkpoint's grid bytes) charged less than either frees.
+    #[test]
+    fn a_keyframe_charges_the_heap_it_holds() {
+        use crate::work_counts::bytes_freed_in;
+
+        let history = |marked: bool| {
+            let mut t = Terminal::new(24, 80);
+            t.set_scrollback_line_limit(Some(4096));
+            for i in 0..2100 {
+                if marked && i % 4 == 0 {
+                    t.process(
+                        format!(
+                            "\x1b]7;file://localhost/home/user/dir{i}\x07\x1b]133;A\x07$ \
+                             \x1b]133;B\x07make target-{i}\r\n\x1b]133;C\x07"
+                        )
+                        .as_bytes(),
+                    );
+                    continue;
+                }
+                t.process(format!("line {i:05} {}\r\n", "z".repeat(60)).as_bytes());
+                if marked && i % 4 == 3 {
+                    t.process(b"\x1b]133;D;0\x07");
+                }
+            }
+            t
+        };
+        let tui = || {
+            let mut t = Terminal::new(50, 200);
+            t.process(b"\x1b[?1049h");
+            for row in 1..=50u16 {
+                let mut line = format!("\x1b[{row};1H");
+                for run in 0..20u16 {
+                    let colour = (row + run) % 8;
+                    line.push_str(&format!("\x1b[1;3{colour};4{}m{:<10}", 7 - colour, run));
+                }
+                line.push_str("\x1b[0m");
+                t.process(line.as_bytes());
+            }
+            t
+        };
+        let image = |pending: bool| {
+            let mut t = Terminal::new(24, 80);
+            t.set_cell_pixel_size(10, 20);
+            let raw = vec![0x5Au8; 128 * 128 * 4];
+            let b64 = aterm_codec::base64::encode(&raw).expect("b64");
+            if pending {
+                let chunk = &b64[..4096];
+                t.process(format!("\x1b_Ga=t,f=32,s=128,v=128,i=2,m=1;{chunk}\x1b\\").as_bytes());
+            } else {
+                t.process(format!("\x1b_Ga=T,f=32,s=128,v=128,i=1;{b64}\x1b\\").as_bytes());
+            }
+            t
+        };
+        let policed = || {
+            let mut t = Terminal::new(24, 80);
+            t.apply_policy_engine(aterm_policy::engine::PolicyEngine::new(
+                aterm_policy::profiles::standard(),
+            ));
+            t.process(b"$ ls\r\n");
+            t
+        };
+        let fixtures: Vec<(&str, Terminal)> = vec![
+            ("fresh 24x80", Terminal::new(24, 80)),
+            ("2100 plain lines", history(false)),
+            ("2100 lines with shell marks", history(true)),
+            ("200x50 styled TUI", tui()),
+            ("standard policy", policed()),
+            ("64 KiB Kitty image", image(false)),
+            ("in-flight m=1 transfer", image(true)),
+        ];
+        let mut grids_short = 0;
+        for (name, live) in &fixtures {
+            let kf = keyframe_of(live, REKEY_SCROLLBACK_LINES).expect(name);
+            if *name == "2100 lines with shell marks" {
+                assert!(
+                    kf.checkpoint.shell.command_marks.len() >= 500,
+                    "REACH: {} marks",
+                    kf.checkpoint.shell.command_marks.len()
+                );
+            }
+            if name.contains("Kitty") {
+                assert!(
+                    kf.carry.retained_image_bytes() >= 128 * 128 * 4,
+                    "REACH: the store holds the image"
+                );
+            }
+            if name.contains("in-flight") {
+                assert!(
+                    kf.carry.pending_transfer_bytes() > 0,
+                    "REACH: the transfer is open"
+                );
+            }
+            let shared = kf.carry.retained_image_bytes() - kf.carry.pending_transfer_bytes();
+            let charged = kf.charge() - shared;
+            let grids = kf.checkpoint.grid.len()
+                + kf.checkpoint.alt_grid.as_ref().map_or(0, Vec::len)
+                + kf.carry.pending_transfer_bytes();
+            let ((), freed) = bytes_freed_in(|| drop(kf));
+            eprintln!(
+                "keyframe {name}: freed {freed} B, grids-only rule {grids} B, charged {charged} B"
+            );
+            assert!(
+                freed <= charged,
+                "{name}: charged {charged} B, freed {freed} B"
+            );
+            assert!(
+                charged <= freed * 5 / 4 + 1024,
+                "{name}: charged {charged} B, past freed {freed} B"
+            );
+            grids_short += usize::from(grids < freed);
+
+            let seen = Arc::new(live.checkpoint_visible().expect(name));
+            let charged = charge_of(&seen);
+            let grids = seen.grid.len() + seen.alt_grid.as_ref().map_or(0, Vec::len);
+            let ((), freed) = bytes_freed_in(|| drop(seen));
+            eprintln!(
+                "witness {name}: freed {freed} B, grids-only rule {grids} B, charged {charged} B"
+            );
+            assert!(
+                freed <= charged,
+                "{name} witness: charged {charged} B, freed {freed} B"
+            );
+            assert!(
+                charged <= freed * 5 / 4 + 1024,
+                "{name} witness: charged {charged} B, past freed {freed} B"
+            );
+        }
+        assert_eq!(
+            grids_short,
+            fixtures.len(),
+            "negative control: the grids-only rule charged less than every keyframe frees"
+        );
+    }
+
+    /// The table a std `HashMap` allocates is at most what [`aterm_alloc::heap::table_bytes`] names for its capacity, and within two control groups of it, at every size a keyframe's Kitty tables reach.
+    #[test]
+    fn table_bytes_names_what_a_hash_map_allocates() {
+        use crate::work_counts::bytes_freed_in;
+        use std::collections::HashMap;
+        fn check<K: std::hash::Hash + Eq, V>(entry: impl Fn(u32) -> (K, V)) {
+            for len in 0..600u32 {
+                let map: HashMap<K, V> = (0..len).map(&entry).collect();
+                let named = aterm_alloc::heap::table_bytes::<(K, V)>(map.capacity());
+                let ((), freed) = bytes_freed_in(|| drop(map));
+                assert!(
+                    freed <= named,
+                    "{len} entries: freed {freed} B, named {named} B"
+                );
+                assert!(
+                    named <= freed + 32,
+                    "{len} entries: named {named} B, freed {freed} B"
+                );
+            }
+        }
+        check(|i| (i, i));
+        check(|i| (i, u64::from(i)));
+        check(|i| (i, [0u8; 3]));
+    }
+
+    /// The sorted keyframe and witness lookups answer what the linear scans they replaced did, at every instant of two thousand chains (ties on a tick, judged, pending and diverged witnesses), for the base keyframe, the fidelity and covering witness, the plan, the instants, the track, the contradictions, the export and the chain plans; a contradiction is where the fidelity reads diverged.
+    #[test]
+    fn keyframe_lookups_match_the_linear_scan_across_many_chains() {
+        const CHAINS: u64 = 2_000;
+        let mut r = TemporalRecorder::with_budget(usize::MAX / 4);
+        let mut live = Terminal::new(2, 8);
+        live.set_scrollback_line_limit(Some(4));
+        r.freeze_now_for_test(Some(Ticks(0)));
+        r.record_keyframe(live.checkpoint());
+        let mut ms = 0;
+        let put = |r: &mut TemporalRecorder, live: &mut Terminal, ms: u64, bytes: &[u8]| {
+            r.freeze_now_for_test(Some(Ticks(ms)));
+            live.process_at(bytes, clock(ms));
+            r.apply_inline(TemporalMsg::RawIn(InputSlice::at(bytes, clock(ms))));
+        };
+        for chain in 0..CHAINS {
+            ms += 10;
+            put(&mut r, &mut live, ms, format!("{chain}\r\n").as_bytes());
+            let seen = if chain == CHAINS / 2 {
+                let mut stranger = Terminal::new(2, 8);
+                stranger.process(b"never shown");
+                stranger.checkpoint_visible()
+            } else {
+                live.checkpoint_visible()
+            };
+            r.apply_inline(TemporalMsg::Witness(Arc::new(seen.expect("visible"))));
+            if chain % 3 != 0 {
+                ms += 10;
+            }
+            put(&mut r, &mut live, ms, b"x");
+            r.record_keyframe(live.checkpoint());
+        }
+        ms += 10;
+        put(&mut r, &mut live, ms, b"tail");
+        assert_eq!(
+            r.keyframe_count(),
+            usize::try_from(CHAINS).expect("fits") + 1,
+            "REACH: every chain is kept"
+        );
+        let plans = r.chain_plans(r.latest_tick());
+        for (idx, plan) in plans.into_iter().enumerate() {
+            if idx % 4 != 1 {
+                r.judge(plan.fold().judged);
+            }
+        }
+        assert_eq!(r.diverged(), 1, "REACH: one chain's witness diverged");
+        assert!(
+            r.witnesses
+                .iter()
+                .any(|w| matches!(w.state, WitnessState::Pending(_))),
+            "REACH: some witnesses wait for a fold"
+        );
+
+        let ticks: Vec<Ticks> = (0..=ms + 10).step_by(5).map(Ticks).collect();
+        let instant_answers = |r: &TemporalRecorder| {
+            ticks
+                .iter()
+                .map(|&at| {
+                    (
+                        r.base_keyframe(at).map(|kf| kf.seq),
+                        r.fidelity_at(at),
+                        r.covering_witness(at),
+                        r.plan(at).map(|p| {
+                            (
+                                p.base_seq,
+                                p.steps.iter().map(|s| s.seq).collect::<Vec<_>>(),
+                            )
+                        }),
+                        r.chain_before(at).map(|p| p.base_seq),
+                        r.warm_plans(at)
+                            .iter()
+                            .map(|p| p.base_seq)
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let whole_answers = |r: &TemporalRecorder| {
+            let instants = r.rewind_instants();
+            let contradicted = r.contradicted(&instants);
+            let export: Vec<(u64, Option<usize>)> = r
+                .export()
+                .expect("export")
+                .events
+                .iter()
+                .map(|(t, e)| match e {
+                    Exported::Screen(cp) => (*t, Some(Arc::as_ptr(cp) as usize)),
+                    _ => (*t, None),
+                })
+                .collect();
+            let plans: Vec<(Seq, Vec<Seq>)> = r
+                .chain_plans(r.latest_tick())
+                .iter()
+                .map(|p| (p.base_seq, p.steps.iter().map(|s| s.seq).collect()))
+                .collect();
+            (instants, contradicted, r.rewind_track(), export, plans)
+        };
+        let (linear_instant, linear_whole) = {
+            let _linear = lookup_scan::scan_linearly();
+            (instant_answers(&r), whole_answers(&r))
+        };
+        let sorted_instant = instant_answers(&r);
+        let sorted_whole = whole_answers(&r);
+        for ((at, linear), sorted) in ticks.iter().zip(&linear_instant).zip(&sorted_instant) {
+            assert_eq!(linear, sorted, "at {at:?}");
+        }
+        assert_eq!(linear_whole, sorted_whole);
+
+        let (instants, contradicted, track, ..) = sorted_whole;
+        let read: Vec<bool> = instants
+            .iter()
+            .map(|i| r.fidelity_at(i.at) == Fidelity::Diverged)
+            .collect();
+        assert_eq!(contradicted, read, "a contradiction is a diverged fidelity");
+        assert!(
+            contradicted.iter().any(|&c| c) && contradicted.iter().any(|&c| !c),
+            "REACH: the diverged chain is contradicted and the rest are not"
+        );
+        assert!(
+            track.spans.iter().any(|&(.., span)| span == Span::Differs),
+            "REACH: the track hatches the diverged chain"
+        );
+        let fidelities: Vec<Fidelity> = linear_instant.iter().map(|a| a.1).collect();
+        for want in [
+            Fidelity::Faithful,
+            Fidelity::Diverged,
+            Fidelity::Unwitnessed,
+        ] {
+            assert!(
+                fidelities.contains(&want),
+                "REACH: an instant reads {want:?}"
+            );
+        }
+        assert!(
+            r.keyframes
+                .iter()
+                .zip(r.keyframes.iter().skip(1))
+                .any(|(a, b)| r
+                    .log
+                    .live_after(a.seq)
+                    .take_while(|ev| ev.seq < b.seq)
+                    .any(|ev| ev.ts == b.ts && matches!(ev.op, Op::RawIn(_)))),
+            "REACH: a keyframe shares its tick with the slice before it"
+        );
+
+        // What a rewound frame pays per `fidelity_at`, sorted against linear, for the report.
+        let mid = ticks[ticks.len() / 2];
+        let per_call = |r: &TemporalRecorder| {
+            let start = Instant::now();
+            for _ in 0..200 {
+                std::hint::black_box(r.fidelity_at(std::hint::black_box(mid)));
+            }
+            start.elapsed() / 200
+        };
+        let linear = {
+            let _linear = lookup_scan::scan_linearly();
+            per_call(&r)
+        };
+        let sorted = per_call(&r);
+        eprintln!(
+            "fidelity_at over {} keyframes and {} witnesses: linear {linear:?}, sorted {sorted:?} per call",
+            r.keyframes.len(),
+            r.witnesses.len()
+        );
     }
 
     #[test]

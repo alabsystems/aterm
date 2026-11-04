@@ -2138,6 +2138,7 @@ pub(crate) struct Sim {
     cfg: Config,
     term: Terminal,
     reference: Terminal,
+    /// The session's screen as [`Self::refilled`] last brought it up to the terminal.
     scratch: RenderInput,
     predictor: Predictor,
     program: Program,
@@ -2153,7 +2154,6 @@ pub(crate) struct Sim {
     noecho_visible: Option<u64>,
     landing: Option<(KeyId, u16, u16, Space, u64)>,
     glass: Vec<(KeyId, u16, u16, char)>,
-    press_scratch: RenderInput,
     press_row: Vec<Seen>,
     press_below: Vec<Seen>,
     stats: Stats,
@@ -2240,7 +2240,6 @@ impl Sim {
             predictor,
             program: Program::new(cols, cfg),
             glass: Vec::new(),
-            press_scratch: RenderInput::empty(),
             press_row: Vec::new(),
             press_below: Vec::new(),
             now: start,
@@ -2330,7 +2329,8 @@ impl Sim {
         self.glass_frame.as_ref()
     }
 
-    /// Returns the unpainted authoritative frame from the last redraw.
+    /// Returns the unpainted authoritative frame from the last refill, a redraw's where one
+    /// came last.
     pub(crate) fn screen(&self) -> &RenderInput {
         &self.scratch
     }
@@ -2726,14 +2726,26 @@ impl Sim {
         Ok(())
     }
 
+    /// Brings [`Self::scratch`] up to the terminal by the refill the GUI paints with: only the
+    /// rows damage names. A frame, a press's row and a settled key's truth all read this one
+    /// damage-scoped buffer, so a row whose damage was lost agrees with itself among them; the
+    /// reference at [`Self::settle`], a full fill of its own terminal, is the one independent
+    /// fill and is what judges the screen a run ends on.
+    fn refilled(&mut self) {
+        let rows = usize::from(self.term.rows());
+        let cols = usize::from(self.term.cols());
+        let _ = self
+            .term
+            .cell_frame_damage_scoped_into(&mut self.scratch, rows, cols);
+    }
+
     fn sample_press_row(&mut self, row: u16, cursor_col: u16) -> bool {
         let rows = usize::from(self.term.rows());
         let cols = usize::from(self.term.cols());
-        self.term
-            .cell_frame_into(&mut self.press_scratch, rows, cols);
+        self.refilled();
         self.press_row.clear();
         let blind = self.cfg.host == Host::TailBlind;
-        let input = &self.press_scratch;
+        let input = &self.scratch;
         self.press_row.extend((0..cols).map(|c| {
             if blind && c > usize::from(cursor_col) {
                 Seen::Blank
@@ -2910,10 +2922,9 @@ impl Sim {
         }
         let rows = usize::from(self.term.rows());
         let cols = usize::from(self.term.cols());
-        let mut now_frame = RenderInput::empty();
-        self.term.cell_frame_into(&mut now_frame, rows, cols);
-        let truth = frame_text(&now_frame, rows, cols);
-        let truth_decoration = frame_decoration(&now_frame, rows, cols);
+        self.refilled();
+        let truth = frame_text(&self.scratch, rows, cols);
+        let truth_decoration = frame_decoration(&self.scratch, rows, cols);
         let cursor = self.term.cursor();
         let space = self.space();
         for f in frames {
@@ -3093,9 +3104,8 @@ impl Sim {
 
     fn frame(&mut self) -> Result<(), Violation> {
         self.stats.frames += 1;
-        let rows = usize::from(self.term.rows());
         let cols = usize::from(self.term.cols());
-        self.term.cell_frame_into(&mut self.scratch, rows, cols);
+        self.refilled();
         let cursor = self.term.cursor();
         let coords = self.host_generation();
         let alt = self.host_alt();

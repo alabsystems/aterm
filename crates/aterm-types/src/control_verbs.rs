@@ -1028,9 +1028,9 @@ pub const VERBS: &[VerbSpec] = &[
          no reading). Only a person changes these, at the places `remediate` names: \
          `settings:<pane>` is a System Settings pane, `aterm-settings:<page>` a page of aterm's \
          Settings (the debugger's is Settings ▸ Security); `devtools hand-over` opens the \
-         Developer Tools pane and `await consent [kind=debugger]` waits for a change. System \
-         State turns debugger access on once per Mac behind macOS's own password dialog; nothing \
-         a session sends starts or answers it, and `[privacy] notice = false` pauses it.",
+         Developer Tools pane and `await consent [kind=debugger]` waits for a change. Setup's \
+         one Mac password, typed in its Mac Setup tab, turns debugger access on (developer \
+         mode); nothing a session sends starts or answers it.",
     )
     .json(Json::Emits),
     v(
@@ -1580,7 +1580,7 @@ pub const VERBS: &[VerbSpec] = &[
         "permissions walk now [<subject>...]: walk aterm's missing macOS grants",
         "— Owner-only, for a person at the Mac. Starts the window's permission walk: one helper \
          panel beside System Settings, one page per grant aterm lacks (`fda`, `devtools`, \
-         `accessibility`, `debugger`, or the rows' words `full-disk-access` and \
+         `accessibility`, or the rows' words `full-disk-access` and \
          `developer-tools`: those named first, then the rest in that order), each turning to the \
          next a second after its switch reads on (Full Disk Access's once macOS's Quit & \
          Reopen sheet over System Settings is gone: Quit & Reopen goes on in the aterm that \
@@ -1589,7 +1589,7 @@ pub const VERBS: &[VerbSpec] = &[
          first page waits while another macOS question of aterm's is up, and a page the owner \
          says Not now to meanwhile is left out; the answer does not wait. No subject names every \
          page. Answers `OK walking <subject>...` (the pages still to show: a walk \
-         under way keeps going and takes the pages a new one would, before its debugger step, \
+         under way keeps going and takes the pages a new one would, \
          one it passed with no grant coming back; it names them only if it names a page \
          itself, so the first launch's walk goes on from every Not now), with \
          `not-now:<subject>` for each page named that the owner's Not now holds back from the \
@@ -1601,7 +1601,7 @@ pub const VERBS: &[VerbSpec] = &[
          (the window did not take the ask within 5 s: no walk starts for it, then or later), \
          headless `ERR headless: …`, \
          non-macOS `ERR unsupported: …`, bad args `ERR usage: permissions walk now \
-         [fda|devtools|accessibility|debugger]...`.",
+         [fda|devtools|accessibility]...`.",
     )
     .input(Input::NONE),
     v(
@@ -1801,6 +1801,20 @@ pub const VERBS: &[VerbSpec] = &[
     )
     .lane(Wait)
     .input(Input::PTY),
+    va(
+        "allocation",
+        Owner,
+        Status,
+        Meta,
+        OwnerOnly,
+        "allocation attach generation=<hex>: queue one private native-session monitor",
+        "— local native callers transfer exactly one read-only monitor descriptor after \
+         admission. The queued attachment revision is not an observed snapshot or current \
+         machine leadership. Exact Owner connection only; no @selector, fleet or remote \
+         forwarding. Descriptor delivery uses the typed aterm-ctl attachment API.",
+    )
+    .lane(Wait)
+    .input(Input::NONE),
     v(
         "chrome",
         Read,
@@ -2104,7 +2118,7 @@ pub const VERBS: &[VerbSpec] = &[
         Read,
         Status,
         Session,
-        "harness policy | recovery: read supervisor policy or observed account recovery",
+        "harness policy | recovery | fact [told]: supervisor policy, account recovery, an act's fact",
         "— read-only `[harness]` policy for a self-supervising agent (`meta` \
          `supervisor_proven=1`). `gen=` is the policy generation (`EVENT <local> harness-policy \
          gen=<n>`); `effective=` and `why=` give this session's verdict \
@@ -2135,9 +2149,25 @@ pub const VERBS: &[VerbSpec] = &[
          Text is percent-encoded; `-` means unknown or absent, \
          counts may be zero, times are Unix seconds from the observation (not read time), and a \
          retained next_at may be past. Phases: unknown, paused, watching, disabled, limited, waiting, probing, \
-         ready, switching, verifying, signing-in. This read never refreshes credentials.",
+         ready, switching, verifying, signing-in. This read never refreshes credentials. \
+         `fact for=<rule> reader=<id> kinds=<kinds> wall=<word>` (Owner; only the session's \
+         standing proven codex-alab self-claim, else `ERR denied`): the session's untold \
+         measured fact under `[harness] facts`, for an act under `<rule>` that aterm's own loop \
+         would let a fact ride (its continuation, done check, Land instruction or nudge, outside \
+         a limit's place), once per stall, leased to `<id>` for 30 s: `OK fact=- \
+         why=<rule|limit|kinds|stale|none|told|offered|busy|off|facts-off>` or `OK fact=<pct \
+         sentence> kind=no-progress episode=<016x> as_of_ms=<unix ms> rider=<pct ' (aterm: \
+         <sentence>)'>`, the rider typed verbatim after the act's words and standing rules; \
+         `ERR the session ledger is unreadable: <why>` where the session ledger stands but cannot \
+         be read whole (no fact this time; the next read asks it again). \
+         `fact told episode=<016x>` (Write) says the act that carried it started: `OK`, or `ERR \
+         stale fact` (no offer of that episode to this claim), and nothing is told.",
     )
-    .forms(&[form(Word("recovery")).owner_only()]),
+    .forms(&[
+        form(Word("recovery")).owner_only(),
+        form(Flag(&["told"])).op(Write).owner_only(),
+        form(Word("fact")).owner_only(),
+    ]),
     v(
         "resources", Read, Lines, Session,
         "resources [capabilities|register]: delegated job ownership and current usage",
@@ -2344,7 +2374,11 @@ pub const VERBS: &[VerbSpec] = &[
          sev=<word>] [held=<word>] [coalesced=<n>] by=aterm src=aterm conf=strong`, a flap past \
          20 at once, then one a second, coalesced the same way; local, never mirrored) and `row` \
          (`row=<kind>`: a timeline row held as a row alone, such as `job-change`); `lvl=` is \
-         `session|run|turn|step`. Header \
+         `session|run|turn|step`. On a codex tab an approval or question step is the \
+         program's own claim (`src=engine conf=claim`): one per box a status sweep's program \
+         mark shows (stacked boxes of one kind share one; a box shown and answered between two \
+         sweeps, or one whose `blocked` coalesced past the bucket, has none), closed when the \
+         box goes, `out=gone` when its program or its turn went. Header \
          (stderr on `aterm ctl`): \
          `OK <n> v=2 as_of=<seq> ep=<e> base=<b> oldest=<seq>[ lost=<k>][ more=<k>]`, then `<seq> \
          <open|close|mark|amend|gap> <node> <kind> [par=<node>] <k=v ...> [by=<actor>] \
@@ -3629,7 +3663,12 @@ pub const VERBS: &[VerbSpec] = &[
          it (`ERR usage` for any other spelling). A codex's `agent=` stays `unknown` (aterm reads no Codex screen), so `await \
          agent` never answers on its state; `await log kind=program since=<log_seq> \
          ep=<log_ep>`, both read from `status` before typing to it, answers on the program's \
-         own report (`program state=<w> [ask=<k>] [coalesced=<n>] src=engine conf=claim`). \
+         own report (`program state=<w> [ask=<k>] [coalesced=<n>] src=engine conf=claim`). On a \
+         codex tab an approval or question step is the program's own claim (`src=engine \
+         conf=claim`): one per box a status sweep's program mark shows (stacked boxes of one \
+         kind share one; a box shown and answered between two sweeps, or one whose `blocked` \
+         coalesced past the bucket, has none), closed when the box goes, `out=gone` when its \
+         program or its turn went; `await log need` answers on its open. \
          `await task [@<sel>[:<rev>[:<fact_rev>]][,...]] [any|all] [since=<rev>] [facts=1 \
          [fact_since=<fact_rev>]]`: a `task` `rev` past `since=` whose state is not `working` or \
          whose ask stands (never a `kind=wait` entry), with `facts=1` a fact word noted past \
@@ -4167,8 +4206,13 @@ pub const VERBS: &[VerbSpec] = &[
          A codex-alab row, whose screen names no state, takes `agent=` from what codex-alab says of \
          itself in OSC 7501 (`working` is `busy`; `blocked` is `prompt`, `question` or \
          `wall:auth`; at rest, `idle`; nothing said, `unknown`) and `model= effort= ctx_left_pct= \
-         usage_5h_pct= usage_7d_pct= doing= cwd= branch= prompt= said=` from its rollout: while \
-         its proven claim stands (`supervisor=codex-alab@<pid>`), and, read only, after this aterm \
+         usage_5h_pct= usage_7d_pct= doing= cwd= branch= prompt= said=` from its rollout, and \
+         `goal= bg=` from its own session record (`bg=` is that record's `backgroundTerminals`: \
+         the unified exec processes codex-alab's own footer and `/ps` count for the thread it \
+         shows, one a running tool call still waits on included, so not only background ones; \
+         its claim, never read off its screen; `bg=-` where its record names no count, as an \
+         older codex-alab's names none): while its proven claim stands \
+         (`supervisor=codex-alab@<pid>`), and, read only, after this aterm \
          saw that claim given back (Autopilot Off, the harness off) while the same process runs \
          on in front, from the thread its own session record names; a codex-alab that never \
          claimed, or one whose claim a previous aterm saw given back, has none until it claims \

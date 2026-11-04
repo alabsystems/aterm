@@ -960,8 +960,7 @@ fn advance(
     limits: &Limits,
     sink: &mut Sink<'_>,
 ) -> Result<bool, ()> {
-    let mut file = super::footer::open_regular(path).ok_or(())?;
-    let meta = file.metadata().map_err(|_| ())?;
+    let (mut file, meta) = super::footer::open_regular_with_meta(path).ok_or(())?;
     let size = meta.len();
     let id = super::session_usage::open_identity(&file, &meta);
     let mut rewritten = matches!((cursor.identity, id), (Some(held), Some(now)) if held != now)
@@ -1029,7 +1028,8 @@ fn advance(
                 if line.len() > MAX_LINE_BYTES {
                     let report = sink.report();
                     report.rows_long = report.rows_long.saturating_add(1);
-                    line = Vec::new();
+                    // Do not retain an oversized row's allocation while skipping it.
+                    drop(std::mem::take(&mut line));
                     cursor.skipping = true;
                     cursor.offset = pos;
                     cursor.boundary = head.last().copied();

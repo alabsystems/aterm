@@ -304,7 +304,7 @@ fn open_rendezvous(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
-fn open_regular_existing(path: &Path) -> io::Result<File> {
+fn open_regular_existing_with_meta(path: &Path) -> io::Result<(File, std::fs::Metadata)> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -313,13 +313,18 @@ fn open_regular_existing(path: &Path) -> io::Result<File> {
         options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     let file = options.open(path)?;
-    if !file.metadata()?.is_file() {
+    let meta = file.metadata()?;
+    if !meta.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("{} is not a regular file", path.display()),
         ));
     }
-    Ok(file)
+    Ok((file, meta))
+}
+
+fn open_regular_existing(path: &Path) -> io::Result<File> {
+    open_regular_existing_with_meta(path).map(|(file, _)| file)
 }
 
 /// The "who" line a holder writes: the first line of `who`, cut on a character boundary
@@ -442,22 +447,22 @@ pub enum Hold {
     Held(Lease),
     /// The directory is none of atpkg's ([`Subject::of_dir`]): nothing of atpkg's reclaims or re-lays it, so there is nothing to hold.
     Unmanaged,
-    /// The lease could not be taken; the holder command runs without one. Callers that require a lease refuse instead.
+    /// The lease could not be taken. Best-effort callers may proceed; callers requiring a lease refuse.
     NotTaken(Subject, LeaseError),
 }
 
-/// The directory a holder was asked to hold is not there.
+/// The path a holder was asked to hold does not resolve to a directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Missing {
     pub dir: PathBuf,
     pub managed: bool,
 }
 
-/// THE HOLDER VERB's lease (`aterm pkg lease <dir> -- <command…>`): the subject `dir` belongs to, leased as `who` under `prefix` for as long as the returned [`Hold`] lives, and `dir` checked to be there AFTER the lease is laid — the check [`take`] leaves to its caller, since only the caller knows what it resolved.
+/// THE HOLDER VERB's lease (`aterm pkg lease <dir> -- <command…>`): the subject `dir` belongs to, leased as `who` under `prefix` for as long as the returned [`Hold`] lives, and `dir` checked to resolve to a directory AFTER the lease is laid — the check [`take`] leaves to its caller, since only the caller knows what it resolved.
 /// # Errors
-/// [`Missing`] when `dir` is not there once the lease is laid (or could not be): the command would run on a toolchain that is gone, so the holder runs nothing.
+/// [`Missing`] when `dir` does not resolve to a directory once the lease is laid (or could not be): the holder runs nothing. Valid directory symlinks are followed; files and dangling symlinks are refused.
 pub fn hold_for(prefix: &Path, dir: &Path, who: &str, wait: Duration) -> Result<Hold, Missing> {
-    let there = || std::fs::symlink_metadata(dir).is_ok();
+    let there = || dir.is_dir();
     let Some(subject) = Subject::of_dir(prefix, dir) else {
         return if there() {
             Ok(Hold::Unmanaged)
@@ -514,11 +519,12 @@ impl Holders {
 /// Test one holder's file: `Ok(Some(who))` live, `Ok(None)` a dead holder's (removed when
 /// `reap`), `Err` when it could not be tested.
 fn probe_file(path: &Path, reap: bool) -> io::Result<Option<String>> {
-    let mut file: std::fs::File = match open_regular_existing(path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e),
-    };
+    let (mut file, meta): (std::fs::File, std::fs::Metadata) =
+        match open_regular_existing_with_meta(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
     #[expect(
         clippy::disallowed_methods,
         reason = "a probe: a dead holder's file it locks is let go by unlock() before its close"
@@ -533,7 +539,8 @@ fn probe_file(path: &Path, reap: bool) -> io::Result<Option<String>> {
             Ok(None)
         }
         Err(std::fs::TryLockError::WouldBlock) => {
-            let mut raw = Vec::new();
+            let cap = usize::try_from(meta.len().min(WHO_MAX).saturating_add(1)).unwrap_or(0);
+            let mut raw = Vec::with_capacity(cap);
             let _ = (&mut file).take(WHO_MAX).read_to_end(&mut raw);
             let who = String::from_utf8_lossy(&raw);
             let who = who.lines().next().unwrap_or_default().trim().to_string();

@@ -652,69 +652,11 @@ fn the_panels_count_leaves_out_a_page_whose_grant_reads_held() {
     );
 }
 
-/// Not now on the walk's own Developer Tools page goes on to the debugger, which the walk hands
-/// to System State's once-per-Mac step: the panel goes, the step looks at once instead of at its
-/// next look, and the walk itself starts no change (it is no person's press on the row's
-/// `Turn On…`; the census's `devtools-door` fence holds it off that door). Control: with no
-/// step queued the walk skips the debugger and no look is brought forward. A Not now on a page
-/// asked for by name ends the walk there.
+/// A Not now on a page asked for by name ends the walk there; with both pages named (as
+/// `aterm doctor` names them), Not now on the first goes on to the second.
 #[test]
-fn not_now_on_developer_tools_goes_on_to_the_debugger_step() {
-    use crate::debugger_access::DebuggerStepQueue;
+fn not_now_on_a_page_asked_for_ends_the_walk_there_or_goes_on_to_the_next_asked_for() {
     let t0 = Instant::now();
-    let later = t0 + Duration::from_secs(600);
-    for queued in [true, false] {
-        let mut app = walk_app();
-        app.debugger_launch = if queued {
-            DebuggerStepQueue::queued_for_test(|| Some("MAC-A"))
-        } else {
-            DebuggerStepQueue::new(false)
-        };
-        // The step waits for its moment, ten minutes out.
-        app.debugger_launch.look_later(later);
-        app.permission_walk.start(
-            Walk::new(vec![Subject::DeveloperTools, Subject::Debugger], t0).expect("two pages"),
-            "first launch",
-        );
-        app.drive_permission_walk(t0);
-        assert_eq!(
-            page_and_step(&app),
-            Some((Page::DeveloperTools, Some((1, 2))))
-        );
-        app.devtools_helper.press_for_test(PanelEvent::NotNow);
-        app.tick_devtools_hand_over(t0);
-        let walk = app.permission_walk.walk().expect("the walk goes on");
-        assert_eq!(walk.current(), Some(Subject::Debugger));
-        assert_eq!(walk.position(|_| false), (2, 2));
-        let closes = panel_counts().2;
-        let at = t0 + UNREAD_WAIT;
-        assert_eq!(
-            app.debugger_launch.next_deadline(),
-            queued.then_some(later),
-            "the step still waits for its moment"
-        );
-        app.drive_permission_walk(at);
-        assert_eq!(panel_counts().2, closes + 1, "the panel goes");
-        assert!(!app.permission_walk.active(), "the debugger was the last");
-        assert!(
-            !app.debugger_change.under_way(),
-            "the walk starts no change"
-        );
-        if queued {
-            assert_eq!(
-                app.debugger_launch.next_deadline(),
-                Some(at),
-                "System State's step looks at once"
-            );
-        } else {
-            assert_eq!(
-                app.debugger_launch.next_deadline(),
-                None,
-                "no step to bring forward"
-            );
-        }
-    }
-
     let mut app = walk_app();
     assert_eq!(
         app.start_permission_walk(&[Subject::DeveloperTools], "a person's press", t0),
@@ -782,38 +724,6 @@ fn walk_app_held_by_local_network(devtools: crate::devtools_helper::Reach) -> Ap
     app.devtools_helper.note_cold_start();
     app.user_input_recent = |within| within >= Duration::from_secs(5);
     app
-}
-
-/// System State's debugger step waits on the run's order as the access steps do
-/// (`App::debugger_step_moment`): while the Local Network step is still to run (after a walk that
-/// went first handed it the debugger) and while System Settings asks something (a sheet over its
-/// main window, a quit of this process), and its admission waits for each
-/// (`lib_macos_access_refresh_tests`). NEGATIVE CONTROL: Local Network on record and System
-/// Settings asking nothing hold it neither way.
-#[test]
-fn the_debugger_steps_moment_reads_local_network_and_system_settings() {
-    let mut held = walk_app_held_by_local_network(test_arms::opening());
-    assert!(held.local_network_step_to_come());
-    let moment = held.debugger_step_moment();
-    assert!(
-        moment.local_network_pending,
-        "the Local Network step is to come"
-    );
-
-    let mut app = walk_app();
-    assert!(!app.local_network_step_to_come(), "on record");
-    let moment = app.debugger_step_moment();
-    assert!(
-        !moment.local_network_pending && !moment.settings_asks,
-        "control: nothing holds it"
-    );
-    SETTINGS_ASKS.with(|asks| asks.set(true));
-    assert!(app.debugger_step_moment().settings_asks, "a sheet stands");
-    SETTINGS_ASKS.with(|asks| asks.set(false));
-    QUIT_ASKED.with(|asked| asked.set(true));
-    assert!(app.debugger_step_moment().settings_asks, "a quit is asked");
-    QUIT_ASKED.with(|asked| asked.set(false));
-    assert!(!app.debugger_step_moment().settings_asks);
 }
 
 /// The look that finds the walk's wait for the Local Network step run out says in aterm.log that
@@ -1971,118 +1881,6 @@ fn the_verb_under_way_takes_back_a_page_the_walk_passed_and_names_only_the_pages
     );
 }
 
-/// A page the verb takes back goes before the debugger still to come, so the debugger's step
-/// stays last and the panel stays up through it: on the first launch's walk over Full Disk
-/// Access, Developer Tools and the debugger, Full Disk Access passed with no grant read on comes
-/// back after Developer Tools in the same panel, and the debugger goes to System State's step
-/// only after it.
-#[test]
-fn a_page_the_verb_takes_back_comes_before_the_debugger_in_the_same_panel() {
-    use crate::debugger_access::DebuggerStepQueue;
-    let t0 = Instant::now();
-    let later = t0 + Duration::from_secs(600);
-    let mut app = walk_app();
-    app.debugger_launch = DebuggerStepQueue::queued_for_test(|| Some("MAC-A"));
-    app.debugger_launch.look_later(later);
-    assert_eq!(
-        app.start_permission_walk(&[], "first launch", t0),
-        walking_over(&[
-            Subject::FullDiskAccess,
-            Subject::DeveloperTools,
-            Subject::Debugger
-        ])
-    );
-    app.devtools_helper.press_for_test(PanelEvent::SwitchedOn);
-    app.tick_devtools_hand_over(t0);
-    app.drive_permission_walk(t0);
-    assert_eq!(
-        page_and_step(&app),
-        Some((Page::DeveloperTools, Some((2, 3))))
-    );
-    let shows = panel_counts().0;
-    assert_eq!(
-        app.ask_permission_walk(&[Subject::FullDiskAccess, Subject::DeveloperTools], t0)
-            .reply(),
-        "OK walking devtools fda debugger\n"
-    );
-    app.devtools_helper.read_for_test(test_arms::on());
-    app.tick_consent_lanes(t0 + GRANT_POLL);
-    let turned = t0 + GRANT_POLL + DONE_FOR;
-    app.tick_consent_lanes(turned);
-    let back = turned + UNREAD_WAIT;
-    app.tick_consent_lanes(back);
-    assert_eq!(
-        page_and_step(&app),
-        Some((Page::FullDiskAccess, Some((3, 4)))),
-        "Full Disk Access comes back before the debugger"
-    );
-    assert_eq!(panel_counts().0, shows, "in the same panel");
-    assert_eq!(
-        app.debugger_launch.next_deadline(),
-        Some(later),
-        "the debugger's step still waits for its moment"
-    );
-
-    app.devtools_helper.press_for_test(PanelEvent::NotNow);
-    app.tick_devtools_hand_over(back);
-    let handed = back + UNREAD_WAIT;
-    app.drive_permission_walk(handed);
-    assert!(!app.permission_walk.active(), "the debugger was the last");
-    assert_eq!(
-        app.debugger_launch.next_deadline(),
-        Some(handed),
-        "System State's step looks once the page before it ended"
-    );
-}
-
-/// A page the verb asks for while the walk waits at the debugger, its step not yet handed, goes
-/// before it too: the debugger's page never comes up, so the panel held up for it turns to the
-/// page the verb asked for, and System State's step still comes last. (A walk at a page that is
-/// up keeps it: `a_page_the_verb_takes_back_comes_before_the_debugger_in_the_same_panel`.)
-#[test]
-fn a_page_the_verb_asks_for_at_the_debugger_comes_up_before_it_in_the_same_panel() {
-    let t0 = Instant::now();
-    let mut app = with_debugger_step(walk_app());
-    let later = app.debugger_launch.next_deadline();
-    app.permission_walk.start(
-        Walk::new(vec![Subject::DeveloperTools, Subject::Debugger], t0).expect("two pages"),
-        "first launch",
-    );
-    app.drive_permission_walk(t0);
-    app.devtools_helper.press_for_test(PanelEvent::NotNow);
-    app.tick_devtools_hand_over(t0);
-    assert_eq!(
-        app.permission_walk.walk().and_then(Walk::current),
-        Some(Subject::Debugger),
-        "the walk waits at the debugger"
-    );
-    let (shows, _, closes) = panel_counts();
-    let fda_opens = test_arms::fda_counts().0;
-    assert_eq!(
-        app.ask_permission_walk(&[Subject::FullDiskAccess], t0)
-            .reply(),
-        "OK walking fda devtools debugger\n",
-        "the page passed comes back too, both before the debugger"
-    );
-    app.drive_permission_walk(t0 + UNREAD_WAIT);
-    assert_eq!(
-        page_and_step(&app),
-        Some((Page::FullDiskAccess, Some((2, 4)))),
-        "Full Disk Access comes up before the debugger"
-    );
-    assert_eq!(test_arms::fda_counts().0, fda_opens + 1, "its page opened");
-    assert_eq!(
-        (panel_counts().0, panel_counts().2),
-        (shows, closes),
-        "in the same panel"
-    );
-    assert_eq!(
-        app.debugger_launch.next_deadline(),
-        later,
-        "the debugger's step still waits for its moment"
-    );
-}
-
 /// A page the verb asks for while a walk is under way counts as asked for by name, and the verb
 /// with no subject asks for every page: a Not now on the page a row's press named goes on to it
 /// instead of ending the walk. NEGATIVE CONTROL: with no ask, the same Not now ends the walk and
@@ -2435,28 +2233,14 @@ thread_local! {
 /// The Mac a released aterm wrote [`STATE`] on, and another.
 const MAC_A: &str = "1D683F62-5C4B-4E3A-9F21-7B8C6D5E4A30";
 
-/// The pages of a walk with System State's debugger step still to come.
-const LEFT: [Subject; 3] = [
-    Subject::FullDiskAccess,
-    Subject::DeveloperTools,
-    Subject::Debugger,
-];
-
-/// [`walk_app`]'s window or [`walk_app_with_fda`]'s, with System State's once-per-Mac debugger
-/// step queued and waiting for its moment, ten minutes out.
-fn with_debugger_step(mut app: App) -> App {
-    use crate::debugger_access::DebuggerStepQueue;
-    app.debugger_launch = DebuggerStepQueue::queued_for_test(|| Some("MAC-A"));
-    app.debugger_launch
-        .look_later(Instant::now() + Duration::from_secs(600));
-    app
-}
+/// The pages of a first launch's walk.
+const LEFT: [Subject; 2] = [Subject::FullDiskAccess, Subject::DeveloperTools];
 
 /// A walk under way when System Settings' Quit & Reopen ends the process leaves its pages, from
 /// the one it is at on, in `<state>`'s reopen marker for the aterm that opens again: at Full
 /// Disk Access's done words, which wait under macOS's sheet
-/// (`docs/measured/first-launch-permission-walk-0.145.0-2026-10-28.md`, finding 1), all three;
-/// once it turned to Developer Tools, that page and the debugger's. NEGATIVE CONTROL: a person's
+/// (`docs/measured/first-launch-permission-walk-0.145.0-2026-10-28.md`, finding 1), both;
+/// once it turned to Developer Tools, that page alone. NEGATIVE CONTROL: a person's
 /// quit (or a logout's) leaves nothing, and neither does a Quit & Reopen with no walk under way.
 #[test]
 fn a_quit_and_reopen_leaves_the_walks_pages_from_the_one_it_is_at() {
@@ -2472,7 +2256,7 @@ fn a_quit_and_reopen_leaves_the_walks_pages_from_the_one_it_is_at() {
         )
     };
     let t0 = Instant::now();
-    let mut app = with_debugger_step(walk_app());
+    let mut app = walk_app();
     assert_eq!(
         app.start_permission_walk(&[], "first launch", t0),
         walking_over(&LEFT)
@@ -2484,7 +2268,7 @@ fn a_quit_and_reopen_leaves_the_walks_pages_from_the_one_it_is_at() {
     app.tick_consent_lanes(granted + DONE_FOR);
     assert_eq!(
         page_and_step(&app),
-        Some((Page::FullDiskAccess, Some((1, 3)))),
+        Some((Page::FullDiskAccess, Some((1, 2)))),
         "the done words wait under the sheet"
     );
 
@@ -2497,12 +2281,12 @@ fn a_quit_and_reopen_leaves_the_walks_pages_from_the_one_it_is_at() {
     app.tick_consent_lanes(granted + DONE_FOR + GRANT_POLL);
     assert_eq!(
         page_and_step(&app),
-        Some((Page::DeveloperTools, Some((2, 3))))
+        Some((Page::DeveloperTools, Some((2, 2))))
     );
     app.leave_walk_at_quit(true);
     assert_eq!(
         taken(),
-        Some(vec![Subject::DeveloperTools, Subject::Debugger]),
+        Some(vec![Subject::DeveloperTools]),
         "Quit & Reopen at Developer Tools"
     );
 
@@ -2510,32 +2294,6 @@ fn a_quit_and_reopen_leaves_the_walks_pages_from_the_one_it_is_at() {
     idle.leave_walk_at_quit(true);
     assert!(!marker.exists(), "no walk under way");
     STATE.with(|cell| *cell.borrow_mut() = None);
-}
-
-/// The debugger is a page of the walk only while System State's once-per-Mac step is still to
-/// come, named or not: that step is the walk's one way to it, so with none queued a walk that
-/// names it leaves it out (and `aterm init` never says the window walks it). NEGATIVE CONTROL:
-/// with the step queued the same name leads the walk.
-#[test]
-fn the_walk_takes_the_debugger_only_while_its_step_is_to_come() {
-    use crate::debugger_access::DebuggerStepQueue;
-    let t0 = Instant::now();
-    let mut idle = walk_app();
-    assert_eq!(
-        idle.start_permission_walk(&[Subject::Debugger], "a test", t0),
-        walking_over(&[Subject::FullDiskAccess, Subject::DeveloperTools])
-    );
-
-    let mut queued = walk_app();
-    queued.debugger_launch = DebuggerStepQueue::queued_for_test(|| Some("MAC-A"));
-    assert_eq!(
-        queued.start_permission_walk(&[Subject::Debugger], "a test", t0),
-        walking_over(&[
-            Subject::Debugger,
-            Subject::FullDiskAccess,
-            Subject::DeveloperTools
-        ])
-    );
 }
 
 /// The walk turns one panel from page to page under one generation, so a Developer Tools list

@@ -958,7 +958,7 @@ impl App {
             changed = Some(view);
         }
         if let Some(view) = changed {
-            self.invalidate_native_view_cache(wid, view, crate::native_app::DamageRegion::All);
+            self.invalidate_native_pointer_style(wid, view);
             self.request_redraw_all_windows();
         }
         sync(self, wid);
@@ -2217,11 +2217,8 @@ impl App {
         let (_, view) = self
             .active_native_view(wid)
             .ok_or("the front tab is not a native view")?;
-        let plan = self
-            .active_visible_leaf_plan(wid)
-            .ok_or("no presented native frame to aim at")?;
         let artifact = self
-            .retained_native_leaf_artifact_from_plan(wid, view, true, &plan)
+            .retained_native_pointer_artifact(wid, view)
             .ok_or("no presented native frame to aim at")?;
         let (x, y) = match target {
             NativePointerTarget::Key(key) => {
@@ -2304,7 +2301,7 @@ impl App {
             }
         }
         for target in hover_changed {
-            self.invalidate_native_view_cache(wid, target, crate::native_app::DamageRegion::All);
+            self.invalidate_native_pointer_style(wid, target);
             self.request_redraw_all_windows();
         }
     }
@@ -2359,7 +2356,7 @@ impl App {
         }
         let (x, y) = ws.last_cursor_px;
         let current = self.active_visible_leaf_plan(wid).is_some_and(|plan| {
-            self.retained_native_leaf_artifact_from_plan(wid, front, true, &plan)
+            self.retained_native_pointer_artifact_from_plan(wid, front, &plan)
                 .is_some()
         });
         if !current {
@@ -5012,7 +5009,7 @@ impl App {
                 if let Some(state) = self.native_runtime.view_state_mut(view) {
                     state.common_mut().pressed = None;
                 }
-                self.invalidate_native_view_cache(wid, view, crate::native_app::DamageRegion::All);
+                self.invalidate_native_pointer_style(wid, view);
                 self.request_redraw_all_windows();
                 if let (Some(armed), Some((release_view, generation, release, value))) =
                     (armed, release)
@@ -5125,11 +5122,7 @@ impl App {
                         common.hovered = Some(key.clone());
                         common.pressed = None;
                     }
-                    self.invalidate_native_view_cache(
-                        wid,
-                        *target_view,
-                        crate::native_app::DamageRegion::All,
-                    );
+                    self.invalidate_native_pointer_style(wid, *target_view);
                     self.request_redraw_all_windows();
                     return native_press;
                 }
@@ -5143,11 +5136,7 @@ impl App {
                         common.last_focus = Some(key.clone());
                         common.focus_visible = false;
                     }
-                    self.invalidate_native_view_cache(
-                        wid,
-                        target_view,
-                        crate::native_app::DamageRegion::All,
-                    );
+                    self.invalidate_native_pointer_style(wid, target_view);
                     self.request_redraw_all_windows();
                     if let Some(byte) = text_position
                         && self.native_runtime.view_generation(target_view) == Some(generation)
@@ -5196,11 +5185,7 @@ impl App {
                     && let Some(state) = self.native_runtime.view_state_mut(view)
                 {
                     state.common_mut().pressed = None;
-                    self.invalidate_native_view_cache(
-                        wid,
-                        view,
-                        crate::native_app::DamageRegion::All,
-                    );
+                    self.invalidate_native_pointer_style(wid, view);
                     if let Some((target_view, key)) = picture {
                         let _ = self.dispatch_native_view_event(
                             wid,
@@ -6445,6 +6430,79 @@ mod tests {
             Some(row),
             "the row is hovered"
         );
+    }
+
+    #[test]
+    fn pointer_feedback_keeps_presented_hits_without_certifying_pending_content() {
+        use super::{NativePointerTarget, PointerAt};
+        use crate::native_settings::SettingsRoute;
+        use aterm_window::event::{ElementState, MouseButton};
+
+        let (mut app, wid, view) = settings_at_1000_by_600(SettingsRoute::KeyboardInput);
+        prepare_presented_native(&mut app, wid);
+        let key = format!("settings/nav{}", SettingsRoute::WindowTabs.path());
+        let (x, y) = app
+            .native_pointer_target_px(wid, &NativePointerTarget::Key(key.clone()))
+            .unwrap();
+        let paint = app.windows[&wid].leaf_render_cache[&view]
+            .native
+            .as_ref()
+            .unwrap()
+            .paint_serial;
+        app.on_cursor_moved(wid, x, y);
+        let cache = &app.windows[&wid].leaf_render_cache[&view];
+        assert!(cache.native_damage.is_some(), "hover still owes a paint");
+        assert_eq!(cache.native.as_ref().unwrap().paint_serial, paint);
+        assert!(app.retained_native_leaf_artifact(wid, view, true).is_none());
+        let cell = app.pointer_readback(wid);
+        assert!(matches!(
+            app.pointer_reply(cell),
+            Ok(PointerAt::Native { key: Some(hit), .. }) if hit == key
+        ));
+        let feedback = app.native_paint_serial(wid, view);
+        app.on_cursor_moved(wid, x, y);
+        assert_eq!(app.native_paint_serial(wid, view), feedback);
+        app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
+        assert_eq!(
+            app.native_runtime
+                .view_state(view)
+                .unwrap()
+                .common()
+                .pressed
+                .as_ref()
+                .map(|key| key.as_str()),
+            Some(key.as_str()),
+        );
+        app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
+        let crate::native_app::AppViewState::Settings(settings) =
+            app.native_runtime.view_state(view).unwrap()
+        else {
+            unreachable!();
+        };
+        assert_eq!(settings.route, SettingsRoute::WindowTabs);
+        assert!(
+            app.pointer_reply(cell).is_err(),
+            "new content is not presented"
+        );
+
+        prepare_presented_native(&mut app, wid);
+        app.invalidate_native_ui_cache(wid);
+        app.apply_native_hover(wid, None);
+        app.apply_native_hover(
+            wid,
+            Some((view, crate::native_ui::UiKey::new(key.as_str()))),
+        );
+        assert!(
+            app.pointer_reply(cell).is_err(),
+            "feedback cannot bless generic invalidation"
+        );
+        let paint = app.windows[&wid].leaf_render_cache[&view]
+            .native
+            .as_ref()
+            .unwrap()
+            .paint_serial;
+        assert!(app.native_paint_serial(wid, view) > paint);
+        assert!(app.retained_native_leaf_artifact(wid, view, true).is_none());
     }
 
     #[test]
@@ -7723,8 +7781,8 @@ mod tests {
         let crate::native_ui::UiContent::TextField(control) = &paint.content else {
             panic!("target is a text field");
         };
-        let text = control.spec.input.as_ref().map_or_else(
-            || match &control.value {
+        let text = control.spec.input.as_ref().map_or(
+            match &control.value {
                 crate::native_ui::SemanticValue::Text(value) => value.as_str(),
                 _ => "",
             },

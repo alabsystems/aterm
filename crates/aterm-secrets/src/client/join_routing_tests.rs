@@ -51,6 +51,8 @@ fn queued(url: &str, line: &str) -> bool {
 
 #[test]
 fn a_join_reaches_the_verified_mirror_even_when_the_configured_queue_accepted_it() {
+    // Every server it reads is its own on loopback, which answers.
+    let _answering = ServersAnswering::set();
     let root = aterm_tempfile::tempdir().unwrap();
     let primary = server(&root.path().join("primary"));
     let mirror = server(&root.path().join("mirror"));

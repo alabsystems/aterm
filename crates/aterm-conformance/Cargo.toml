@@ -26,6 +26,9 @@ aterm-uds = { workspace = true }
 libc = { workspace = true }
 # The scratch world each take runs in, a private directory under /tmp.
 aterm-tempfile = { workspace = true }
+# What that world turns off, shared with the GUI smoke's and the perf arena's
+# worlds (`aterm_types::world`): its marker and its lanes-off tables.
+aterm-types = { workspace = true }
 
 # A windowed take's CPU time: `proc_pid_rusage` counts it in Mach ticks, which the
 # kernel's own timebase turns into ns (`measure::usage`). Workspace crate, already
@@ -42,6 +45,8 @@ aterm-types = { workspace = true }
 aterm-capacity = { workspace = true }
 # Scratch directories for the scanner's end-to-end PNG test.
 aterm-tempfile = { workspace = true }
+# Reads the measure world's aterm.toml back as a document, as aterm does.
+aterm-toml = { workspace = true }
 # THE DIFFERENTIAL VT ORACLE (tests/vt_oracle/): astream's pure, zero-dependency
 # screen fold, an engine written independently of aterm-core, fed the same bytes
 # and compared cell by cell inside the subset it models. A dev edge, so no

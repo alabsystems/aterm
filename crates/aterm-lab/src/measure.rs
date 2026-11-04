@@ -37,6 +37,7 @@ use std::process::ExitStatus;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use aterm_agent::harness::codex_shown;
 use aterm_agent::harness::steps::StepEvent;
 use aterm_json::Value;
 use aterm_phase::anchors::Anchor;
@@ -77,6 +78,10 @@ pub(crate) struct Family {
     /// Whether the fold acts on no row of the record kind `kind` (`<type>/<…>`): a new key or
     /// record kind there is only noted.
     pub inert: fn(&str) -> bool,
+    /// The closed words a gated read reads, beside their keys (`codex_steps::GATED_WORDS`): a
+    /// build none of whose legs shows one that the previous build's reductions showed is noted,
+    /// never refused, since a gated read that is off says nothing false ([`gated_gone`]).
+    pub words: &'static [(&'static str, &'static str)],
     /// Whether the file `name` in the step testdata is one of its reductions, as aterm-agent's
     /// `build.rs` reads one.
     pub holds: fn(&str) -> bool,
@@ -485,6 +490,7 @@ fn shape_of(ev: &StepEvent) -> Option<String> {
     match ev {
         StepEvent::Bind { .. } => None,
         StepEvent::Prompt { .. } => Some("prompt".to_string()),
+        StepEvent::HarnessTurn { .. } => Some("harness".to_string()),
         StepEvent::Interrupt => Some("interrupt".to_string()),
         StepEvent::ToolUse { tool, .. } => Some(format!("call {}", tool.as_str())),
         StepEvent::ToolResult { .. } => Some("result".to_string()),
@@ -681,6 +687,38 @@ pub(crate) fn order_of(build: &str) -> (Vec<u64>, u64) {
     )
 }
 
+/// THE GATED WORDS A BUILD DROPS (gaps 20, 25): each of `f`'s closed words
+/// ([`Family::words`]) that the reductions committed for the previous build `prev` show and none
+/// of this build's `legs` does, noted as `<key>=<word> gone since <prev>: its gated read is off on
+/// this build`. A gated read is the build's, not a leg's: `CODEX_SHOWN` is
+/// [`codex_shown::words`] over every reduction of a build, so a word another leg still shows
+/// keeps the read on, and the note judges the legs together.
+fn gated_gone(
+    f: &Family,
+    prev: Option<&str>,
+    legs: &[(&str, String)],
+    measured: &[&Reduction],
+) -> Vec<String> {
+    let Some(prev) = prev else {
+        return Vec::new();
+    };
+    let was: Vec<&str> = measured
+        .iter()
+        .filter(|r| r.build.as_deref() == Some(prev))
+        .map(|r| r.text.as_str())
+        .collect();
+    let now: Vec<&str> = legs.iter().map(|(_, text)| text.as_str()).collect();
+    let (shown, showing) = (codex_shown::words(&was), codex_shown::words(&now));
+    f.words
+        .iter()
+        .filter(|(k, w)| {
+            let t = format!("\n{k}={w}\n");
+            shown.contains(&t) && !showing.contains(&t)
+        })
+        .map(|(k, w)| format!("{k}={w} gone since {prev}: its gated read is off on this build"))
+        .collect()
+}
+
 /// The committed measured build step 5 holds `build` to leg by leg: the newest older one, else
 /// the newest.
 #[must_use]
@@ -766,6 +804,7 @@ pub(crate) fn judge(
         noted.extend(d.noted);
         pending.extend(d.pending);
     }
+    noted.extend(gated_gone(f, prev.as_deref(), legs, &measured));
     if !new.is_empty() {
         let also = if gone.is_empty() {
             String::new()

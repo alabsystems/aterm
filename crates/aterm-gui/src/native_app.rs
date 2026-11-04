@@ -3109,6 +3109,18 @@ impl NativeRuntime {
     }
 
     /// Publish independent immutable observations to every Allocation view.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn publish_allocation_monitor(
+        &mut self,
+        instance: AppInstanceId,
+        monitor: Arc<crate::allocation_monitor_host::Presentation>,
+    ) {
+        if let Some(NativeApp::Allocation(app)) = self.instances.get_mut(&instance) {
+            app.monitor = Some(monitor);
+        }
+    }
+
+    /// Publish independent immutable capacity and kernel observations.
     pub(crate) fn publish_allocation(
         &mut self,
         instance: AppInstanceId,

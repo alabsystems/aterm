@@ -60,7 +60,6 @@ fn point(reset_at: Option<Instant>, person: bool) -> TurnEndReading {
         worked: Some(LONG),
         rules: None,
         pending_input: false,
-        background: false,
         interrupted: false,
         restartable: true,
         relaunch_off: false,

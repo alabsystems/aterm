@@ -13,7 +13,7 @@
 //! op set is a lossless projection of the current fold's bounded subset, not of
 //! full xterm.
 
-use crate::screen::{Charset, Color};
+use crate::screen::{Charset, Color, Underline};
 use std::fmt;
 
 /// One normalized terminal operation: the top-level mutation a VT dispatch made.
@@ -64,7 +64,8 @@ pub enum ScreenOp {
         fg: Color,
         /// Resolved background.
         bg: Color,
-        /// Resolved attribute bits.
+        /// Resolved attribute bits, bit 1 set when the pen underlines in any style
+        /// (applied alone, a single uncoloured underline).
         attrs: u8,
     },
     /// Set the drawing pen when one or both channels carry a **resolved** 24-bit
@@ -79,8 +80,21 @@ pub enum ScreenOp {
         bg: Color,
         /// Resolved 24-bit background `(r, g, b)`, if active.
         bg_rgb: Option<(u8, u8, u8)>,
-        /// Resolved attribute bits.
+        /// Resolved attribute bits, bit 1 set when the pen underlines in any style
+        /// (applied alone, a single uncoloured underline).
         attrs: u8,
+    },
+    /// Set the drawing pen's underline: its **resolved** style and colour (`4`, `21`,
+    /// `4:n`, `24`, `58`, `59`). Emitted after a [`ScreenOp::SetSgr`] or
+    /// [`ScreenOp::SetSgrRgb`] only when the pen's underline is more than that op's bit
+    /// 1 says: a style other than single, or a colour.
+    SetUnderline {
+        /// The style.
+        style: Underline,
+        /// Resolved palette/default colour (`Color::Default` when `ul_rgb` is `Some`).
+        ul: Color,
+        /// Resolved 24-bit colour `(r, g, b)`, if active.
+        ul_rgb: Option<(u8, u8, u8)>,
     },
     /// Set/reset DEC private modes (cursor visibility, origin mode, alternate
     /// screen).
@@ -208,10 +222,18 @@ pub enum OpsWireError {
     InvalidChar(u32),
     /// Boolean field carried a byte other than `0` or `1`.
     InvalidBool(u8),
-    /// [`Color`] tag byte was neither `0` (`Default`) nor `1` (`Indexed`).
-    InvalidColorTag(u8),
+    /// [`Color`] tag byte was neither `0` (`Default`) nor `1` (`Indexed`), in the op `op`
+    /// names ([`ScreenOp::SetSgr`], [`ScreenOp::SetSgrRgb`] or [`ScreenOp::SetUnderline`]).
+    InvalidColorTag {
+        /// The [`ScreenOp`] variant the colour belongs to.
+        op: &'static str,
+        /// The tag byte read.
+        tag: u8,
+    },
     /// [`Charset`] tag byte was neither `0` (`Ascii`) nor `1` (`DecSpecial`).
     InvalidCharsetTag(u8),
+    /// [`Underline`] style byte was not one of [`Underline::code`]'s `0..=5`.
+    InvalidUnderlineStyle(u8),
     /// Batch exceeded [`MAX_OPS_PER_BATCH`].
     TooManyOps(usize),
     /// [`ScreenOp::SetMode`] exceeded [`MAX_MODE_PARAMS`].
@@ -233,13 +255,19 @@ impl fmt::Display for OpsWireError {
                 write!(f, "invalid Unicode scalar 0x{c:x} in ScreenOp::Print")
             }
             OpsWireError::InvalidBool(b) => write!(f, "invalid bool byte 0x{b:02x} in ScreenOp"),
-            OpsWireError::InvalidColorTag(t) => {
-                write!(f, "invalid Color wire tag 0x{t:02x} in ScreenOp::SetSgr")
+            OpsWireError::InvalidColorTag { op, tag } => {
+                write!(f, "invalid Color wire tag 0x{tag:02x} in ScreenOp::{op}")
             }
             OpsWireError::InvalidCharsetTag(t) => {
                 write!(
                     f,
                     "invalid Charset wire tag 0x{t:02x} in ScreenOp::Designate"
+                )
+            }
+            OpsWireError::InvalidUnderlineStyle(s) => {
+                write!(
+                    f,
+                    "invalid Underline style 0x{s:02x} in ScreenOp::SetUnderline"
                 )
             }
             OpsWireError::TooManyOps(n) => {
@@ -318,7 +346,8 @@ fn take_u32_le(rest: &[u8]) -> Result<(u32, &[u8]), OpsWireError> {
     Ok((u32::from_le_bytes([b0, b1, b2, b3]), tail))
 }
 
-fn take_color(rest: &[u8]) -> Result<(Color, &[u8]), OpsWireError> {
+/// Read a [`Color`]; a bad tag is reported against `op`, the variant it belongs to.
+fn take_color<'a>(rest: &'a [u8], op: &'static str) -> Result<(Color, &'a [u8]), OpsWireError> {
     let (tag, tail) = take_u8(rest)?;
     match tag {
         0 => Ok((Color::Default, tail)),
@@ -326,7 +355,7 @@ fn take_color(rest: &[u8]) -> Result<(Color, &[u8]), OpsWireError> {
             let (idx, tail2) = take_u8(tail)?;
             Ok((Color::Indexed(idx), tail2))
         }
-        other => Err(OpsWireError::InvalidColorTag(other)),
+        tag => Err(OpsWireError::InvalidColorTag { op, tag }),
     }
 }
 
@@ -369,6 +398,7 @@ const fn encode_op_group(op: &ScreenOp) -> u8 {
         | ScreenOp::ScrollDown(_) => 1,
         ScreenOp::SetSgr { .. }
         | ScreenOp::SetSgrRgb { .. }
+        | ScreenOp::SetUnderline { .. }
         | ScreenOp::SetMode { .. }
         | ScreenOp::SetScrollRegion { .. }
         | ScreenOp::SetInsertMode(_)
@@ -530,6 +560,12 @@ fn encode_op_style_or_mode(out: &mut Vec<u8>, op: &ScreenOp) -> Result<(), OpsWi
             put_opt_rgb(out, *bg_rgb);
             out.push(*attrs);
         }
+        ScreenOp::SetUnderline { style, ul, ul_rgb } => {
+            out.push(0x22);
+            out.push(style.code());
+            put_color(out, *ul);
+            put_opt_rgb(out, *ul_rgb);
+        }
         _ => {}
     }
     Ok(())
@@ -636,8 +672,8 @@ fn decode_op_high(tag: u8, tail: &[u8]) -> Result<(ScreenOp, &[u8]), OpsWireErro
     match tag {
         0x12 => Ok((ScreenOp::ReverseIndex, tail)),
         0x13 => {
-            let (fg, t1) = take_color(tail)?;
-            let (bg, t2) = take_color(t1)?;
+            let (fg, t1) = take_color(tail, "SetSgr")?;
+            let (bg, t2) = take_color(t1, "SetSgr")?;
             let (attrs, t3) = take_u8(t2)?;
             Ok((ScreenOp::SetSgr { fg, bg, attrs }, t3))
         }
@@ -707,9 +743,9 @@ fn decode_op_high(tag: u8, tail: &[u8]) -> Result<(ScreenOp, &[u8]), OpsWireErro
             Ok((ScreenOp::Resize(cols, rows), t2))
         }
         0x21 => {
-            let (fg, t1) = take_color(tail)?;
+            let (fg, t1) = take_color(tail, "SetSgrRgb")?;
             let (fg_rgb, t2) = take_opt_rgb(t1)?;
-            let (bg, t3) = take_color(t2)?;
+            let (bg, t3) = take_color(t2, "SetSgrRgb")?;
             let (bg_rgb, t4) = take_opt_rgb(t3)?;
             let (attrs, t5) = take_u8(t4)?;
             Ok((
@@ -722,6 +758,14 @@ fn decode_op_high(tag: u8, tail: &[u8]) -> Result<(ScreenOp, &[u8]), OpsWireErro
                 },
                 t5,
             ))
+        }
+        0x22 => {
+            let (code, t1) = take_u8(tail)?;
+            let style =
+                Underline::from_code(code).ok_or(OpsWireError::InvalidUnderlineStyle(code))?;
+            let (ul, t2) = take_color(t1, "SetUnderline")?;
+            let (ul_rgb, t3) = take_opt_rgb(t2)?;
+            Ok((ScreenOp::SetUnderline { style, ul, ul_rgb }, t3))
         }
         other => Err(OpsWireError::UnknownOpTag(other)),
     }

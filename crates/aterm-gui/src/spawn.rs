@@ -5714,7 +5714,7 @@ fn read_kitty_file(path: &Path) -> Option<Vec<u8>> {
         return None;
     }
     use std::io::Read as _;
-    let mut bytes = Vec::with_capacity(meta.len() as usize);
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
     (&file)
         .take(MAX_KITTY_MEDIUM_BYTES + 1)
         .read_to_end(&mut bytes)
@@ -6143,16 +6143,14 @@ mod reply_writer_lifetime_tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn the_reply_writer_runs_at_the_class_the_keystroke_path_needs() {
-        use std::os::unix::thread::JoinHandleExt as _;
         let (sink, mut peer) = sink_and_peer();
         let (reply_tx, join) =
             spawn_reply_writer(sink.clone(), ReportRoute::default()).expect("spawn");
-        let thread = join.as_pthread_t() as libc::pthread_t;
         assert!(reply_tx.submit(Arc::from(&b"ok"[..])), "queued");
         let mut buf = [0u8; 2];
         peer.read_exact(&mut buf).expect("the reply is written");
         assert_eq!(&buf, b"ok");
-        let observed = crate::qos::class_of(thread).expect("the writer's QoS class");
+        let observed = crate::qos::class_of(&join).expect("the writer's QoS class");
         assert_eq!(
             observed,
             crate::qos::class_for(crate::qos::Role::Interactive),

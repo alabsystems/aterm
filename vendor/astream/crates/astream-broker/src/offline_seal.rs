@@ -1020,7 +1020,7 @@ fn read_back(
     {
         return Err(differs("a record"));
     }
-    if ver.tier.bts() != src.tier.bts() {
+    if (0..src.tier.len()).any(|i| ver.tier.bt(i) != src.tier.bt(i)) {
         return Err(differs("a broker time"));
     }
     if ver.carried_wills != src.carried_wills

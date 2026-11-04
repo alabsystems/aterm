@@ -904,7 +904,7 @@ fn a_first_lab_sync_lists_the_default_login_under_its_lab_label() {
         let code = alab_roster::with_lab(lab, || {
             run_cli_accounts_sync_with(
                 Cli::Codex,
-                &env,
+                (&env, None),
                 (None, None, false),
                 (&mut out, &mut err),
                 &fetch,

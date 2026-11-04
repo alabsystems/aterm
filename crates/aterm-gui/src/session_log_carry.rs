@@ -369,6 +369,7 @@ impl SessionLog {
                             who,
                             by_screen,
                             tracker: TurnTracker::new(node),
+                            pairs: super::transcript::HarnessPairs::default(),
                         });
                         self.note_agent_cmd(node);
                     }
@@ -438,7 +439,8 @@ impl SessionLog {
 
     /// Close, innermost first and `out=gone`, every node the adopted log
     /// holds open that no producer holds (nor anything beneath it): a carried
-    /// command whose block line did not read, a turn no tracker knows.
+    /// command whose block line did not read, a turn no tracker knows. The
+    /// tracker holds its turn, its screen step and its claimed box's step.
     fn reconcile(&mut self, at: Stamp) {
         let mut held: Vec<Node> = Vec::new();
         held.extend(self.cmd.map(|c| c.node));
@@ -448,6 +450,7 @@ impl SessionLog {
             let view = a.tracker.view(at.mono_ms);
             held.extend(view.turn);
             held.extend(view.step.map(|(n, ..)| n));
+            held.extend(view.claim);
         }
         let holds = |log: &Log, n: Node| held.iter().any(|h| *h == n || descends_in(log, *h, n));
         let open: Vec<Node> = self.log.open_nodes().iter().map(|e| e.node).collect();

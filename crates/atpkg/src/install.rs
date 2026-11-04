@@ -1372,8 +1372,36 @@ struct Mount {
 }
 
 #[cfg(target_os = "macos")]
-#[cfg(not(test))]
 const ATTACH_ATTEMPTS: u32 = 4;
+
+#[cfg(target_os = "macos")]
+const _: () = assert!(
+    ATTACH_ATTEMPTS >= 2,
+    "a transient EAGAIN gets a second attempt"
+);
+
+/// Up to [`ATTACH_ATTEMPTS`] times: `arm` a guard and `attempt` the attach under it, the guard
+/// on success, else `reclaim` it and try again; the last failure once every attempt failed.
+#[cfg(target_os = "macos")]
+fn attach_retrying<M>(
+    mut arm: impl FnMut() -> M,
+    mut attempt: impl FnMut(&M) -> Result<(), StageError>,
+    mut reclaim: impl FnMut(M),
+) -> Result<M, StageError> {
+    let mut last: Option<StageError> = None;
+    for _ in 0..ATTACH_ATTEMPTS {
+        let m = arm();
+        match attempt(&m) {
+            Ok(()) => return Ok(m),
+            Err(e) => {
+                reclaim(m);
+                last = Some(e);
+            }
+        }
+    }
+    Err(last
+        .unwrap_or_else(|| StageError::Payload(String::from("hdiutil attach was never attempted"))))
+}
 
 #[cfg(target_os = "macos")]
 impl Mount {
@@ -1382,37 +1410,34 @@ impl Mount {
         let point = dmg_mount_point(dest)?;
         let _ = std::fs::remove_dir(&point);
         std::fs::create_dir_all(&point).map_err(StageError::Io)?;
-        let mut last: Option<StageError> = None;
-        for _ in 0..ATTACH_ATTEMPTS {
-            let mut m = Mount {
+        attach_retrying(
+            || Mount {
                 image: image.to_path_buf(),
                 point: point.clone(),
                 attached: true,
-            };
-            match run_tool(
-                aterm_uds::os_path!("hdiutil"),
-                &[
-                    "attach".as_ref(),
-                    "-nobrowse".as_ref(),
-                    "-readonly".as_ref(),
-                    "-noverify".as_ref(),
-                    "-noautoopen".as_ref(),
-                    "-mountpoint".as_ref(),
-                    m.point.as_os_str(),
-                    image.as_os_str(),
-                ],
-            ) {
-                Ok(()) => return Ok(m),
-                Err(e) => {
-                    let _ = m.detach_now();
-                    last = Some(e);
-                }
-            }
-        }
-        let _ = std::fs::remove_dir(&point);
-        Err(last.unwrap_or_else(|| {
-            StageError::Payload(String::from("hdiutil attach was never attempted"))
-        }))
+            },
+            |m| {
+                run_tool(
+                    aterm_uds::os_path!("hdiutil"),
+                    &[
+                        "attach".as_ref(),
+                        "-nobrowse".as_ref(),
+                        "-readonly".as_ref(),
+                        "-noverify".as_ref(),
+                        "-noautoopen".as_ref(),
+                        "-mountpoint".as_ref(),
+                        m.point.as_os_str(),
+                        image.as_os_str(),
+                    ],
+                )
+            },
+            |mut m| {
+                let _ = m.detach_now();
+            },
+        )
+        .inspect_err(|_| {
+            let _ = std::fs::remove_dir(&point);
+        })
     }
 
     fn detach_now(&mut self) -> Result<(), StageError> {
@@ -3097,6 +3122,50 @@ mod tests {
                 Err(e) => panic!("{label}: {e:?}"),
             }
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_failed_attach_is_reclaimed_and_retried_until_the_attempts_run_out() {
+        let (mut armed, mut tried, mut reclaimed) = (0u32, 0u32, Vec::new());
+        let r = attach_retrying(
+            || {
+                armed += 1;
+                armed
+            },
+            |m| {
+                tried += 1;
+                match m {
+                    1 => Err(StageError::Payload(String::from(
+                        "hdiutil failed: Resource temporarily unavailable",
+                    ))),
+                    _ => Ok(()),
+                }
+            },
+            |m| reclaimed.push(m),
+        );
+        assert!(matches!(r, Ok(2)), "the second guard attached: {r:?}");
+        assert_eq!(tried, 2, "no attempt after the one that attached");
+        assert_eq!(reclaimed, [1], "the failed attempt's guard was reclaimed");
+
+        let (mut armed, mut reclaimed) = (0u32, Vec::new());
+        let r = attach_retrying(
+            || {
+                armed += 1;
+                armed
+            },
+            |m| Err(StageError::Payload(format!("attempt {m}"))),
+            |m| reclaimed.push(m),
+        );
+        assert!(
+            matches!(&r, Err(StageError::Payload(s)) if *s == format!("attempt {ATTACH_ATTEMPTS}")),
+            "the last attempt's error: {r:?}"
+        );
+        assert_eq!(
+            reclaimed,
+            (1..=ATTACH_ATTEMPTS).collect::<Vec<_>>(),
+            "every failed guard was reclaimed"
+        );
     }
 
     #[cfg(target_os = "macos")]

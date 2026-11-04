@@ -596,10 +596,41 @@ fn shared_in(
 #[cfg(unix)]
 #[cfg_attr(trust_verify, trust::skip)]
 fn holds(me: u32, file: &Path, text: &str) -> bool {
+    use std::io::Read as _;
     use std::os::unix::fs::MetadataExt as _;
-    fs::symlink_metadata(file)
-        .is_ok_and(|m| m.is_file() && m.uid() == me && m.mode() & 0o7777 == 0o555)
-        && fs::read(file).is_ok_and(|read| read == text.as_bytes())
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let want = text.len() as u64;
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    if !fs::symlink_metadata(file).is_ok_and(|m| m.is_file()) {
+        return false;
+    }
+    let mut opts = fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(target_os = "macos")]
+    opts.custom_flags(0x0004 | 0x0100);
+    #[cfg(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "arm")))]
+    opts.custom_flags(0o100_000 | 0o4000);
+    #[cfg(all(
+        target_os = "linux",
+        not(any(target_arch = "aarch64", target_arch = "arm"))
+    ))]
+    opts.custom_flags(0o400_000 | 0o4000);
+    let Ok(opened) = opts.open(file) else {
+        return false;
+    };
+    let Ok(meta) = opened.metadata() else {
+        return false;
+    };
+    if !meta.is_file() || meta.uid() != me || meta.mode() & 0o7777 != 0o555 || meta.len() != want {
+        return false;
+    }
+    let mut read = Vec::with_capacity(text.len().saturating_add(1));
+    opened
+        .take(want.saturating_add(1))
+        .read_to_end(&mut read)
+        .is_ok()
+        && read == text.as_bytes()
 }
 
 /// The file holding `text` in user `me`'s stand-in cache in `tmp`'s quiet folder ([`quiet_in`]),

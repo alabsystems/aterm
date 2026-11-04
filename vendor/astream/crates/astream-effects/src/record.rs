@@ -257,7 +257,8 @@ impl<O: RealEffects, K: RecordSink> EffectSeam for RecordingSeam<O, K> {
         request: &[u8],
         live: &mut dyn FnMut(&[u8]) -> Vec<u8>,
     ) -> Result<Vec<u8>, Infallible> {
-        let reply = live(request);
+        let op: fn(_, _) -> _ = Option::map;
+        let reply = op(Some(request), live).unwrap_or_default();
         self.tape(&EffectRecord::Exchange {
             door: door.to_string(),
             request: request.to_vec(),
@@ -278,7 +279,8 @@ impl<O: RealEffects, K: RecordSink> EffectSeam for RecordingSeam<O, K> {
             // can never show this program (or its replay) a lowered stop.
             return Ok(true);
         }
-        if !live() {
+        let op: fn(_, _) -> _ = Option::unwrap_or_else;
+        if !op(None, live) {
             self.latches.note_false_read(door);
             return Ok(false);
         }
@@ -346,7 +348,8 @@ impl<O: RealEffects> EffectSeam for LiveSeam<O> {
         request: &[u8],
         live: &mut dyn FnMut(&[u8]) -> Vec<u8>,
     ) -> Result<Vec<u8>, Infallible> {
-        Ok(live(request))
+        let op: fn(_, _) -> _ = Option::map;
+        Ok(op(Some(request), live).unwrap_or_default())
     }
     fn emit(&mut self, _door: &str, _bytes: &[u8]) -> Result<(), Infallible> {
         Ok(())
@@ -355,7 +358,8 @@ impl<O: RealEffects> EffectSeam for LiveSeam<O> {
         if self.latches.is_raised(door) {
             return Ok(true);
         }
-        let up = live();
+        let op: fn(_, _) -> _ = Option::unwrap_or_else;
+        let up = op(None, live);
         if up {
             self.latches.raise(door);
         }

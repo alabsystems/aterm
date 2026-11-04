@@ -137,6 +137,24 @@ fn observe_case(state: &ModelState, legacy: bool, capture_late: bool) -> [(&'sta
     ]
 }
 
+/// Whether a capture after the renewal can read otherwise than the first: only a renewal moves the
+/// row between its capture and the read, so at any other binding the two runs have one input.
+fn renewal_moves_the_row(state: &ModelState) -> bool {
+    state["binding"] == 1
+}
+
+/// Whether a state also runs on the legacy Claude profile. `record_session` reads the profile once,
+/// before and apart from what the point records, so legacy times a point is the plain run at that
+/// point and the legacy identity result, each read at a turn's end; a slice of the walls closes
+/// what that leaves, a wall's own read of the profile that a plain run would not see. What it
+/// gives up: such a read that also depends on the binding, the home or the expected login, outside
+/// the slice. No such read exists today.
+fn reads_the_legacy_profile(state: &ModelState) -> bool {
+    state["provider"] == 0
+        && (state["point"] == 0
+            || (state["binding"] == 0 && state["default"] == 0 && state["expected"] == 1))
+}
+
 pub(crate) fn observation_transition(state: &ModelState, action: &str) -> ModelState {
     let mut next = state.clone();
     match action {
@@ -155,12 +173,14 @@ pub(crate) fn observation_transition(state: &ModelState, action: &str) -> ModelS
         }
         "Observe" => {
             let result = observe_case(state, false, false);
-            assert_eq!(
-                result,
-                observe_case(state, false, true),
-                "capture after renewal: {state:?}"
-            );
-            if state["provider"] == 0 {
+            if renewal_moves_the_row(state) {
+                assert_eq!(
+                    result,
+                    observe_case(state, false, true),
+                    "capture after renewal: {state:?}"
+                );
+            }
+            if reads_the_legacy_profile(state) {
                 assert_eq!(
                     result,
                     observe_case(state, true, false),
@@ -181,6 +201,7 @@ fn pool_observation_identity_conforms_for_current_and_retained_logins() {
     let model = aterm_models_harness::account_pool_observation_identity_model();
     assert_eq!(model.mutant_dials(), (1..=13).collect::<Vec<_>>());
     assert!(aterm_spec::interp::prove_and_catch(&model) > 1);
+    let (mut renewed, mut legacy_at_a_turn, mut legacy_at_a_wall) = (0, 0, 0);
     for state in aterm_spec::interp::reachable_states(&model) {
         for action in &model.actions {
             if model.action_enabled(action.name, &state) {
@@ -190,9 +211,20 @@ fn pool_observation_identity_conforms_for_current_and_retained_logins() {
                     "{}: {state:?} -> {next:?}",
                     action.name
                 );
+                if action.name == "Observe" {
+                    renewed += usize::from(renewal_moves_the_row(&state));
+                    if reads_the_legacy_profile(&state) {
+                        legacy_at_a_turn += usize::from(state["point"] == 0);
+                        legacy_at_a_wall += usize::from(state["point"] == 1);
+                    }
+                }
             }
         }
     }
+    assert!(
+        renewed > 0 && legacy_at_a_turn > 0 && legacy_at_a_wall > 0,
+        "{renewed} {legacy_at_a_turn} {legacy_at_a_wall}"
+    );
     let mut state = model.init_state();
     state.insert("expected", 1);
     state.insert("credential", 2);

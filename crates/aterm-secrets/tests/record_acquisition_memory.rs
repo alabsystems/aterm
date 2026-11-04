@@ -839,6 +839,8 @@ fn peer_retry(complete: bool) {
 
 #[test]
 fn real_sync_bounds_acquisition_and_preserves_completion() {
+    // Every server it reads is its own on loopback, which answers.
+    let _answering = client::ServersAnswering::within(HANG);
     let declared = measured(Framing::Length);
     let chunked = measured(Framing::Chunked);
     unreadable_large_frame(false);

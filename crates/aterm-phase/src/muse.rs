@@ -13,7 +13,7 @@ use crate::wall::{ApiCause, Placement, Wall, WallKind};
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 9, "0.9");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 10, "0.10");
 
 #[derive(Debug, Clone, Copy)]
 struct Frame {
@@ -34,12 +34,32 @@ fn is_panel_row(row: &str) -> bool {
     row.starts_with("└ ") || row.starts_with("├ ") || row.starts_with("│ ")
 }
 
+/// Whether `row` is the prompt-history search's (Ctrl-R) own: its scope in brackets (`[everywhere]`,
+/// `[session]` or `[project]`, which Ctrl-S cycles), then `search prompts:` or, its query matching
+/// nothing, `no matching prompt:`, the query after it (measured on 1.4.14-R7309.1).
+fn is_search_row(row: &str) -> bool {
+    leading_spaces(row) == 2
+        && crate::text::trim_start(row)
+            .strip_prefix('[')
+            .and_then(|rest| rest.split_once("] "))
+            .is_some_and(|(scope, words)| {
+                !scope.is_empty()
+                    && !scope.contains([' ', '[', ']'])
+                    && (words.starts_with(const { crate::anchor!("muse.history.search") })
+                        || words.starts_with(const { crate::anchor!("muse.history.no_match") }))
+            })
+}
+
 fn bottom_and_footer(rows: &[String]) -> Option<(usize, usize)> {
     let footer = rows.iter().rposition(|r| !blank(r))?;
     if leading_spaces(&rows[footer]) != 2 {
         return None;
     }
     let mut k = footer.checked_sub(1)?;
+    // The history search draws its row between the bottom rule and the footer.
+    if is_search_row(&rows[k]) && plain_rule_width(&rows[k.checked_sub(1)?]).is_some() {
+        return Some((k - 1, footer));
+    }
     if plain_rule_width(&rows[k]).is_some() {
         return Some((k, footer));
     }
@@ -148,6 +168,17 @@ pub fn composer_draft(rows: &[String]) -> Option<(usize, Vec<String>)> {
             .map(|r| crate::text::trim(r).to_string()),
     );
     Some((f.caret, lines))
+}
+
+/// WHETHER MUSE CODE'S PROMPT-HISTORY SEARCH (Ctrl-R) IS OPEN: its row ([`is_search_row`]) stands
+/// between the composer's bottom rule and the footer. Measured on 1.4.14-R7309.1
+/// (`muse-1.4.14-R7309.1-history-search*`): the composer's row shows the old prompt the search
+/// matched, in the ink of typed text, or nothing, the cursor stands after the query on the search's
+/// row, keys type into the query, and Enter sends the match. Only that row is read: a person's draft
+/// is drawn between the rules, and the transcript above them.
+#[must_use]
+pub fn history_search(rows: &[String]) -> bool {
+    open_frame(rows).is_some_and(|f| f.bottom + 1 < f.footer && is_search_row(&rows[f.bottom + 1]))
 }
 
 const STATUS_GLYPHS: [char; 3] = ['◇', '◈', '◆'];
@@ -765,7 +796,9 @@ fn tool_block(lines: &[&str]) -> bool {
         .is_some_and(|&head| tool_row(head) && (lines.len() == 1 || !bare_tool_row(head)))
 }
 
-const TOOL_OUTCOMES: [&str; 4] = ["failed", "denied", "rejected", "no effect"];
+/// What follows ` — ` on a tool row: `unavailable` where the session declares no such tool
+/// (measured on 1.4.14-R7309.1, `◆ Used tool operation — unavailable`).
+const TOOL_OUTCOMES: [&str; 5] = ["failed", "denied", "rejected", "no effect", "unavailable"];
 
 fn names_a_path(rest: &str) -> bool {
     let token = rest.split(' ').next().unwrap_or_default();
@@ -2368,6 +2401,12 @@ pub mod fixtures {
     pub const IDLE_NARROW: &str =
         include_str!("fixtures/muse-1.4.11-R6667.1-idle-narrow-26-40col.txt");
     pub const DRAFT: &str = include_str!("fixtures/muse-1.4.9-R6297.1-draft.txt");
+    /// The prompt-history search (Ctrl-R) open (`crate::muse::history_search`): its match in the
+    /// composer row, and, opened over an empty composer, nothing there.
+    pub const HISTORY_SEARCH: &str =
+        include_str!("fixtures/muse-1.4.14-R7309.1-history-search.txt");
+    pub const HISTORY_SEARCH_EMPTY: &str =
+        include_str!("fixtures/muse-1.4.14-R7309.1-history-search-empty.txt");
     pub const BUSY: &str = include_str!("fixtures/muse-1.4.9-R6297.1-busy-thinking.txt");
     pub const BUSY_ALT_GLYPH: &str =
         include_str!("fixtures/muse-1.4.9-R6297.1-busy-thinking-alt-glyph.txt");

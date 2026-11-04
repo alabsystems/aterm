@@ -12,8 +12,8 @@
 //!   member's hostname; an expired, revoked, mismatched or untrusted ring runs nothing;
 //! - xcrun has a developer directory that holds `notarytool` (the Command Line Tools', or the
 //!   selected Xcode's): without one, `/usr/bin/xcrun` puts Apple's install dialog on screen;
-//! - the entry differs from the last one handled successfully ([`APPLIED`]), and from one
-//!   this subscriber already tried and failed with.
+//! - a successful check is reused for at most thirty minutes in this subscriber, and a
+//!   failed attempt backs off for one minute. A new subscriber checks again.
 //!
 //! The name `notary`, which 0.145 reads after every applied version, is never read here.
 
@@ -31,9 +31,7 @@ pub use signing::{SigningStatus, effective_signing_identity, signing_status, syn
 /// The vault entry this reads.
 pub(crate) const ENTRY: &str = crate::need::catalog::NOTARY_ENTRY;
 
-/// The record, in the vault's state folder, of the entry's digest last handled successfully
-/// while the profile authenticated (SHA-256 hex, as `state.toml`'s manifest already keeps it).
-const APPLIED: &str = "release-notary.applied";
+const NOTARY_RECHECK: Duration = Duration::from_secs(30 * 60);
 
 /// The release-credentials profile, under the home (`~/.aterm/release-ring/`, with fallback to
 /// the 0.145 `~/.aterm/` location while an older vault has not yet rotated its path).
@@ -456,12 +454,6 @@ fn authorized_ring_check(paths: &Paths, anchors: &[&str], now: i64, advance: boo
         .is_ok()
 }
 
-/// The entry digest last handled successfully ([`APPLIED`]).
-fn applied(paths: &Paths) -> Option<String> {
-    let bytes = fsx::read_private(&paths.dir.join(APPLIED), 128).ok()??;
-    Some(bytes.as_str()?.trim().to_owned())
-}
-
 /// Handle the current signed entry, preserving an already working profile: its line and the
 /// successfully handled entry's digest. `None` when the entry cannot be read as the vault
 /// applied it just now (another apply under way): the next round looks again. The password
@@ -477,11 +469,15 @@ fn materialize_with(
     };
     let digest = materialize::digest_hex(entry.value().as_slice());
     let notary = parse_notary(entry.value().as_slice())?;
-    if (tools.history)()? {
+    let authenticates = (tools.history)()?;
+    check_notary_current(paths, &entry, tools)?;
+    if authenticates {
         return Ok(Some(("notary profile already authenticates", digest)));
     }
     (tools.store)(&notary)?;
-    if (tools.history)()? {
+    let authenticates = (tools.history)()?;
+    check_notary_current(paths, &entry, tools)?;
+    if authenticates {
         Ok(Some(("notary profile stored and live-checked", digest)))
     } else {
         Err(Error::new(
@@ -490,11 +486,59 @@ fn materialize_with(
     }
 }
 
+fn check_notary_current(
+    paths: &Paths,
+    entry: &super::entry::VerifiedEntry,
+    tools: &Tools<'_>,
+) -> crate::Result<()> {
+    if !(tools.authorized_ring)(paths) || entry.snapshot().read(paths)?.is_none() {
+        return Err(Error::new(
+            "notary credential or release authority changed during authentication; retry",
+        ));
+    }
+    Ok(())
+}
+
+/// Revalidate and materialize the authenticated shared notary credential, without prompting.
+/// Returns `None` when no configured vault, authorized release ring or entry is available.
+/// An existing profile that authenticates is preserved. A previous successful check never
+/// suppresses this explicitly requested repair.
+///
+/// # Errors
+/// The vault state or entry cannot be verified, developer tools are unavailable, or the
+/// bounded credential storage/authentication operation fails.
+pub fn sync_notary(paths: &Paths) -> crate::Result<Option<String>> {
+    if !cfg!(target_os = "macos") || config(paths)?.is_none() {
+        return Ok(None);
+    }
+    let mut history = LIVE_HISTORY;
+    let mut store = LIVE_STORE;
+    let mut tools = Tools {
+        authorized_ring: &authorized_ring,
+        developer_dir: &LIVE_DEVELOPER_DIR,
+        history: &mut history,
+        store: &mut store,
+    };
+    sync_notary_with(paths, &mut tools).map(|done| done.map(|(line, _)| line.to_owned()))
+}
+
+fn sync_notary_with(
+    paths: &Paths,
+    tools: &mut Tools<'_>,
+) -> crate::Result<Option<(&'static str, String)>> {
+    if !(tools.authorized_ring)(paths) || !load_state(paths)?.manifest.files.contains_key(ENTRY) {
+        return Ok(None);
+    }
+    if (tools.developer_dir)().is_none() {
+        return Err(Error::new(WAITS_FOR_CLT));
+    }
+    materialize_with(paths, tools)
+}
+
 /// What one round's look at the entry decided.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Step {
-    /// No entry, its digest was handled successfully, or this subscriber is backing off:
-    /// nothing to do.
+    /// No entry, a recent successful check, or this subscriber is backing off: nothing to do.
     Quiet,
     /// The entry waits: why.
     Waits(&'static str),
@@ -507,6 +551,7 @@ pub(super) enum Step {
 #[derive(Debug, Default)]
 pub(super) struct NotaryRounds {
     signing: signing::Rounds,
+    checked: Option<(String, Instant)>,
     tried: Option<(String, Instant)>,
     said: Option<Step>,
 }
@@ -536,22 +581,31 @@ impl NotaryRounds {
         self.said = Some(step);
     }
 
-    /// One round: no work without a `release-notary` entry, or for its last successfully
-    /// handled digest or this subscriber's recent failed attempt. Otherwise a release host and
-    /// developer directory are checked with file reads before notarytool runs. A successfully
-    /// handled entry's digest is kept in [`APPLIED`]; a failed attempt backs off for a minute.
+    /// Recheck an unchanged entry after thirty minutes and after every subscriber restart.
+    /// The release ring and developer directory are checked before notarytool runs. Failed
+    /// attempts back off for a minute; a changed credential is eligible immediately.
     pub(super) fn step(&mut self, paths: &Paths, _config: &Config, tools: &mut Tools<'_>) -> Step {
+        self.step_with_clock(paths, tools, Instant::now)
+    }
+
+    fn step_with_clock(
+        &mut self,
+        paths: &Paths,
+        tools: &mut Tools<'_>,
+        clock: impl Fn() -> Instant,
+    ) -> Step {
+        let now = clock();
         let Ok(state) = load_state(paths) else {
             return Step::Quiet;
         };
         let Some(digest) = state.manifest.files.get(ENTRY) else {
             return Step::Quiet;
         };
-        if applied(paths).as_ref() == Some(digest)
-            || self.tried.as_ref().is_some_and(|(failed, at)| {
-                failed == digest && at.elapsed() < Duration::from_secs(60)
-            })
-        {
+        if self.checked.as_ref().is_some_and(|(checked, at)| {
+            checked == digest && now.saturating_duration_since(*at) < NOTARY_RECHECK
+        }) || self.tried.as_ref().is_some_and(|(failed, at)| {
+            failed == digest && now.saturating_duration_since(*at) < Duration::from_secs(60)
+        }) {
             return Step::Quiet;
         }
         if !(tools.authorized_ring)(paths) {
@@ -560,23 +614,16 @@ impl NotaryRounds {
         if (tools.developer_dir)().is_none() {
             return Step::Waits(WAITS_FOR_CLT);
         }
+        self.checked = None;
         match materialize_with(paths, tools) {
             Ok(Some((line, stored))) => {
-                if let Err(error) = fsx::write_atomic(
-                    &paths.dir.join(APPLIED),
-                    format!("{stored}\n").as_bytes(),
-                    0o600,
-                ) {
-                    self.tried = Some((stored, Instant::now()));
-                    return Step::Ran(Err(format!(
-                        "{line}, but its record could not be kept: {error}"
-                    )));
-                }
+                self.checked = Some((stored, clock()));
+                self.tried = None;
                 Step::Ran(Ok(line))
             }
             Ok(None) => Step::Quiet,
             Err(error) => {
-                self.tried = Some((digest.clone(), Instant::now()));
+                self.tried = Some((digest.clone(), clock()));
                 Step::Ran(Err(error.to_string()))
             }
         }

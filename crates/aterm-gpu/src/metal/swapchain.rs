@@ -142,6 +142,11 @@ impl SwapchainConfig {
     }
 }
 
+/// Seconds within which a nil `nextDrawable` is the layer refusing (an invalid configuration, a
+/// drawable with no texture) rather than its one-second wait for a free drawable running out:
+/// [`Swapchain::acquire_within`] asks again only after the wait.
+const REFUSED_WITHIN_S: f64 = 0.5;
+
 /// One configured `CAMetalLayer` and what every acquire needs.
 #[derive(Debug)]
 pub(crate) struct Swapchain {
@@ -381,30 +386,49 @@ impl Swapchain {
 
     /// Acquire the next drawable as a [`Frame`], or fail within a bound.
     pub(crate) fn acquire(&mut self) -> Result<Frame<'_>, String> {
-        if let Some(reason) = self.latch.reason() {
-            return Err(format!(
-                "acquire refused: the device-loss latch is set ({reason}); \
-                 not touching the layer or its queue — downgrade instead"
-            ));
-        }
+        self.acquire_within(std::time::Duration::ZERO)
+    }
+
+    /// [`Self::acquire`], asked again until `hang` has passed while the pool stays empty: a nil
+    /// that took the layer's own wait (`allowsNextDrawableTimeout`, a second) asks again, so a
+    /// caller whose earlier presents must retire waits `hang` for one of their drawables rather
+    /// than that second; a nil sooner ([`REFUSED_WITHIN_S`]) is the layer refusing, and fails at
+    /// once.
+    pub(crate) fn acquire_within(
+        &mut self,
+        hang: std::time::Duration,
+    ) -> Result<Frame<'_>, String> {
         // SAFETY: reading a monotonic clock.
         let started = unsafe { CACurrentMediaTime() };
-        match self.raw_next_drawable() {
-            Some((drawable, texture)) => Ok(Frame {
-                drawable,
-                texture,
-                swapchain: self,
-            }),
-            None => {
-                // SAFETY: reading a monotonic clock.
-                let waited = unsafe { CACurrentMediaTime() } - started;
-                Err(format!(
-                    "nextDrawable returned nil after {waited:.2}s — all \
+        let mut asks = 0u32;
+        loop {
+            if let Some(reason) = self.latch.reason() {
+                return Err(format!(
+                    "acquire refused: the device-loss latch is set ({reason}); \
+                     not touching the layer or its queue — downgrade instead"
+                ));
+            }
+            // SAFETY: reading a monotonic clock.
+            let asked = unsafe { CACurrentMediaTime() };
+            asks = asks.saturating_add(1);
+            if let Some((drawable, texture)) = self.raw_next_drawable() {
+                return Ok(Frame {
+                    drawable,
+                    texture,
+                    swapchain: self,
+                });
+            }
+            // SAFETY: reading a monotonic clock.
+            let now = unsafe { CACurrentMediaTime() };
+            let waited = now - started;
+            if waited >= hang.as_secs_f64() || now - asked < REFUSED_WITHIN_S {
+                return Err(format!(
+                    "nextDrawable returned nil after {waited:.2}s (asked {asks}x) — all \
                      {} drawables in flight (or an invalid layer configuration); \
                      the bounded timeout is allowsNextDrawableTimeout=YES doing \
                      its job instead of parking the thread",
                     self.maximum_drawable_count(),
-                ))
+                ));
             }
         }
     }
@@ -1068,7 +1092,7 @@ mod tests {
                 // SAFETY: reading a monotonic clock.
                 let t0 = unsafe { CACurrentMediaTime() };
                 let frame = sc
-                    .acquire()
+                    .acquire_within(aterm_spec::wait::MUST_HAPPEN)
                     .unwrap_or_else(|e| panic!("cycle {cycle} step {i}: acquire: {e}"));
                 // SAFETY: reading a monotonic clock.
                 let waited = unsafe { CACurrentMediaTime() } - t0;
@@ -1267,7 +1291,7 @@ mod tests {
             let submit_a: Submitted = cb_a.commit();
 
             let frame_obj = sc
-                .acquire()
+                .acquire_within(aterm_spec::wait::MUST_HAPPEN)
                 .unwrap_or_else(|e| panic!("frame {frame}: acquire failed: {e}"));
 
             let mut cb_b = session.begin().expect("cb B");

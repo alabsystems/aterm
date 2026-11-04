@@ -321,6 +321,10 @@ NEEDS YOU: say "go" so the stale remote branches can be deleted and I can push m
 Once you say so, the stale remote branches will be deleted and my branch pushed to main.
 NEEDS YOU: confirmation that the old logs can be purged before I rebuild.
 Once you say so I'll push my branch and main gets overwritten with it.
+# A drop with its object, and a destructive act of two words: each row is all that holds its
+# clause of `outward` (2026-11-04).
+NEEDS YOU: say "go" so I can drop the table and rebuild.
+NEEDS YOU: say "go" so I can rewrite history and rebuild.
 # Work its owner is named after (`the worktree you made`), another agent's, or another
 # session's the agent would finish.
 I'll remove the worktree you made once you say so.

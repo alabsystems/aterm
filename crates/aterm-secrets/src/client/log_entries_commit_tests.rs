@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::commons::binding::Request;
-use crate::membership_log::MAX_HELD_RECORDS;
+use crate::crossing::fixture::LEGACY;
 
 fn entrant(tag: u8, label: &str) -> ([u8; 32], [u8; 16], MemberId, Entrant) {
     let writer = [tag; 32];
@@ -54,12 +54,16 @@ fn append_name(
 
 #[test]
 fn concurrent_ingress_cannot_commit_only_a_prefix_of_an_authored_batch() {
+    LEGACY.within(concurrent_ingress_at_a_full_held_store);
+}
+
+fn concurrent_ingress_at_a_full_held_store() {
     let root = aterm_tempfile::tempdir().unwrap();
     let paths = Paths::for_home(root.path());
     let (writer, incarnation, actor, first) = entrant(1, "m1");
     let (peer_writer, peer_incarnation, peer, second) = entrant(2, "m2");
     let mut base = Log::new(Record::found(&[7; 32], vec![first, second], 1_000).unwrap()).unwrap();
-    while base.held_count() < MAX_HELD_RECORDS - 8 {
+    while base.held_count() < LEGACY.held - 8 {
         append_name(&mut base, &actor, &writer, incarnation);
     }
     super::super::save_records(&paths, &encode_records(base.records())).unwrap();
@@ -96,7 +100,7 @@ fn concurrent_ingress_cannot_commit_only_a_prefix_of_an_authored_batch() {
         retained, 0,
         "a refused authored batch must not publish a prefix"
     );
-    assert_eq!(after.len(), MAX_HELD_RECORDS - 1);
+    assert_eq!(after.len(), LEGACY.held - 1);
     assert!(
         peer_ids.iter().all(|id| after.contains(id)),
         "peer ingress remains durable"
@@ -120,7 +124,7 @@ fn concurrent_ingress_cannot_commit_only_a_prefix_of_an_authored_batch() {
     })
     .unwrap();
     assert_eq!(records.len(), 1);
-    assert_eq!(complete.len(), MAX_HELD_RECORDS);
+    assert_eq!(complete.len(), LEGACY.held);
     assert!(complete.holds(records[0].id()));
 
     // An already-held batch is a complete idempotent result even at capacity.
@@ -132,6 +136,10 @@ fn concurrent_ingress_cannot_commit_only_a_prefix_of_an_authored_batch() {
 
 #[test]
 fn an_admin_publish_that_cannot_fit_its_log_refuses_without_publishing() {
+    LEGACY.within(admin_publication_at_a_full_held_store);
+}
+
+fn admin_publication_at_a_full_held_store() {
     let mut outcomes = Vec::new();
     for stamped in [false, true] {
         let root = aterm_tempfile::tempdir().unwrap();
@@ -174,7 +182,7 @@ fn an_admin_publish_that_cannot_fit_its_log_refuses_without_publishing() {
                 .contains(&request.binding().actor())
         );
         owner.device().with_seed(|seed| {
-            while store.log().unwrap().held_count() < MAX_HELD_RECORDS {
+            while store.log().unwrap().held_count() < LEGACY.held {
                 let record = store
                     .log()
                     .unwrap()

@@ -330,6 +330,68 @@ fn a_divergence_unwinds_and_nothing_is_served_after_it() {
     ));
 }
 
+/// `ask` on a replay of `record` is refused as `want`, latched at the record, and
+/// nothing is served after it.
+fn diverges_as(
+    what: &str,
+    record: EffectRecord,
+    ask: impl FnOnce(&ReplayCore),
+    want: &ReplayDivergence,
+) {
+    let core = core_of(vec![record, EffectRecord::Mono(1)]);
+    assert!(run(|| ask(&core)).is_err(), "{what}: not served");
+    assert!(run(|| core.mono()).is_err(), "{what}: nothing after it");
+    let d = core.diverged().expect("latched");
+    assert_eq!(d.at, 0, "{what}");
+    assert!(
+        matches!(&d.cause, Cause::Refused(got) if got == want),
+        "{what}: {:?}",
+        d.cause
+    );
+}
+
+#[test]
+fn a_door_or_a_path_that_differs_is_astreams_divergence_by_name() {
+    let status = codec::ctl_request(&["status"]);
+    diverges_as(
+        "an exchange at another door",
+        exchange(doors::CTL, &status, b"\x00\x00\x00OK"),
+        |core| {
+            core.exchange(doors::PROBE_ASLEEP, &status);
+        },
+        &ReplayDivergence::DoorDiverged {
+            recorded: doors::CTL.to_string(),
+            asked: doors::PROBE_ASLEEP.to_string(),
+        },
+    );
+    diverges_as(
+        "an output at another door",
+        EffectRecord::Emit {
+            door: doors::JOURNAL.to_string(),
+            bytes: b"{}\n".to_vec(),
+        },
+        |core| core.emit(doors::LEDGER, b"{}\n"),
+        &ReplayDivergence::DoorDiverged {
+            recorded: doors::JOURNAL.to_string(),
+            asked: doors::LEDGER.to_string(),
+        },
+    );
+    diverges_as(
+        "a file read at another path",
+        EffectRecord::File {
+            path: "/l/s-1.jsonl".to_string(),
+            bytes: b"{}\n".to_vec(),
+        },
+        |core| {
+            let _ = core.file(Path::new("/l/s-2.jsonl"));
+        },
+        &ReplayDivergence::PathDiverged {
+            recorded: "/l/s-1.jsonl".to_string(),
+            asked: "/l/s-2.jsonl".to_string(),
+        },
+    );
+}
+
 #[test]
 fn a_flag_is_raised_where_it_was_and_the_guard_bounds_idle_reads() {
     let core = core_of(vec![

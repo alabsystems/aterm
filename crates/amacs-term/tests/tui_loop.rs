@@ -32,8 +32,18 @@ fn target(path: &Path) -> Target {
     }
 }
 
+fn scratch_dir(tag: &str) -> aterm_tempfile::TempDir {
+    let end = tag.floor_char_boundary(24);
+    let prefix = format!("amacs-tui-loop-{}-", &tag[..end]);
+    aterm_tempfile::Builder::new()
+        .prefix(&prefix)
+        .suffix(".noindex")
+        .tempdir()
+        .expect("a scratch directory")
+}
+
 fn file(name: &str, bytes: &[u8]) -> (aterm_tempfile::TempDir, PathBuf) {
-    let dir = aterm_tempfile::tempdir().expect("a scratch directory");
+    let dir = scratch_dir(name);
     let path = dir.path().join(name);
     std::fs::write(&path, bytes).expect("the file to edit");
     let path = std::fs::canonicalize(&path).expect("realpath");
@@ -431,7 +441,7 @@ fn a_refused_open_says_why_in_the_save_words() {
     use amacs_files::save_words::{Failure, Speaker, words};
     use std::os::unix::ffi::OsStrExt as _;
 
-    let dir = aterm_tempfile::tempdir().expect("a scratch directory");
+    let dir = scratch_dir("refused-open");
     let folder = std::fs::canonicalize(dir.path()).expect("realpath");
     let refused = |path: &Path| {
         tui(Options::default())

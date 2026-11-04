@@ -74,6 +74,7 @@ pub(crate) const CODEX: Family = Family {
     source: "rollout",
     read: ROLLOUT_KEYS,
     inert: no_kind_is_inert,
+    words: &aterm_agent::harness::codex_steps::GATED_WORDS,
     holds: is_reduction,
     measures: is_alab,
     kind: record_kind,
@@ -123,9 +124,9 @@ const FILTERS: [&str; 4] = [
 /// The standing tests step 7 must see pass, by their libtest names: the fold whole and `On`,
 /// equal to the rollout's own account, a moved duration (NC4), the key lower bound, the names,
 /// the fixed point with no text kept, every codex-alab build in the step testdata read as
-/// measured, its six legs whole, and every key the fold reads of a committed reduction one GONE
-/// holds the next build to.
-pub(crate) const STANDING: [&str; 8] = [
+/// measured, its six legs whole, every key the fold reads of a committed reduction one GONE
+/// holds the next build to, and the gated reads' table equal to what each build's reductions show.
+pub(crate) const STANDING: [&str; 9] = [
     "harness::codex_steps::tests::every_committed_codex_reduction_folds_whole",
     "harness::codex_steps::tests::the_codex_alab_legs_fold_exact",
     "harness::codex_steps::tests::a_moved_duration_fails_the_exact_golden",
@@ -134,6 +135,7 @@ pub(crate) const STANDING: [&str; 8] = [
     "reduce::tests::a_tool_argument_name_is_never_kept_as_written",
     "codex_measure::tests::every_codex_alab_build_in_the_step_testdata_is_its_six_legs",
     "codex_measure::tests::gone_holds_a_build_to_every_rollout_key_the_fold_reads",
+    "harness::codex_steps::tests::codex_shown_is_what_each_measured_builds_reductions_hold",
 ];
 
 /// Whether `build` is a codex-alab build, as the reductions' names and aterm-agent's `build.rs`

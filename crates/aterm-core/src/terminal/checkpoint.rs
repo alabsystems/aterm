@@ -383,6 +383,22 @@ impl ReplayCarry {
         .min()
     }
 
+    /// The bytes this carry holds besides its image payloads: its own size and every allocation it owns, its Kitty tables, placements and span lists, its policy and its hyperlink schemes among them. The image payloads an `Arc` shares with the engine it was taken from, and an in-flight transfer's chunks, are [`Self::retained_image_bytes`].
+    #[must_use]
+    pub fn memory_used(&self) -> usize {
+        use super::checkpoint_heap::Heap as _;
+        std::mem::size_of::<Self>().saturating_add(self.0.as_ref().map_or(0, CapturedCarry::heap))
+    }
+
+    /// The bytes of the in-flight Kitty transfer's chunks this carry copied (an `m=1` command's payload so far), which it owns alone.
+    #[must_use]
+    pub fn pending_transfer_bytes(&self) -> usize {
+        self.0
+            .as_ref()
+            .and_then(|c| c.kitty_pending.as_ref())
+            .map_or(0, |cmd| cmd.payload.capacity())
+    }
+
     /// Distinct Kitty image and in-flight chunk payload bytes retained by this carry.
     #[must_use]
     pub fn retained_image_bytes(&self) -> usize {
@@ -392,10 +408,7 @@ impl ReplayCarry {
             return 0;
         };
         let mut seen: Vec<usize> = Vec::new();
-        let mut total = c
-            .kitty_pending
-            .as_ref()
-            .map_or(0, |cmd| cmd.payload.capacity());
+        let mut total = self.pending_transfer_bytes();
         let mut visit = |img: &Arc<ImageData>| {
             let ptr = Arc::as_ptr(img) as usize;
             if let Err(pos) = seen.binary_search(&ptr) {
@@ -1749,6 +1762,8 @@ enum PendingRestore {
     Touched,
 }
 
+super::checkpoint_heap::no_heap!(PendingRestore);
+
 #[derive(Clone, Debug)]
 #[allow(
     clippy::struct_excessive_bools,
@@ -1809,6 +1824,145 @@ struct CapturedCarry {
     inactive_handback: Option<aterm_grid::GridHandbackCarry>,
     active_images: aterm_grid::GridImageCarry,
     inactive_images: Option<aterm_grid::GridImageCarry>,
+}
+
+impl super::checkpoint_heap::Heap for CapturedCarry {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one exhaustive destructure and one term per field of the carry, so a field added \
+                  later fails to compile until it is counted here"
+    )]
+    fn heap(&self) -> usize {
+        let Self {
+            program_state,
+            shell_integration_auth,
+            foreground_job,
+            probe_job_active,
+            policy,
+            hyperlink_auth,
+            clipboard_auth,
+            kitty_media_admitted,
+            configured_modes,
+            default_cursor_style,
+            host_alternate_scroll,
+            sync_timeout_duration,
+            last_bell_time,
+            bell_total,
+            notify_total,
+            cell_px,
+            cell_px_from_host,
+            bidi_config,
+            color_baseline,
+            color_overrides,
+            bold_is_bright,
+            faint_opacity,
+            indexed_minimum_contrast,
+            palette_set_refused,
+            frame_foreground_authoritative,
+            frame_background_authoritative,
+            frame_cursor_authoritative,
+            scrollback_line_limit,
+            pending_restore,
+            response_rate_limiter,
+            sync_start,
+            alt_entered_without_cursor_save,
+            conhost_alt_screen_left_up,
+            dead_alt_screen,
+            dead_alt_prompt_at,
+            screen_replaced,
+            size_report_held,
+            bracketed_paste_from_prompt,
+            kitty_last_assigned_id,
+            kitty_serial,
+            live_image_charge,
+            last_osc_bel_terminated,
+            kitty_images,
+            kitty_frames,
+            kitty_variants,
+            kitty_virtual,
+            kitty_numbers,
+            kitty_pending,
+            kitty_floating,
+            kitty_relations,
+            active_handback,
+            inactive_handback,
+            active_images,
+            inactive_images,
+        } = self;
+        let super::config_api::ColorBaseline {
+            foreground,
+            background,
+            cursor,
+            selection_background,
+            selection_foreground,
+            palette,
+            color_scheme,
+        } = color_baseline;
+        [
+            program_state.heap(),
+            shell_integration_auth.heap(),
+            foreground_job.heap(),
+            probe_job_active.heap(),
+            policy.heap(),
+            hyperlink_auth.heap(),
+            clipboard_auth.heap(),
+            kitty_media_admitted.heap(),
+            configured_modes.heap(),
+            default_cursor_style.heap(),
+            host_alternate_scroll.heap(),
+            sync_timeout_duration.heap(),
+            last_bell_time.heap(),
+            bell_total.heap(),
+            notify_total.heap(),
+            cell_px.heap(),
+            cell_px_from_host.heap(),
+            bidi_config.heap(),
+            foreground.heap(),
+            background.heap(),
+            cursor.heap(),
+            selection_background.heap(),
+            selection_foreground.heap(),
+            palette.heap(),
+            color_scheme.heap(),
+            color_overrides.heap(),
+            bold_is_bright.heap(),
+            faint_opacity.heap(),
+            indexed_minimum_contrast.heap(),
+            palette_set_refused.heap(),
+            frame_foreground_authoritative.heap(),
+            frame_background_authoritative.heap(),
+            frame_cursor_authoritative.heap(),
+            scrollback_line_limit.heap(),
+            pending_restore.heap(),
+            response_rate_limiter.heap(),
+            sync_start.heap(),
+            alt_entered_without_cursor_save.heap(),
+            conhost_alt_screen_left_up.heap(),
+            dead_alt_screen.heap(),
+            dead_alt_prompt_at.heap(),
+            screen_replaced.heap(),
+            size_report_held.heap(),
+            bracketed_paste_from_prompt.heap(),
+            kitty_last_assigned_id.heap(),
+            kitty_serial.heap(),
+            live_image_charge.heap(),
+            last_osc_bel_terminated.heap(),
+            kitty_images.heap(),
+            kitty_frames.heap(),
+            kitty_variants.heap(),
+            kitty_virtual.heap(),
+            kitty_numbers.heap(),
+            kitty_pending.heap(),
+            kitty_floating.heap(),
+            kitty_relations.heap(),
+            active_handback.heap(),
+            inactive_handback.heap(),
+            active_images.heap(),
+            inactive_images.heap(),
+        ]
+        .into_iter()
+        .fold(0, usize::saturating_add)
+    }
 }
 
 fn osc_payload_is_shell_mark(osc: &[u8]) -> bool {

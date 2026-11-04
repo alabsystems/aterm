@@ -111,6 +111,10 @@ aterm-digest = { workspace = true }
 aterm-uds = { workspace = true }
 aterm-tempfile = { workspace = true }
 
+# `benches/quiet_commit.rs` reads its own footprint (`proc_pid_rusage`).
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+libc = { workspace = true }
+
 [lints]
 workspace = true
 
@@ -140,4 +144,9 @@ path = "tests/frame_instrumentation.rs"
 [[bench]]
 name = "first_frame_compile"
 path = "benches/first_frame_compile.rs"
+harness = false
+
+[[bench]]
+name = "quiet_commit"
+path = "benches/quiet_commit.rs"
 harness = false

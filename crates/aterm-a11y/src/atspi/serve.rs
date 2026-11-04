@@ -332,10 +332,18 @@ pub(crate) fn machine_id_from_files(paths: &[&std::path::Path]) -> Option<String
         else {
             continue;
         };
-        if !file.metadata().is_ok_and(|m| m.is_file()) {
+        let Ok(meta) = file.metadata() else {
+            continue;
+        };
+        if !meta.is_file() || meta.len() >= 128 {
             continue;
         }
-        let mut bytes = Vec::new();
+        let mut bytes = Vec::with_capacity(
+            usize::try_from(meta.len())
+                .unwrap_or(0)
+                .min(128)
+                .saturating_add(1),
+        );
         if file.take(128).read_to_end(&mut bytes).is_err() || bytes.len() >= 128 {
             continue;
         }

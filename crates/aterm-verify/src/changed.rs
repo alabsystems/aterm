@@ -833,16 +833,26 @@ pub fn parse_graph_entries(text: &str, root_prefix: &str) -> Vec<(String, String
         .collect()
 }
 
+/// What `cargo tree`, run in `root`, prints before the directory of a package under it.
 fn tree_root_prefix(root: &Path) -> String {
-    let raw = root.display().to_string();
-    let plain = if cfg!(windows) {
-        raw.strip_prefix(r"\\?\").unwrap_or(&raw)
+    tree_prefix(&root.display().to_string(), cfg!(windows))
+}
+
+/// `root` as a child started in it reads its own directory, then the separator. Off Windows that
+/// is `root` as given. On Windows std starts the child in `root` without a verbatim `\\?\` (what
+/// `fs::canonicalize` returns), turning `\\?\UNC\` into `\\`, and cargo prints each path with
+/// `\`, where git's `rev-parse --show-toplevel` spells the root `C:/…`.
+fn tree_prefix(root: &str, windows: bool) -> String {
+    let (mut prefix, sep) = if windows {
+        let plain = match root.strip_prefix(r"\\?\UNC\") {
+            Some(share) => format!(r"\\{share}"),
+            None => root.strip_prefix(r"\\?\").unwrap_or(root).to_owned(),
+        };
+        (plain.replace('/', "\\"), '\\')
     } else {
-        raw.as_str()
+        (root.to_owned(), '/')
     };
-    let mut prefix = plain.to_owned();
-    let sep = std::path::MAIN_SEPARATOR;
-    if !prefix.ends_with(['/', '\\']) {
+    if !prefix.ends_with(sep) {
         prefix.push(sep);
     }
     prefix
@@ -1993,6 +2003,30 @@ indexmap v2.14.0 (/repo/vendor/indexmap)
             ]
         );
         assert!(parse_graph_entries("a v1.0.0 (/repo (copy)/crates/a", "/repo (copy)/").is_empty());
+    }
+
+    /// The root prefix a Windows checkout's `cargo tree` lines start with, from each spelling the
+    /// root reaches it in: git's `C:/…`, `fs::canonicalize`'s `\\?\C:\…` and `\\?\UNC\…`, and the
+    /// plain one. NEGATIVE CONTROL: git's `C:/…` root with only the separator appended, the prefix
+    /// this replaced, reads no package, and the cone then widens to the whole workspace.
+    #[test]
+    fn a_windows_root_is_spelled_as_cargo_tree_prints_it() {
+        let tree =
+            "a v1.0.0 (C:\\w\\crates\\a)\nb v1.0.0 (\\\\srv\\share\\w\\b) (*)\nserde v1.0.0\n";
+        for root in ["C:/w", "C:\\w", "\\\\?\\C:\\w", "C:\\w\\"] {
+            assert_eq!(
+                parse_graph_entries(tree, &tree_prefix(root, true)),
+                [("a".into(), "crates\\a".into())],
+                "{root}"
+            );
+        }
+        assert_eq!(
+            parse_graph_entries(tree, &tree_prefix("\\\\?\\UNC\\srv\\share\\w", true)),
+            [("b".into(), "b".into())]
+        );
+        assert!(parse_graph_entries(tree, "C:/w\\").is_empty());
+        assert_eq!(tree_prefix("/repo (copy)", false), "/repo (copy)/");
+        assert_eq!(tree_prefix("/", false), "/");
     }
 
     #[test]

@@ -314,6 +314,15 @@ pub fn kept<S: std::os::fd::AsFd>(socket: S) -> S {
     socket
 }
 
+/// A directory of its own under the short `/tmp` (a socket path's limit is 104 bytes) for a
+/// stub's or a broker's socket, removed when dropped, a test that panics included.
+pub fn sock_dir(tag: &str) -> aterm_tempfile::TempDir {
+    aterm_tempfile::Builder::new()
+        .prefix(&format!("atl-{tag}-"))
+        .tempdir_in("/tmp")
+        .expect("the socket's dir")
+}
+
 /// Connects a broker client on `sock` with read and write timeouts bounded by [`VERB_DEADLINE`].
 pub fn broker_client(sock: impl AsRef<Path>) -> Client {
     let sock = sock.as_ref();

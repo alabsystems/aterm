@@ -499,7 +499,7 @@ fn unavailable_browser_stops_native_pkce_without_requesting_a_person() {
     );
     assert_eq!(
         drove.outcome,
-        Outcome::Unverified("pinned browser fetch is unavailable".into())
+        Outcome::PageNotOpened("pinned browser fetch is unavailable".into())
     );
     assert!(!home.join("auth.json").exists());
 }
@@ -1391,7 +1391,7 @@ fn native_wham_usage_reads_windows_walls_and_refreshes_expired_or_unauthorized_t
         &home_fresh,
         &usage_url,
         &token_url,
-        Duration::from_secs(10),
+        aterm_spec::wait::MUST_HAPPEN,
         now,
     )
     .expect("fresh usage");
@@ -1428,7 +1428,7 @@ fn native_wham_usage_reads_windows_walls_and_refreshes_expired_or_unauthorized_t
         &home_expiring,
         &usage_url,
         &token_url,
-        Duration::from_secs(10),
+        aterm_spec::wait::MUST_HAPPEN,
         now,
         None,
     );
@@ -1478,7 +1478,7 @@ fn native_wham_usage_reads_windows_walls_and_refreshes_expired_or_unauthorized_t
         &home_revoked,
         &usage_url,
         &token_url,
-        Duration::from_secs(10),
+        aterm_spec::wait::MUST_HAPPEN,
         now,
     )
     .expect("reactively refreshed usage");
@@ -4379,7 +4379,7 @@ fn code_exchange_validates_and_clears_refresh_journal_around_publication() {
             "http://127.0.0.1/callback",
             "one-use-code",
             "verifier",
-            Duration::from_secs(10),
+            aterm_spec::wait::MUST_HAPPEN,
             1_790_000_000,
         ),
         None
@@ -4400,7 +4400,7 @@ fn code_exchange_validates_and_clears_refresh_journal_around_publication() {
             "http://127.0.0.1/callback",
             "one-use-code",
             "verifier",
-            Duration::from_secs(10),
+            aterm_spec::wait::MUST_HAPPEN,
             1_790_000_000,
         ),
         None
@@ -4435,7 +4435,7 @@ fn code_exchange_validates_and_clears_refresh_journal_around_publication() {
             "http://127.0.0.1/callback",
             "bad-code",
             "verifier",
-            Duration::from_secs(10),
+            aterm_spec::wait::MUST_HAPPEN,
             1_790_000_000,
         ),
         None
@@ -4454,7 +4454,7 @@ fn code_exchange_validates_and_clears_refresh_journal_around_publication() {
         "http://127.0.0.1/callback",
         "good-code",
         "verifier",
-        Duration::from_secs(10),
+        aterm_spec::wait::MUST_HAPPEN,
         1_790_000_000,
     );
     assert_eq!(signed_in, Some(Some("relogin@example.test".to_owned())));
@@ -4462,8 +4462,11 @@ fn code_exchange_validates_and_clears_refresh_journal_around_publication() {
         !beside_auth(&relogin_home, JOURNAL_SUFFIX).exists(),
         "successful sign-in must discard stale or corrupt auth.json.refreshed"
     );
-    let _held = AuthLock::within(&relogin_home, Instant::now() + Duration::from_secs(5))
-        .expect("take auth lock");
+    let _held = AuthLock::within(
+        &relogin_home,
+        Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+    )
+    .expect("take auth lock");
     assert!(recover_journal_held(&relogin_home).is_ok());
     drop(_held);
 

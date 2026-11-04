@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Read-only Allocation application. All inputs are immutable observations made
-//! by the existing vitals worker; rendering performs no probes or file reads.
+//! Read-only Allocation application. Inputs are independent immutable vitals
+//! and delegated native-session observations; rendering performs no probes or I/O.
 
 use std::cell::Cell;
 use std::sync::Arc;
@@ -28,6 +28,8 @@ pub(crate) struct ObservedCpu {
 
 #[derive(Default)]
 pub(crate) struct AllocationApp {
+    #[cfg(target_os = "macos")]
+    pub(crate) monitor: Option<Arc<crate::allocation_monitor_host::Presentation>>,
     pub(crate) leases: Option<Arc<ObservedCpu>>,
     pub(crate) machine: Option<Arc<aterm_vitals::Snapshot>>,
     pub(crate) machine_at: Option<Instant>,
@@ -42,6 +44,68 @@ pub(crate) struct AllocationViewState {
 }
 
 const STALE: Duration = Duration::from_secs(15);
+
+#[cfg(target_os = "macos")]
+fn whole_age_seconds(lower: Duration, upper: Duration) -> Option<(u64, u64)> {
+    if lower > upper {
+        return None;
+    }
+    Some((
+        lower.as_secs(),
+        upper
+            .as_secs()
+            .checked_add(u64::from(upper.subsec_nanos() != 0))?,
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn completion_row(
+    record: &atpkg::build_admit::service::monitor::RecordSummary,
+) -> Option<(String, String)> {
+    use atpkg::build_admit::service::monitor::EventKind;
+
+    let (outcome, revision) = match record.kind {
+        EventKind::Finished {
+            succeeded,
+            cancelled,
+        } => (
+            format!(
+                "{} · Finished · {}{}",
+                record.attempt.map_or_else(
+                    || "Session outcome".into(),
+                    |attempt| format!("Session attempt {attempt}")
+                ),
+                if succeeded {
+                    "success established"
+                } else {
+                    "success not established"
+                },
+                if cancelled {
+                    " · cancellation requested"
+                } else {
+                    ""
+                }
+            ),
+            if record.attempt.is_some() {
+                "completion revision"
+            } else {
+                "history revision"
+            },
+        ),
+        EventKind::Failed => match record.attempt {
+            Some(attempt) => (
+                format!("Session attempt {attempt} · Owner-reported failure"),
+                "completion revision",
+            ),
+            None => ("Session service failure".into(), "history revision"),
+        },
+        _ => return None,
+    };
+    Some((
+        format!("monitor/completion/{}", record.revision),
+        format!("{outcome} · {revision} {}", record.revision),
+    ))
+}
 
 fn age(at: Option<Instant>, now: Instant) -> String {
     match at {
@@ -72,6 +136,8 @@ impl AllocationApp {
                 ),
             ),
         ];
+        #[cfg(target_os = "macos")]
+        self.monitor_rows(&mut rows);
         match self.leases.as_ref().map(|s| &s.value) {
             None => rows.push((
                 "lease-state".into(),
@@ -163,6 +229,163 @@ impl AllocationApp {
         rows.push(("limits".into(), "Build identities, demand, grants, wait reasons and arena accounting are not yet provided by the host service.".into()));
         rows
     }
+
+    #[cfg(target_os = "macos")]
+    fn monitor_rows(&self, rows: &mut Vec<(String, String)>) {
+        use crate::allocation_monitor_host::Phase;
+        use aterm_capacity::host_protocol::Phase as JobPhase;
+        let Some(monitor) = self.monitor.as_ref().filter(|m| m.requested != 0) else {
+            return;
+        };
+        let mut native = vec![(
+            "monitor/scope".into(),
+            "Delegated native session · read-only observation".into(),
+        )];
+        let phase = match monitor.phase {
+            Phase::Unattached => "Unattached".into(),
+            Phase::Queued => "Queued".into(),
+            Phase::Reading => "Reading".into(),
+            Phase::Observed => "Observed".into(),
+            Phase::Failed(failure) => format!(
+                "Failed ({:?}); previous observations remain historical",
+                failure.kind
+            ),
+        };
+        native.push((
+            "monitor/attachment".into(),
+            format!("Monitor attachment {}: {phase}", monitor.requested),
+        ));
+        if let Some(generation) = monitor.desired_generation
+            && monitor
+                .last
+                .as_ref()
+                .is_none_or(|last| last.observation.snapshot.generation != generation)
+        {
+            native.push((
+                "monitor/requested-source".into(),
+                format!(
+                    "Requested source generation: {}",
+                    aterm_uds::rand::hex_encode(&generation.0)
+                ),
+            ));
+        }
+        let Some(last) = &monitor.last else {
+            native.push((
+                "monitor/empty".into(),
+                "No native-session observation received yet".into(),
+            ));
+            rows.splice(1..1, native);
+            return;
+        };
+        if last.attachment != monitor.requested {
+            native.push((
+                "monitor/retained".into(),
+                format!(
+                    "Retained observation from attachment {}; attachment {} has no observation",
+                    last.attachment, monitor.requested
+                ),
+            ));
+        }
+        let snapshot = &last.observation.snapshot;
+        native.push((
+            "monitor/source".into(),
+            format!(
+                "Source generation: {} · snapshot revision {} · attachment {}",
+                aterm_uds::rand::hex_encode(&snapshot.generation.0),
+                snapshot.revision,
+                last.attachment
+            ),
+        ));
+        native.push((
+            "monitor/history".into(),
+            format!(
+                "Delivered history through revision {} · last published frame {}",
+                last.observation.next.revision, last.observation.request_sequence
+            ),
+        ));
+        if let Some(gap) = last.last_gap {
+            native.push((
+                "monitor/history-gap".into(),
+                format!(
+                    "Latest reported history gap: revisions {}–{} unavailable",
+                    gap.first, gap.last
+                ),
+            ));
+        }
+        native.push((
+            "monitor/age".into(),
+            last.observation
+                .age_bounds()
+                .and_then(|age| {
+                    whole_age_seconds(age.lower, age.upper).map(|seconds| (age, seconds))
+                })
+                .map_or_else(
+                    || "Native observation age: unavailable".into(),
+                    |(age, (lower, upper))| {
+                        format!(
+                            "Native observation age: {}–{}s{}",
+                            lower,
+                            upper,
+                            if age.upper > STALE { " · Stale" } else { "" }
+                        )
+                    },
+                ),
+        ));
+        if snapshot.closed {
+            native.push((
+                "monitor/closed".into(),
+                "Source owner closed; last observation retained".into(),
+            ));
+        }
+        for job in &snapshot.jobs {
+            let phase = match job.phase {
+                JobPhase::Starting => "Starting",
+                JobPhase::Waiting => "Waiting for next child observation",
+                JobPhase::Stopped => "Stopped",
+                JobPhase::Cancelling => "Cancelling",
+                JobPhase::ExitPinned => "Exit observed; leader retained",
+                JobPhase::Faulted => "Faulted",
+            };
+            native.push((
+                format!("monitor/attempt/{}", job.attempt),
+                format!(
+                    "Session attempt {} · {phase} · admitted peak {} bytes ({:.1} GiB)",
+                    job.attempt,
+                    job.reserved_bytes,
+                    job.reserved_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+                ),
+            ));
+        }
+        if snapshot.jobs.is_empty() {
+            native.push((
+                "monitor/roots".into(),
+                "No owned native roots in this snapshot; retained work may remain".into(),
+            ));
+        }
+        native.push((
+            "monitor/completions".into(),
+            "Recent delivered outcomes".into(),
+        ));
+        if last.omitted_terminals != 0 {
+            native.push((
+                "monitor/completions-omitted".into(),
+                format!(
+                    "Earlier delivered outcomes omitted locally: {}",
+                    last.omitted_terminals
+                ),
+            ));
+        }
+        let completed = native.len();
+        native.extend(last.recent.iter().filter_map(completion_row));
+        if native.len() == completed {
+            native.push((
+                "monitor/completions-empty".into(),
+                "No delivered outcomes retained".into(),
+            ));
+        }
+        native.push(("monitor/limits".into(), "Session observation does not establish CPU grants, current computer leadership or proof status.".into()));
+        rows.splice(1..1, native);
+    }
 }
 
 impl NativeAppModel for AllocationApp {
@@ -206,12 +429,13 @@ impl NativeAppModel for AllocationApp {
         for (key, text) in std::iter::once(("title".into(), "Allocation · This computer".into()))
             .chain(self.rows(Instant::now()))
         {
-            let role = if key == "title" {
+            let heading = key == "title" || key == "monitor/completions";
+            let role = if heading {
                 SemanticRole::Heading
             } else {
                 SemanticRole::Text
             };
-            let style = if key == "title" {
+            let style = if heading {
                 StyleRef::Plain
             } else {
                 StyleRef::Secondary
@@ -292,9 +516,31 @@ impl NativeAppModel for AllocationApp {
     }
 }
 
+#[cfg(all(test, target_os = "macos"))]
+#[path = "native_allocation_completion_tests.rs"]
+mod completion_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn monitor_age_seconds_enclose_fractional_bounds_and_refuse_overflow() {
+        assert_eq!(
+            whole_age_seconds(Duration::from_millis(100), Duration::from_millis(900)),
+            Some((0, 1))
+        );
+        assert_eq!(
+            whole_age_seconds(Duration::from_secs(1), Duration::from_secs(2)),
+            Some((1, 2))
+        );
+        assert_eq!(
+            whole_age_seconds(Duration::from_secs(2), Duration::from_secs(1)),
+            None
+        );
+        assert_eq!(whole_age_seconds(Duration::ZERO, Duration::MAX), None);
+    }
     use crate::native_app::{
         ActionInvocation, AppViewState, NativeApp, NativeRuntime, ViewId, ViewMotionCx,
     };

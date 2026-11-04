@@ -50,11 +50,38 @@ pub fn restore(lifted: Lifted) {
 /// answer.
 #[must_use]
 pub fn requested_class_of_self() -> Option<(libc::c_uint, libc::c_int)> {
+    // SAFETY: `pthread_self` names the calling thread, alive across the call.
+    unsafe { requested_class_of_thread(pthread_self().addr()) }
+}
+
+/// The class and relative priority the thread `handle` names has requested, read from the calling
+/// thread, so nothing has to run on that thread to say it, or `None` where the platform declined
+/// to answer.
+#[cfg(any(test, debug_assertions))]
+#[must_use]
+pub fn requested_class_of<T>(
+    handle: &std::thread::JoinHandle<T>,
+) -> Option<(libc::c_uint, libc::c_int)> {
+    use std::os::unix::thread::JoinHandleExt as _;
+    // SAFETY: the borrowed handle is neither joined nor detached, so the thread it names stays
+    // valid across the call.
+    unsafe { requested_class_of_thread(handle.as_pthread_t()) }
+}
+
+/// The class and relative priority `thread` has requested.
+///
+/// # Safety
+///
+/// `thread` must name a thread that stays valid (neither joined nor detached and exited) across
+/// the call.
+unsafe fn requested_class_of_thread(
+    thread: libc::pthread_t,
+) -> Option<(libc::c_uint, libc::c_int)> {
     let mut class: libc::c_uint = 0;
     let mut relative: libc::c_int = 0;
-    // SAFETY: both out-parameters are live, correctly typed locals, and `pthread_self` names the
-    // calling thread, alive across the call.
-    let rc = unsafe { pthread_get_qos_class_np(pthread_self().addr(), &mut class, &mut relative) };
+    // SAFETY: both out-parameters are live, correctly typed locals, and the caller keeps `thread`
+    // valid across the call.
+    let rc = unsafe { pthread_get_qos_class_np(thread, &mut class, &mut relative) };
     (rc == 0).then_some((class, relative))
 }
 

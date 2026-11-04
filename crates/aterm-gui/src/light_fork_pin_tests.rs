@@ -286,10 +286,21 @@ fn breaks(drawn: &Drawn) -> Vec<&'static str> {
         theme_bg: bg,
         ..cfg
     };
-    if !same_table(
-        &drawn.bed,
-        &BedInkLut::synced(&rk::Config::from_glow(&mains, false)),
-    ) {
+    thread_local! {
+        // Main's table for the last config this thread read: a run's frames repeat it, and `synced`
+        // is a function of it. Boxed: inline it would be part of every thread's TLS.
+        static MAINS_TABLE: std::cell::RefCell<Option<Box<(GlowConfig, BedInkLut)>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    let table = MAINS_TABLE.with_borrow_mut(|held| match held.as_deref() {
+        Some((config, table)) if *config == mains => *table,
+        _ => {
+            let table = BedInkLut::synced(&rk::Config::from_glow(&mains, false));
+            *held = Some(Box::new((mains, table)));
+            table
+        }
+    });
+    if !same_table(&drawn.bed, &table) {
         out.push("bed ink table");
     }
     light_symbols_absent(drawn, &mut out);

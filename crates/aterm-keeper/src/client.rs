@@ -68,8 +68,13 @@ fn check_failed(e: CheckError) -> io::Error {
 }
 
 /// Minimum wait for a HELLO's answer from the keeper.
+#[cfg(not(test))]
 pub const WELCOME_WAIT: Duration = crate::identity::PEER_CHECK_HANG.saturating_add(FRAME_BUDGET);
+/// Unit tests: the hang detector, since every keeper these tests dial answers a HELLO.
+#[cfg(test)]
+pub const WELCOME_WAIT: Duration = aterm_spec::wait::MUST_HAPPEN;
 
+#[cfg(not(test))]
 const FRAME_BUDGET: Duration = Duration::from_secs(2);
 
 /// One connection to a keeper.
@@ -1468,9 +1473,8 @@ mod tests {
     fn a_listener_of_other_code_is_refused_as_not_this_build() {
         use std::os::unix::fs::PermissionsExt as _;
         aterm_uds::deadline::require_trust_service();
-        let dir = std::env::temp_dir().join(format!("akl-other-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("dir");
+        let scratch = crate::test_scratch_dir("other");
+        let dir = scratch.path();
         let own = Identity::for_self(crate::identity::IdentityPolicy::Designated).expect("own");
 
         let sock = dir.join("nc.sock");
@@ -1517,15 +1521,13 @@ mod tests {
             .expect_err("a socket this process may not open");
         assert_eq!(denied.kind(), io::ErrorKind::PermissionDenied, "{denied}");
         assert!(!refused_identity(&denied), "{denied}");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_keeper_at_the_uid_floor_is_refused_by_a_window_that_checks_code() {
         aterm_uds::deadline::require_trust_service();
-        let dir = std::env::temp_dir().join(format!("akl-floor-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("dir");
+        let scratch = crate::test_scratch_dir("floor");
+        let dir = scratch.path();
         let own = || Identity::for_self(IdentityPolicy::Designated).expect("own");
         for (name, keeper, accepted) in [
             ("uid.sock", Identity::same_uid(), false),
@@ -1580,7 +1582,6 @@ mod tests {
                 }
             }
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1605,10 +1606,8 @@ mod tests {
 
     #[test]
     fn a_restarted_keeper_is_told_again_without_a_new_op() {
-        let base = std::env::temp_dir();
-        let dir = base.join(format!("akl-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let sock = dir.join("k.sock");
+        let scratch = crate::test_scratch_dir("restart");
+        let sock = scratch.path().join("k.sock");
         let mut first = serve(&sock);
         let master = std::fs::File::open("/dev/null").expect("open");
         let rdev = master.metadata().expect("stat").rdev();
@@ -1631,15 +1630,12 @@ mod tests {
         });
         link.shutdown();
         drop(second);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_restarted_keeper_is_told_each_region_again() {
-        let base = std::env::temp_dir();
-        let dir = base.join(format!("akl-journal-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let sock = dir.join("k.sock");
+        let scratch = crate::test_scratch_dir("journal");
+        let sock = scratch.path().join("k.sock");
         let mut first = serve(&sock);
         let (journaled, journaled_op) = register_op("/dev/null", 1);
         let (unsaid, unsaid_op) = register_op("/dev/zero", 2);
@@ -1700,15 +1696,11 @@ mod tests {
         );
         link.shutdown();
         drop(third);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_replacement_companion_is_confirmed_only_once_the_keeper_has_read_it() {
-        let scratch = aterm_tempfile::Builder::new()
-            .prefix("akl-receipt-")
-            .tempdir()
-            .expect("exclusive receipt fixture");
+        let scratch = crate::test_scratch_dir("receipt");
         let sock = scratch.path().join("k.sock");
         let mut server = serve(&sock);
         let (rdev, register) = register_op("/dev/null", 1);
@@ -1862,10 +1854,7 @@ mod tests {
     /// it arrives, not on its next op or its next idle wake, neither of which comes here.
     #[test]
     fn a_receipt_is_confirmed_as_the_keeper_answers_with_no_op_behind_it() {
-        let scratch = aterm_tempfile::Builder::new()
-            .prefix("akl-answer-")
-            .tempdir()
-            .expect("exclusive receipt fixture");
+        let scratch = crate::test_scratch_dir("answer");
         let sock = scratch.path().join("k.sock");
         let mut server = serve(&sock);
         let (rdev, register) = register_op("/dev/null", 1);
@@ -1949,10 +1938,7 @@ mod tests {
                 }
             }
         }
-        let scratch = aterm_tempfile::Builder::new()
-            .prefix("akl-closed-")
-            .tempdir()
-            .expect("exclusive closing-keeper fixture");
+        let scratch = crate::test_scratch_dir("closed");
         let sock = scratch.path().join("k.sock");
         let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
         let asked = std::sync::Arc::new(AtomicBool::new(false));
@@ -2005,9 +1991,8 @@ mod tests {
 
     #[test]
     fn a_release_the_link_could_not_write_is_told_to_the_next_connection() {
-        let base = std::env::temp_dir();
-        let dir = base.join(format!("akl-rel-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let scratch = crate::test_scratch_dir("rel");
+        let dir = scratch.path();
         let sock = dir.join("k.sock");
         let aside = dir.join("k.aside");
         let mut server = serve(&sock);
@@ -2031,15 +2016,12 @@ mod tests {
         assert!(server.holds(kept), "the open tab stays in custody");
         link.shutdown();
         drop(server);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_release_the_keeper_dropped_unread_is_told_to_the_next_connection() {
-        let base = std::env::temp_dir();
-        let dir = base.join(format!("akl-unread-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let sock = dir.join("k.sock");
+        let scratch = crate::test_scratch_dir("unread");
+        let sock = scratch.path().join("k.sock");
         let mut server = serve(&sock);
         let (closed, closed_op) = register_op("/dev/null", 1);
         let (kept, kept_op) = register_op("/dev/zero", 2);
@@ -2059,7 +2041,6 @@ mod tests {
         assert!(server.holds(kept), "the open tab stays in custody");
         link.shutdown();
         drop(server);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2077,10 +2058,8 @@ mod tests {
             .enumerate()
             .collect();
         aterm_spec::check::each(&dials, |&(n, hello)| {
-            let dir = std::env::temp_dir().join(format!("akl-late-{}-{n}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).expect("dir");
-            let sock = dir.join("k.sock");
+            let scratch = crate::test_scratch_dir(&format!("late-{n}"));
+            let sock = scratch.path().join("k.sock");
             let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
             let keeper = std::thread::spawn(move || {
                 let (stream, _) = listener.accept().expect("accept");
@@ -2139,18 +2118,14 @@ mod tests {
                 "{hello:?}"
             );
             drop(keeper.join().expect("the late keeper"));
-            let _ = std::fs::remove_dir_all(&dir);
         });
     }
 
     #[test]
     fn a_keeper_that_answers_no_sync_is_sent_none() {
         use crate::wire::Kind;
-        let base = std::env::temp_dir();
-        let dir = base.join(format!("akl-nosync-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("dir");
-        let sock = dir.join("k.sock");
+        let scratch = crate::test_scratch_dir("nosync");
+        let sock = scratch.path().join("k.sock");
         let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
         let older = std::thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accept");
@@ -2189,15 +2164,12 @@ mod tests {
             [Kind::Hello, Kind::Register, Kind::Release, Kind::Pending]
         );
         link.shutdown();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn pending_and_bye_are_acknowledged_once_written() {
-        let base = std::env::temp_dir();
-        let dir = base.join(format!("akl-ack-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let sock = dir.join("k.sock");
+        let scratch = crate::test_scratch_dir("ack");
+        let sock = scratch.path().join("k.sock");
         let mut server = serve(&sock);
         let master = std::fs::File::open("/dev/null").expect("open");
         let rdev = master.metadata().expect("stat").rdev();
@@ -2236,15 +2208,12 @@ mod tests {
         );
         assert!(server.holds(rdev), "the RELEASE after the BYE never came");
         drop(server);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_waited_op_with_no_keeper_is_refused_promptly() {
-        let base = std::env::temp_dir();
-        let dir = base.join(format!("akl-none-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let sock = dir.join("absent.sock");
+        let scratch = crate::test_scratch_dir("none");
+        let sock = scratch.path().join("absent.sock");
         let link = KeeperLink::start(sock, Identity::same_uid(), "t".into()).expect("link");
         let master = std::fs::File::open("/dev/null").expect("open");
         let rdev = master.metadata().expect("stat").rdev();
@@ -2270,10 +2239,7 @@ mod tests {
 
     #[test]
     fn a_refused_companion_does_not_poison_a_later_valid_companion_on_the_same_link() {
-        let scratch = aterm_tempfile::Builder::new()
-            .prefix("akl-rc-")
-            .tempdir_in("/tmp")
-            .expect("exclusive fixture");
+        let scratch = crate::test_scratch_dir("rc");
         let sock = scratch.path().join("k.sock");
         let mut server = serve(&sock);
         let (rdev, register) = register_op("/dev/null", 1);
@@ -2573,7 +2539,8 @@ mod offer_tests {
                     None
                 }
             });
-            let wait = Duration::from_secs(2);
+            // This peer always answers, so its frames wait out only the hang detector.
+            let wait = aterm_spec::wait::MUST_HAPPEN;
             stream.set_read_timeout(Some(wait)).expect("read timeout");
             stream.set_write_timeout(Some(wait)).expect("write timeout");
             let client = KeeperClient {

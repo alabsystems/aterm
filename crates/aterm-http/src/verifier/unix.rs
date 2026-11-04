@@ -137,7 +137,11 @@ fn read_pem_file_up_to(path: &Path, cap: u64, out: &mut Vec<Vec<u8>>) {
     if !open_meta.is_file() || open_meta.len() > cap {
         return;
     }
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(open_meta.len())
+            .unwrap_or(0)
+            .saturating_add(1),
+    );
     if file
         .take(cap.saturating_add(1))
         .read_to_end(&mut bytes)

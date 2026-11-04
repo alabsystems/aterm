@@ -1311,6 +1311,463 @@ fn unused_peer_selection_does_not_skip_envelope_failover() {
     );
 }
 
+#[test]
+fn an_exact_peer_recovers_a_damaged_cache_after_a_bodyless_primary_response() {
+    let _answering = ServersAnswering::set();
+    for etag in ["ETag: \"3\"\r\n", "ETag: \"2\"\r\n", ""] {
+        let at = dead_source();
+        let fresh = served(&at.fresh.url);
+        let candidates = [at.fresh.clone()];
+        let browse = |_: &Config| candidates.to_vec();
+        let found = PeerDiscovery::supplied(&browse);
+        let said = std::cell::Cell::new(SourceSaid::AtOnce);
+        sync_found(&at.member, None, &found, &said).unwrap();
+        let before = load_state(&at.member).unwrap();
+        assert_eq!(before.seq, 3);
+        let primary = StandIn::at(&at.url_primary, Duration::ZERO, Some(ok_with(&fresh)));
+
+        // The normal repair path already obtains a full body when the cache is
+        // damaged, even though the held sequence has not advanced.
+        std::fs::write(at.member.cache_file(), b"damaged cache").unwrap();
+        let mut repaired = None;
+        assert!(repair_due(&at.member, &mut repaired));
+        subscriber_pass(&at.member, &mut repaired, &found).unwrap();
+        assert!(cache_intact(&at.member, &before));
+
+        // A bodyless source must not strand that same repair while an exact,
+        // authenticated copy remains available from the peer.
+        primary.answer_with(Some(
+            format!(
+                "HTTP/1.1 204 No Content\r\n{etag}Content-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .into_bytes(),
+        ));
+        std::fs::write(at.member.cache_file(), b"damaged cache again").unwrap();
+        subscriber_pass(&at.member, &mut repaired, &found).unwrap();
+        assert!(
+            cache_intact(&at.member, &before),
+            "bodyless source: {etag:?}"
+        );
+        assert_eq!(std::fs::read(at.member.cache_file()).unwrap(), fresh);
+        assert_eq!(load_state(&at.member).unwrap().digest, before.digest);
+        assert!(materialization_ready(&at.member).unwrap());
+        let config = configured(&at.member).unwrap();
+        let MaterializationObservation::Ready(observed) =
+            observe_materialization(&at.member, &config, || Ok(())).unwrap()
+        else {
+            panic!("repaired materialization is ready");
+        };
+        assert_eq!(
+            observed
+                .snapshot
+                .network_materialization()
+                .unwrap()
+                .source(),
+            VaultNetworkSource::PeerUrl
+        );
+        drop(primary);
+        for server in at.servers {
+            server.stop();
+        }
+    }
+}
+
+#[test]
+fn an_intact_cache_repairs_missing_files_after_a_bodyless_primary_response() {
+    let _answering = ServersAnswering::set();
+    for bodyless in [false, true] {
+        let at = dead_source();
+        let fresh = served(&at.fresh.url);
+        let primary = StandIn::at(&at.url_primary, Duration::ZERO, Some(ok_with(&fresh)));
+        let mut repaired = None;
+        subscriber_pass(&at.member, &mut repaired, &FOUND_NONE).unwrap();
+        let before = load_state(&at.member).unwrap();
+        let config = configured(&at.member).unwrap();
+        let observation = network_observation::project(&at.member, &config, &before);
+        assert!(observation.is_some());
+        let file = at.member.home.join(".secrets/shared-key");
+        assert_eq!(std::fs::read(&file).unwrap(), b"v2");
+        assert!(materialization_ready(&at.member).unwrap());
+        if bodyless {
+            primary.answer_with(Some(
+                b"HTTP/1.1 204 No Content\r\nETag: \"3\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+            ));
+        }
+        std::fs::remove_file(&file).unwrap();
+        assert!(!materialization_ready(&at.member).unwrap());
+        subscriber_pass(&at.member, &mut repaired, &FOUND_NONE).unwrap();
+        assert!(
+            materialization_ready(&at.member).unwrap(),
+            "bodyless={bodyless}"
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), b"v2");
+        assert_eq!(load_state(&at.member).unwrap().digest, before.digest);
+        if bodyless {
+            assert_eq!(
+                network_observation::project(&at.member, &config, &load_state(&at.member).unwrap()),
+                observation
+            );
+            // A repeatedly removed file is still the same repair set at this
+            // version; the subscriber must not keep fighting the local writer.
+            std::fs::remove_file(&file).unwrap();
+            subscriber_pass(&at.member, &mut repaired, &FOUND_NONE).unwrap();
+            assert!(!file.exists());
+            // Explicit readers still request a repair, including the bounded
+            // Commons recovery path. Neither grants a new network receipt.
+            super::super::bounded::sync_reader_with_candidates_until(
+                &at.member,
+                Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+                &[],
+            )
+            .unwrap();
+            assert_eq!(std::fs::read(&file).unwrap(), b"v2");
+            std::fs::remove_file(&file).unwrap();
+            super::super::sync(&at.member, None).unwrap();
+            assert_eq!(std::fs::read(&file).unwrap(), b"v2");
+            for etag in ["", "ETag: \"2\"\r\n"] {
+                primary.answer_with(Some(format!(
+                    "HTTP/1.1 204 No Content\r\n{etag}Content-Length: 0\r\nConnection: close\r\n\r\n"
+                ).into_bytes()));
+                std::fs::remove_file(&file).unwrap();
+                super::super::bounded::sync_reader_with_candidates_until(
+                    &at.member,
+                    Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+                    &[],
+                )
+                .unwrap();
+                assert_eq!(std::fs::read(&file).unwrap(), b"v2");
+            }
+            assert_eq!(
+                network_observation::project(&at.member, &config, &load_state(&at.member).unwrap()),
+                observation
+            );
+        }
+        drop(primary);
+        for server in at.servers {
+            server.stop();
+        }
+    }
+}
+
+#[test]
+fn bounded_log_only_readers_recover_before_contacting_an_endpoint() {
+    let _answering = ServersAnswering::set();
+    for change in ["update", "remove", "repair"] {
+        let lab = log_entries_tests::two_macs(&[(Audience::Everyone, "shared", b"old")]);
+        let (reader, request, allowed) =
+            log_entries_tests::newcomer(lab.root.path(), &lab.m22, "m8");
+        let (bundle, logged) = log_entries_tests::hand(&lab.m22, &request, &allowed, true);
+        assert!(logged);
+        admit::write_from_log_bundle(&reader, &bundle).unwrap();
+        let before = load_state(&reader).unwrap();
+        assert_eq!(before.seq, 0);
+        assert!(before.digest.is_none() && before.records_digest.is_some());
+        assert_eq!(fsx::kind(&reader.cache_file()).unwrap(), fsx::Kind::Missing);
+        assert!(materialization_ready(&reader).unwrap());
+        match change {
+            "update" => {
+                let admin = admin_open(&lab.m22).unwrap();
+                let mut doc = admin.doc.clone();
+                doc.set_entry(&Audience::Everyone, "shared", b"new")
+                    .unwrap();
+                admin_publish(&lab.m22, &admin, &doc).unwrap();
+                save_records(&reader, &load_records(&lab.m22).unwrap().encode()).unwrap();
+            }
+            "remove" => {
+                remove_member_in_log(&lab.m22, request.binding().actor()).unwrap();
+                save_records(&reader, &load_records(&lab.m22).unwrap().encode()).unwrap();
+            }
+            "repair" => std::fs::remove_file(reader.home.join(".secrets/shared")).unwrap(),
+            _ => unreachable!(),
+        }
+        lab.server.stop();
+        let primary = StandIn::at(
+            &lab.url,
+            Duration::ZERO,
+            Some(
+                b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_vec(),
+            ),
+        );
+        let outcome = super::super::bounded::sync_reader_with_candidates_until(
+            &reader,
+            Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+            &[],
+        );
+        assert_eq!(
+            primary.asked(),
+            0,
+            "already-held log-only {change} must precede network requests"
+        );
+        let outcome = outcome.unwrap();
+        let after = load_state(&reader).unwrap();
+        assert_eq!((after.seq, after.digest), (0, None));
+        assert!(after.network_materialization.is_none());
+        if change == "remove" {
+            assert!(matches!(outcome, SyncOutcome::NotIn));
+            assert_eq!(after.membership, Stored::Revoked);
+            assert!(!materialization_ready(&reader).unwrap());
+        } else {
+            assert!(matches!(outcome, SyncOutcome::Applied { .. }));
+            assert_eq!(
+                std::fs::read(reader.home.join(".secrets/shared")).unwrap(),
+                if change == "update" { b"new" } else { b"old" }
+            );
+            assert!(materialization_ready(&reader).unwrap());
+        }
+    }
+}
+
+#[test]
+fn bounded_readers_replay_local_records_before_contacting_an_endpoint() {
+    let _answering = ServersAnswering::set();
+    let receipt = |state: &State| {
+        state.network_materialization.as_ref().map(|receipt| {
+            let mut text = String::new();
+            receipt.write(&mut text);
+            text
+        })
+    };
+    for removed in [false, true] {
+        let lab = log_entries_tests::two_macs(&[(Audience::Everyone, "shared", b"old")]);
+        let config = configured(&lab.m7).unwrap();
+        let before = load_state(&lab.m7).unwrap();
+        let recipient = read_identity(&lab.m7).unwrap().unwrap().recipient().0;
+        let refresh = network_refresh::project(&config, Some(recipient), &before);
+        let observed = receipt(&before);
+        assert!(observed.is_some(), "the initial network receipt exists");
+        let admin = admin_open(&lab.m22).unwrap();
+        if removed {
+            admin_revoke(&lab.m22, &admin, "m7", true).unwrap();
+        } else {
+            let mut doc = admin.doc.clone();
+            doc.set_entry(&Audience::Everyone, "shared", b"new")
+                .unwrap();
+            admin_publish(&lab.m22, &admin, &doc).unwrap();
+        }
+        save_records(&lab.m7, &load_records(&lab.m22).unwrap().encode()).unwrap();
+        assert!(files_intact(&lab.m7, &before), "old files remain intact");
+        assert_ne!(
+            log_entries::current_records_digest(&lab.m7, &config, &before),
+            before.records_digest,
+            "a real signed log change is already present"
+        );
+        lab.server.stop();
+        let primary = StandIn::at(
+            &lab.url,
+            Duration::ZERO,
+            Some(
+                b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_vec(),
+            ),
+        );
+        let outcome = super::super::bounded::sync_reader_with_candidates_until(
+            &lab.m7,
+            Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            primary.asked(),
+            0,
+            "local records must precede network waits"
+        );
+        let after = load_state(&lab.m7).unwrap();
+        assert_eq!((after.seq, after.digest), (before.seq, before.digest));
+        assert_ne!(after.records_digest, before.records_digest);
+        assert_eq!(
+            network_refresh::project(&config, Some(recipient), &after),
+            refresh
+        );
+        assert_eq!(receipt(&after), observed, "retain historical evidence");
+        assert!(network_observation::project(&lab.m7, &config, &after).is_none());
+        if removed {
+            assert!(matches!(outcome, SyncOutcome::NotIn));
+            assert_eq!(after.membership, Stored::Revoked);
+            assert!(!materialization_ready(&lab.m7).unwrap());
+        } else {
+            assert!(matches!(outcome, SyncOutcome::Applied { .. }));
+            assert_eq!(
+                std::fs::read(lab.m7.home.join(".secrets/shared")).unwrap(),
+                b"new"
+            );
+            assert!(materialization_ready(&lab.m7).unwrap());
+        }
+    }
+}
+
+#[test]
+fn pending_readers_apply_local_admission_or_continue_to_the_network() {
+    let _answering = ServersAnswering::set();
+    for local_admission in [false, true] {
+        let lab = log_entries_tests::two_macs(&[(Audience::Everyone, "shared", b"newly admitted")]);
+        let mut server = Some(lab.server);
+        let (reader, request, _) = log_entries_tests::newcomer(lab.root.path(), &lab.m22, "m8");
+        let mut config = configured(&lab.m7).unwrap();
+        config.host = "m8".to_owned();
+        save_config(&reader, &config).unwrap();
+        save_records(&reader, &load_records(&lab.m22).unwrap().encode()).unwrap();
+        sync_with(&reader, std::fs::read(lab.m22.cache_file()).unwrap()).unwrap();
+        assert_eq!(load_state(&reader).unwrap().membership, Stored::Pending);
+        let admin = admin_open(&lab.m22).unwrap();
+        let mut doc = admin.doc.clone();
+        doc.set_entry(&Audience::Everyone, "shared", b"newly admitted")
+            .unwrap();
+        doc.set_entry(&Audience::Everyone, "unrelated", b"gossip")
+            .unwrap();
+        admin_publish(&lab.m22, &admin, &doc).unwrap();
+        save_records(&reader, &load_records(&lab.m22).unwrap().encode()).unwrap();
+        log_entries::admit_member_in_log(
+            &lab.m22,
+            crate::membership_log::Entrant {
+                request,
+                node_key: [91; 32],
+                name: "m8".to_owned(),
+                label: "m8".to_owned(),
+            },
+            crate::membership_log::Evidence::Phrase,
+        )
+        .unwrap();
+        let primary = if local_admission {
+            save_records(&reader, &load_records(&lab.m22).unwrap().encode()).unwrap();
+            server.take().unwrap().stop();
+            Some(StandIn::at(
+                &lab.url,
+                Duration::ZERO,
+                Some(
+                    b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_vec(),
+                ),
+            ))
+        } else {
+            log_entries::mirror_log_to_servers(&lab.m22, std::slice::from_ref(&lab.url)).unwrap();
+            None
+        };
+        let outcome = super::super::bounded::sync_reader_with_candidates_until(
+            &reader,
+            Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+            &[],
+        )
+        .unwrap();
+        assert!(matches!(outcome, SyncOutcome::Applied { .. }));
+        assert_eq!(load_state(&reader).unwrap().membership, Stored::In);
+        assert_eq!(
+            std::fs::read(reader.home.join(".secrets/shared")).unwrap(),
+            b"newly admitted"
+        );
+        if let Some(primary) = primary {
+            assert_eq!(primary.asked(), 0, "local admission precedes networking");
+        }
+        if let Some(server) = server {
+            server.stop();
+        }
+    }
+}
+
+#[test]
+fn an_intact_cache_repairs_missing_files_when_every_endpoint_fails() {
+    let _answering = ServersAnswering::set();
+    for reply in [
+        None,
+        Some(
+            b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+        ),
+    ] {
+        let at = dead_source();
+        let fresh = served(&at.fresh.url);
+        let primary = StandIn::at(&at.url_primary, Duration::ZERO, Some(ok_with(&fresh)));
+        let mut repaired = None;
+        subscriber_pass(&at.member, &mut repaired, &FOUND_NONE).unwrap();
+        let before = load_state(&at.member).unwrap();
+        let config = configured(&at.member).unwrap();
+        let observation = network_observation::project(&at.member, &config, &before);
+        assert!(observation.is_some());
+        for server in at.servers {
+            server.stop();
+        }
+        primary.answer_with(reply);
+        let file = at.member.home.join(".secrets/shared-key");
+        std::fs::remove_file(&file).unwrap();
+        assert!(!materialization_ready(&at.member).unwrap());
+        let said = std::cell::Cell::new(SourceSaid::AtOnce);
+        let (_, outcome) = subscriber_pass_saying(&at.member, &mut repaired, &FOUND_NONE, &said)
+            .expect("offline cache repairs the missing file");
+        assert!(matches!(outcome, SyncOutcome::Applied { seq: 3, .. }));
+        assert_eq!(std::fs::read(&file).unwrap(), b"v2");
+        assert!(materialization_ready(&at.member).unwrap());
+        assert!(failed_over_idle(Pass {
+            source: said.get(),
+            moved: false,
+        }));
+        let after = load_state(&at.member).unwrap();
+        assert_eq!((after.seq, after.digest), (before.seq, before.digest));
+        assert_eq!(after.records_digest, before.records_digest);
+        assert_eq!(
+            network_observation::project(&at.member, &config, &after),
+            observation
+        );
+        assert_eq!(
+            network_refresh::project(
+                &config,
+                read_identity(&at.member)
+                    .unwrap()
+                    .as_ref()
+                    .map(|key| key.recipient().0),
+                &after
+            )
+            .unwrap()
+            .outcome(),
+            network_refresh::VaultNetworkRefreshOutcome::Failed
+        );
+
+        // Offline repair has the same debounce as an online repair. A repeated
+        // local edit is left alone; an explicit reader can still restore it.
+        std::fs::remove_file(&file).unwrap();
+        assert!(subscriber_pass(&at.member, &mut repaired, &FOUND_NONE).is_err());
+        assert!(!file.exists());
+        let asked = primary.asked();
+        let before_local = network_refresh::project(
+            &config,
+            read_identity(&at.member)
+                .unwrap()
+                .as_ref()
+                .map(|key| key.recipient().0),
+            &load_state(&at.member).unwrap(),
+        );
+        super::super::bounded::sync_reader_with_candidates_until(
+            &at.member,
+            Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"v2");
+        assert_eq!(
+            primary.asked(),
+            asked,
+            "local repair precedes all network work"
+        );
+        assert_eq!(
+            network_refresh::project(
+                &config,
+                read_identity(&at.member)
+                    .unwrap()
+                    .as_ref()
+                    .map(|key| key.recipient().0),
+                &load_state(&at.member).unwrap(),
+            ),
+            before_local,
+            "a local-only repair makes no network attempt"
+        );
+        std::fs::remove_file(&file).unwrap();
+        super::super::sync(&at.member, None).unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"v2");
+        assert_eq!(
+            network_observation::project(&at.member, &config, &load_state(&at.member).unwrap()),
+            observation
+        );
+    }
+}
+
 /// A source that answers with a body claiming a newer seq that does not verify (a host that
 /// took the source's name or address while its server is away) does not stop the failover: the
 /// pass still reads the servers its browse found and applies the highest verified seq.
@@ -1511,8 +1968,8 @@ fn a_merge_keeps_a_policy_only_another_branch_set_and_its_own_over_another() {
 
 #[test]
 fn sync_auto_reconciles_diverged_policy_servers_for_admin_and_keeps_member_steady() {
-    // Every server it reads is its own on loopback, which answers.
-    let _answering = ServersAnswering::set();
+    // Every server it reads is its own on loopback, which answers, but the silent primary below.
+    let answering = ServersAnswering::set();
     let root = aterm_tempfile::tempdir().expect("tempdir");
     let s1 = start_loopback_server(&root.path().join("s1"));
     let s2 = start_loopback_server(&root.path().join("s2"));
@@ -1672,12 +2129,15 @@ fn sync_auto_reconciles_diverged_policy_servers_for_admin_and_keeps_member_stead
     };
     super::super::sync_with(&bounded, held_bytes.clone()).unwrap();
     let held_digest = load_state(&bounded).unwrap().digest;
+    // The silent primary's reads keep their own bounds: lifted, they would wait out the deadline.
+    drop(answering);
     super::super::bounded::sync_reader_with_candidates_until(
         &bounded,
         Instant::now() + aterm_spec::wait::MUST_HAPPEN,
         &[url1.clone(), url2.clone()],
     )
     .expect("exact held peer remains readable through an equal-sequence split");
+    let _answering = ServersAnswering::set();
     assert_eq!(load_state(&bounded).unwrap().digest, held_digest);
 
     // Both readers can recover the exact held head when the primary has lost
@@ -3780,11 +4240,32 @@ fn a_mac_a_release_behind_a_rotation_roots_the_genesis_the_new_key_signed() {
 
 #[test]
 fn an_unequal_seq_parentless_partition_heals_preserving_lower_seq_entry_and_member() {
+    unequal_partition_recovers(PartitionReader::Reachable);
+}
+
+#[test]
+fn a_transient_primary_failure_cannot_overwrite_an_unmerged_branch() {
+    unequal_partition_recovers(PartitionReader::FailingOrdinary);
+}
+
+#[test]
+fn a_bounded_primary_failure_cannot_discard_an_unmerged_branch() {
+    unequal_partition_recovers(PartitionReader::FailingBounded);
+}
+
+#[derive(Clone, Copy)]
+enum PartitionReader {
+    Reachable,
+    FailingOrdinary,
+    FailingBounded,
+}
+
+fn unequal_partition_recovers(reader: PartitionReader) {
     // Every server it reads is its own on loopback, which answers.
     let _answering = ServersAnswering::set();
     let root = aterm_tempfile::tempdir().expect("tempdir");
     let s1 = start_loopback_server(&root.path().join("s1"));
-    let s2 = start_loopback_server(&root.path().join("s2"));
+    let mut s2 = start_loopback_server(&root.path().join("s2"));
     let url1 = format!("http://{}/v1/team", s1.addr);
     let url2 = format!("http://{}/v1/team", s2.addr);
 
@@ -3858,19 +4339,74 @@ fn an_unequal_seq_parentless_partition_heals_preserving_lower_seq_entry_and_memb
     assert_eq!(load_state(&b2).unwrap().membership, Stored::In);
     assert_eq!(load_state(&b3).unwrap().membership, Stored::In);
 
+    let candidates = vec![url1.clone(), url2.clone()];
+    let read = |paths: &Paths| match reader {
+        PartitionReader::FailingBounded => {
+            super::super::bounded::sync_reader_with_candidates_until(
+                paths,
+                Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+                &candidates,
+            )
+        }
+        _ => sync_with_candidates(paths, None, &candidates),
+    };
+    if !matches!(reader, PartitionReader::Reachable) {
+        let address = s2.addr;
+        s2.stop();
+        let down = StandIn::at(
+            &url2,
+            Duration::ZERO,
+            Some(
+                b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_vec(),
+            ),
+        );
+        // The reader may report the outage, but it must not adopt the other
+        // island. Let the primary return before judging state and repair.
+        let _ = read(&b2);
+        let _ = read(&b3);
+        drop(down);
+        s2 = crate::server::start(
+            std::net::TcpListener::bind(address).unwrap(),
+            &ServerOptions {
+                listen: address,
+                store: root.path().join("s2"),
+                advertise: None,
+                pins: Vec::new(),
+                hold: Duration::from_millis(100),
+                keep_awake: false,
+            },
+        )
+        .unwrap();
+        let _ = read(&b2);
+        let _ = read(&b3);
+        let Fetched::Body(bytes) = transport::fetch(
+            &Source::Url(url2.clone()),
+            None,
+            aterm_spec::wait::MUST_HAPPEN,
+        )
+        .unwrap() else {
+            panic!("the returning primary serves its retained branch")
+        };
+        assert_eq!(
+            envelope::parse(&bytes).unwrap().seq,
+            4,
+            "a reader overwrote the returning primary before an admin merged the branches"
+        );
+    }
+
     // The cut heals, and non-admin subscribers `b2` and `b3` pass BEFORE any admin syncs:
     // - `b3` must not adopt `s1`'s unmerged seq 5 (which omits `b3`) and mark itself `Revoked`.
     // - `b2` must not adopt `s1`'s unmerged seq 5 (which omits `f8-b-1`) or `PutBack` seq 5 onto `s2`.
-    let candidates = vec![url1.clone(), url2.clone()];
     for _ in 0..2 {
-        let out_b3 = sync_with_candidates(&b3, None, &candidates).unwrap();
+        let out_b3 = read(&b3).unwrap();
         assert!(
             matches!(out_b3, SyncOutcome::Unchanged { seq: 4 }),
             "b3 must stay on seq 4 until admin merges both islands, got {out_b3:?}"
         );
         assert_eq!(load_state(&b3).unwrap().membership, Stored::In);
 
-        let out_b2 = sync_with_candidates(&b2, None, &candidates).unwrap();
+        let out_b2 = read(&b2).unwrap();
         assert!(
             matches!(out_b2, SyncOutcome::Unchanged { seq: 4 }),
             "b2 must not adopt unmerged peer fork or overwrite s2, got {out_b2:?}"
@@ -4020,6 +4556,8 @@ fn a_member_re_posts_held_records_when_a_server_lacks_its_frontier() {
 
 #[test]
 fn merge_diverged_heads_cascades_cross_branch_revoke_to_deny_lists_pool_and_lease() {
+    // Every server it reads is its own on loopback, which answers.
+    let _answering = ServersAnswering::set();
     let root = aterm_tempfile::tempdir().expect("tempdir");
     let s1 = start_loopback_server(&root.path().join("s1"));
     let s2 = start_loopback_server(&root.path().join("s2"));

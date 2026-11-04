@@ -56,7 +56,10 @@ pub(super) fn rounds(lab: &Lab) {
         })
         .collect();
     let (mut a, mut b) = (Repair::default(), Repair::default());
-    for _ in 0..3 {
+    // One exchange transfers one common table and these labs hold two, so two exchanges are a
+    // lap when no record defers; a deferral or a third table fails the caller's own check of what
+    // crossed, loudly.
+    for _ in 0..2 {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         thread::scope(|threads| {
@@ -363,8 +366,19 @@ fn recovered_catalog_keeps_an_intact_resource_table_after_creator_retirement() {
     let allocation = allocation(&lab, &[3, 3]);
     let a = resources(&lab, 0, &allocation);
     let b = resources(&lab, 1, &allocation);
-    a.initialize().unwrap();
+    let scope = a.initialize().unwrap();
     rounds(&lab);
+    let bootstrap = lab.bootstrap(1);
+    let session = Session::open(&bootstrap).unwrap();
+    let discovered = Directory::new(&lab.paths[1], bootstrap.trust())
+        .snapshot(&session)
+        .unwrap();
+    assert_eq!(
+        discovered.entries[&scope.digest()].state,
+        crate::catalog::State::Subscribed,
+        "the creator's table reached this Mac before it joins"
+    );
+    drop(session);
     b.initialize().unwrap();
     b.reserve([1; 16], 1).unwrap();
     let bootstrap = lab.bootstrap(1);

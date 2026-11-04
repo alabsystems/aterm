@@ -856,7 +856,7 @@ pub(crate) fn read_regular_utf8(
     if meta.len() > limit as u64 {
         return Err(Error::new(oversize));
     }
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
     file.take(limit as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| err())?;

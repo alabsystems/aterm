@@ -370,14 +370,37 @@ mod tests {
         roundtrip(&repeated);
     }
 
+    /// The streaming reader PNG decode reads with hands back what `z` holds, read a row's worth
+    /// at a time and all at once.
+    fn streams_back(z: &[u8], data: &[u8]) {
+        use std::io::Read as _;
+        for chunk in [4096, 1 << 20] {
+            let mut reader = aterm_codec::inflate::stream::ZlibReader::new(z);
+            let mut buf = vec![0u8; chunk];
+            let mut back = Vec::with_capacity(data.len());
+            loop {
+                let n = reader
+                    .read(&mut buf)
+                    .unwrap_or_else(|e| panic!("the stream refused at {} bytes: {e}", back.len()));
+                if n == 0 {
+                    break;
+                }
+                back.extend_from_slice(&buf[..n]);
+            }
+            assert!(back == data, "the stream differed, read {chunk} at a time");
+        }
+    }
+
     /// A maximal match (258 bytes) and a maximal distance (32768) must both be
-    /// expressible — the two ends of the code tables.
+    /// expressible — the two ends of the code tables — through the one-shot inflate and through
+    /// the streaming reader, which keeps only the window behind its write head.
     #[test]
     fn roundtrips_extreme_match_geometry() {
         let mut max_len = vec![7u8; 258];
         max_len.extend(std::iter::repeat_n(0u8, WINDOW - 258));
         max_len.extend(std::iter::repeat_n(7u8, 258));
         roundtrip(&max_len);
+        streams_back(&zlib_compress(&max_len), &max_len);
 
         // Place `[9, 8, 7]` only at index 0 and index `WINDOW` (32768) so the greedy
         // matcher has no nearer `[9, 8, 7]` candidate and emits distance 32768 (code 29,
@@ -386,6 +409,27 @@ mod tests {
         max_dist.extend(std::iter::repeat_n(0u8, WINDOW - 3));
         max_dist.extend_from_slice(&[9, 8, 7]);
         roundtrip(&max_dist);
+        streams_back(&zlib_compress(&max_dist), &max_dist);
+
+        // Noise repeating at exactly the window, past where the reader first compacts: nothing
+        // nearer repeats, so every match after the first period is at distance 32768, and the
+        // first symbol after each compaction reaches back to the oldest byte the reader kept.
+        let mut state = 0x1234_5678u32;
+        let period: Vec<u8> = (0..WINDOW)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 24) as u8
+            })
+            .collect();
+        let repeated = period.repeat(8);
+        let z = zlib_compress(&repeated);
+        assert!(
+            z.len() < 2 * WINDOW,
+            "CONTROL: {} bytes: the repeats are matches at the window's own distance",
+            z.len()
+        );
+        roundtrip(&repeated);
+        streams_back(&z, &repeated);
     }
 
     /// Pseudo-random bytes are incompressible; the stream must still be valid

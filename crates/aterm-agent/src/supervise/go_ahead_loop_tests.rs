@@ -497,7 +497,11 @@ fn the_loops_stamps_of_the_person_count_the_macs_sleep() {
     s.set_fx(Fx::over(ClockSource::Scripted(Arc::clone(&clock))));
     s.set_clock(TEST_NOW, PDT);
     assert!(s.foreground_program().is_ok(), "the read before the sleep");
-    s.draft_seen = Some(("wait, one more thing".to_string(), s.fx.mono()));
+    s.draft_seen = Some((
+        "wait, one more thing".to_string(),
+        s.fx.mono(),
+        turn_end_loop::DraftCell::Typed,
+    ));
     clock.slept(i64::try_from(slept.as_secs()).unwrap_or(i64::MAX));
     s.watch_sleep();
     let now = s.fx.mono();

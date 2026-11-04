@@ -56,7 +56,7 @@ pub(crate) fn read_regular_bytes(path: &Path, max_bytes: u64) -> std::io::Result
             format!("file exceeds {max_bytes} bytes"),
         ));
     }
-    let mut buf = Vec::new();
+    let mut buf = Vec::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
     file.take(max_bytes.saturating_add(1))
         .read_to_end(&mut buf)?;
     if u64::try_from(buf.len()).unwrap_or(u64::MAX) > max_bytes {
@@ -82,7 +82,7 @@ fn read_key_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
             format!("key file exceeds {MAX_KEY_BYTES} bytes"),
         ));
     }
-    let mut buf = Vec::new();
+    let mut buf = Vec::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
     if let Err(e) = file.take(MAX_KEY_BYTES + 1).read_to_end(&mut buf) {
         scrub_bytes(&mut buf);
         return Err(e);

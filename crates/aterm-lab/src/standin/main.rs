@@ -129,10 +129,11 @@ fn read_regular_text(path: &Path) -> Option<String> {
         .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)
         .ok()?;
-    if !file.metadata().ok()?.is_file() {
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.len() > 16 * 1024 * 1024 {
         return None;
     }
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0).saturating_add(1));
     file.take(16 * 1024 * 1024 + 1)
         .read_to_end(&mut bytes)
         .ok()?;

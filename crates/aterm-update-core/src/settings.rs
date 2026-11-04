@@ -85,7 +85,8 @@ fn read_config_file(path: &Path) -> Option<String> {
     if !meta.is_file() || meta.len() > MAX_CONFIG_BYTES {
         return None;
     }
-    let mut text = String::new();
+    let mut text =
+        String::with_capacity(usize::try_from(meta.len()).unwrap_or(0).saturating_add(1));
     file.take(MAX_CONFIG_BYTES.saturating_add(1))
         .read_to_string(&mut text)
         .ok()?;
@@ -175,14 +176,14 @@ mod tests {
 
     #[test]
     fn a_missing_or_foreign_file_is_on() {
-        let dir = std::env::temp_dir().join(format!("aterm-upd-settings-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        assert!(update_enabled_at(&dir.join("absent.toml")));
-        assert!(update_enabled_at(&dir), "a directory is not a config file");
-        let off = dir.join("aterm.toml");
+        let dir = crate::test_scratch_dir("upd-settings");
+        assert!(update_enabled_at(&dir.path().join("absent.toml")));
+        assert!(
+            update_enabled_at(dir.path()),
+            "a directory is not a config file"
+        );
+        let off = dir.path().join("aterm.toml");
         std::fs::write(&off, "[update]\nenabled = false\n").unwrap();
         assert!(!update_enabled_at(&off));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

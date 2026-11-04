@@ -457,7 +457,11 @@ fn read_private(path: &Path, max: u64) -> Result<Vec<u8>, String> {
             return Err("writable by others".to_string());
         }
     }
-    let mut bytes = Vec::new();
+    if meta.len() > max {
+        return Err(format!("larger than {} KiB", max / 1024));
+    }
+    let cap = usize::try_from(meta.len().min(max).saturating_add(1)).unwrap_or(0);
+    let mut bytes = Vec::with_capacity(cap);
     file.take(max + 1)
         .read_to_end(&mut bytes)
         .map_err(|e| one(&e.to_string()))?;

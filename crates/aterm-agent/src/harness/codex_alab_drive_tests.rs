@@ -41,6 +41,7 @@ fn primary_copy(rig: &Rig, thread: &str) -> crate::harness::self_claimed::Copy {
         frame: Some("idle".to_string()),
         initializing: false,
         goal: None,
+        background_terminals: None,
     };
     let live = ClaimedLive {
         exec_path: rig.twin.to_string_lossy().into_owned(),
@@ -899,6 +900,7 @@ fn a_self_claimed_crash_relaunch_keeps_the_captured_home_environment() {
             draft_empty: None,
             frame: None,
             goal: None,
+            background_terminals: None,
             initializing: false,
         };
         let live = ClaimedLive {

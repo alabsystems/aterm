@@ -75,13 +75,13 @@ struct Inner {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct Identity {
-    dev: u64,
-    ino: u64,
+pub(super) struct Identity {
+    pub(super) dev: u64,
+    pub(super) ino: u64,
 }
 
 impl Identity {
-    fn of(file: &File) -> io::Result<Self> {
+    pub(super) fn of(file: &File) -> io::Result<Self> {
         let meta = file.metadata()?;
         Ok(Self { dev: meta.dev(), ino: meta.ino() })
     }
@@ -311,7 +311,7 @@ impl Pool {
 /// explicitly at drop. A host that forks to spawn (a `pre_exec` hook does) copies every
 /// descriptor into the child until its exec, and a lock released only by its final close stays
 /// held that long: readers saw a pending initialization, and claimants a busy slot.
-struct Probe(File);
+pub(super) struct Probe(pub(super) File);
 
 impl Drop for Probe {
     fn drop(&mut self) {
@@ -365,7 +365,7 @@ impl AsRawFd for Lease {
     }
 }
 
-fn slot_name(slot: u32) -> String {
+pub(super) fn slot_name(slot: u32) -> String {
     format!("slot-{slot:08x}")
 }
 
@@ -373,7 +373,7 @@ fn bounded_text(file: &mut File) -> io::Result<String> {
     read_text(file, MAX_RECORD_BYTES)
 }
 
-fn read_text(file: &mut File, max: usize) -> io::Result<String> {
+pub(super) fn read_text(file: &mut File, max: usize) -> io::Result<String> {
     let mut text = String::new();
     file.take((max + 1) as u64).read_to_string(&mut text)?;
     if text.len() > max {
@@ -382,7 +382,7 @@ fn read_text(file: &mut File, max: usize) -> io::Result<String> {
     Ok(text)
 }
 
-fn open_parent(path: &Path) -> io::Result<File> {
+pub(super) fn open_parent(path: &Path) -> io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
     let file = std::fs::OpenOptions::new()
         .read(true)
@@ -490,7 +490,7 @@ fn parse_config(text: &str) -> io::Result<Vec<Identity>> {
     Ok(identities)
 }
 
-fn open_at(directory: &File, name: &str, flags: i32, create: bool) -> io::Result<File> {
+pub(super) fn open_at(directory: &File, name: &str, flags: i32, create: bool) -> io::Result<File> {
     let name = CString::new(name).map_err(|_| invalid("CPU pool leaf contains NUL"))?;
     let flags = flags
         | libc::O_NOFOLLOW
@@ -507,7 +507,7 @@ fn open_at(directory: &File, name: &str, flags: i32, create: bool) -> io::Result
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
-fn check_private(file: &File, directory: bool) -> io::Result<()> {
+pub(super) fn check_private(file: &File, directory: bool) -> io::Result<()> {
     let meta = file.metadata()?;
     // SAFETY: geteuid only reads the effective uid of this process.
     let uid = unsafe { libc::geteuid() };

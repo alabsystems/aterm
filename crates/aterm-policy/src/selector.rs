@@ -78,6 +78,32 @@ pub struct SequenceSelector {
 }
 
 impl SequenceSelector {
+    /// The heap bytes this selector holds past its own size: its suffix and its parameter matchers.
+    #[must_use]
+    pub(crate) fn heap_bytes(&self) -> usize {
+        const _: () = assert!(
+            !std::mem::needs_drop::<(FunctionKind, Option<u32>)>(),
+            "a field counted as holding nothing has drop glue: count it"
+        );
+        let Self {
+            function: _,
+            major: _,
+            suffix,
+            params,
+        } = self;
+        params.iter().fold(
+            suffix.as_ref().map_or(0, String::capacity).saturating_add(
+                params
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<SelectorParam>()),
+            ),
+            |sum, param| match param {
+                SelectorParam::Literal(lit) => sum.saturating_add(lit.capacity()),
+                SelectorParam::Wildcard | SelectorParam::Query | SelectorParam::NotQuery => sum,
+            },
+        )
+    }
+
     /// The universal matcher (matches every dispatched sequence).
     #[must_use]
     #[inline]

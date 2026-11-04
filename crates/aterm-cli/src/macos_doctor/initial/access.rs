@@ -249,7 +249,7 @@ fn kept_answer(root: &Path) -> Option<(LanAnswer, u64)> {
 
 fn kept_answer_for_subject(root: &Path, subject: Option<[u8; 32]>) -> Option<(LanAnswer, u64)> {
     let subject = subject?;
-    let bytes = std::fs::read(root.join(kept_names(subject).0)).ok()?;
+    let bytes = crate::macos_doctor::read_record_bytes(&root.join(kept_names(subject).0)).ok()?;
     let value: Value = aterm_json::from_slice(&bytes).ok()?;
     if value["profile"].as_str() != Some(super::PROFILE)
         || value["subject"].as_str() != Some(aterm_codec::hex::encode_lower(&subject).as_str())
@@ -449,15 +449,14 @@ pub(super) struct Grants {
 /// (Permissions turned off and on again) asks again (§6).
 pub(super) const NOT_NOW: &str = "You chose Not now. Setting Permissions up again asks again.";
 
-/// The Debugger row's description once its step is declined (Cancel in macOS's dialog, an answer
-/// on aterm's Settings ▸ Security, or an earlier approval's step): the step asks once per Mac
-/// (the window's `privacy-debugger-asked` record), so [`NOT_NOW`]'s promise would be false.
-pub(super) const DEBUGGER_ANSWERED: &str = "aterm asks for debugger access once per Mac, and this Mac has answered: \
-     setting Permissions up again does not ask again.";
+/// The Debugger row's note while developer mode reads off on an account that may turn it on.
+pub(super) use aterm_types::macos_setup::DEBUGGER_BY_ELEVATION;
 
 /// Why the person opted each grant out, in [`Access::ALL`] order, as its row says it: what the
 /// window published ([`opt_out::get`]; an [`OptOut::WhileOff`] only where `reads_off`), else a
-/// Not now in this approval's `records` (the debugger's in [`DEBUGGER_ANSWERED`]'s words).
+/// Not now in this approval's `records`. Nothing asks for debugger access on its own (setup's
+/// one early elevation turns it on, [`DEBUGGER_BY_ELEVATION`]), so a declined Debugger record an
+/// earlier aterm's step wrote is no opt-out.
 pub(super) fn opted_out(
     published: [Option<OptOut>; 5],
     records: &[(Access, AccessOutcome)],
@@ -465,19 +464,15 @@ pub(super) fn opted_out(
 ) -> [Option<&'static str>; 5] {
     let mut opted = [None; 5];
     for (slot, access) in Access::ALL.into_iter().enumerate() {
-        let declined = records
-            .iter()
-            .rev()
-            .find_map(|(row, outcome)| (*row == access).then_some(*outcome))
-            == Some(AccessOutcome::Declined);
-        let not_now = if access == Access::Debugger {
-            DEBUGGER_ANSWERED
-        } else {
-            NOT_NOW
-        };
+        let declined = access != Access::Debugger
+            && records
+                .iter()
+                .rev()
+                .find_map(|(row, outcome)| (*row == access).then_some(*outcome))
+                == Some(AccessOutcome::Declined);
         opted[slot] = published[slot]
             .and_then(|why| why.holds(reads_off[slot]))
-            .or(declined.then_some(not_now));
+            .or(declined.then_some(NOT_NOW));
     }
     opted
 }
@@ -656,14 +651,17 @@ pub(super) fn observation(access: Access, grants: &Grants, selection: Selection)
             },
             Access::Debugger => match grants.debugger {
                 Debugger::On => (Standing::InPlace, Some("On"), None, None),
+                Debugger::Off if managed => (
+                    Standing::Waiting,
+                    Some("Off"),
+                    Some(DEBUGGER_BY_ELEVATION),
+                    Some("Turning it on lets debuggers attach without a password."),
+                ),
                 Debugger::Off => (
                     person,
                     Some("Off"),
                     None,
-                    Some(
-                        "Turning it on lets debuggers attach without a password. macOS asks \
-                         for an administrator password in a dialog named SamplingTools.",
-                    ),
+                    Some("Turning it on lets debuggers attach without a password."),
                 ),
                 Debugger::NotNeeded(why) => (Standing::NotNeeded, None, None, Some(why)),
                 Debugger::NeedsAdmin => (person, Some("Off"), None, admin.as_deref()),
@@ -704,10 +702,11 @@ pub(super) fn observation(access: Access, grants: &Grants, selection: Selection)
     // Nobody asked for macOS's grants: what only a person can give is offered, never waited on.
     // The sign-outs' Accessibility stays their own stage's, which waits for a person by design,
     // and a grant the person opted out of or refused reads as they chose ([`honor_opt_out`]),
-    // never offered again.
+    // never offered again. Developer mode is setup's own elevation's, never a person's press.
     let (standing, note) = if managed
         && !grants.acquiring
         && access != Access::Accessibility
+        && note != Some(DEBUGGER_BY_ELEVATION)
         && opted(grants, access).is_none()
         && matches!(standing, Standing::NeedsYou | Standing::Waiting)
     {
@@ -806,6 +805,10 @@ pub(super) fn stage_rows(grants: &Grants, records: &[(Access, AccessOutcome)]) -
             (Standing::Waiting, _) if access == Access::DeveloperTools => {
                 (true, "waits on Full Disk Access".to_owned())
             }
+            // The elevation's, which nothing here waits on.
+            (Standing::Waiting, _) if seen.note.as_deref() == Some(DEBUGGER_BY_ELEVATION) => {
+                (true, DEBUGGER_BY_ELEVATION.to_owned())
+            }
             // The window takes no step on a grant this Mac does not let aterm read, so waiting
             // on one would park the run for good.
             (Standing::Unknown, None) if access != Access::LocalNetwork => (
@@ -896,22 +899,23 @@ mod tests {
     }
 
     /// With nobody asking, what only a person can give is on offer and the stage completes: the
-    /// run finishes by itself. Negative control: a person's ask parks on the same grants.
+    /// run finishes by itself. Developer mode is never on offer: setup's one early Mac password
+    /// turns it on, so its row says so and waits on nothing. Negative control: a person's ask
+    /// parks on the same person's grants.
     #[test]
     fn a_grant_nobody_asked_for_is_offered_and_completes_the_stage() {
         let offered = Grants {
             acquiring: false,
             ..grants()
         };
-        for access in [
-            Access::FullDiskAccess,
-            Access::DeveloperTools,
-            Access::Debugger,
-        ] {
+        for access in [Access::FullDiskAccess, Access::DeveloperTools] {
             let seen = observation(access, &offered, managed());
             assert_eq!(seen.standing, Standing::NotNeeded, "{access:?}");
             assert_eq!(seen.note.as_deref(), Some(ACCESS_OFFERED), "{access:?}");
         }
+        let debugger = observation(Access::Debugger, &offered, managed());
+        assert_eq!(debugger.standing, Standing::Waiting);
+        assert_eq!(debugger.note.as_deref(), Some(DEBUGGER_BY_ELEVATION));
         assert_eq!(
             observation(Access::Accessibility, &offered, managed()).standing,
             Standing::NeedsYou,
@@ -974,7 +978,14 @@ mod tests {
         let debugger = observation(Access::Debugger, &g, managed());
         assert_eq!(
             (debugger.standing, debugger.now.as_deref()),
-            (Standing::NeedsYou, Some("Off"))
+            (Standing::Waiting, Some("Off"))
+        );
+        assert_eq!(debugger.note.as_deref(), Some(DEBUGGER_BY_ELEVATION));
+        let unmanaged = observation(Access::Debugger, &g, Selection::none());
+        assert_eq!(
+            unmanaged.standing,
+            Standing::Differs,
+            "CONTROL: {unmanaged:?}"
         );
         let lan = observation(Access::LocalNetwork, &g, managed());
         assert_eq!((lan.standing, lan.now), (Standing::Untold, None));
@@ -1086,16 +1097,17 @@ mod tests {
             assert_eq!(seen.standing, Standing::NeedsYou, "{access:?}");
             assert!(seen.detail.unwrap().contains("_developer"));
         }
-        // An admin's account that has not turned them on still waits for the window's steps.
+        // An admin's account that has not turned them on still waits for the window's
+        // Developer Tools step; developer mode is the early elevation's, waited on by nothing.
         let admin = Grants {
             debugger: Debugger::Off,
             ..standard
         };
         let rows = stage_rows(&admin, &lan);
-        for name in ["Developer Tools", "Debugger access"] {
-            let row = rows.iter().find(|row| row.name == name).unwrap();
-            assert_eq!(row.status, WAITING, "{row:?}");
-        }
+        let row = |name: &str| rows.iter().find(|row| row.name == name).unwrap();
+        assert_eq!(row("Developer Tools").status, WAITING);
+        assert_eq!(row("Debugger access").status, "ok");
+        assert_eq!(row("Debugger access").detail, DEBUGGER_BY_ELEVATION);
     }
 
     #[test]
@@ -1110,7 +1122,8 @@ mod tests {
         };
         assert_eq!(status(&rows, "Full Disk Access"), WAITING);
         assert_eq!(status(&rows, "Local Network"), WAITING);
-        assert_eq!(status(&rows, "Debugger access"), WAITING);
+        // Setup's one early Mac password turns developer mode on: nothing here waits on it.
+        assert_eq!(status(&rows, "Debugger access"), "ok");
         // Developer Tools waits on Full Disk Access: complete for this stage.
         assert_eq!(status(&rows, "Developer Tools"), "ok");
         assert_eq!(
@@ -1321,25 +1334,22 @@ mod tests {
         );
     }
 
-    /// The debugger's step asks once per Mac, so its declined row never promises to ask again.
+    /// Nothing asks for debugger access on its own, so a declined Debugger record an earlier
+    /// aterm's step wrote is no opt-out: the row reads as setup's elevation leaves it.
+    /// NEGATIVE CONTROL: a declined Full Disk Access record is the person's Not now.
     #[test]
-    fn a_declined_debugger_step_never_promises_to_ask_again() {
+    fn a_declined_debugger_record_is_no_opt_out() {
         let records = [
             (Access::FullDiskAccess, AccessOutcome::Declined),
             (Access::Debugger, AccessOutcome::Declined),
         ];
         let opted = opted_out([None; 5], &records, [false; 5]);
         assert_eq!(opted[0], Some(NOT_NOW));
-        assert_eq!(opted[2], Some(DEBUGGER_ANSWERED));
-        assert!(!DEBUGGER_ANSWERED.contains("asks again"));
+        assert_eq!(opted[2], None);
         let mut g = grants();
         g.opted_out = opted;
         let row = observation(Access::Debugger, &g, managed());
-        assert_eq!(
-            (row.standing, row.now.as_deref(), row.wanted.as_str()),
-            (Standing::InPlace, Some("Off"), "Off")
-        );
-        assert_eq!(row.detail.as_deref(), Some(DEBUGGER_ANSWERED));
+        assert_ne!(row.standing, Standing::InPlace);
     }
 
     #[test]

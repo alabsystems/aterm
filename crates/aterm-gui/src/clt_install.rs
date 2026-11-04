@@ -4,7 +4,7 @@
 //! The Command Line Tools install, an early step of a Mac's first launch. A launch that finds
 //! Apple's Command Line Tools (git, cc, the macOS SDK) missing, which only a root install with the
 //! person's password adds, asks for them at once, with no setup pass and no page to wait for: the
-//! window opens a terminal tab titled `Command Line Tools` ([`TAB_TITLE`]) in front of its current
+//! window opens a terminal tab titled `Mac Setup` ([`TAB_TITLE`]) in front of its current
 //! tab, whose own program is `aterm init --only base.clt`, in plain words
 //! ([`aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB`]): its one Mac password prompt is the
 //! person's, in the tab, and a run parked on the tools wakes once they are there (System State
@@ -134,7 +134,7 @@ impl Install {
 pub(crate) const ARGS: [&str; 3] = ["init", "--only", "base.clt"];
 
 /// The tab's fixed title, which the page names ([`crate::system_state::TOOLS_PASSWORD_HEADLINE`]).
-pub(crate) const TAB_TITLE: &str = "Command Line Tools";
+pub(crate) const TAB_TITLE: &str = "Mac Setup";
 
 /// How long the page keeps the GitHub repositories row calm after the tools were found installed
 /// (the tab's program said so, or the watch found them), while the row's next reading has not
@@ -254,9 +254,7 @@ impl Mark {
         ) {
             Ok(added) => added,
             Err(error) => {
-                aterm_log::warn!(
-                    "System State: the Command Line Tools tab's mark was not claimed: {error}"
-                );
+                aterm_log::warn!("System State: the Mac Setup tab's mark was not claimed: {error}");
                 false
             }
         }
@@ -277,9 +275,7 @@ impl Mark {
                 &aterm_types::version::build_id(),
             )
         {
-            aterm_log::warn!(
-                "System State: the Command Line Tools tab's mark was not removed: {error}"
-            );
+            aterm_log::warn!("System State: the Mac Setup tab's mark was not removed: {error}");
         }
     }
 }
@@ -600,6 +596,57 @@ pub(crate) fn watch_for_tools() {
     }
 }
 
+/// Whether setup's one early elevation owes this Mac a root step beside the tools, from what
+/// this account reads with no prompt (`aterm_machines::root_steps::owed` reads the same for
+/// `aterm init`): developer mode `off` (`DevToolsSecurity -status`), or `rule`, the stat of the
+/// rule that names the Mac after admission ([`aterm_types::macos_setup::ADMITTED_NAME_RULE`]),
+/// reading no root-owned 0440 file while no refused rule stands
+/// ([`aterm_types::macos_setup::ADMITTED_NAME_RULE_REFUSED`], `refused`). A step that cannot be
+/// read is not owed: no password is asked for want of a reading. Only macOS reads it.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+pub(crate) fn root_steps_owed_by(
+    off: Option<bool>,
+    rule: std::io::Result<(u32, u32, bool)>,
+    refused: bool,
+) -> bool {
+    let rule_owed = match rule {
+        Ok((uid, mode, file)) => !(file && uid == 0 && mode == 0o440),
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound && !refused,
+    };
+    off == Some(true) || rule_owed
+}
+
+/// Read, on a thread of its own, whether setup's one early elevation owes this Mac anything
+/// beside the tools ([`root_steps_owed_by`]), and wake the window with it
+/// ([`App::root_steps_owed`]).
+pub(crate) fn read_root_steps() {
+    let read = std::thread::Builder::new()
+        .name("aterm-root-steps".to_owned())
+        .spawn(|| {
+            #[cfg(target_os = "macos")]
+            {
+                use aterm_containment::consent::{DebuggerMode, ProbeGate, probe_debugger};
+                use std::os::unix::fs::MetadataExt as _;
+                let off = match probe_debugger(ProbeGate::on()).mode {
+                    DebuggerMode::Disabled | DebuggerMode::Unrecognized => Some(true),
+                    DebuggerMode::Enabled => Some(false),
+                    DebuggerMode::Unknown => None,
+                };
+                let rule = std::fs::symlink_metadata(aterm_types::macos_setup::ADMITTED_NAME_RULE)
+                    .map(|meta| (meta.uid(), meta.mode() & 0o7777, meta.file_type().is_file()));
+                let refused =
+                    std::fs::symlink_metadata(aterm_types::macos_setup::ADMITTED_NAME_RULE_REFUSED)
+                        .is_ok();
+                let owed = root_steps_owed_by(off, rule, refused);
+                aterm_log::info!("System State: setup's one Mac password owes this Mac: {owed}");
+                let _ = crate::workstation_setup::send_setup_wake(Wake::RootStepsOwed(owed));
+            }
+        });
+    if let Err(error) = read {
+        aterm_log::warn!("System State: the elevation's steps were not read: {error}");
+    }
+}
+
 /// Tell the window whether the setup pass that just ended waits on Apple's Command Line Tools
 /// (`wanted`), with that pass's exact `revision`: the setup run's hook
 /// (`aterm_cli::macos_doctor::SetupHooks::developer_tools`), called from its worker.
@@ -768,9 +815,7 @@ impl App {
             self.settle_developer_tools_shim();
         }
         if let Err(error) = self.pin_developer_tools_title(session) {
-            aterm_log::info!(
-                "System State: the Command Line Tools tab kept its own title: {error:?}"
-            );
+            aterm_log::info!("System State: the Mac Setup tab kept its own title: {error:?}");
         }
         if go {
             self.type_into_new_session(sid, aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_GO);
@@ -1110,7 +1155,7 @@ impl App {
         };
         self.workstation_setup.developer_tools = Install::Pressed;
         aterm_log::info!(
-            "System State: Install… starts the Command Line Tools tab (`aterm {}`)",
+            "System State: Install… starts the Mac Setup tab (`aterm {}`)",
             ARGS.join(" ")
         );
         let ask = crate::tab_spawn::SpawnAsk {
@@ -1138,7 +1183,7 @@ impl App {
             }
             self.workstation_setup.developer_tools = Install::PressedQueued { wanted: None };
             aterm_log::info!(
-                "System State: the Command Line Tools tab Install… asked for waits for the dialog slot"
+                "System State: the Mac Setup tab Install… asked for waits for the dialog slot"
             );
             self.republish_system_state_developer_tools();
             return false;
@@ -1148,7 +1193,7 @@ impl App {
             self.workstation_setup.developer_tools_after.refused = Some(NotOpened::LeftPage);
         }
         aterm_log::info!(
-            "System State: the Command Line Tools tab Install… asked for did not land{}",
+            "System State: the Mac Setup tab Install… asked for did not land{}",
             if front {
                 ": an installer is up"
             } else {
@@ -1271,10 +1316,10 @@ impl App {
         let current = self.workstation_setup.developer_tools_attempt == Some(session);
         match exit {
             Some(aterm_pty::ChildExit::Code(0)) => {
-                aterm_log::info!("System State: the Command Line Tools tab installed them");
+                aterm_log::info!("System State: the Mac Setup tab installed them");
             }
             Some(aterm_pty::ChildExit::Code(1)) => {
-                aterm_log::info!("System State: the Command Line Tools tab said it did not finish");
+                aterm_log::info!("System State: the Mac Setup tab said it did not finish");
                 // The program ran and failed (a wrong password, a download that broke), which is
                 // no person's closing the tab: the next launch asks again by itself, where the
                 // line is this tab's own (its landing's or an adoption's claim added it). One a
@@ -1291,9 +1336,10 @@ impl App {
             Some(aterm_pty::ChildExit::Code(code))
                 if code == i32::from(aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_STOPPED) =>
             {
-                aterm_log::info!("System State: the Command Line Tools tab was stopped");
+                aterm_log::info!("System State: the Mac Setup tab was stopped");
                 // A person declined (a Ctrl-C at the password prompt or later): the opening stays
-                // spent, as for a closed tab, and Install… is the way on.
+                // spent, as for a closed tab, and the way on is the person's own `aterm init`
+                // (or Install…, while the tools are missing).
                 if current {
                     self.workstation_setup.developer_tools_unfinished = true;
                 }
@@ -1305,7 +1351,7 @@ impl App {
                     ) =>
             {
                 aterm_log::info!(
-                    "System State: the Command Line Tools tab said Apple's window closed without them"
+                    "System State: the Mac Setup tab said Apple's window closed without them"
                 );
                 // A person pressed a button in Apple's window (Not Now, Cancel, or Done on Apple's
                 // own failure): the opening stays spent, as for a stop, and Install… is the way
@@ -1317,9 +1363,7 @@ impl App {
             Some(aterm_pty::ChildExit::Code(code))
                 if code == i32::from(aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_LOW_DATA) =>
             {
-                aterm_log::info!(
-                    "System State: the Command Line Tools tab waits for Low Data Mode"
-                );
+                aterm_log::info!("System State: the Mac Setup tab waits for Low Data Mode");
                 // That opening installed nothing: it is not spent. A pass that still wants the
                 // tools opens the tab by itself once the mode is off.
                 if current {
@@ -1343,14 +1387,14 @@ impl App {
                     == i32::from(aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_NOT_ADMIN) =>
             {
                 aterm_log::info!(
-                    "System State: the Command Line Tools tab found an account that may not install them"
+                    "System State: the Mac Setup tab found an account that may not install them"
                 );
                 if current {
                     self.workstation_setup.developer_tools_not_admin = true;
                 }
             }
             Some(other) => {
-                aterm_log::info!("System State: the Command Line Tools tab ended: {other:?}");
+                aterm_log::info!("System State: the Mac Setup tab ended: {other:?}");
                 if current {
                     let setup = &mut self.workstation_setup;
                     setup.developer_tools_unfinished = true;
@@ -1399,7 +1443,7 @@ impl App {
             && !self.close_ends_window(session)
             && let Err(why) = self.close_session_by_id(session)
         {
-            aterm_log::info!("System State: the Command Line Tools tab stays open: {why}");
+            aterm_log::info!("System State: the Mac Setup tab stays open: {why}");
         }
     }
 
@@ -1422,7 +1466,7 @@ impl App {
         }
     }
 
-    /// The window and tab of the Command Line Tools tab, while it is open (its program still
+    /// The window and tab of the Mac Setup tab, while it is open (its program still
     /// running first): what the headline's Go to tab selects.
     pub(crate) fn developer_tools_tab(&self) -> Option<(crate::WindowId, usize)> {
         let mut sessions: Vec<&Terminal> = self
@@ -1451,7 +1495,7 @@ impl App {
         })
     }
 
-    /// The headline's Go to tab: the Command Line Tools tab comes to the front of its window,
+    /// The headline's Go to tab: the Mac Setup tab comes to the front of its window,
     /// and that window to the front. `false` when it is not open.
     pub(crate) fn go_to_developer_tools_tab(&mut self) -> bool {
         let Some((window, index)) = self.developer_tools_tab() else {
@@ -1491,14 +1535,18 @@ impl App {
         self.workstation_setup.developer_tools_seen = reading;
         if reading.is_none() {
             let setup = &mut self.workstation_setup;
-            if matches!(
-                setup.developer_tools,
-                Install::Wanted(_) | Install::PressedQueued { .. }
-            ) {
-                setup.developer_tools = Install::Unasked;
-            }
-            if setup.developer_tools_want == Some(LAUNCH_WANT) {
-                setup.developer_tools_want = None;
+            // The elevation's other steps still owed keep the launch's want: its one password
+            // does them on a Mac that has the tools too ([`Self::root_steps_owed`]).
+            if !setup.developer_tools_root_owed {
+                if matches!(
+                    setup.developer_tools,
+                    Install::Wanted(_) | Install::PressedQueued { .. }
+                ) {
+                    setup.developer_tools = Install::Unasked;
+                }
+                if setup.developer_tools_want == Some(LAUNCH_WANT) {
+                    setup.developer_tools_want = None;
+                }
             }
             if !self.developer_tools_install_active() {
                 self.read_repositories_again();
@@ -1527,6 +1575,33 @@ impl App {
         if let Some(handlers) = self.system_state_handlers() {
             (handlers.tools_installed)();
         }
+    }
+
+    /// The launch's reading of setup's one early elevation ([`read_root_steps`]): `owed`, a root
+    /// step beside the tools is still to do (developer mode, the rule that names the Mac after
+    /// admission). Owed, the launch wants the tab as it wants it for missing tools
+    /// ([`LAUNCH_WANT`]), on a Mac that has them too, so its one password does every root step
+    /// setup has, asked by aterm itself with no press; the same holds and gates keep it (no
+    /// scratch world, the account's [`Mark`], a quiet keyboard, no macOS dialog up, an
+    /// administrator's account), and nothing else waits on it.
+    pub(crate) fn root_steps_owed(&mut self, owed: bool) {
+        let setup = &mut self.workstation_setup;
+        setup.developer_tools_root_owed = owed;
+        if owed {
+            if setup.developer_tools == Install::Unasked {
+                setup.developer_tools = Install::Wanted(LAUNCH_WANT);
+            }
+            setup.developer_tools_want.get_or_insert(LAUNCH_WANT);
+        }
+        self.settle_developer_tools_want();
+        self.tick_developer_tools_install();
+    }
+
+    /// Whether the elevation's tab has anything to do: the tools are missing, or its other root
+    /// steps are owed ([`Self::root_steps_owed`]).
+    fn elevation_owed(&self) -> bool {
+        let setup = &self.workstation_setup;
+        !setup.developer_tools_shim.tools_present() || setup.developer_tools_root_owed
     }
 
     /// A setup pass ended waiting on the Command Line Tools (`wanted`), or not
@@ -1640,9 +1715,13 @@ impl App {
     }
 
     /// Whether the automatic tab waits on the network: Low Data Mode holds the download back, or
-    /// a watch just started has not read it yet ([`FIRST_READING`]).
+    /// a watch just started has not read it yet ([`FIRST_READING`]). With the tools there is no
+    /// download, so the elevation's other steps never wait on it.
     fn developer_tools_wait_network(&self) -> bool {
         let setup = &self.workstation_setup;
+        if setup.developer_tools_shim.tools_present() {
+            return false;
+        }
         match setup.developer_tools_low_data {
             Some(on) => on,
             None => setup
@@ -1655,26 +1734,54 @@ impl App {
     /// [`Install::due`] for a want still authorized, once the keyboard was quiet for 2.5 s
     /// ([`crate::hands_off_keys`]): the landed tab takes the window's keys. Never once the tab has
     /// opened on this build ([`Mark`]): Install… is the way then; nor once the tools exist,
-    /// however they came (the shim's reading, [`crate::clt_shim::Shim::tools_present`]). A live
+    /// however they came (the shim's reading, [`crate::clt_shim::Shim::tools_present`]), and the
+    /// elevation owes nothing else ([`Self::elevation_owed`]). A live
     /// installer, as the window knows it ([`Self::developer_tools_installing_known`]; the
     /// landing's check reads it live), an earlier aterm's tab running on with no custody here
     /// ([`Self::developer_tools_tab_adopted`]), Low Data Mode
     /// ([`Self::developer_tools_wait_network`]) and an account that is none of the Mac's
-    /// administrators hold the request, without consuming the automatic attempt.
+    /// administrators hold the request, without consuming the automatic attempt. The window reads
+    /// [`Self::developer_tools_install_held`], which says which of these holds it.
+    #[cfg(test)]
     fn developer_tools_install_due(&self, dialog_up: bool) -> bool {
-        !self.workstation_setup.developer_tools_mark.opened()
-            && !self.workstation_setup.developer_tools_not_admin
-            && !self.developer_tools_wait_network()
-            && crate::hands_off_keys(true, self.last_keystroke_at, std::time::Instant::now())
-            && matches!(self.workstation_setup.developer_tools, Install::Wanted(revision)
-            if self.developer_tools_install_authorized(revision))
-            && self.workstation_setup.developer_tools.due(dialog_up)
-            && !self.workstation_setup.developer_tools_shim.tools_present()
-            && !self.developer_tools_tab_adopted()
-            && !self.developer_tools_installing_known()
+        self.developer_tools_install_held(dialog_up).is_none()
     }
 
-    /// Whether a session adopted from an earlier aterm runs the Command Line Tools tab's program:
+    /// What holds the automatic tab ([`Self::developer_tools_install_due`]), in the order the
+    /// gates are read: `None` when it is due. The window logs each new answer while a want stands
+    /// ([`Self::begin_developer_tools_install`]), so a tab that never opens says why.
+    fn developer_tools_install_held(&self, dialog_up: bool) -> Option<&'static str> {
+        let setup = &self.workstation_setup;
+        if setup.developer_tools_scratch_world {
+            Some("a scratch world (a check's bundle asks for no password)")
+        } else if setup.developer_tools_mark.opened() {
+            Some("this build asked already (the account's mark)")
+        } else if setup.developer_tools_not_admin {
+            Some("this account is no administrator")
+        } else if self.developer_tools_wait_network() {
+            Some("Low Data Mode, or the network watch's first reading")
+        } else if !crate::hands_off_keys(true, self.last_keystroke_at, std::time::Instant::now()) {
+            Some("a key typed in the last 2.5 s")
+        } else if !matches!(setup.developer_tools, Install::Wanted(_)) {
+            Some("no want")
+        } else if !matches!(setup.developer_tools, Install::Wanted(revision)
+            if self.developer_tools_install_authorized(revision))
+        {
+            Some("no admitted run, or setup held")
+        } else if !setup.developer_tools.due(dialog_up) {
+            Some("a macOS dialog this process started is up")
+        } else if !self.elevation_owed() {
+            Some("nothing owed")
+        } else if self.developer_tools_tab_adopted() {
+            Some("an earlier aterm's tab runs on")
+        } else if self.developer_tools_installing_known() {
+            Some("an installer runs")
+        } else {
+            None
+        }
+    }
+
+    /// Whether a session adopted from an earlier aterm runs the Mac Setup tab's program:
     /// aterm's pin of [`TAB_TITLE`], which an adoption carries with the tab, over a child that has
     /// not ended ([`child_ended`]). Its own `sudo` may be asking for the password now, with no
     /// placeholder, stamp or installer yet for a probe to see, and a tab whose recovery record this
@@ -1715,8 +1822,8 @@ impl App {
     /// slot through the installer child's lifetime. A key typed while the shell started
     /// defers it too, as does an earlier aterm's tab running on
     /// ([`Self::developer_tools_tab_adopted`]); a newer want survives a refused shell. Tools that
-    /// arrived since the shell was booked land nothing, and the request goes
-    /// ([`Install::Unasked`]). Last of all the landing claims
+    /// arrived since the shell was booked, with nothing else owed, land nothing, and the request
+    /// goes ([`Install::Unasked`]). Last of all the landing claims
     /// this build's ask in the account's record ([`Mark::claim`]): one another asker of this
     /// build won since the shell was booked (the follow-up of a package install or update,
     /// whose `sudo` may be asking now), or a claim that failed, lands nothing, and this launch's
@@ -1725,7 +1832,7 @@ impl App {
         let Install::Opening { wanted } = self.workstation_setup.developer_tools else {
             return false;
         };
-        let missing = !self.workstation_setup.developer_tools_shim.tools_present();
+        let missing = self.elevation_owed();
         if wanted == Some(revision)
             && missing
             && crate::hands_off_keys(true, self.last_keystroke_at, std::time::Instant::now())
@@ -1751,7 +1858,7 @@ impl App {
             } else if missing {
                 "withdrawn"
             } else {
-                "withdrawn: the tools are installed"
+                "withdrawn: the tools are installed, and nothing else is owed"
             }
         );
         false
@@ -1842,7 +1949,16 @@ impl App {
             let (ask, then) = started?;
             return Some((window, ask, then));
         }
-        if !self.developer_tools_install_due(self.access_dialog_up()) {
+        let held = self.developer_tools_install_held(self.access_dialog_up());
+        if matches!(self.workstation_setup.developer_tools, Install::Wanted(_))
+            && self.workstation_setup.developer_tools_held_said.get() != held
+        {
+            self.workstation_setup.developer_tools_held_said.set(held);
+            if let Some(why) = held {
+                aterm_log::info!("System State: the Mac Setup tab waits: {why}");
+            }
+        }
+        if held.is_some() {
             return None;
         }
         // The account's record names this build now: another asker of this build (the follow-up
@@ -2019,6 +2135,27 @@ mod tests {
         assert!(
             !app.developer_tools_install_due(false),
             "a delayed pass callback must not reopen installation after Stop"
+        );
+    }
+
+    /// A scratch world's launch (a check's or a lab's bundle, `ATERM_STATE_HOME` or `CI` set)
+    /// never opens the automatic tab, for missing tools or owed root steps alike: it would ask
+    /// the desk's person for a password and take the keys the check types into its own session
+    /// (the 0.154.0 cut's measure, on a Mac without the name rule: 30 keys queued, none written).
+    #[test]
+    fn clt_install_a_scratch_world_never_opens_the_tab() {
+        let mut app = App::headless_for_test();
+        observe_run(&mut app, 4, true, policy(4));
+        app.want_developer_tools_install(4, true);
+        app.workstation_setup.developer_tools_root_owed = true;
+        assert!(
+            app.developer_tools_install_due(false),
+            "CONTROL: outside a scratch world the owed tab is due"
+        );
+        app.workstation_setup.developer_tools_scratch_world = true;
+        assert_eq!(
+            app.developer_tools_install_held(false),
+            Some("a scratch world (a check's bundle asks for no password)")
         );
     }
 
@@ -2362,6 +2499,82 @@ mod tests {
             marked.developer_tools,
             Install::Unasked,
             "the tab opened before"
+        );
+    }
+
+    /// On a Mac that has the tools, the launch's reading that the elevation still owes a root
+    /// step (developer mode, the naming rule) wants the tab as [`LAUNCH_WANT`] by itself, with no
+    /// press, and the tools' watch ending keeps that want. NEGATIVE CONTROLS: a reading that owes
+    /// nothing leaves the host unasked and no tab due; the account's mark still holds an owed
+    /// reading's tab; and an unreadable step owes nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_mac_with_the_tools_still_gets_the_one_elevation_for_what_is_owed() {
+        let tmp = aterm_tempfile::tempdir().expect("a state directory");
+        let app_with = |mark: &str| {
+            let mut app = App::headless_for_test();
+            app.workstation_setup = crate::workstation_setup::Host::for_launch_marked(
+                None,
+                false,
+                Mark::at(tmp.path().join(mark)),
+                crate::clt_shim::Shim::at(tmp.path().join("clt-shim"), || true),
+            );
+            app
+        };
+        let mut owed = app_with("no-mark");
+        assert_eq!(owed.workstation_setup.developer_tools, Install::Unasked);
+        owed.root_steps_owed(true);
+        assert_eq!(
+            owed.workstation_setup.developer_tools,
+            Install::Wanted(LAUNCH_WANT)
+        );
+        assert_eq!(
+            owed.workstation_setup.developer_tools_want,
+            Some(LAUNCH_WANT)
+        );
+        owed.workstation_setup.developer_tools_low_data = Some(true);
+        assert!(
+            owed.developer_tools_install_due(false),
+            "due with no press, Low Data Mode or not: nothing downloads"
+        );
+        owed.developer_tools_watch(None);
+        assert_eq!(
+            owed.workstation_setup.developer_tools_want,
+            Some(LAUNCH_WANT),
+            "the tools being there ends no want the elevation still has"
+        );
+
+        let mut settled = app_with("no-mark");
+        settled.root_steps_owed(false);
+        assert_eq!(settled.workstation_setup.developer_tools, Install::Unasked);
+        assert!(!settled.developer_tools_install_due(false));
+
+        super::landing_tests::this_builds_mark(&tmp.path().join("opened"));
+        let mut marked = app_with("opened");
+        marked.root_steps_owed(true);
+        assert!(
+            !marked.developer_tools_install_due(false),
+            "asked on this build"
+        );
+
+        let gone = || Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+        let denied = || Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert!(root_steps_owed_by(Some(true), Ok((0, 0o440, true)), false));
+        assert!(root_steps_owed_by(Some(false), gone(), false));
+        assert!(root_steps_owed_by(
+            Some(false),
+            Ok((501, 0o440, true)),
+            false
+        ));
+        assert!(!root_steps_owed_by(
+            Some(false),
+            Ok((0, 0o440, true)),
+            false
+        ));
+        assert!(!root_steps_owed_by(None, denied(), false));
+        assert!(
+            !root_steps_owed_by(Some(false), gone(), true),
+            "refused stands"
         );
     }
 

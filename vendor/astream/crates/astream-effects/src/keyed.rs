@@ -66,14 +66,62 @@ fn exchange_key(record: &EffectRecord) -> Option<(&str, &[u8])> {
     }
 }
 
-/// The first index in `0..len` at which `before` is false, for a `before`
-/// that is true on a prefix of the range and false after it.
-fn partition(len: usize, before: impl Fn(usize) -> bool) -> usize {
+fn key_at<'r>(
+    positions: &[usize],
+    records: &'r [EffectRecord],
+    index: usize,
+) -> Option<(&'r str, &'r [u8])> {
+    positions
+        .get(index)
+        .and_then(|&p| records.get(p))
+        .and_then(exchange_key)
+}
+
+fn partition_key_lt(
+    positions: &[usize],
+    records: &[EffectRecord],
+    asked: Option<(&str, &[u8])>,
+) -> usize {
     let mut low = 0usize;
-    let mut high = len;
+    let mut high = positions.len();
     while low < high {
         let mid = low.saturating_add(high.saturating_sub(low) / 2);
-        if before(mid) {
+        if key_at(positions, records, mid) < asked {
+            low = mid.saturating_add(1);
+        } else {
+            high = mid;
+        }
+    }
+    low
+}
+
+fn partition_key_le(
+    positions: &[usize],
+    records: &[EffectRecord],
+    asked: Option<(&str, &[u8])>,
+) -> usize {
+    let mut low = 0usize;
+    let mut high = positions.len();
+    while low < high {
+        let mid = low.saturating_add(high.saturating_sub(low) / 2);
+        if key_at(positions, records, mid) <= asked {
+            low = mid.saturating_add(1);
+        } else {
+            high = mid;
+        }
+    }
+    low
+}
+
+fn partition_within_cutoff(run: &[usize], seen: usize) -> usize {
+    let mut low = 0usize;
+    let mut high = run.len();
+    while low < high {
+        let mid = low.saturating_add(high.saturating_sub(low) / 2);
+        if run
+            .get(mid)
+            .is_some_and(|&p| keyed_hit_within_cutoff(p, seen))
+        {
             low = mid.saturating_add(1);
         } else {
             high = mid;
@@ -173,23 +221,14 @@ impl Order {
                 return None;
             }
         };
-        let key_at = |i: usize| -> Option<(&str, &[u8])> {
-            positions
-                .get(i)
-                .and_then(|&p| records.get(p))
-                .and_then(exchange_key)
-        };
         // The run of (door, request): its keys are neither below nor above
         // the one asked.
-        let start = partition(positions.len(), |i| key_at(i) < asked);
-        let end = partition(positions.len(), |i| key_at(i) <= asked);
+        let start = partition_key_lt(positions, records, asked);
+        let end = partition_key_le(positions, records, asked);
         let run = positions.get(start..end)?;
         // The run is sorted by tape position: the hits within the cutoff are
         // a prefix of it, and the answer is its last.
-        let admitted = partition(run.len(), |i| {
-            run.get(i)
-                .is_some_and(|&p| keyed_hit_within_cutoff(p, seen))
-        });
+        let admitted = partition_within_cutoff(run, seen);
         let position = *run.get(admitted.checked_sub(1)?)?;
         match records.get(position)? {
             EffectRecord::Exchange {

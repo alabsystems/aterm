@@ -106,7 +106,7 @@ pub(crate) fn parse_report(json: &Value) -> Option<PerfReport> {
 /// The committed baseline for a [`PerfReport`].
 pub(crate) fn baseline_json(r: &PerfReport, ratio: f64, comment: &str) -> String {
     format!(
-        "{{\n  \"_comment\": {},\n  \"median_mbps\": {:.3},\n  \"min_mbps\": {:.3},\n  \"max_mbps\": {:.3},\n  \"workload_bytes\": {},\n  \"n\": {},\n  \"warmup\": {},\n  \"pass_ratio\": {:.3}\n}}\n",
+        "{{\n  \"_comment\": {},\n  \"median_mbps\": {},\n  \"min_mbps\": {},\n  \"max_mbps\": {},\n  \"workload_bytes\": {},\n  \"n\": {},\n  \"warmup\": {},\n  \"pass_ratio\": {}\n}}\n",
         quoted(comment),
         r.median_mbps,
         r.min_mbps,
@@ -546,9 +546,9 @@ pub(crate) fn parse_keyed(lane: &FloorLane, json: &Value) -> Option<Vec<(&'stati
 pub(crate) fn keyed_baseline_json(values: &[(&str, f64)], ratio: f64, comment: &str) -> String {
     let mut s = format!("{{\n  \"_comment\": {},\n", quoted(comment));
     for (key, v) in values {
-        s.push_str(&format!("  \"{key}\": {v:.3},\n"));
+        s.push_str(&format!("  \"{key}\": {v},\n"));
     }
-    s.push_str(&format!("  \"pass_ratio\": {ratio:.3}\n}}\n"));
+    s.push_str(&format!("  \"pass_ratio\": {ratio}\n}}\n"));
     s
 }
 
@@ -727,6 +727,10 @@ pub(crate) fn last_json_line(stdout: &str) -> Option<Value> {
 
 /// Record or judge a keyed lane from its measured report.
 pub(crate) fn judge_keyed(lane: &FloorLane, json: &Value, record: bool) -> LaneRun {
+    judge_keyed_at(lane, json, record, &keyed_baseline_path(lane))
+}
+
+fn judge_keyed_at(lane: &FloorLane, json: &Value, record: bool, path: &Path) -> LaneRun {
     let Some(values) = parse_keyed(lane, json) else {
         return LaneRun::fail(format!(
             "the harness report lacks a gated key ({}); refusing to judge it",
@@ -743,11 +747,10 @@ pub(crate) fn judge_keyed(lane: &FloorLane, json: &Value, record: bool) -> LaneR
             at: Vec::new(),
         })
         .collect();
-    let path = keyed_baseline_path(lane);
     let mut run = if record {
-        record_keyed(lane, &path, &values)
+        record_keyed(lane, path, &values)
     } else {
-        compare_keyed_against_baseline(lane, &path, &values)
+        compare_keyed_against_baseline(lane, path, &values)
     };
     run.samples = samples;
     run
@@ -852,8 +855,13 @@ pub(crate) fn gate_crash_restore(record: bool) -> LaneRun {
 }
 
 fn judge_crash_restore(json: &Value, record: bool) -> LaneRun {
-    let mut run = judge_keyed(&CRASH_RESTORE_LANE, json, record);
-    match tail_tap_fence(json) {
+    judge_crash_restore_at(json, record, &keyed_baseline_path(&CRASH_RESTORE_LANE))
+}
+
+fn judge_crash_restore_at(json: &Value, record: bool, path: &Path) -> LaneRun {
+    let fence = tail_tap_fence(json);
+    let mut run = judge_keyed_at(&CRASH_RESTORE_LANE, json, record && fence.is_ok(), path);
+    match fence {
         Ok(()) => run.fence_held(CRASH_RESTORE_LANE.cli),
         Err(finding) => run.add_failure(finding),
     }
@@ -1069,7 +1077,12 @@ pub(crate) fn gate_resize(record: bool) -> LaneRun {
 }
 
 fn judge_resize(json: &Value, record: bool) -> LaneRun {
-    let mut run = judge_keyed(&RESIZE_LANE, json, record);
+    judge_resize_at(json, record, &keyed_baseline_path(&RESIZE_LANE))
+}
+
+fn judge_resize_at(json: &Value, record: bool, path: &Path) -> LaneRun {
+    let breached = resize_fences(json);
+    let mut run = judge_keyed_at(&RESIZE_LANE, json, record && breached.is_empty(), path);
     for key in RESIZE_INVERTED_TREND_KEYS {
         match number(json, key) {
             Some(v) => run.samples.push(TrendSample {
@@ -1082,7 +1095,6 @@ fn judge_resize(json: &Value, record: bool) -> LaneRun {
             None => eprintln!("    {key}: NO TREND SAMPLE — absent from the harness report."),
         }
     }
-    let breached = resize_fences(json);
     if breached.is_empty() {
         run.fence_held(RESIZE_LANE.cli);
     }
@@ -1321,6 +1333,54 @@ mod tests {
     }
 
     #[test]
+    fn recorded_positive_floors_survive_reload() {
+        let dir = scratch();
+        for value in [42.0, 0.0004] {
+            let path = dir.path().join("keyed.json");
+            let values = [("restore_median_hz", value)];
+            assert_eq!(
+                record_keyed(&RESTORE_LANE, &path, &values).status,
+                Status::Recorded(path.clone())
+            );
+            let stored = json(&std::fs::read_to_string(&path).unwrap());
+            assert_eq!(number(&stored, "restore_median_hz"), Some(value));
+            assert_eq!(
+                compare_keyed_against_baseline(&RESTORE_LANE, &path, &values).status,
+                Status::Pass
+            );
+        }
+    }
+
+    #[test]
+    fn recorded_throughput_values_survive_reload() {
+        let dir = scratch();
+        for value in [42.0, 0.0004] {
+            let path = dir.path().join("throughput.json");
+            let report = PerfReport {
+                median_mbps: value,
+                min_mbps: value,
+                max_mbps: value,
+                workload_bytes: 32,
+                n: 3,
+                warmup: 1,
+            };
+            assert_eq!(
+                record_throughput(&path, &report).status,
+                Status::Recorded(path.clone())
+            );
+            let stored = json(&std::fs::read_to_string(&path).unwrap());
+            let restored = parse_report(&stored).unwrap();
+            assert_eq!(restored.median_mbps, value);
+            assert_eq!(restored.min_mbps, value);
+            assert_eq!(restored.max_mbps, value);
+            assert_eq!(
+                compare_against_baseline(&path, &report).status,
+                Status::Pass
+            );
+        }
+    }
+
+    #[test]
     fn recording_refuses_a_floor_that_judges_nothing() {
         let dir = scratch();
         let path = dir.path().join("baseline.json");
@@ -1330,7 +1390,7 @@ mod tests {
         let run = record_keyed(&RESTORE_LANE, &path, &[("restore_median_hz", 42.0)]);
         assert_eq!(run.status, Status::Recorded(path.clone()));
         let text = std::fs::read_to_string(&path).expect("written");
-        assert!(text.contains("\"restore_median_hz\": 42.000"), "{text}");
+        assert_eq!(number(&json(&text), "restore_median_hz"), Some(42.0));
     }
 
     #[test]
@@ -1370,6 +1430,81 @@ mod tests {
             3,
             "missing is a breach"
         );
+    }
+
+    fn assert_failed_fence_preserves_baseline(
+        lane: &FloorLane,
+        judge: fn(&Value, bool, &Path) -> LaneRun,
+        breach: bool,
+    ) {
+        let dir = scratch();
+        let path = dir.path().join(lane.cli);
+        let values: Vec<_> = lane.keys.iter().map(|key| (*key, 10.0)).collect();
+        let report = keyed_baseline_json(&values, PASS_RATIO, "fixture");
+        let mut good = json(&report);
+        let fields = good.as_object_mut().unwrap();
+        fields.insert("tail_tap_ratio".into(), Value::from(TAIL_TAP_RATIO_FENCE));
+        for (key, cap, _) in RESIZE_FENCES {
+            fields.insert(key.into(), Value::from(cap));
+        }
+        assert_eq!(
+            judge(&good, true, &path).status,
+            Status::Recorded(path.clone())
+        );
+        let original = std::fs::read(&path).unwrap();
+        let mut missing = json(&report);
+        for key in lane.keys {
+            missing
+                .as_object_mut()
+                .unwrap()
+                .insert((*key).into(), Value::from(20.0));
+        }
+        let mut breached = missing.clone();
+        breached
+            .as_object_mut()
+            .unwrap()
+            .insert("tail_tap_ratio".into(), Value::from(0.5));
+        for (key, cap, _) in RESIZE_FENCES {
+            breached
+                .as_object_mut()
+                .unwrap()
+                .insert(key.into(), Value::from(cap * 2.0));
+        }
+        let run = judge(if breach { &breached } else { &missing }, true, &path);
+        assert!(run.failed());
+        assert_eq!(std::fs::read(&path).unwrap(), original, "{}", lane.cli);
+        let mut changed = good;
+        for key in lane.keys {
+            changed
+                .as_object_mut()
+                .unwrap()
+                .insert((*key).into(), Value::from(20.0));
+        }
+        assert_eq!(
+            judge(&changed, true, &path).status,
+            Status::Recorded(path.clone())
+        );
+        assert_ne!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn missing_crash_fence_preserves_recorded_baseline() {
+        assert_failed_fence_preserves_baseline(&CRASH_RESTORE_LANE, judge_crash_restore_at, false);
+    }
+
+    #[test]
+    fn breached_crash_fence_preserves_recorded_baseline() {
+        assert_failed_fence_preserves_baseline(&CRASH_RESTORE_LANE, judge_crash_restore_at, true);
+    }
+
+    #[test]
+    fn missing_resize_fence_preserves_recorded_baseline() {
+        assert_failed_fence_preserves_baseline(&RESIZE_LANE, judge_resize_at, false);
+    }
+
+    #[test]
+    fn breached_resize_fence_preserves_recorded_baseline() {
+        assert_failed_fence_preserves_baseline(&RESIZE_LANE, judge_resize_at, true);
     }
 
     #[test]

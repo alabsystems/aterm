@@ -227,6 +227,12 @@ impl Scratch {
             .env("HOP_LEDGER", self.ledger())
             .env("HOP_OUT", self.out())
             .env(atpkg::build_admit::hold::READS_ENV, self.reads())
+            // A holder that arms may arm late on a loaded machine: the front waits the hang
+            // detector for it.
+            .env(
+                atpkg::build_admit::HOLDER_ARMS_WITHIN_ENV,
+                MUST_HAPPEN.as_millis().to_string(),
+            )
             .env(
                 "HOP_SUITE",
                 std::env::current_exe().expect("the suite's own path"),

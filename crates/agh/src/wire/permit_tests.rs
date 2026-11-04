@@ -28,10 +28,7 @@ use crate::wire::{
 const LIMIT: u64 = 1 << 20;
 
 fn scratch() -> aterm_tempfile::TempDir {
-    aterm_tempfile::Builder::new()
-        .prefix("agh-permit-")
-        .tempdir()
-        .expect("a scratch directory")
+    crate::test_fixtures::scratch_dir("permit")
 }
 
 /// The canonical config (`tests/fixtures/canonical.toml`) under `root`, as a router.

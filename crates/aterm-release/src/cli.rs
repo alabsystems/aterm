@@ -29,7 +29,7 @@ USAGE
                  (--mac-only | --linux-artifacts DIRECTORY [--linux-target aarch64|x86_64]...
                   [--linux-worker ARCH=HOST:REPO]...)
                  [--release-credentials <profile.toml>] [--engine DIRECTORY]
-                 [--dry-run] [--verbose] [--prepare] [--forget | --abandon vX.Y.Z]
+                 [--dry-run] [--verbose] [--prepare | --qualify] [--forget | --abandon vX.Y.Z]
       The way to release aterm, from a clean clone of its own on main. Steps:
       checks, sync, commit, stage, build (the one build of the bundle), verify
       (`verify release` on those bytes), ready, publish (pub publish), cut (claim,
@@ -39,7 +39,7 @@ USAGE
       again resumes. A gap only the owner can close is asked once on the owner's
       aterm while the long steps run, and waited on at the publish. Ends in one
       line: RELEASED …, or REFUSED at <step>: <why> — <what is public>. <remedy>.
-      Exit 0 released, prepared, or a dry run with nothing refused · 1 refused ·
+      Exit 0 released, prepared, qualified, or a dry run with nothing refused · 1 refused ·
       2 usage, or no checkout, HOME or log directory to run in · 3 a resumable
       stop (run it again) · 130 interrupted.
         --bump             commit the next MINOR on origin/main's tip, push it,
@@ -63,6 +63,11 @@ USAGE
                            tag, the ledger tail and the engine (a mismatch
                            refuses before the claim); --prepare again redoes a
                            stale prepare. With --dry-run: the plan of both halves
+        --qualify          check the full export locally, build and verify, then
+                           stop without pushing a staging snapshot or publishing.
+                           Keeps the verified bundle for `cut --dry-run` signing;
+                           a later release still stages before publishing.
+                           Cannot combine with --bump or --prepare
         --forget           drop this clone's release journal, withdraw its open
                            asks, and exit; nothing public changes. Takes no flag
                            of a run
@@ -178,6 +183,11 @@ USAGE
                            macOS guards (~/Downloads) raises a dialog
         --check            audit only: nothing provisioned, minted or written;
                            exits non-zero while anything is open
+
+  targo --unverified ship provision --notary-only [--check]
+        Check or repair only the notary keychain profile from the authenticated
+        shared vault entry. Never asks for credentials, provisions other tools,
+        changes release identities or profiles, or publishes. --check only reads.
 
   targo --unverified ship provision --id <existing-id> --roster-only --roster <public-pair-path> [--check]
         --roster-only      restore only the canonical public roster pair for an existing
@@ -411,6 +421,9 @@ pub enum Cmd {
         /// `--cert-dir`: the visible folder the browser errand may use.
         cert_dir: Option<std::path::PathBuf>,
     },
+    NotaryOnly {
+        check: bool,
+    },
     /// `release`: the one release command ([`crate::release`]).
     Release(crate::release::ReleaseOptions),
     StageLocal(Vec<String>),
@@ -626,6 +639,7 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
         "provision" => {
             let mut id: Option<String> = None;
             let mut check = false;
+            let mut notary_only = false;
             let mut roster_only = false;
             let mut roster = None;
             let mut cert_dir: Option<std::path::PathBuf> = None;
@@ -642,6 +656,12 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
                         );
                     }
                     "--check" => check = true,
+                    "--notary-only" => {
+                        if notary_only {
+                            return Err("--notary-only given twice".into());
+                        }
+                        notary_only = true;
+                    }
                     "--roster-only" => roster_only = true,
                     "--roster" => {
                         if roster.is_some() {
@@ -669,6 +689,12 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
                     }
                     other => return Err(format!("unknown provision flag {other:?}")),
                 }
+            }
+            if notary_only {
+                if id.is_some() || roster_only || roster.is_some() || cert_dir.is_some() {
+                    return Err("--notary-only takes only --check; no identity, roster or certificate options".into());
+                }
+                return Ok(Cmd::NotaryOnly { check });
             }
             let id = id.ok_or(
                 "provision needs --id <machine-id> — the roster name this machine signs \
@@ -883,6 +909,7 @@ fn parse_release<'a>(
             "--dry-run" => opts.dry_run = true,
             "--verbose" | "-v" => opts.verbose = true,
             "--prepare" => opts.prepare = true,
+            "--qualify" => opts.qualify = true,
             "--forget" => opts.forget = true,
             "--abandon" => {
                 let v = it.next().ok_or("--abandon needs a version (vX.Y.Z)")?;
@@ -898,6 +925,7 @@ fn parse_release<'a>(
             || opts.commit.is_some()
             || opts.dry_run
             || opts.prepare
+            || opts.qualify
             || opts.forget
             || opts.linux.declared()
             || !opts.linux.workers.is_empty()
@@ -914,6 +942,7 @@ fn parse_release<'a>(
             || opts.commit.is_some()
             || opts.dry_run
             || opts.prepare
+            || opts.qualify
             || opts.linux.declared()
             || !opts.linux.workers.is_empty()
             || !opts.linux.targets.is_empty())
@@ -924,6 +953,9 @@ fn parse_release<'a>(
              and a release after it is a run of its own"
                 .into(),
         );
+    }
+    if opts.qualify && (opts.bump || opts.prepare) {
+        return Err("--qualify cannot combine with --bump or --prepare".into());
     }
     if opts.bump && opts.commit.is_some() {
         return Err(
@@ -1144,6 +1176,7 @@ fn dispatch(cmd: Cmd) -> ledger::Result<()> {
             abandon: Some(v), ..
         } => verify::run_abandon(&repo_root()?, &v),
         Cmd::Cut { opts, .. } => publish::run_cut(&repo_root()?, &opts),
+        Cmd::NotaryOnly { check } => crate::provision::run_notary_only(check),
         Cmd::Provision {
             id,
             check,
@@ -1241,6 +1274,35 @@ fn repo_root() -> ledger::Result<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notary_only_cannot_select_other_provisioning_work() {
+        let parse_flags = |flags: &[&str]| {
+            let args: Vec<String> = ["provision", "--notary-only"]
+                .into_iter()
+                .chain(flags.iter().copied())
+                .map(str::to_string)
+                .collect();
+            parse(&args)
+        };
+        assert!(matches!(
+            parse_flags(&[]).unwrap(),
+            Cmd::NotaryOnly { check: false }
+        ));
+        assert!(matches!(
+            parse_flags(&["--check"]).unwrap(),
+            Cmd::NotaryOnly { check: true }
+        ));
+        for flags in [
+            vec!["--id", "m22"],
+            vec!["--roster-only"],
+            vec!["--roster", "/public/pair"],
+            vec!["--cert-dir", "/cert"],
+            vec!["--notary-only"],
+        ] {
+            assert!(parse_flags(&flags).is_err());
+        }
+    }
 
     #[test]
     fn roster_only_requires_an_explicit_pair_and_cannot_acquire_certificates() {

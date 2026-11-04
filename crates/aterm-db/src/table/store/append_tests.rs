@@ -2,11 +2,17 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
-use crate::table::tests::frontier::wide_lab;
+use crate::table::tests::frontier::built_wide_lab;
 
+/// At 129 writers an append needs two joins and its edit, so a bound of 3. A refusal by records,
+/// bytes, payload or a factory failure on the second join spends no table slot and writes nothing,
+/// and the exact capacity then admits the whole edit. This is the crate's one frontier wide enough
+/// for a second join: `catalog_append_bound` gives 2 at 126 heads and 3 from 127, `MAX_PARENTS` is
+/// a wire constant, and 128 writers force the same two joins as 129, so the width can shrink by at
+/// most one.
 #[test]
 fn wide_append_rejections_preserve_capacity_for_a_complete_edit() {
-    let lab = wide_lab(2 * MAX_PARENTS + 1);
+    let lab = built_wide_lab(2 * MAX_PARENTS + 1);
     let bootstrap = lab.bootstrap(0);
     let session = Session::open(&bootstrap).unwrap();
     let directory = lab._home.path().join("wide-append");

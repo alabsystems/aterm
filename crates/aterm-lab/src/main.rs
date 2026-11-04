@@ -24,6 +24,10 @@ mod agy_captures;
 #[cfg(target_os = "macos")]
 mod agy_proof;
 #[cfg(target_os = "macos")]
+mod allocation_monitor;
+#[cfg(target_os = "macos")]
+mod aos_cadence;
+#[cfg(target_os = "macos")]
 mod aos_gpu_bench;
 #[cfg(target_os = "macos")]
 mod aos_learn;
@@ -483,7 +487,8 @@ usage: targo --unverified lab <command> [tag] [args]
   statusline [tag] on [SECS]|off|show
                                  record (every SECS, default 5) or show what Claude Code pipes to its statusLine command
   transcript [tag]               print the newest scratch transcript's rows (type/subtype and system/user text)
-  debuglog [tag] [regex]         print lines from `claude TAG --debug-log` (default: request/account/telemetry lines)
+  debuglog [tag] [regex]         print lines from `claude TAG --debug-log`, then from each forever tab's own log
+                                 (`[<chain>] `-led; default: request/account/telemetry lines)
   settings [tag] '<json>'        deep-merge JSON into the scratch settings.json (null removes a key; read live)
   survey [tag] on|off [--reread] toggle CLAUDE_FORCE_DISPLAY_SURVEY in the scratch settings env (--reread: rewrite every
                                  3 s until Claude Code reports a re-read)
@@ -614,6 +619,11 @@ usage: targo --unverified lab <command> [tag] [args]
                                    held-text NOTE where the first look past its write saw nothing move (~10 min)
                                  - --no-ready-gate: every tab launched at once and prompted with no look that its program
                                    has finished starting (the lab before slice at1), so Land writes behind unread input
+                                 - each Claude Code tab writes its own debug log (claude-debug-<chain>.log), and a start
+                                   the ready gate watches whose input stands unread 1 s is captured once (process tree,
+                                   lsof, a 2 s sample) into the run's input-holds/, which `down` keeps (none under
+                                   --no-ready-gate); LAB_HOLD_CAPTURE_MS=<ms> moves the threshold (0: every start, once
+                                   it is ready)
                                  - --window (needs the land-p or same-land chain; refused under LAB_RESTORE=1): opens a real
                                    window, verifies L13's native controller draft via NSEvent `hwkey` with unchanged
                                    `human_seq=` (person takeover stays UNOBSERVED), and reads same-land's hold off it
@@ -663,9 +673,10 @@ Outside any lab (no jail, no stub):
                                  custodies in this process, repaired over loopback, never a real Mac's state;
                                  the seal waits for every Writer, m1 seals in the cut, m2 edits the sealed
                                  generation, the late roll carries it (debug lab image)
-  commons-lan prepare-recipient|prepare-source|join|run|follow|stop|declare|write|read …
+  commons-lan prepare-recipient|prepare-source|join|run|follow|stop|db|declare|write|read …
                                  prepare preserved private profiles on separate LAN hosts; synthetic prior vault approval,
                                  ordinary executable startup, exact generic table readback, no installed state changes
+                                 db: run the shipped proposal/data CLI in that profile, online or offline
                                  a world on the live default ALab vault (one an earlier run left admitted there) opens for no
                                  verb but behind --live-alab-vault-keeps-member: no run takes that member out again
   commons-startup <aterm> <new-output-directory> [--log-backed] [--suppressed | --observe SECONDS | --peer-cycle [--peer-details] | --local-follower]
@@ -746,6 +757,9 @@ Outside any lab (no jail, no stub):
                                  instance at a time, into contact sheets, and judge each frame from the page's own
                                  layout: text >= 4.5:1, glyph >= 3:1, card >= 1.2:1, no clipped text, a 4 pt rhythm
                                  (`--help` for details)
+  allocation-monitor --aterm PATH --targo PATH --out DIR [--look dark|light] [--keep]
+                                 one attachment observes actual two-to-one fenced Targo builds in a private Allocation
+                                 window; preserve both frames/audits, close the panel before peer release, run both outputs
   trail-census <png> [--dims FILE|--origin X,Y --cell WxH] [--clean PNG] [--caret ROW,COL] [--pet X0,Y0,X1,Y1]...
                [--selection RRGGBB] [--pixels FILE] [--mud-max N] [--glyph-min X] ...
                                  the Prism Glass census of a trail frame and its clean twin, layer by layer: OKLab mud,
@@ -761,6 +775,8 @@ Outside any lab (no jail, no stub):
                                  (HEAD~1), run both on the scripts and compare main's state and streams (`--help` for details)
   aos-repair [--aterm PATH] [--control | --publish PLAN_HEX] [--keep] [--out DIR]
                                  OPENS A WINDOW: verify Aos M2 live repair of a stranded momentum glow, or publish an Aos M4 plan against a control (~25 s; `--help` for details)
+  aos-cadence --a PATH --b PATH [--no-attach] [--keep]
+                                 OPENS A WINDOW, four in turn: typing latency to the glass with a recording holding each key for its echo, builds A B B A (~3 min plus each window's wait for a quiet Mac; `--help` for details)
   aos-search [--grid] [--plans FILE] --out DIR [--toolchain LINE] | aos-search --verify FILE
                                  run Aos M4's candidate search under the pinned policy, or verify a bundle FILE offline (`--help` for details)
   aos-workers-bench --plans FILE --out DIR [--lab PATH] [--faults] [--rounds N]
@@ -801,11 +817,12 @@ Outside any lab (no jail, no stub):
                                  OPENS A WINDOW (with --window): verify predictive editing over a simulated RTT `link` in
                                  single and split panes (defaults: both shells, 100 ms, both modes, 2 rounds)
   codex-alab-proof [--package DIR] [--upgrade-package DIR] [--aterm PATH] [--expect-rollout bound|partial]
-                   [--policy-only|--upgrade-only|--raw-upgrade-only|--window-only]
+                   [--policy-only|--terminals-only|--upgrade-only|--raw-upgrade-only|--window-only]
                                  end-to-end native harness proof on the real codex-alab package against a loopback fake
-                                 model (~11 min; --policy-only: the cybersecurity-refusal leg alone; --upgrade-only: one
-                                 live handoff; --raw-upgrade-only: started through the produced primary with its managed
-                                 entry absent, automatic crash repair, then a live handoff; --window-only: the window
+                                 model (~11 min; --policy-only: the cybersecurity-refusal leg alone; --terminals-only:
+                                 the background terminals leg alone, about 1 min; --upgrade-only: one live handoff;
+                                 --raw-upgrade-only: started through the produced primary with its managed entry
+                                 absent, automatic crash repair, then a live handoff; --window-only: the window
                                  pass, four tabs' chip lines, pads, state lines, hovers, This Mac and menu rows, judged by
                                  what the package's build tells, then END's idle window with Settings ▸ Harness open and
                                  shut; the default run leaves it out); its scratch world is kept
@@ -813,6 +830,16 @@ Outside any lab (no jail, no stub):
                                  CODEX_MEASURED_BUILDS says of the package's build; one proof at a time on this Mac (it
                                  waits up to 20 min for another to end, then is NOT RUN); an --aterm older than the
                                  lifeline every lab launch is armed with (its broker refuses --lifeline-fd) is NOT RUN
+  codex-boxes [--runs N] [--package DIR] [--aterm PATH] [--keep]
+                                 how many of a codex-alab's approval boxes its tab's session log holds as claimed steps
+                                 (GAP 26), on codex-alab-proof's rig: each run (default 3, at most 9) a tab whose model
+                                 asks for 20 escalated commands, each forced to codex's box by a `ctl hold` the lab lifts
+                                 once `status` shows it; reports the boxes forced against the claim steps opened (the
+                                 undercount) and their closes' out= and by=, never failing on those; FAIL on a stalled
+                                 run (no proven claim within 180 s, a hold that did not go on or lift, a box or the done
+                                 line past its one-minute hang detector, or a log that did not read), a blocked mark
+                                 with no claim step, or a step left open (the wait for the last close a one-minute hang
+                                 detector too)
   harness-proof <id> --repo DIR [--aterm PATH] [--target-dir DIR.noindex]
                                  the harness proof (design harness-repos §9 step 2) of a rostered harness built from its
                                  checkout (muse-alab; the others are NOT RUN until the stand-in plays their vendor) in a
@@ -1095,6 +1122,7 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "trail-contrast" => trail_contrast::cmd_trail_contrast(args),
         "video-sheet" => video_sheet::cmd(args),
         "system-state-gallery" => system_state_gallery::cmd_system_state_gallery(args),
+        "allocation-monitor" => allocation_monitor::cmd(args),
         "trail-diff" => trail_diff::cmd_trail_diff(args),
         "trail-census" => trail_census::cmd_trail_census(args),
         "trail-companion" => trail_companion::cmd_trail_companion(args),
@@ -1103,6 +1131,7 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "trail-replay" => trail_replay::cmd(args),
         "first-key" => first_key::cmd_first_key(args),
         "aos-repair" => aos_repair::cmd_aos_repair(args),
+        "aos-cadence" => aos_cadence::cmd_aos_cadence(args),
         "aos-search" => aos_search::cmd_aos_search(args),
         "aos-workers-bench" => aos_workers_bench::cmd_aos_workers_bench(args),
         "aos-gpu-bench" => aos_gpu_bench::cmd_aos_gpu_bench(args),
@@ -1113,6 +1142,7 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "meta-keys" => meta_keys::cmd_meta_keys(args),
         "predict-live" => predict_live::cmd_predict_live(args),
         "codex-alab-proof" => codex_alab_proof::cmd_codex_alab_proof(args),
+        "codex-boxes" => codex_alab_proof::cmd_codex_boxes(args),
         "harness-proof" => harness_proof::cmd_harness_proof(args),
         "codex-measure" => codex_measure::cmd_codex_measure(args),
         "claude-measure" => claude_measure::cmd_claude_measure(args),

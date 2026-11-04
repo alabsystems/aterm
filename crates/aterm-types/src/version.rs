@@ -10,11 +10,12 @@ use std::sync::OnceLock;
 pub struct BuildStamp {
     /// `[workspace.package] version`, as written.
     pub app_version: &'static str,
-    /// Short commit (12 hex, `-dirty` suffixed for an uncommitted tree), or `"unknown"` without git.
+    /// Short commit (12 hex, `-dirty` suffixed for a tree with changes outside the measured
+    /// ledger `docs/measured`, as `crates/aterm/stamp_paths.rs` says), or `"unknown"` without git.
     pub git_commit: &'static str,
     /// All forty hexadecimal commit characters, or `"unknown"`.
     pub git_commit_full: &'static str,
-    /// `"true"` when the tree had uncommitted changes, else `"false"`.
+    /// `"true"` when [`Self::git_commit`] ends `-dirty`, else `"false"`.
     pub git_dirty: &'static str,
     /// UTC build timestamp (RFC3339), or `"unknown"`.
     pub build_time: &'static str,

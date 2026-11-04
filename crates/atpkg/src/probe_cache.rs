@@ -125,8 +125,7 @@ fn read_admitted(file: &Path) -> Option<String> {
     if !admitted_dir(dir) {
         return None;
     }
-    let handle = crate::metadata_io::open_regular(file).ok()?;
-    let meta = handle.metadata().ok()?;
+    let (handle, meta) = crate::metadata_io::open_regular_with_meta(file).ok()?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
@@ -137,7 +136,7 @@ fn read_admitted(file: &Path) -> Option<String> {
     if meta.len() > MAX_PROBE_CACHE_BYTES as u64 {
         return None;
     }
-    let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
     handle
         .take(MAX_PROBE_CACHE_BYTES as u64 + 1)
         .read_to_end(&mut bytes)

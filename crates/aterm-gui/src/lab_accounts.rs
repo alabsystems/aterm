@@ -49,8 +49,8 @@ pub(crate) fn collect(config: &Path, now_ms: u64) -> LabAccounts {
     }
 }
 
-/// The lab journal's facts of one account: who last used it, where it is signed in, and each
-/// window with its reading's age, Mac and source.
+/// The lab journal's facts of one account: who last used it, retained sign-in records with
+/// their ages, and each window with its reading's age, Mac and source.
 fn journal_facts(found: &alab_seen::AccountSeen, now: i64, facts: &mut Vec<(String, String)>) {
     if let Some(last) = &found.last_use {
         facts.push((
@@ -58,13 +58,8 @@ fn journal_facts(found: &alab_seen::AccountSeen, now: i64, facts: &mut Vec<(Stri
             alab_seen::when(&last.by, last.t, now),
         ));
     }
-    if !found.signed_in.is_empty() {
-        let on: Vec<String> = found
-            .signed_in
-            .iter()
-            .map(|s| format!("{} ({})", s.on, s.state))
-            .collect();
-        facts.push(("Signed in on (lab journal)".into(), on.join(", ")));
+    if let Some(records) = alab_seen::signed_in_words(&found.signed_in, now) {
+        facts.push(("Sign-in records (lab journal)".into(), records));
     }
     for window in &found.windows {
         facts.push((
@@ -111,23 +106,24 @@ fn project(records: &AccountRecords, now_ms: u64) -> LabAccounts {
 }
 
 /// The rows of `records`, each with what the lab journal `seen` says of its account (last used
-/// by, signed in on, each window), read from the journal and never from a provider.
+/// by, sign-in records, each window), read from the journal and never from a provider.
 fn project_with(
     records: &AccountRecords,
     seen: Option<&alab_seen::Seen>,
     now_ms: u64,
 ) -> LabAccounts {
     let now = seconds(now_ms);
-    let lab = seen.and_then(|_| aterm_agent::harness::alab_roster::current());
     let rows: Vec<_> = records.roster.rows.iter().map(|row| {
         let account = records.state.accounts.get(&row.label).cloned().unwrap_or_default();
         let binding = records.logins.get(&row.label);
-        let next_step = binding.and_then(|binding| binding.sign_in_task)
+        let configured = records.raw_roster.row(&row.label);
+        let current_task = configured.and_then(|raw| accounts::current_sign_in_task(raw, &records.logins));
+        let current_attempt = configured.and_then(|raw| accounts::current_sign_in_attempt(raw, &records.logins));
+        let next_step = current_task
             .map(|task| task.action.next_step(Cli::Claude, &row.label))
             .or_else(|| {
                 (account.current_auth(row) == Auth::SignedOut
-                    || binding.and_then(|binding| binding.sign_in_attempt.as_ref())
-                        .is_some_and(|attempt| attempt.outcome.failing()))
+                    || current_attempt.is_some_and(|attempt| attempt.outcome.failing()))
                     .then(|| "Run aterm harness accounts to inspect recovery details".into())
             });
         let auth = match account.auth {
@@ -179,10 +175,15 @@ fn project_with(
             }
             if let Some(task) = binding.sign_in_task {
                 facts.push(("Recorded sign-in task".into(), match task.action {
-                    SignInAction::Browser => "Browser sign-in needed",
-                    SignInAction::Login => "CLI sign-in needed",
+                    SignInAction::Browser => "Browser sign-in requested on record",
+                    SignInAction::Login => "CLI sign-in requested on record",
                 }.into()));
                 facts.push(("Sign-in task observed".into(), observation_time(Some(task.at), now)));
+                facts.push(("Sign-in task applicability".into(), if current_task.is_some() {
+                    "Applies to the configured workflow; completion unverified"
+                } else {
+                    "Historical only; not a step for the current workflow"
+                }.into()));
             }
             if let Some(attempt) = &binding.sign_in_attempt {
                 facts.push(("Last automatic sign-in".into(), match attempt.outcome {
@@ -192,6 +193,11 @@ fn project_with(
                     AttemptOutcome::SignedIn => "Succeeded on record; current sign-in is unverified",
                 }.into()));
                 facts.push(("Attempt observed".into(), observation_time(Some(attempt.since), now)));
+                facts.push(("Attempt applicability".into(), if current_attempt.is_some() {
+                    "Applies to the configured sign-in workflow"
+                } else {
+                    "Historical only; not evidence for the current workflow"
+                }.into()));
             } else {
                 facts.push(("Last automatic sign-in".into(), "No attempt recorded".into()));
             }
@@ -241,7 +247,7 @@ fn project_with(
         }
         // What every Mac's journal says of this account, beside this Mac's own records.
         if let Some(found) = seen.and_then(|seen| {
-            let pk = alab_seen::row_key(Cli::Claude, row, &records.state, lab.as_deref())?;
+            let pk = alab_seen::row_key(Cli::Claude, row)?;
             seen.accounts.get(&pk)
         }) {
             journal_facts(found, now, &mut facts);

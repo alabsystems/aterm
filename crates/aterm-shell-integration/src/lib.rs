@@ -903,7 +903,7 @@ fn injection_for(shell: ShellType, base: &Path) -> Option<InjectionEnv> {
 fn cache_dir() -> PathBuf {
     #[cfg(any(unix, windows))]
     if let Some(root) = aterm_uds::test_binary::scratch_root()
-        && (cfg!(windows) || std::env::var_os("XDG_CACHE_HOME").is_none())
+        && (cfg!(windows) || posix_absolute(std::env::var_os("XDG_CACHE_HOME")).is_none())
     {
         return root.join("cache").join("aterm").join("shell-integration");
     }
@@ -911,27 +911,56 @@ fn cache_dir() -> PathBuf {
 }
 
 fn per_user_cache_dir() -> PathBuf {
-    #[cfg(windows)]
-    {
-        match std::env::var_os("LOCALAPPDATA") {
-            Some(local) => PathBuf::from(local).join("aterm").join("shell-integration"),
-            None => std::env::temp_dir().join("aterm-shell-integration"),
-        }
-    }
+    per_user_cache_dir_from(
+        cfg!(windows),
+        |key| std::env::var_os(key),
+        std::env::temp_dir,
+    )
+}
 
-    #[cfg(not(windows))]
-    {
-        if let Some(cache) = std::env::var_os("XDG_CACHE_HOME") {
-            PathBuf::from(cache).join("aterm").join("shell-integration")
-        } else if let Some(home) = std::env::var_os("HOME") {
-            PathBuf::from(home)
-                .join(".cache")
-                .join("aterm")
-                .join("shell-integration")
-        } else {
-            std::env::temp_dir().join("aterm-shell-integration")
-        }
+/// [`per_user_cache_dir`] for a platform, an environment and a temp dir passed in, so every
+/// platform's order runs on any host. A variable that is not an absolute path by its platform's
+/// rule (blank included; XDG names a relative `XDG_CACHE_HOME` invalid) is unset, so no variable
+/// puts the cache relative to whatever directory the shell is in. The temp dir is the last
+/// resort, as `std::env::temp_dir` gives it.
+fn per_user_cache_dir_from(
+    windows: bool,
+    var: impl Fn(&str) -> Option<std::ffi::OsString>,
+    temp_dir: impl FnOnce() -> PathBuf,
+) -> PathBuf {
+    if windows {
+        return match windows_absolute(var("LOCALAPPDATA")) {
+            Some(local) => PathBuf::from(local).join("aterm").join("shell-integration"),
+            None => temp_dir().join("aterm-shell-integration"),
+        };
     }
+    if let Some(cache) = posix_absolute(var("XDG_CACHE_HOME")) {
+        PathBuf::from(cache).join("aterm").join("shell-integration")
+    } else if let Some(home) = posix_absolute(var("HOME")) {
+        PathBuf::from(home)
+            .join(".cache")
+            .join("aterm")
+            .join("shell-integration")
+    } else {
+        temp_dir().join("aterm-shell-integration")
+    }
+}
+
+/// `value` where it is an absolute path by POSIX's rule (it starts with `/`), on any host.
+fn posix_absolute(value: Option<std::ffi::OsString>) -> Option<std::ffi::OsString> {
+    value.filter(|v| v.as_encoded_bytes().first() == Some(&b'/'))
+}
+
+/// `value` where it is an absolute path by Windows' rule, on any host: a drive letter, `:` and a
+/// separator (`C:\`, `C:/`), or a UNC or device path, two separators and a name
+/// (`\\server\share`, `//server/share`, `\\?\`).
+fn windows_absolute(value: Option<std::ffi::OsString>) -> Option<std::ffi::OsString> {
+    let sep = |b: &u8| *b == b'\\' || *b == b'/';
+    value.filter(|v| match v.as_encoded_bytes() {
+        [drive, b':', next, ..] => drive.is_ascii_alphabetic() && sep(next),
+        [first, second, name, ..] => sep(first) && sep(second) && !sep(name),
+        _ => false,
+    })
 }
 
 /// Write one integration script or wrapper file.

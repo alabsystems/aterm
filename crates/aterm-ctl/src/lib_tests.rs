@@ -5,7 +5,7 @@ use super::*;
 
 #[test]
 fn maintenance_inventory_cannot_skip_an_unreadable_or_malformed_graph_record() {
-    let scratch = aterm_tempfile::tempdir().expect("private inventory");
+    let scratch = test_scratch_dir("inventory");
     let dir = scratch.path();
     let read =
         || enumerate_instances_with(dir, std::fs::read_dir(dir).unwrap(), Inventory::Complete);
@@ -205,10 +205,8 @@ fn help_fills_what_an_older_server_cannot_say() {
     use std::io::{BufRead, Write};
     use std::os::unix::net::UnixListener;
 
-    let dir = std::env::temp_dir().join(format!("aterm-ctl-oldhelp-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&dir);
-    let sock = dir.join("old.sock");
-    let _ = std::fs::remove_file(&sock);
+    let scratch = test_scratch_dir("oldhelp");
+    let sock = scratch.path().join("old.sock");
     let listener = UnixListener::bind(&sock).expect("bind mock socket");
     let srv = std::thread::spawn(move || {
         let mut seen = Vec::new();
@@ -250,8 +248,6 @@ fn help_fills_what_an_older_server_cannot_say() {
         srv.join().expect("server"),
         ["help resizes", "help cast", "help status"]
     );
-    let _ = std::fs::remove_file(&sock);
-    let _ = std::fs::remove_dir(&dir);
 }
 
 /// The `exchange` backstop: a `cast drift` that reaches it (every one is the
@@ -266,10 +262,8 @@ fn the_exchange_backstop_refuses_an_older_servers_bare_cast() {
 
     const CAST: &str = "{\"version\": 2, \"width\": 20, \"height\": 8}\n\
                         [0.1, \"o\", \"hi\"]\n[0.2, \"r\", \"20x7\"]\n";
-    let dir = std::env::temp_dir().join(format!("aterm-ctl-olddrift-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&dir);
-    let sock = dir.join("old.sock");
-    let _ = std::fs::remove_file(&sock);
+    let scratch = test_scratch_dir("olddrift");
+    let sock = scratch.path().join("old.sock");
     let listener = UnixListener::bind(&sock).expect("bind mock socket");
     let srv = std::thread::spawn(move || {
         let (conn, _) = listener.accept().expect("accept");
@@ -305,8 +299,6 @@ fn the_exchange_backstop_refuses_an_older_servers_bare_cast() {
     assert!(err.contains("predates `cast drift`"), "{err}");
     cli.join().expect("client thread");
     assert_eq!(srv.join().expect("server thread"), "cast drift\n");
-    let _ = std::fs::remove_file(&sock);
-    let _ = std::fs::remove_dir(&dir);
 }
 
 #[test]
@@ -589,9 +581,8 @@ fn an_over_long_request_never_leaves_the_client() {
     use std::sync::atomic::{AtomicBool, Ordering};
     const HANG: std::time::Duration = std::time::Duration::from_secs(60);
 
-    let dir = std::env::temp_dir().join(format!("aterm-ctl-overlong-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&dir);
-    let sock = dir.join("cap.sock");
+    let scratch = test_scratch_dir("overlong");
+    let sock = scratch.path().join("cap.sock");
     let path = sock.to_str().expect("utf8 path").to_string();
     let sent = |text: String| {
         let _ = std::fs::remove_file(&sock);
@@ -640,8 +631,6 @@ fn an_over_long_request_never_leaves_the_client() {
         bytes > MAX_REQUEST_LINE,
         "the request at the cap was sent: {bytes}"
     );
-    let _ = std::fs::remove_file(&sock);
-    let _ = std::fs::remove_dir(&dir);
 }
 
 fn argv(v: &[&str]) -> Vec<String> {
@@ -877,10 +866,8 @@ fn a_workers_task_follows_only_the_servers_go() {
     use std::io::{BufRead, Read};
     use std::os::unix::net::UnixListener;
 
-    let dir = std::env::temp_dir().join(format!("aterm-ctl-worker-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&dir);
-    let sock = dir.join("worker.sock");
-    let _ = std::fs::remove_file(&sock);
+    let scratch = test_scratch_dir("worker");
+    let sock = scratch.path().join("worker.sock");
     let listener = UnixListener::bind(&sock).expect("bind mock socket");
     let path = sock.to_str().expect("utf8 path").to_string();
     let task = b"close\ntab close\nsend rm -rf ~\n";
@@ -932,8 +919,6 @@ fn a_workers_task_follows_only_the_servers_go() {
     let (_, first, rest) = srv.join().expect("server");
     assert_eq!(first, format!("{head}\n"));
     assert!(rest.is_empty(), "not a byte of the task: {rest:?}");
-    let _ = std::fs::remove_file(&sock);
-    let _ = std::fs::remove_dir(&dir);
 }
 
 #[test]
@@ -1040,7 +1025,7 @@ fn publish_entry(dir: &Path, sid: &str, sock: &Path) {
 #[cfg(unix)]
 #[test]
 fn a_peer_selector_dials_its_host() {
-    let scratch = aterm_tempfile::TempDir::new_in("/tmp").expect("scratch dir");
+    let scratch = test_scratch_dir("peer-host");
     let dir = scratch.path().to_path_buf();
     std::fs::create_dir(dir.join("graph")).expect("graph dir");
     let host = dir.join(control_socket::instance_sock_name(4001));
@@ -1125,7 +1110,7 @@ fn a_host_that_took_the_request_ends_the_call() {
     fn unreached(_: &CastDriftJob<'_>) -> Result<String, String> {
         Err("no read reached the analyzer".to_string())
     }
-    let scratch = aterm_tempfile::TempDir::new_in("/tmp").expect("scratch dir");
+    let scratch = test_scratch_dir("took-req");
     let dir = scratch.path().to_path_buf();
     std::fs::create_dir(dir.join("graph")).expect("graph dir");
     let host = dir.join(control_socket::instance_sock_name(4011));
@@ -1244,7 +1229,7 @@ fn only_nothing_listening_on_a_graph_entry_is_no_host() {
 #[cfg(unix)]
 #[test]
 fn hosting_sock_holds_an_entry_to_the_rendezvous_dir() {
-    let scratch = aterm_tempfile::TempDir::new_in("/tmp").expect("scratch dir");
+    let scratch = test_scratch_dir("rv-entry");
     let (dir, away) = (scratch.path().join("rv"), scratch.path().join("away"));
     for d in [&dir.join("graph"), &dir.join("sub"), &away] {
         std::fs::create_dir_all(d).expect("scratch dirs");
@@ -1350,7 +1335,7 @@ fn a_target_is_followed_to_where_its_successor_answers() {
         "outside a session the flagless rule follows the alias"
     );
 
-    let scratch = aterm_tempfile::TempDir::new_in("/tmp").expect("scratch dir");
+    let scratch = test_scratch_dir("took-req");
     let dir = scratch.path().to_path_buf();
     std::fs::create_dir(dir.join("graph")).expect("graph dir");
     let (peer, own) = (dir.join("aterm-4006.sock"), dir.join("aterm-4007.sock"));
@@ -1564,10 +1549,8 @@ fn a_server_that_stalls_is_a_named_wait_not_eagain() {
     use std::io::{BufRead, Read};
     use std::os::unix::net::UnixListener;
 
-    let dir = std::env::temp_dir().join(format!("aterm-ctl-silent-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&dir);
-    let sock = dir.join("silent.sock");
-    let _ = std::fs::remove_file(&sock);
+    let scratch = test_scratch_dir("silent");
+    let sock = scratch.path().join("silent.sock");
     let listener = UnixListener::bind(&sock).expect("bind mock socket");
     let replies: [&[u8]; 3] = [b"", b"", b"OK 2\nrow one\n"];
     let srv = std::thread::spawn(move || {
@@ -1616,8 +1599,6 @@ fn a_server_that_stalls_is_a_named_wait_not_eagain() {
         srv.join().expect("server"),
         ["text\n", "feed-bin 1\n", "help text\n"]
     );
-    let _ = std::fs::remove_file(&sock);
-    let _ = std::fs::remove_dir(&dir);
 }
 
 /// A `turn` whose verdict arrived was typed (`submitted=1` here), so a server
@@ -1630,7 +1611,7 @@ fn a_turn_cut_after_its_verdict_exits_75_never_1() {
     use std::io::BufRead;
     use std::os::unix::net::UnixListener;
 
-    let scratch = aterm_tempfile::tempdir().expect("private dir");
+    let scratch = test_scratch_dir("turn-cut");
     let sock = scratch.path().join("turn.sock");
     let listener = UnixListener::bind(&sock).expect("bind mock socket");
     let verdict =
@@ -1847,10 +1828,8 @@ fn an_empty_selector_never_reaches_the_socket_and_a_named_one_does() {
     use std::io::{BufRead, Write};
     use std::os::unix::net::UnixListener;
 
-    let dir = std::env::temp_dir().join(format!("aterm-ctl-emptysel-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&dir);
-    let sock = dir.join("s.sock");
-    let _ = std::fs::remove_file(&sock);
+    let scratch = test_scratch_dir("emptysel");
+    let sock = scratch.path().join("s.sock");
     let listener = UnixListener::bind(&sock).expect("bind mock socket");
     let srv = std::thread::spawn(move || {
         let (conn, _) = listener.accept().expect("accept");
@@ -1894,8 +1873,6 @@ fn an_empty_selector_never_reaches_the_socket_and_a_named_one_does() {
     let code = run(&["@.", "task"]).expect("the named selector is sent");
     assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
     assert_eq!(srv.join().expect("server"), "@. task\n");
-    let _ = std::fs::remove_file(&sock);
-    let _ = std::fs::remove_dir(&dir);
 }
 
 #[test]
@@ -1991,9 +1968,8 @@ fn uds_token_name_mirror_matches_aterm_types() {
 
 #[test]
 fn two_explicit_sockets_in_one_directory_read_their_own_tokens() {
-    let dir = std::env::temp_dir().join(format!("aterm-ctl-tok-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("test dir");
+    let scratch = test_scratch_dir("tok");
+    let dir = scratch.path();
     let a = dir.join("a.sock").to_string_lossy().into_owned();
     let b = dir.join("b.sock").to_string_lossy().into_owned();
     std::fs::write(dir.join("a.sock.token"), "aaaa\n").expect("token a");
@@ -2030,8 +2006,6 @@ fn two_explicit_sockets_in_one_directory_read_their_own_tokens() {
     let (path, err) = read_token_at(&a).expect_err("an empty token is a miss");
     assert_eq!(path, dir.join("a.sock.token"));
     assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -2486,14 +2460,8 @@ fn connector_deadline_bounds_one_stuck_worker_and_late_success() {
 #[cfg(unix)]
 #[test]
 fn token_reader_rejects_oversized_symlink_and_fifo_without_parking() {
-    let dir = std::env::temp_dir().join(format!(
-        "aterm-ctl-token-bound-{}-{}",
-        std::process::id(),
-        aterm_time::since_epoch()
-            .expect("clock after epoch")
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).expect("token fixture directory");
+    let scratch = test_scratch_dir("tok-bound");
+    let dir = scratch.path();
     let socket = dir.join("mock.sock");
     let token = dir.join("aterm.token");
     let socket_text = socket.to_str().expect("utf8 socket path");
@@ -2533,8 +2501,6 @@ fn token_reader_rejects_oversized_symlink_and_fifo_without_parking() {
         started.elapsed() < HANG_DETECTOR,
         "the token FIFO parked discovery"
     );
-
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// The server's words before its hang-up, not the write's error: a listener
@@ -2630,9 +2596,8 @@ fn probe_lines_classifies_real_sockets() {
     let probe = |path: &str, verb: &str, pid: u32| {
         probe_lines_with_deadline(path, verb, pid, HANG_DETECTOR)
     };
-    let dir = std::env::temp_dir().join(format!("aterm-ctl-f8-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("private dir");
+    let scratch = test_scratch_dir("f8");
+    let dir = scratch.path();
 
     let stale = dir.join(control_socket::instance_sock_name(DEAD_PID));
     abandon_socket(&stale);
@@ -2663,7 +2628,7 @@ fn probe_lines_classifies_real_sockets() {
         other => panic!("a missing socket file is Other(NotFound), got {other:?}"),
     }
 
-    let (sock, srv) = mock_instance(&dir, "mock.sock", b"ERR auth\n");
+    let (sock, srv) = mock_instance(dir, "mock.sock", b"ERR auth\n");
     match probe(&sock, "sessions", 0) {
         Probe::NoToken(path, _) => assert_eq!(path, dir.join("mock.sock.token")),
         other => panic!("no token on disk + ERR auth is NoToken, got {other:?}"),
@@ -2671,25 +2636,25 @@ fn probe_lines_classifies_real_sockets() {
     assert_eq!(srv.join().expect("mock"), "sessions\n");
 
     std::fs::write(dir.join("mock.sock.token"), "deadbeef\n").expect("token");
-    let (sock, srv) = mock_instance(&dir, "mock.sock", b"ERR auth\n");
+    let (sock, srv) = mock_instance(dir, "mock.sock", b"ERR auth\n");
     assert!(matches!(probe(&sock, "sessions", 0), Probe::AuthRejected));
     assert_eq!(srv.join().expect("mock"), "sessions\n");
 
-    let (sock, srv) = mock_instance(&dir, "mock.sock", b"OK 2\nalpha\r\nbeta\n");
+    let (sock, srv) = mock_instance(dir, "mock.sock", b"OK 2\nalpha\r\nbeta\n");
     match probe(&sock, "sessions", 0) {
         Probe::Answered(lines) => assert_eq!(lines, vec!["alpha", "beta"]),
         other => panic!("OK 2 + two rows is Answered, got {other:?}"),
     }
     srv.join().expect("mock");
 
-    let (sock, srv) = mock_instance(&dir, "mock.sock", b"OK 2\nalpha\n");
+    let (sock, srv) = mock_instance(dir, "mock.sock", b"OK 2\nalpha\n");
     match probe(&sock, "sessions", 0) {
         Probe::Other(e) => assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof),
         other => panic!("a truncated OK body is UnexpectedEof, got {other:?}"),
     }
     srv.join().expect("mock");
 
-    let (sock, srv) = mock_instance(&dir, "mock.sock", b"ERR usage: sessions\n");
+    let (sock, srv) = mock_instance(dir, "mock.sock", b"ERR usage: sessions\n");
     match probe(&sock, "sessions", 0) {
         Probe::Replied(said) => {
             assert_eq!(said, "ERR usage: sessions");
@@ -2701,8 +2666,6 @@ fn probe_lines_classifies_real_sockets() {
         other => panic!("a non-auth ERR is Replied, got {other:?}"),
     }
     srv.join().expect("mock");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Discovery dials only what it can reach.
@@ -2713,7 +2676,7 @@ fn discovery_skips_dead_and_foreign_graph_entries_and_dials_the_reachable() {
     let _serial = PROBE_SOCKET_TEST_LOCK
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
-    let scratch = aterm_tempfile::TempDir::new_in("/tmp").expect("scratch dir");
+    let scratch = test_scratch_dir("disc-reach");
     let root = scratch.path();
     let (rv, private, public) = (root.join("rv"), root.join("priv"), root.join("pub"));
     for d in [&rv.join("graph"), &private, &public] {
@@ -2824,7 +2787,7 @@ fn discovery_skips_dead_and_foreign_graph_entries_and_dials_the_reachable() {
 #[cfg(target_vendor = "apple")]
 #[test]
 fn discovery_skips_and_keeps_an_entry_whose_pid_now_names_a_younger_process() {
-    let scratch = aterm_tempfile::TempDir::new_in("/tmp").expect("scratch dir");
+    let scratch = test_scratch_dir("younger");
     let rv = scratch.path().join("rv");
     std::fs::create_dir_all(rv.join("graph")).expect("graph dir");
     let me = std::process::id();
@@ -2867,10 +2830,8 @@ fn a_reply_sent_before_the_peer_hung_up_is_read() {
     let _serial = PROBE_SOCKET_TEST_LOCK
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
-    let dir = std::env::temp_dir().join(format!("aterm-ctl-hungup-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("private dir");
-    let sock = dir.join("mock.sock");
+    let scratch = test_scratch_dir("hungup");
+    let sock = scratch.path().join("mock.sock");
     let listener = aterm_uds::CtlListener::bind(&sock).expect("bind mock instance");
     let srv = std::thread::spawn(move || {
         let (mut conn, _) = listener.accept().expect("accept");
@@ -2887,7 +2848,6 @@ fn a_reply_sent_before_the_peer_hung_up_is_read() {
     assert_eq!(line, "ERR auth\n");
     line.clear();
     assert_eq!(reader.read_line(&mut line).expect("then the end"), 0);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Every byte arrives sooner than the socket timeout, so only the one total
@@ -2909,10 +2869,8 @@ fn probe_deadline_is_total_against_a_trickling_peer() {
     let _serial = PROBE_SOCKET_TEST_LOCK
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
-    let dir = std::env::temp_dir().join(format!("aterm-ctl-trickle-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("private trickle dir");
-    let sock = dir.join("mock.sock");
+    let scratch = test_scratch_dir("trickle");
+    let sock = scratch.path().join("mock.sock");
     let listener = aterm_uds::CtlListener::bind(&sock).expect("bind trickle mock");
     let server = std::thread::spawn(move || {
         let (mut conn, _) = listener.accept().expect("accept trickle client");
@@ -2943,7 +2901,6 @@ fn probe_deadline_is_total_against_a_trickling_peer() {
     );
 
     server.join().expect("trickle server");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The `attach` lane's foreground handoff names the receiving instance from
@@ -2952,8 +2909,8 @@ fn probe_deadline_is_total_against_a_trickling_peer() {
 #[cfg(windows)]
 #[test]
 fn the_forward_target_pid_comes_from_the_socket_name_or_its_alias() {
-    let dir = std::env::temp_dir().join(format!("aterm-ctl-fgpid-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&dir);
+    let scratch = test_scratch_dir("fgpid");
+    let dir = scratch.path();
     let named = dir.join("aterm-77.sock");
     assert_eq!(
         instance_pid_of(named.to_str().expect("utf8 path")),
@@ -2975,14 +2932,12 @@ fn the_forward_target_pid_comes_from_the_socket_name_or_its_alias() {
     );
     std::fs::write(&alias, "..\\..\\somewhere-else.sock").expect("rewrite the pointer file");
     assert_eq!(instance_pid_of(alias.to_str().expect("utf8 path")), None);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn the_front_door_probe_dials_through_the_latest_alias() {
-    let dir = std::env::temp_dir().join(format!("aterm-ctl-probe-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("private probe dir");
+    let scratch = test_scratch_dir("probe");
+    let dir = scratch.path();
     let instance = dir.join(control_socket::instance_sock_name(std::process::id()));
     let alias = dir.join(control_socket::LATEST_SOCK_FILE);
     let alias_str = alias.to_str().expect("utf8 path").to_string();
@@ -3005,8 +2960,6 @@ fn the_front_door_probe_dials_through_the_latest_alias() {
         "the probe must dial the live instance through the alias"
     );
     drop(listener);
-    let _ = std::fs::remove_file(&instance);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A front-door forward with no readable reply after the request was written
@@ -3094,7 +3047,6 @@ fn a_front_door_failure_after_the_send_is_delivered() {
     let reply = send(HANG_DETECTOR).expect("a refusal");
     assert_eq!(srv.join().expect("mock server"), "version\n");
     assert!(reply.starts_with("ERR auth"), "{reply}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A listener that never accepts passes `front_door_instance`'s connect, yet a
@@ -3130,7 +3082,6 @@ fn a_front_door_forward_nobody_accepts_is_never_sent() {
         queued, "AUTH deadbeef\nversion\n",
         "the request was never sent"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[cfg(unix)]
@@ -3178,12 +3129,14 @@ fn a_front_door_ask_counts_an_aterm_only_where_it_answers() {
             return;
         }
     });
+    // This server answers the accept probe, so its accept is held to the hang detector too.
     assert_eq!(
-        front_door_ask_at(&path, ("status\n", HANG_DETECTOR), running),
+        with_accept_within(HANG_DETECTOR, || {
+            front_door_ask_at(&path, ("status\n", HANG_DETECTOR), running)
+        }),
         FrontDoorAnswer::Answered("OK schema=1 fleet=off".to_owned())
     );
     srv.join().expect("mock server");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A stopped aterm's socket takes a connection in the kernel and answers nothing until resumed:
@@ -3213,14 +3166,12 @@ fn a_front_door_ask_reads_a_stopped_aterm_as_that_before_it_sends_or_waits() {
         conn.read_to_string(&mut sent).expect("the queued bytes");
         assert_eq!(sent, "", "nothing is sent to a stopped aterm");
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn flagless_target_falls_back_to_the_newest_live_instance_when_latest_is_dead() {
-    let dir = std::env::temp_dir().join(format!("aterm-ctl-latest-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("private dir");
+    let scratch = test_scratch_dir("latest");
+    let dir = scratch.path();
     let alias = dir.join(control_socket::LATEST_SOCK_FILE);
     let alias_s = alias.to_str().expect("utf8").to_string();
     let corpse = dir.join(control_socket::instance_sock_name(DEAD_PID));
@@ -3228,26 +3179,26 @@ fn flagless_target_falls_back_to_the_newest_live_instance_when_latest_is_dead() 
     let live_s = live.to_str().expect("utf8").to_string();
 
     aterm_uds::latest::publish(&alias, corpse.to_str().expect("utf8"));
-    assert_eq!(flagless_target(&dir, alias_s.clone()), alias_s);
-    assert_eq!(newest_live_instance_in(&dir), None);
+    assert_eq!(flagless_target(dir, alias_s.clone()), alias_s);
+    assert_eq!(newest_live_instance_in(dir), None);
 
     abandon_socket(&corpse);
     let listener = aterm_uds::CtlListener::bind(&live).expect("bind the live instance");
     let stranger =
         aterm_uds::CtlListener::bind(dir.join("private.sock")).expect("bind the explicit one");
     assert_eq!(
-        flagless_target(&dir, alias_s.clone()),
+        flagless_target(dir, alias_s.clone()),
         live_s,
         "a dead alias resolves to the live instance beside it"
     );
     assert_eq!(
-        newest_live_instance_in(&dir).as_deref(),
+        newest_live_instance_in(dir).as_deref(),
         Some(live_s.as_str())
     );
 
     aterm_uds::latest::publish(&alias, &live_s);
     assert_eq!(
-        flagless_target(&dir, alias_s.clone()),
+        flagless_target(dir, alias_s.clone()),
         alias_s,
         "a live alias is dialed as the alias"
     );
@@ -3255,10 +3206,9 @@ fn flagless_target_falls_back_to_the_newest_live_instance_when_latest_is_dead() 
     drop(listener);
     let _ = std::fs::remove_file(&live);
     let _ = std::fs::remove_file(&alias);
-    assert_eq!(flagless_target(&dir, alias_s.clone()), alias_s);
-    assert_eq!(newest_live_instance_in(&dir), None);
+    assert_eq!(flagless_target(dir, alias_s.clone()), alias_s);
+    assert_eq!(newest_live_instance_in(dir), None);
     drop(stranger);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -3503,9 +3453,8 @@ fn the_mux_notice_stamp_matches_the_shell_integrations_path_exactly() {
 
 #[test]
 fn the_boundary_is_announced_only_where_it_cost_a_session_something() {
-    let root = std::env::temp_dir().join(format!("aterm-ctl-muxnotice-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(&root).expect("private scratch root");
+    let scratch = test_scratch_dir("muxnotice");
+    let root = scratch.path();
     let stamp = mux_notice_stamp(
         "screen",
         None,
@@ -3544,7 +3493,6 @@ fn the_boundary_is_announced_only_where_it_cost_a_session_something() {
     );
 
     announce_mux_boundary(None, false);
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 fn session_rows(rows: &[&str]) -> Vec<String> {
@@ -3711,15 +3659,25 @@ fn discovery_verbs_reject_trailing_arguments_with_the_usage_shape() {
     assert_eq!(discovery_given_arguments(&parts(&[])), None);
 }
 
+#[cfg(unix)]
+struct TokenedSocketDir(aterm_tempfile::TempDir);
+
+#[cfg(unix)]
+impl std::ops::Deref for TokenedSocketDir {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        self.0.path()
+    }
+}
+
 /// A private dir holding the token file for `mock.sock`: the token is what
 /// makes the client authenticate, and so probe.
 #[cfg(unix)]
-fn tokened_socket_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("aterm-ctl-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("private dir");
-    std::fs::write(dir.join("mock.sock.token"), "deadbeef\n").expect("token");
-    dir
+fn tokened_socket_dir(tag: &str) -> TokenedSocketDir {
+    let dir = test_scratch_dir(tag);
+    std::fs::write(dir.path().join("mock.sock.token"), "deadbeef\n").expect("token");
+    TokenedSocketDir(dir)
 }
 
 /// A forward whose host went away under the request (`ERR gone pid=<host>
@@ -3733,8 +3691,8 @@ fn a_forward_whose_host_went_away_is_a_replacement_not_a_refusal() {
     use std::io::{BufRead, Write};
     use std::os::unix::net::UnixListener;
 
-    let dir = std::env::temp_dir().join(format!("aterm-ctl-fwd-gone-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let scratch = test_scratch_dir("fwd-gone");
+    let dir = scratch.path();
     std::fs::create_dir_all(dir.join("graph")).expect("graph dir");
     let relay_sock = dir.join("a.sock");
     let host_sock = dir.join("b.sock");
@@ -3821,7 +3779,6 @@ fn a_forward_whose_host_went_away_is_a_replacement_not_a_refusal() {
     }
     relay.join().expect("relay");
     successor.join().expect("successor");
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// A listener that never accepts: the client's connect succeeds into the kernel
@@ -3865,7 +3822,6 @@ fn a_dead_listen_queue_fails_fast_and_named() {
         ),
         "the connect phase waits the caller's {short:?}, not {ACCEPT_DEADLINE:?}"
     );
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// The dead queue through the two exchanges that open their own connection:
@@ -3903,7 +3859,6 @@ fn help_and_cast_drift_fail_fast_on_a_dead_queue_too() {
         waited < HANG_DETECTOR,
         "the two connect phases took {waited:?}"
     );
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// An update's predecessor drops the connection at its Commit, and the one
@@ -3971,7 +3926,6 @@ fn the_retry_after_a_replaced_listener_sends_the_new_token() {
     assert_eq!(first, ["AUTH deadbeef\n", "version\n"]);
     assert_eq!(lines, ["AUTH cafef00d\n", "version\n", "status\n"]);
     assert_eq!(outcome, ExitCode::SUCCESS);
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// A client that authenticates its own connection
@@ -4007,7 +3961,6 @@ fn the_token_read_for_a_connection_is_its_listeners() {
         other => panic!("exactly one listener holds the connection: {other:?}"),
     };
     assert_eq!(token.expect("a token"), holders_token);
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Through the `latest` alias, the token read for a connection is the one
@@ -4039,7 +3992,6 @@ fn a_token_read_through_the_alias_is_the_connected_instances() {
         other => panic!("exactly one listener holds the connection: {other:?}"),
     };
     assert_eq!(token.expect("a token"), holders_token);
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// A busy listener writes `ERR control server busy; retry` and closes
@@ -4085,7 +4037,6 @@ fn a_busy_reply_is_reported_as_busy() {
         send_served(&client, &big).is_err(),
         "negative control: a hang-up with no reason stays the I/O error"
     );
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -4264,10 +4215,8 @@ fn a_sys_instances_all_run_sends_the_plain_request_to_each_instance() {
     use std::io::{BufRead, Write};
     use std::os::unix::net::UnixListener;
 
-    let dir = std::env::temp_dir().join(format!("aterm-ctl-sysall-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&dir);
-    let sock = dir.join("s.sock");
-    let _ = std::fs::remove_file(&sock);
+    let scratch = test_scratch_dir("sysall");
+    let sock = scratch.path().join("s.sock");
     let listener = UnixListener::bind(&sock).expect("bind mock socket");
     let srv = std::thread::spawn(move || {
         let (conn, _) = listener.accept().expect("accept");
@@ -4302,15 +4251,12 @@ fn a_sys_instances_all_run_sends_the_plain_request_to_each_instance() {
         !sent.contains("instances=all") && !sent.contains("@s-x"),
         "{sent:?}"
     );
-    let _ = std::fs::remove_file(&sock);
-    let _ = std::fs::remove_dir(&dir);
 }
 
 #[test]
 fn read_control_token_file_rejects_internal_whitespace_and_control_chars() {
-    let dir = std::env::temp_dir().join(format!("aterm-ctl-tok-bad-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&dir);
-    let path = dir.join("aterm-1.sock.token");
+    let scratch = test_scratch_dir("tok-bad");
+    let path = scratch.path().join("aterm-1.sock.token");
     std::fs::write(&path, "  deadbeef  \n").expect("write valid token");
     assert_eq!(read_control_token_file(&path).unwrap(), "deadbeef");
     for bad in [
@@ -4323,8 +4269,6 @@ fn read_control_token_file_rejects_internal_whitespace_and_control_chars() {
         let err = read_control_token_file(&path).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{bad:?}");
     }
-    let _ = std::fs::remove_file(&path);
-    let _ = std::fs::remove_dir(&dir);
 }
 
 /// A read of a nonblocking stream says `WouldBlock` at once, so a reply that arrives here was
@@ -4375,4 +4319,36 @@ fn a_probe_reply_is_waited_for_in_poll() {
     };
     assert_eq!(probe.read(&mut [0]).unwrap(), 1);
     drop(answering.join().unwrap());
+}
+
+/// NEGATIVE CONTROL: an unbounded UTF-8 tag or `$TMPDIR` root pushes `rv/aterm-<u32>.sock` past BSD
+/// `SUN_LEN` (`104` bytes); `test_scratch_dir` keeps `.noindex` and stays bindable on Unix.
+#[test]
+fn test_scratch_dir_stays_under_unix_sun_len_even_for_long_tags() {
+    let scratch = test_scratch_dir("a-very-long-tag-for-control-socket-discovery-and-redial-😺");
+    let name = scratch
+        .path()
+        .file_name()
+        .and_then(|s| s.to_str())
+        .expect("utf8 scratch name");
+    assert!(name.ends_with(".noindex"), "{name}");
+    #[cfg(target_os = "macos")]
+    assert!(
+        aterm_tempfile::is_quiet(scratch.path()),
+        "expected `.ubd` quiet ancestor: {}",
+        scratch.path().display()
+    );
+    #[cfg(unix)]
+    {
+        let rv = scratch.path().join("rv");
+        std::fs::create_dir(&rv).expect("create rv subdir");
+        let sock = rv.join(control_socket::instance_sock_name(u32::MAX));
+        assert!(
+            sock.as_os_str().len() < 103,
+            "socket path too long for BSD SUN_LEN ({} bytes): {}",
+            sock.as_os_str().len(),
+            sock.display()
+        );
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind socket");
+    }
 }

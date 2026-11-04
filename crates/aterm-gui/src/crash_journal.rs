@@ -1089,7 +1089,8 @@ mod unix {
         if meta.len() > MAX_JOURNAL_BYTES || meta.size() > MAX_JOURNAL_BYTES {
             return Err(format!("{} bytes, more than any layout", meta.len()));
         }
-        let mut text = String::new();
+        let mut text =
+            String::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
         file.take(MAX_JOURNAL_BYTES)
             .read_to_string(&mut text)
             .map_err(|error| format!("not read ({error})"))?;

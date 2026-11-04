@@ -15,7 +15,9 @@ use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use astream_broker::refill::{RefillStep, SharedRefillMeter};
 use astream_broker::Record as BrokerRecord;
+use astream_wire::WakeClass;
 use aterm_hash::fnv1a_64;
 use aterm_types::control_verbs::ScreenGen;
 use aterm_types::fabric_grammar::{Bye, DeadReason, ANSWER_KINDS};
@@ -86,19 +88,22 @@ const LINK_DOWN_RETELL: Duration = Duration::from_secs(30);
 
 const REFILL_FLOOR_SPAN: u64 = 4096;
 
-/// What one record the attach's shared refill read carries and offers to no session costs, in
-/// records the broker scans (`Bridge::refill_node`). Measured on an Apple M5 Max at the
-/// `opt-test` profile, against the broker in the test's own process (2026-10-27, two runs of
-/// five repetitions, at 1-minute loads of 9 and 16): a lane's `Fetch` scanned 7.7-10.7 ns a
-/// record over 200,000 `ev` records, and the shared read carried 100,000 mail records of lanes
-/// it read for no one at 1.48-2.13 us a record, 158-255 records' scan each. A cost off by a
-/// factor of two moves the hand-on by a page or two (256 records carried each).
-const REFILL_ROW_COST: u64 = 192;
-
-/// How far, in records scanned, what the shared refill read carried may pass what it saved
-/// before each session reads on alone (`Bridge::refill_node`): one page's scan, about half a
-/// millisecond at the rate above, or some 340 records carried for no session.
-const REFILL_SPLIT_SLACK: u64 = astream_broker::broker::FETCH_SCAN_MAX as u64;
+// The attach's shared refill read is weighed by astream's `SharedRefillMeter` at its defaults
+// (`Bridge::refill_node`). Its `REFILL_ROW_COST`, what one record the read carries and offers to
+// no session costs in records the broker scans, was measured here: on an Apple M5 Max at the
+// `opt-test` profile, against the broker in the test's own process (2026-10-27, two runs of
+// five repetitions, at 1-minute loads of 9 and 16), a lane's `Fetch` scanned 7.7-10.7 ns a
+// record over 200,000 `ev` records, and the shared read carried 100,000 mail records of lanes
+// it read for no one at 1.48-2.13 us a record, 158-255 records' scan each. A cost off by a
+// factor of two moves the hand-on by a page or two (256 records carried each). Its slack, how
+// far what the read carried may pass what it saved before each session reads on alone, is one
+// page's scan: about half a millisecond at the rate above, or some 340 records carried for no
+// session. astream defines that slack from the page (`FETCH_SCAN_MAX`); the build holds it
+// there, so a pin bump that parts the two stops this crate compiling.
+const _: () = assert!(
+    astream_broker::refill::DEFAULT_REFILL_SPLIT_SLACK
+        == astream_broker::broker::FETCH_SCAN_MAX as u64
+);
 
 const ROSTER_REFRESH: Duration = Duration::from_millis(2_000);
 
@@ -249,9 +254,7 @@ const SELF_ACK_KEEP: usize = 4096;
 /// publish or settle.
 const CLAIMS_KEEP: usize = 4096;
 
-const DEMOTE_UNLESS_ACCEPTED: [&str; 2] = ["task", "control"];
-
-const VERDICT_KINDS: [&str; 2] = ["undeliverable", "expired"];
+const VERDICT_KINDS: [WakeClass; 2] = [WakeClass::Undeliverable, WakeClass::Expired];
 
 const WAITING_KINDS: [&str; 2] = ["ask", "task"];
 
@@ -825,6 +828,13 @@ fn refused_for_good(e: &io::Error) -> bool {
     astream_broker::broker_refusal(e).is_some_and(|r| r.is_permanent() && !r.is_expired())
 }
 
+/// Whether `e` is a broker's refusal of a write behind a GAP FENCE (`gap-fenced=<seq>`): refused
+/// for a write sent before it, not for its own sake.
+fn gap_fenced(e: &io::Error) -> bool {
+    astream_broker::broker_refusal(e)
+        .is_some_and(|r| astream_broker::sticky_fence::parse_gap_fenced_seq(&r.msg).is_some())
+}
+
 fn refusal_is_ack(e: &io::Error) -> bool {
     astream_broker::broker_refusal(e).is_some_and(|r| {
         r.code != astream_broker::proto::ERR_TOO_MANY_CONNS && !r.is_expired() && !r.is_poisoned()
@@ -974,6 +984,7 @@ const INBOX_COMMIT_EVERY: usize = 256;
 enum Then {
     Ev {
         payload: String,
+        sid: Option<String>,
         record: Option<u64>,
     },
     Presence {
@@ -1024,6 +1035,13 @@ impl Then {
             Then::Post(sent) => Some(&sent.post),
             _ => None,
         }
+    }
+
+    /// Whether this is a post of `sid`'s in `identity`'s words (one pinned before identities,
+    /// whatever its words).
+    fn posted_in(&self, sid: &str, identity: &PublishIdentity) -> bool {
+        matches!(self, Then::Post(sent) if sent.post.sid == sid
+            && sent.pin.identity.as_ref().is_none_or(|words| words == identity))
     }
 
     fn own_lane_post(&self) -> bool {
@@ -1209,6 +1227,12 @@ pub struct Bridge {
     ghost_due: Instant,
     ghosts: BTreeMap<String, Instant>,
     exits_owed: BTreeSet<String>,
+    /// The `ev` records a GAP FENCE refused (`gap-fenced=`), by session (`None`: the node's
+    /// own face) and payload: refused only because a write the bridge sent before them was,
+    /// they are sent again once the fence is lifted ([`Bridge::resend_fenced_evs`]), so on a
+    /// broker that gap-fences an `ev` is lost only where its own batch is refused, as on one
+    /// that does not.
+    evs_fenced: Vec<(Option<String>, String)>,
     /// The subjects a departed session held that this node may give back, each with the
     /// offset of its newest record and since when it has been one ([`Bridge::reclaim_subjects`]).
     reclaim: BTreeMap<String, (u64, Instant)>,
@@ -1282,6 +1306,11 @@ pub struct Bridge {
     /// carries (the rule [`Bridge::refill_node`] keeps switched off, a test's negative control).
     #[cfg(test)]
     refill_never_hands_on: bool,
+    /// The broker answers each page of the attach's shared refill read with no records, ending
+    /// where it began ([`Bridge::refill_node`]): a fault a test injects, as no broker of the
+    /// rigs or the seeded worlds answers a page that makes no progress short of the head.
+    #[cfg(test)]
+    refill_page_stalls: bool,
     /// A session below the node inbox's oldest joins the attach's shared refill read there without
     /// reading its own lane below it (the rule [`Bridge::refill_together`] keeps switched off, a
     /// test's negative control).
@@ -1317,11 +1346,15 @@ pub struct Bridge {
     /// sender's earlier post again, above the head of the sender's next post of the same words,
     /// and taken for that post it would settle it where it never landed. A retry takes its own
     /// sequence's claim as where it landed ([`Bridge::landed_at_its_pin`]). A first attempt is
-    /// never claimed: a sender's posts go one at a time, so its first attempts land below the
-    /// head of every later post of its. At most [`CLAIMS_KEEP`], the lowest offsets going first.
+    /// never claimed: a post's pin is made only once every earlier post of its sender in the
+    /// same words was answered ([`Bridge::settle_same_words`]), so their first attempts land below
+    /// its head. At most [`CLAIMS_KEEP`], the lowest offsets going first.
     claims: Option<(astream_broker::LogIdentity, BTreeMap<u64, u64>)>,
     unsent: Option<u64>,
     held_senders: BTreeSet<String>,
+    /// The attach's replay runs ([`Bridge::settle_in_flight`]): the gap fences a refused
+    /// entry set stay up until it ends ([`Bridge::lift_gap_fences`]).
+    fences_held: bool,
     collided: Option<(u64, u64)>,
     seq_block: Option<SeqBlock>,
     lanes_opened: BTreeSet<String>,
@@ -1581,6 +1614,7 @@ impl Bridge {
             claims: None,
             unsent: None,
             held_senders: BTreeSet::new(),
+            fences_held: false,
             collided: None,
             seq_block: None,
             lanes_opened: BTreeSet::new(),
@@ -1613,6 +1647,7 @@ impl Bridge {
             ghost_due: now + ghost_sweep(),
             ghosts: BTreeMap::new(),
             exits_owed: BTreeSet::new(),
+            evs_fenced: Vec::new(),
             reclaim: BTreeMap::new(),
             reclaim_owed: false,
             reclaim_remote: false,
@@ -1664,6 +1699,8 @@ impl Bridge {
             refill_carried: 0,
             #[cfg(test)]
             refill_never_hands_on: false,
+            #[cfg(test)]
+            refill_page_stalls: false,
             #[cfg(test)]
             refill_joins_below_the_oldest: false,
             #[cfg(test)]
@@ -2026,7 +2063,112 @@ impl Bridge {
 
     fn conn_now(&mut self) -> Option<&mut Conn> {
         self.settle_acks();
+        self.lift_gap_fences();
         self.conn.as_mut().and_then(Link::ready)
+    }
+
+    /// ASK THE BROKER TO GAP-FENCE this link's writes where its `Hello` offered it
+    /// ([`Link::ask_gap_fences`]), before the attach writes anything: a broker fences only a
+    /// connection that asks, so only then does a refused write hold back what the bridge sent
+    /// after it, and only then may a sender keep several posts in flight
+    /// ([`Bridge::pipelines_posts`]). `false` once the link is lost.
+    fn ask_gap_fences(&mut self) -> bool {
+        #[cfg(test)]
+        if self
+            .fx
+            .mutant(crate::sim::world::Mutant::NeverAskForTheFence)
+        {
+            if let Some(link) = self.conn.as_mut() {
+                link.assume_asked();
+            }
+            return true;
+        }
+        let started = self.fx.now();
+        let Some(link) = self.conn.as_mut() else {
+            return false;
+        };
+        if !link.supports_gap_fences() {
+            return true;
+        }
+        let asked = link.ask_gap_fences();
+        self.observe(started, asked, Some("attach")).is_ok()
+    }
+
+    /// Whether a sender may have several posts in flight: only where the broker GAP-FENCES
+    /// (its `Hello` offered it and the link asked, [`Link::gap_fences`]), so a refused post lets
+    /// nothing the bridge sent after it land. Against any other broker (one opened without the
+    /// option, or an older `aterm link broker` that outlived an update) a refused batch is
+    /// rolled back and the next post lands ahead of its retry, and a sender keeps one post in
+    /// flight ([`Bridge::settle_sender`]).
+    fn pipelines_posts(&self) -> bool {
+        #[cfg(test)]
+        if self.fx.mutant(crate::sim::world::Mutant::PipelineSender) {
+            return self.conn.is_some();
+        }
+        self.conn.as_ref().is_some_and(Link::gap_fences)
+    }
+
+    /// A broker's answer to one of this bridge's writes, refused: on a broker that
+    /// gap-fences, its connection now holds a fence ([`Link::note_refused`]).
+    fn note_refused<T>(&mut self, answer: &io::Result<T>) {
+        if answer
+            .as_ref()
+            .err()
+            .is_some_and(|e| astream_broker::broker_refusal(e).is_some())
+        {
+            if let Some(link) = self.conn.as_mut() {
+                link.note_refused();
+            }
+        }
+    }
+
+    /// LIFT THE GAP FENCES a refused write set ([`Link::lift_gap_fences`]), before the bridge
+    /// writes again: every owed answer is read first, so each refused post has been concluded
+    /// (its sender held for the drain, its pin kept for the retry, [`Bridge::conclude_post`])
+    /// and nothing the bridge wrote after a refused write is left to land behind the lift.
+    /// Whatever the refused write was, the bridge goes on without a reconnect: an `ev` the fence
+    /// refused is sent again ([`Bridge::resend_fenced_evs`]), and one refused for its own sake is
+    /// lost, as a refused batch's `ev` records always were; presence and the mirror's
+    /// slots are sent again; a post is retried at its pin by a later drain, after the posts
+    /// of its sender ahead of it; and the node's will, which rides this connection, does not
+    /// fire. A lift the broker refuses or cannot answer drops the connection, which lifts
+    /// them too. The attach's replay holds them up ([`Bridge::settle_in_flight`]).
+    fn lift_gap_fences(&mut self) {
+        if self.fences_held || !self.conn.as_ref().is_some_and(Link::fenced) {
+            return;
+        }
+        #[cfg(test)]
+        if self.fx.mutant(crate::sim::world::Mutant::KeepGapFences) {
+            return;
+        }
+        self.settle_acks();
+        // A conclusion read there may have written again, and lifted them first.
+        if !self.conn.as_ref().is_some_and(Link::fenced) {
+            return;
+        }
+        let started = self.fx.now();
+        let Some(lifted) = self.conn.as_mut().and_then(Link::lift_gap_fences) else {
+            return;
+        };
+        if let Err(e) = &lifted {
+            stderr_line!("aterm-link: the broker's gap fences could not be lifted: {e}");
+        }
+        self.judge(started, lifted.as_ref().map(drop), Some("fence"));
+    }
+
+    /// Read every owed answer to a publish sent above `seq`, before one is sent at `seq`, on
+    /// a broker that gap-fences: a write at or under a fence lands and lifts it there, so a
+    /// publish below a refused one still in flight would let a later write land ahead of
+    /// that one's retry. Every publish but the bus mirror's slots takes a fresh sequence,
+    /// above every one sent, and reads nothing here.
+    fn settle_above(&mut self, seq: u64) {
+        let waiting = self.fx.now();
+        while self
+            .conn
+            .as_ref()
+            .is_some_and(|link| link.gap_fences() && link.owes_above(seq))
+            && self.settle_one(waiting)
+        {}
     }
 
     fn settle_acks(&mut self) {
@@ -2077,6 +2219,7 @@ impl Bridge {
         self.waits.ack(reading, commit);
         let rider = owed.rider;
         let other = (commit && !commit_refusal_is_an_answer(&owed.tag, &answer)).then_some("read");
+        self.note_refused(&answer);
         self.judge(owed.sent.max(waiting), answer.as_ref().map(drop), other);
         if let Then::Mirror { slot } = owed.tag {
             self.conclude_mirror(slot, owed.seq, owed.first, answer);
@@ -2105,6 +2248,9 @@ impl Bridge {
     fn conclude(&mut self, then: Then, outcome: io::Result<u64>) {
         match (then, outcome) {
             (Then::Ev { .. }, Ok(_)) => {}
+            (Then::Ev { payload, sid, .. }, Err(e)) if gap_fenced(&e) => {
+                self.evs_fenced.push((sid, payload));
+            }
             (Then::Ev { payload, .. }, Err(e)) => {
                 stderr_line!("aterm-link: could not publish ev {payload:?}: {e}");
             }
@@ -2166,6 +2312,7 @@ impl Bridge {
 
     fn send_pipelined(&mut self, seq: u64, subject: &str, body: &[u8], then: Then) {
         let first = self.unsent == Some(seq);
+        self.settle_above(seq);
         let waiting = self.fx.now();
         while self
             .conn
@@ -2173,6 +2320,10 @@ impl Bridge {
             .is_some_and(|link| link.unacked() >= PIPELINE_WINDOW)
             && self.settle_one(waiting)
         {}
+        self.lift_gap_fences();
+        if let Some(e) = then.post().and_then(|post| self.unsendable(&post.sid)) {
+            return self.conclude(then, Err(unsent(e)));
+        }
         let producer_id = self.producer_id;
         self.note_remote_lane(subject);
         let held = self
@@ -2180,7 +2331,7 @@ impl Bridge {
             .map(|upto| (upto, subject::inbox_group(&self.cfg.fleet, &self.node)));
         let retry = self.commit_refused;
         let Some(link) = self.conn.as_mut() else {
-            return self.conclude(then, Err(broker_unreachable()));
+            return self.conclude(then, Err(unsent(broker_unreachable())));
         };
         let started = self.fx.now();
         let commit = held.as_ref().map(|(upto, group)| HeldCommit {
@@ -2492,6 +2643,7 @@ impl Bridge {
         if first {
             self.unsent = None;
         }
+        self.note_refused(&answer);
         let (off, deduped) = self.observe(started, answer, None)?;
         self.bus_high = self.bus_high.max(off.saturating_add(1));
         if deduped && first {
@@ -2647,6 +2799,7 @@ impl Bridge {
             body.as_bytes(),
             Then::Ev {
                 payload: payload.to_string(),
+                sid: sid.map(str::to_string),
                 record: self.group_record,
             },
         );
@@ -3143,7 +3296,7 @@ impl Bridge {
                 },
             );
         }
-        if together.len() > 1 {
+        if let (Some(oldest), true) = (oldest, together.len() > 1) {
             let lowest = together.values().map(|s| s.from).min().unwrap_or(head);
             #[cfg(test)]
             let lowest = if self
@@ -3154,7 +3307,7 @@ impl Bridge {
             } else {
                 lowest
             };
-            match self.refill_node(&node_filter, lowest, &mut together) {
+            match self.refill_node(&node_filter, oldest, lowest, &mut together) {
                 Together::Read => {}
                 Together::Failed => return false,
                 Together::HandedOn(at) => {
@@ -3194,21 +3347,23 @@ impl Bridge {
     }
 
     /// The shared read of [`Self::refill_together`]: pages of `filter`, the node's inbox, from
-    /// `from`, each record offered to its lane's session in `sessions` at or past that
-    /// session's start, until the head.
+    /// `from` (at or above the inbox's `oldest`), each record offered to its lane's session in
+    /// `sessions` at or past that session's start, until the head.
     ///
-    /// WEIGHED AS IT READS. A page costs the broker its scan once, where a read of each lane
-    /// would have scanned it once for each session it reads for; and it carries the records it
-    /// offers to no session (a lane's below its session's start, a lane it reads for no
-    /// session, a session stopped or gone), which lane by lane no read carried, each costing
-    /// about [`REFILL_ROW_COST`] records scanned. Once what it carried passes what it saved by
-    /// [`REFILL_SPLIT_SLACK`], it ends where it got to and each session reads on alone
-    /// (`HandedOn`), checked after each page: so the shared read never costs more than lane by
-    /// lane did by more than the slack and one page of records carried, and over a log of `ev`
-    /// records past the watermarks it reads once for every session.
+    /// WEIGHED AS IT READS, by astream's `SharedRefillMeter` ([`weigh_shared_page`]). A page
+    /// costs the broker its scan once, where a read of each lane would have scanned it once for
+    /// each session it reads for; and it carries the records it offers to no session (a lane's
+    /// below its session's start, a lane it reads for no session, a session stopped or gone),
+    /// which lane by lane no read carried, each costing about `REFILL_ROW_COST` records
+    /// scanned. Once what it carried passes what it saved by the meter's slack (one page's
+    /// scan), it ends where it got to and each session reads on alone (`HandedOn`), checked
+    /// after each page: so the shared read never costs more than lane by lane did by more than
+    /// the slack and one page of records carried, and over a log of `ev` records past the
+    /// watermarks it reads once for every session.
     fn refill_node(
         &mut self,
         filter: &str,
+        oldest: u64,
         from: u64,
         sessions: &mut BTreeMap<String, Refilling>,
     ) -> Together {
@@ -3217,11 +3372,10 @@ impl Bridge {
         self.fx.refill_tap(crate::fx::RefillTap::Together {
             sessions: sessions.len(),
         });
-        let scan_max = astream_broker::broker::FETCH_SCAN_MAX as u64;
-        // What the read carried past what it saved, in records scanned.
-        let mut owing: i64 = 0;
-        let mut cursor = from;
+        let mut meter =
+            SharedRefillMeter::new(oldest, from, astream_broker::broker::FETCH_SCAN_MAX as u64);
         loop {
+            let cursor = meter.cursor();
             let page = {
                 let fx = self.fx.clone();
                 let Some(conn) = self.conn_now() else {
@@ -3247,6 +3401,12 @@ impl Bridge {
                 }
             };
             let (rows, (next, head)) = page;
+            #[cfg(test)]
+            let (rows, next) = if self.refill_page_stalls {
+                (Vec::new(), cursor)
+            } else {
+                (rows, next)
+            };
             let mut carried: u64 = 0;
             for (off, subj, body) in rows {
                 let owed_to = subj
@@ -3292,50 +3452,46 @@ impl Bridge {
             {
                 self.refill_carried += carried;
             }
-            if next >= head {
-                #[cfg(test)]
-                for (sid, s) in sessions.iter() {
-                    if s.stopped {
-                        continue;
-                    }
-                    if self.per_sid.epochs.contains_key(sid) {
-                        self.fx
-                            .refill_tap(crate::fx::RefillTap::Ended { sid, head });
-                    } else {
-                        self.fx.refill_tap(crate::fx::RefillTap::Dropped { sid });
-                    }
-                }
-                return Together::Read;
-            }
-            if next <= cursor {
-                stderr_line!("aterm-link: the attach's refill made no progress at {cursor}");
-                return Together::Failed;
-            }
-            let scanned = (next - cursor).min(scan_max);
             let reading = sessions
                 .iter()
                 .filter(|(sid, s)| {
                     !s.stopped && s.from < next && self.per_sid.epochs.contains_key(*sid)
                 })
-                .count() as u64;
-            let cost = carried.saturating_mul(REFILL_ROW_COST);
-            let saved = reading.saturating_sub(1).saturating_mul(scanned);
-            owing = owing
-                .saturating_add(i64::try_from(cost).unwrap_or(i64::MAX))
-                .saturating_sub(i64::try_from(saved).unwrap_or(i64::MAX));
-            cursor = next;
-            #[cfg(test)]
-            let hands_on = !self.refill_never_hands_on;
-            #[cfg(not(test))]
-            let hands_on = true;
-            if hands_on && owing > i64::try_from(REFILL_SPLIT_SLACK).unwrap_or(i64::MAX) {
-                stderr_line!(
-                    "aterm-link: the attach's refill of {} sessions together carried more of the \
-                     node's inbox than reading once saved (to @{cursor}); each reads on alone \
-                     from there",
-                    sessions.values().filter(|s| !s.stopped).count()
-                );
-                return Together::HandedOn(cursor);
+                .count();
+            let Some(step) = weigh_shared_page(&mut meter, next, head, carried, reading) else {
+                stderr_line!("aterm-link: the attach's refill made no progress at {cursor}");
+                return Together::Failed;
+            };
+            match step {
+                RefillStep::Complete { .. } => {
+                    #[cfg(test)]
+                    for (sid, s) in sessions.iter() {
+                        if s.stopped {
+                            continue;
+                        }
+                        if self.per_sid.epochs.contains_key(sid) {
+                            self.fx
+                                .refill_tap(crate::fx::RefillTap::Ended { sid, head });
+                        } else {
+                            self.fx.refill_tap(crate::fx::RefillTap::Dropped { sid });
+                        }
+                    }
+                    return Together::Read;
+                }
+                RefillStep::Continue { .. } => {}
+                RefillStep::HandOn { handoff_offset } => {
+                    #[cfg(test)]
+                    if self.refill_never_hands_on {
+                        continue;
+                    }
+                    stderr_line!(
+                        "aterm-link: the attach's refill of {} sessions together carried more of \
+                         the node's inbox than reading once saved (to @{handoff_offset}); each \
+                         reads on alone from there",
+                        sessions.values().filter(|s| !s.stopped).count()
+                    );
+                    return Together::HandedOn(handoff_offset);
+                }
             }
         }
     }
@@ -3749,6 +3905,18 @@ impl Bridge {
         self.take_held_commit()
     }
 
+    /// Whether the bus mirror's burst, sent now, would carry an inbox commit
+    /// ([`Bridge::take_commit_for_the_mirror`]): one is due ([`Bridge::inbox_commit_due`]), and
+    /// a round holds it or no inbox record is queued (a queued record keeps a commit no round
+    /// holds for its own delivery). A take that would carry none waits for the loop's next write
+    /// (critic item E04, [`Bridge::mirror_rides_nothing`]). A commit whose record rides an owed
+    /// ack is not due until that ack is read, which the round's settle or the park's backstop
+    /// does.
+    pub(super) fn mirror_has_a_commit_to_carry(&self) -> bool {
+        (self.commit_held.is_some() || !self.mailbox.inbox_queued())
+            && self.inbox_commit_due().is_some()
+    }
+
     /// THE COMMIT AHEAD OF THE FENCE (critic item D06's review): a mirror pass whose open has
     /// yet to make the pin's fence ([`StateDir::ensure_logpin_durable`], two full flushes)
     /// sends the inbox commit its burst would carry ([`Bridge::take_commit_for_the_mirror`])
@@ -3909,15 +4077,19 @@ impl Bridge {
             node: self.node.clone(),
             sid: sid.to_string(),
             src: say.node.clone(),
-            kind: body.kind.clone().unwrap_or_else(|| "note".to_string()),
+            kind: body
+                .kind
+                .as_deref()
+                .and_then(WakeClass::parse)
+                .unwrap_or(WakeClass::Note),
         };
         let (kind, demoted, _stray) = self.classify_delivery(&addr, body);
         let (outcome, taken) = self.deliver_line_taking(&DeliverLine {
             addr: &addr,
             body,
             off,
-            kind: &kind,
-            demoted: demoted.as_deref(),
+            kind,
+            demoted,
             late: false,
             topic: Some(&say.topic),
         });
@@ -4121,7 +4293,7 @@ impl Bridge {
             .filter(|_| !stray && ANSWER_KINDS.contains(&kind.as_str()));
         let expiry = body
             .re
-            .filter(|_| kind == "expired" && addr.src == self.node);
+            .filter(|_| kind == WakeClass::Expired && addr.src == self.node);
         // AN ANSWER, OR THIS NODE'S `expired`, IS DELIVERED ONLY ONCE THE DEADLINE IT SETTLES IS
         // OFF THE DISK (item F4), as an own record waits for its in-flight entry: a bridge that
         // dies between the two leaves the next one a deadline that a sweep expires once
@@ -4156,8 +4328,8 @@ impl Bridge {
             addr: &addr,
             body: &body,
             off,
-            kind: &kind,
-            demoted: demoted.as_deref(),
+            kind,
+            demoted,
             late,
             topic: None,
         })
@@ -4204,7 +4376,7 @@ impl Bridge {
         if let Some(via) = &body.via {
             line.push_str(&format!(" via={via}"));
         }
-        if kind == "ack" {
+        if kind == WakeClass::Ack {
             if let Some(v) = &body.verdict {
                 line.push_str(&format!(" verdict={v}"));
             }
@@ -4330,22 +4502,19 @@ impl Bridge {
         forged_self(&self.self_acked, off)
     }
 
-    fn classify_kind(&self, addr: &subject::InAddr, body: &Body) -> (String, Option<String>) {
-        if body.via.is_some() {
-            return ("note".to_string(), Some(addr.kind.clone()));
-        }
-        if DEMOTE_UNLESS_ACCEPTED.contains(&addr.kind.as_str()) && !self.accepted(&addr.src) {
-            return ("note".to_string(), Some(addr.kind.clone()));
-        }
-        (addr.kind.clone(), None)
-    }
-
+    /// The kind `addr`'s record is delivered as, the kind it claimed when the receiver demoted
+    /// it (every relayed record's, §6.7), and whether it is a stray reply. The kind is
+    /// astream's sender demotion ([`WakeClass::classify_for_sender`], claim
+    /// `wire.wake-and-control-acks`) over this bridge's reading of the record: its sender
+    /// accepted ([`Self::accepted`]) or not, relayed (`via=`) or not, and a stray reply or not,
+    /// by the asks table (an answer, report or ack to an ask that went to another principal)
+    /// or by its node (another node's `expired`).
     fn classify_delivery(
         &mut self,
         addr: &subject::InAddr,
         body: &Body,
-    ) -> (String, Option<String>, bool) {
-        let stray = if addr.kind == "expired" {
+    ) -> (WakeClass, Option<WakeClass>, bool) {
+        let stray = if addr.kind == WakeClass::Expired {
             addr.src != self.node
         } else {
             ANSWER_KINDS.contains(&addr.kind.as_str())
@@ -4354,10 +4523,16 @@ impl Bridge {
                     self.reply_from(re, &addr.src) == Some(false)
                 })
         };
-        if stray {
-            return ("note".to_string(), Some(addr.kind.clone()), true);
-        }
-        let (kind, demoted) = self.classify_kind(addr, body);
+        let relayed = body.via.is_some();
+        #[cfg(test)]
+        let relayed = relayed
+            && !self
+                .fx
+                .mutant(crate::sim::world::Mutant::RelayedKeepsItsKind);
+        let kind = addr
+            .kind
+            .classify_for_sender(self.accepted(&addr.src), relayed, stray);
+        let demoted = (kind != addr.kind || relayed).then_some(addr.kind);
         (kind, demoted, stray)
     }
 
@@ -4422,7 +4597,7 @@ impl Bridge {
         // is a publish loop with a durable `fsync` per iteration and nothing that
         // bounds it. The refusal is still recorded as an `ev` by the caller; what
         // does not happen is another notice.
-        if VERDICT_KINDS.contains(&addr.kind.as_str()) {
+        if VERDICT_KINDS.contains(&addr.kind) {
             self.publish_ev_for(
                 Some(&addr.sid),
                 &format!("unnotified off={off} src={} reason=verdict", addr.src),
@@ -4714,7 +4889,7 @@ impl Bridge {
         if let Some(via) = &body.via {
             fields.push_str(&format!(" via={via}"));
         }
-        if kind == "ack" {
+        if kind == WakeClass::Ack {
             if let Some(v) = &body.verdict {
                 fields.push_str(&format!(" verdict={v}"));
             }
@@ -4883,6 +5058,7 @@ impl Bridge {
         };
         let started = fx.now();
         let answer = astream_broker::ack(conn, producer_id, &group, upto, subject, body);
+        self.note_refused(&answer);
         let (off, deduped) = self.observe(started, answer, None)?;
         self.bus_high = self.bus_high.max(off.saturating_add(1));
         if !deduped {
@@ -4904,18 +5080,61 @@ impl Bridge {
         self.publish_reserved(pin, subject, body)
     }
 
+    /// Whether a failed publish's record may yet be on the bus, so its in-flight entry stands
+    /// for the attach's replay: only where the link went with no answer read for it
+    /// ([`Answered`]) and some connection may have carried it. One its send concluded before
+    /// the link took it ([`Unsent`]) never left the bridge, and its entry goes whatever became
+    /// of the link.
     fn fate_unknown(&self, e: &io::Error) -> bool {
-        self.conn.is_none() && !e.get_ref().is_some_and(|inner| inner.is::<Answered>())
+        self.conn.is_none()
+            && !e
+                .get_ref()
+                .is_some_and(|inner| inner.is::<Answered>() || inner.is::<Unsent>())
     }
 
     /// An attach's republish of this node's in-flight journal, by sequence, before the attach
-    /// drains a post. Within one boot it keeps each sender's order on the bus, as 06d102f827
-    /// argued, because a sender has one post in flight (`settle_sender` before its next,
-    /// asserted in `send_post`), an entry outlives its answer only where its `acked` could not
-    /// be written, and the log keeps a prefix. A bridge that keeps several of a sender's posts
-    /// in flight must make that argument again.
+    /// drains a post. Within one boot it keeps each sender's order on the bus. 06d102f827
+    /// argued it for one post in flight per sender (`settle_sender`, against a broker that
+    /// does not gap-fence); for several, behind the broker's gap fence
+    /// ([`Bridge::pipelines_posts`]):
+    ///
+    /// 1. A sender's posts take their sequences in its order: a fresh pin is the next
+    ///    sequence, made as the drain reaches the post, and a drain reaches a sender's posts in
+    ///    its order and none past one it holds; a retry keeps its pin. A keyed post may take an
+    ///    older sequence, and it is sent alone, every owed answer read first (`conn_now`).
+    /// 2. Of the publishes in flight on one connection, sent by sequence
+    ///    ([`Bridge::settle_above`] reads the answers above a lower one first), the log holds a
+    ///    prefix: a refused one fences every later one ([`Link::gap_fences`]); the fence is
+    ///    lifted only once every answer is read and each refused post is concluded, its sender
+    ///    held until a later drain retries it first ([`Bridge::lift_gap_fences`]); and no write
+    ///    lands under a fence ahead of one sent before it (`settle_above` again). A connection
+    ///    that closes takes its fences, and nothing more is sent on it.
+    /// 3. An entry outlives its answer where its `acked` could not be written (it landed) and
+    ///    where its answer was never read (a kill, a lost link: its fate is unknown); a refused
+    ///    one is dropped, its post kept queued at its pin. With several of a sender's posts in
+    ///    flight, the later ones' entries are dropped with an earlier one's refusal, ahead of it:
+    ///    by 2 none of them lands, and their posts stay queued at their pins for the drain, which
+    ///    sends them after the earlier one's retry, each read back first
+    ///    ([`Bridge::drop_behind_a_refused_post`]; C12s1's review). A stop between their drops
+    ///    and its own leaves the refused one's entry, which the replay publishes again before the
+    ///    drain sends them.
+    ///
+    /// So, by 2 and 3, each entry the replay publishes comes after every post of its sender's
+    /// that landed and after none still queued at a pin, and the replay, by sequence, publishes
+    /// them in its order (1). While it runs it HOLDS THE FENCES ([`Bridge::fences_held`]): it
+    /// drops a refused entry and does not retry it, so every later one is refused behind it
+    /// (`gap-fenced=`) and dropped too, and the drain sends those posts again at their pins,
+    /// each sender's in its order.
     fn settle_in_flight(&mut self) -> bool {
+        #[cfg(test)]
+        let hold = !self
+            .fx
+            .mutant(crate::sim::world::Mutant::LiftFencesDuringReplay);
+        #[cfg(not(test))]
+        let hold = true;
+        self.fences_held = hold;
         let settled = self.replay_in_flight();
+        self.fences_held = false;
         self.release_replays_by_a_peek();
         settled
     }
@@ -5088,11 +5307,12 @@ impl Bridge {
     /// it made the pin or journaled the entry of sequence `seq` (`PublishPin::at`,
     /// `InFlight::at`), brought down to where a moved log continues it
     /// ([`Bridge::read_back_from`]). Below it lies only what landed before the attempt: a
-    /// sender's earlier post of the same words (its posts go one at a time) is never taken for
-    /// this one there. Above it, that earlier post's copy can lie only where the attach's replay
-    /// published it again (an entry the disk refused to clear, whose copy retention gave up):
-    /// a claim of the replay's, skipped here. A copy of it a replay published in an earlier
-    /// process, whose entry is since cleared, is not known: there, before a cut drops its key,
+    /// sender's earlier post of the same words (answered before this one's pin was made,
+    /// [`Bridge::settle_same_words`]) is never taken for this one there. Above it, that earlier
+    /// post's copy can lie only where the attach's replay published it again (an entry the disk
+    /// refused to clear, whose copy retention gave up): a claim of the replay's, skipped here. A
+    /// copy of it a replay published in an earlier process, whose entry is since cleared, is not
+    /// known: there, before a cut drops its key,
     /// the later post is published again at its own pin (the replay settles its own entries
     /// before it clears any, so that later post's own copy is on the bus by then, unless it
     /// was only reserved and never journaled in flight, and the process stopped in between).
@@ -7351,14 +7571,31 @@ impl Bridge {
         let peek_past = self.fx.mutant(crate::sim::world::Mutant::PeekPastOwedPost);
         #[cfg(not(test))]
         let peek_past = false;
-        let waiting = self.fx.now();
-        while !peek_past
-            && self
-                .conn
-                .as_ref()
-                .is_some_and(|link| link.owed().any(|then| then.post().is_some()))
-            && self.settle_one(waiting)
-        {}
+        let owed_at_peek = if self.pipelines_posts() {
+            // SEVERAL POSTS OF A SENDER IN FLIGHT, behind the broker's gap fence: the peek
+            // goes past the posts owed. The answers already in are read first, without
+            // waiting, so a post whose ack came has its `outbox sent` and is not listed
+            // again; a fence a refusal set is lifted, every owed answer read first
+            // (`lift_gap_fences`), so each refused post is concluded before the held senders
+            // clear and the listing names it again for its retry.
+            self.try_settle_acks();
+            self.lift_gap_fences();
+            Some(if peek_past {
+                BTreeSet::new()
+            } else {
+                self.posts_owed()
+            })
+        } else {
+            let waiting = self.fx.now();
+            while !peek_past
+                && self
+                    .conn
+                    .as_ref()
+                    .is_some_and(|link| link.owed().any(|then| then.post().is_some()))
+                && self.settle_one(waiting)
+            {}
+            None
+        };
         self.conn.as_ref()?;
         self.held_senders.clear();
         let peeked = self.mailbox.event_mark();
@@ -7422,26 +7659,70 @@ impl Bridge {
             }
         }
         let looked = std::mem::replace(&mut self.roster_looked, true);
-        let finished = self.batched(|bridge| bridge.drain_posts(drain.posts));
+        let finished =
+            self.batched(|bridge| bridge.drain_posts(drain.posts, owed_at_peek.as_ref()));
         self.roster_looked = looked;
         (finished && stalled.is_empty() && self.held_senders.is_empty())
             .then_some(whole)
             .flatten()
     }
 
-    fn drain_posts(&mut self, posts: Vec<QueuedPost>) -> bool {
+    /// Every post owed an answer now, by `(sid, post id)`.
+    fn posts_owed(&self) -> BTreeSet<(String, u64)> {
+        self.conn.as_ref().map_or_else(BTreeSet::new, |link| {
+            link.owed()
+                .filter_map(|then| then.post().map(|post| (post.sid.clone(), post.id)))
+                .collect()
+        })
+    }
+
+    /// Send `posts`, as one listing gave them. With `owed_at_peek` (several posts of a sender
+    /// in flight, [`Bridge::pipelines_posts`]) a listed post that was owed an answer at the
+    /// peek is skipped: it is listed again because its `outbox sent` has not gone yet. The
+    /// skip reads the set taken at the peek, never what is owed when the loop reaches the
+    /// post: any blocking broker call between (`conn_now`'s settle, before a receipt, an
+    /// `ev`, a fetch's answer, a new subject's budget read, a keyed or retried post; a send's
+    /// window or `settle_above`) can conclude a listed post, its pin cleared, and its stale
+    /// row would take a fresh sequence and go out a second time (C12's review). Before each
+    /// post the fences a refusal set are lifted ([`Bridge::lift_gap_fences`]), which reads
+    /// every owed answer first, so a sender whose post was refused is held before its next
+    /// is looked at. Without it, a sender's post waits for the answer to its last
+    /// ([`Bridge::settle_sender`]). The look at aterm before each post is not the last word:
+    /// the same blocking calls can conclude an earlier post whose `outbox sent` meets aterm
+    /// gone, so each send looks again after the last of them ([`Bridge::unsendable`]; a retry
+    /// or a keyed post after the settle before its read back, in [`Bridge::drain_post`]).
+    fn drain_posts(
+        &mut self,
+        posts: Vec<QueuedPost>,
+        owed_at_peek: Option<&BTreeSet<(String, u64)>>,
+    ) -> bool {
         for post in posts {
             self.service_urgent();
             if self.aterm_gone() {
                 return false;
             }
-            #[cfg(test)]
-            let settled = self.fx.mutant(crate::sim::world::Mutant::PipelineSender)
-                || self.settle_sender(&post.sid);
-            #[cfg(not(test))]
-            let settled = self.settle_sender(&post.sid);
-            if !settled || self.aterm_gone() {
-                return false;
+            match owed_at_peek {
+                Some(owed) => {
+                    self.lift_gap_fences();
+                    if self.conn.is_none() || self.aterm_gone() {
+                        return false;
+                    }
+                    #[cfg(test)]
+                    let owed_now = self
+                        .fx
+                        .mutant(crate::sim::world::Mutant::LiveOwedSkip)
+                        .then(|| self.posts_owed());
+                    #[cfg(test)]
+                    let owed = owed_now.as_ref().unwrap_or(owed);
+                    if owed.contains(&(post.sid.clone(), post.id)) {
+                        continue;
+                    }
+                }
+                None => {
+                    if !self.settle_sender(&post.sid) || self.aterm_gone() {
+                        return false;
+                    }
+                }
             }
             if self.held_senders.contains(&post.sid) {
                 continue;
@@ -7506,6 +7787,15 @@ impl Bridge {
                 #[cfg(test)]
                 let existing_pin = existing_pin
                     .filter(|_| !self.fx.mutant(crate::sim::world::Mutant::FreshSeqOnRetry));
+                if existing_pin.is_none() && keyed.is_none() {
+                    if !self.settle_same_words(&post.sid, &publication_identity(&subject, &encoded))
+                    {
+                        return false;
+                    }
+                    if self.held_senders.contains(&post.sid) {
+                        return true;
+                    }
+                }
                 if existing_pin.is_none()
                     && keyed.is_none()
                     && !self.budget_allows(&subject, opens, 0)
@@ -7593,6 +7883,17 @@ impl Bridge {
                 if fresh && staged.is_none() {
                     return self.send_post(post, pin, subject, encoded);
                 }
+                // A retry, or a keyed post, goes alone, every owed answer read first (its
+                // publish would read them), and not past one that held its sender or an aterm
+                // gone meanwhile ([`Bridge::unsendable`]).
+                self.settle_acks();
+                self.lift_gap_fences();
+                if self.conn.is_none() || self.aterm_gone() {
+                    return false;
+                }
+                if self.unsendable(&post.sid).is_some() {
+                    return true;
+                }
                 // A retry at a pin an earlier attempt took, read back first: past a cut
                 // astream's dedup no longer answers the pin with the record that attempt
                 // landed, which a reader can still be handed (carried below the base); the
@@ -7643,6 +7944,54 @@ impl Bridge {
         true
     }
 
+    /// Before a post's first pin is made, read the answer to every post of its sender in the
+    /// SAME WORDS still owed (its publication `identity`): the pin's head (`PublishPin::at`) is
+    /// where a later read back starts ([`Bridge::landed_since`]), which takes the first record
+    /// of those words above it for this post's, so each earlier copy of them must lie below
+    /// it. A refused one holds the sender, and this post waits for a later drain, after that
+    /// one's retry. Several posts in other words go on in flight together. `false` once the
+    /// connection is lost.
+    fn settle_same_words(&mut self, sid: &str, identity: &PublishIdentity) -> bool {
+        #[cfg(test)]
+        if self
+            .fx
+            .mutant(crate::sim::world::Mutant::PinAheadOfSameWords)
+        {
+            return self.conn.is_some();
+        }
+        let waiting = self.fx.now();
+        while self
+            .conn
+            .as_ref()
+            .is_some_and(|link| link.owed().any(|then| then.posted_in(sid, identity)))
+            && self.settle_one(waiting)
+        {}
+        self.conn.is_some()
+    }
+
+    /// Why a post of `sid`'s is not sent now, though the drain reached it: an answer read since
+    /// (a blocking call's settle, a full window's, a lifted fence's) refused an earlier post of
+    /// `sid`'s and held the sender, so sent now this one would land ahead of that one's retry;
+    /// or the answer it concluded took long enough for aterm to go (its retirement waits on
+    /// aterm), and a bridge whose aterm is gone publishes nothing more. It stays queued at its
+    /// pin for a later drain, its in-flight entry dropped whatever became of the link
+    /// ([`Unsent`]), so no attach on the state dir, a successor's included, publishes it.
+    fn unsendable(&self, sid: &str) -> Option<io::Error> {
+        if self.aterm_gone() {
+            return Some(io::Error::other("aterm is gone"));
+        }
+        #[cfg(test)]
+        if self
+            .fx
+            .mutant(crate::sim::world::Mutant::SendPastAHeldSender)
+        {
+            return None;
+        }
+        self.held_senders
+            .contains(sid)
+            .then(|| io::Error::other(format!("held behind a refused post of {sid}'s")))
+    }
+
     fn settle_sender(&mut self, sid: &str) -> bool {
         let waiting = self.fx.now();
         while self
@@ -7661,17 +8010,14 @@ impl Bridge {
         subject: String,
         encoded: Vec<u8>,
     ) -> bool {
-        #[cfg(test)]
-        let pipelined = self.fx.mutant(crate::sim::world::Mutant::PipelineSender);
-        #[cfg(not(test))]
-        let pipelined = false;
         debug_assert!(
-            pipelined
+            self.pipelines_posts()
                 || !self
                     .conn
                     .as_ref()
                     .is_some_and(|link| link.owed().any(|then| then.posted_by(&post.sid))),
-            "one pipelined post in flight per sender ({})",
+            "one pipelined post in flight per sender against a broker that does not gap-fence \
+             ({})",
             post.sid
         );
         let journaled = self.on_own_lane(&subject);
@@ -7737,6 +8083,7 @@ impl Bridge {
             }
             Err(e) => {
                 if journaled && !self.fate_unknown(&e) {
+                    self.drop_behind_a_refused_post(&post.sid, pin.seq, &e);
                     self.drop_in_flight(pin.seq);
                 }
                 self.post_refused(&post, &subject, pin.seq, e)
@@ -7747,6 +8094,38 @@ impl Bridge {
         }
         self.unsent = unsent;
         self.group_record = record;
+    }
+
+    /// THE LATER POSTS OF A REFUSED POST'S SENDER LEAVE THE IN-FLIGHT JOURNAL WITH IT, ahead of
+    /// its own entry, on a link that gap-fences ([`Link::gap_fences`]): the broker refused the
+    /// post at `seq`, so its fence refuses every write of this producer above `seq` that the link
+    /// sent after it (`gap-fenced=`), and the fence is lifted only once their answers are read
+    /// ([`Bridge::lift_gap_fences`]): none of them lands. Their answers, still owed, conclude
+    /// them as ever. Left in the journal, an entry whose answer a kill or a lost link leaves
+    /// unread would be published by the attach's replay ([`Bridge::settle_in_flight`]) ahead of
+    /// the refused post's retry, which the drain sends first (C12s1's review). Against any other
+    /// broker a sender has one post in flight, and none is owed after it.
+    fn drop_behind_a_refused_post(&mut self, sid: &str, seq: u64, e: &io::Error) {
+        if astream_broker::broker_refusal(e).is_none() {
+            return;
+        }
+        let Some(link) = self.conn.as_ref().filter(|link| link.gap_fences()) else {
+            return;
+        };
+        let behind: Vec<u64> = link
+            .owed()
+            .filter_map(|then| match then {
+                Then::Post(sent)
+                    if sent.journaled && sent.post.sid == sid && sent.pin.seq > seq =>
+                {
+                    Some(sent.pin.seq)
+                }
+                _ => None,
+            })
+            .collect();
+        for later in behind {
+            self.drop_in_flight(later);
+        }
     }
 
     /// A held post's retry landed at `off`: where this bridge already delivered that ask's answer
@@ -8503,6 +8882,10 @@ impl Bridge {
             self.conn = None;
             return false;
         };
+        if !self.ask_gap_fences() {
+            self.conn = None;
+            return false;
+        }
         self.note_broker_retention();
         let lineage = self.conn_now().and_then(|c| c.log_lineage().cloned());
         #[cfg(test)]
@@ -9622,7 +10005,29 @@ impl Bridge {
         self.park_and_take(wait)
     }
 
+    /// SEND AGAIN THE `ev` RECORDS A GAP FENCE REFUSED ([`Bridge::evs_fenced`]), once the fence
+    /// is lifted. The round waits on no answer for them: it reads those already in, lifts the
+    /// fence only once none is owed ([`Bridge::lift_gap_fences`]), and while the link is still
+    /// fenced, or there is none, they wait for a later round. Each goes at a fresh sequence, as
+    /// it would have, and one a fence refuses again waits again.
+    fn resend_fenced_evs(&mut self) {
+        if self.evs_fenced.is_empty() || self.conn.is_none() {
+            return;
+        }
+        self.try_settle_acks();
+        if self.conn.as_ref().is_some_and(|link| link.unacked() == 0) {
+            self.lift_gap_fences();
+        }
+        if !self.conn.as_ref().is_some_and(|link| !link.fenced()) {
+            return;
+        }
+        for (sid, payload) in std::mem::take(&mut self.evs_fenced) {
+            self.publish_ev_for(sid.as_deref(), &payload);
+        }
+    }
+
     fn settle_owed(&mut self) {
+        self.resend_fenced_evs();
         if !self.mailbox.inbox_queued() && !self.hold_inbox_commit() {
             self.flush_inbox_commit();
         }
@@ -9830,6 +10235,27 @@ impl std::fmt::Display for Answered {
 
 impl std::error::Error for Answered {}
 
+/// A POST ITS SEND CONCLUDED BEFORE THE LINK TOOK IT ([`Bridge::send_pipelined`]: its aterm
+/// gone or its sender held, [`Bridge::unsendable`], or the link lost in a wait before it): no
+/// connection carried it, so its fate is known whatever became of the link, and its in-flight
+/// entry is dropped ([`Bridge::fate_unknown`]). Kept, the next attach on the state dir would
+/// publish it, a successor's for an aterm that is gone included.
+#[derive(Debug)]
+struct Unsent(String);
+
+impl std::fmt::Display for Unsent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Unsent {}
+
+/// `e`, said of a post that never left the bridge ([`Unsent`]), its kind and words kept.
+fn unsent(e: io::Error) -> io::Error {
+    io::Error::new(e.kind(), Unsent(e.to_string()))
+}
+
 fn plain_pin(seq: u64, subject: &str, body: &[u8]) -> PublishPin {
     PublishPin {
         seq,
@@ -10011,12 +10437,32 @@ enum Together {
     /// Every session's records to the head were offered (a session whose delivery was owed
     /// stopped there).
     Read,
-    /// The connection to aterm or the broker failed: the sessions stay owed their refill.
+    /// The connection to aterm or the broker failed, or a page made no progress: the sessions
+    /// stay owed their refill.
     Failed,
     /// Every record below this offset was offered, and each session not stopped reads on
     /// alone from there: the node inbox's oldest rose above the read, or what the read carried
     /// passed what it saved.
     HandedOn(u64),
+}
+
+/// One page of the attach's shared refill read, weighed by `meter` ([`Bridge::refill_node`]):
+/// the page ended at `next` of a log whose head is `head`, carrying `carried` records it
+/// offered to no session while `reading` sessions read there. `None` when it ended at or below
+/// where it began, short of the head: it made no progress, and the read fails, as a lane's read
+/// does ([`Bridge::refill_lane`]), where the meter alone would hand each session on to its own
+/// lane from there.
+fn weigh_shared_page(
+    meter: &mut SharedRefillMeter,
+    next: u64,
+    head: u64,
+    carried: u64,
+    reading: usize,
+) -> Option<RefillStep> {
+    if next < head && next <= meter.cursor() {
+        return None;
+    }
+    Some(meter.observe_page(next, head, carried, reading))
 }
 
 /// One session in the attach's shared refill read ([`Bridge::refill_together`]).
@@ -10048,8 +10494,8 @@ struct DeliverLine<'a> {
     addr: &'a subject::InAddr,
     body: &'a Body,
     off: u64,
-    kind: &'a str,
-    demoted: Option<&'a str>,
+    kind: WakeClass,
+    demoted: Option<WakeClass>,
     late: bool,
     topic: Option<&'a str>,
 }
@@ -12516,7 +12962,9 @@ mod tests {
         transcript: Arc<std::sync::Mutex<Vec<String>>>,
         on_deliver: Arc<std::sync::Mutex<Option<LaneHook>>>,
         deliver_answers: Arc<std::sync::Mutex<BTreeMap<String, String>>>,
-        hang_up: Arc<std::sync::atomic::AtomicBool>,
+        /// The request the lane hangs up at, unanswered, as aterm's going does: the first line
+        /// that starts with it ([`FakeVerbLane::hang_up_at`]).
+        hang_up: Arc<std::sync::Mutex<Option<&'static str>>>,
         hold_refusals: Arc<std::sync::Mutex<BTreeMap<String, String>>>,
         holds: Arc<std::sync::Mutex<BTreeMap<String, bool>>>,
         status_rows: Arc<std::sync::Mutex<Option<Vec<String>>>>,
@@ -12736,6 +13184,14 @@ mod tests {
                     if !line.starts_with("AUTH ") {
                         requests.lock().unwrap().push(line.clone());
                     }
+                    if hang_up
+                        .lock()
+                        .unwrap()
+                        .is_some_and(|verb| line.starts_with(verb))
+                    {
+                        transcript.lock().unwrap().push(line);
+                        return;
+                    }
                     // The canned per-session header: `@<sid> meta`'s, or `@<sid> status`'s.
                     let canned = match line.strip_prefix('@').and_then(|l| l.split_once(' ')) {
                         Some((_, "meta")) => meta_answer.lock().unwrap().clone(),
@@ -12812,9 +13268,6 @@ mod tests {
                         r
                     } else if let Some(rest) = line.strip_prefix("hold ") {
                         transcript.lock().unwrap().push(line.clone());
-                        if hang_up.load(std::sync::atomic::Ordering::SeqCst) {
-                            return;
-                        }
                         let mut words = rest.split_whitespace();
                         let sid = words.next().expect("a hold's sid");
                         let on = words.next() == Some("on");
@@ -13049,9 +13502,10 @@ mod tests {
                 .unwrap_or(false)
         }
 
-        fn hang_up_on_hold(&self) {
-            self.hang_up
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+        /// Hang up at the next request that starts with `verb`, leaving it unanswered: aterm
+        /// gone under the bridge's request.
+        fn hang_up_at(&self, verb: &'static str) {
+            *self.hang_up.lock().unwrap() = Some(verb);
         }
     }
 
@@ -16416,68 +16870,156 @@ mod tests {
     }
 
     #[test]
-    fn a_remote_node_cannot_speak_for_a_local_session_or_answer_anothers_ask() {
+    fn a_remote_node_cannot_speak_for_a_local_session() {
         let (_lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-mgr")]);
         bridge
             .per_sid
             .epochs
             .insert("s-w".to_string(), "e".to_string());
         let local = bridge.node.clone();
-        let addr = |src: &str, kind: &str| subject::InAddr {
+        let addr = |src: &str, kind: WakeClass| subject::InAddr {
             node: local.clone(),
             sid: "s-mgr".to_string(),
             src: src.to_string(),
-            kind: kind.to_string(),
+            kind,
         };
         let mut body = Body::new(0);
         body.from = Some("s-w".to_string());
         assert_eq!(
-            bridge.render_from(&addr(&local, "report"), &body),
+            bridge.render_from(&addr(&local, WakeClass::Report), &body),
             format!("s-w@{local}")
         );
         assert_eq!(
-            bridge.render_from(&addr("n-evil", "report"), &body),
+            bridge.render_from(&addr("n-evil", WakeClass::Report), &body),
             "n-evil"
         );
         body.from = Some("s-far".to_string());
         assert_eq!(
-            bridge.render_from(&addr("n-far", "report"), &body),
+            bridge.render_from(&addr("n-far", WakeClass::Report), &body),
             "s-far@n-far"
         );
         bridge.state.pin("s-far", "n-far").expect("pin");
         assert_eq!(
-            bridge.render_from(&addr("n-far", "report"), &body),
+            bridge.render_from(&addr("n-far", WakeClass::Report), &body),
             "s-far@n-far"
         );
         assert_eq!(
-            bridge.render_from(&addr("n-evil", "report"), &body),
+            bridge.render_from(&addr("n-evil", WakeClass::Report), &body),
             "n-evil"
         );
+    }
 
-        bridge.asked.insert(91, local.clone());
-        let mut reply = Body::new(0);
-        reply.re = Some(91);
-        for kind in ["answer", "report", "ack"] {
-            assert_eq!(
-                bridge.classify_delivery(&addr("n-evil", kind), &reply),
-                ("note".to_string(), Some(kind.to_string()), true),
-                "a stray {kind}"
-            );
-            assert_eq!(
-                bridge.classify_delivery(&addr(&local, kind), &reply),
-                (kind.to_string(), None, false),
-                "the recipient's {kind}"
-            );
+    /// One cell of the nine kinds x an accepted sender x a relayed record x a stray reply:
+    /// `(claimed, accepted, relayed, stray)`.
+    type DemotionCell = (WakeClass, bool, bool, bool);
+
+    /// What `classify_delivery` answered in a cell: `(kind, demoted, stray)`.
+    type Delivered = (WakeClass, Option<WakeClass>, bool);
+
+    /// What `bridge` delivers in every [`DemotionCell`]. A stray cell's record answers an ask
+    /// that went to another node, or is another node's `expired`; its sender is accepted when
+    /// `--accept-from` names it.
+    fn delivered_in_every_cell(bridge: &mut Bridge) -> Vec<(DemotionCell, Delivered)> {
+        let node = bridge.node.clone();
+        bridge.asked.insert(91, "n-asked".to_string());
+        let mut cells = Vec::new();
+        for claimed in WakeClass::ALL {
+            for (accepted, relayed, stray) in (0..8).map(|b| (b & 4 != 0, b & 2 != 0, b & 1 != 0)) {
+                let src = match (claimed, stray) {
+                    (_, true) => "n-far".to_string(),
+                    (WakeClass::Expired, false) => node.clone(),
+                    (_, false) => "n-asked".to_string(),
+                };
+                bridge.cfg.accept_from = if accepted {
+                    vec![src.clone()]
+                } else {
+                    Vec::new()
+                };
+                let addr = subject::InAddr {
+                    node: node.clone(),
+                    sid: "s-mgr".to_string(),
+                    src,
+                    kind: claimed,
+                };
+                let mut body = Body::new(0);
+                body.re = Some(91);
+                body.via = relayed.then(|| "s-inner".to_string());
+                let delivered = bridge.classify_delivery(&addr, &body);
+                cells.push(((claimed, accepted, relayed, stray), delivered));
+            }
         }
-        assert_eq!(
-            bridge.classify_delivery(&addr("n-evil", "expired"), &reply),
-            ("note".to_string(), Some("expired".to_string()), true),
-            "a third node's expired"
+        cells
+    }
+
+    /// The cells whose delivery differs from astream's sender demotion
+    /// ([`WakeClass::classify_for_sender`]): its kind, the claimed kind on `demoted=` when the
+    /// two differ or the record is relayed, and a stray reading for exactly the kinds whose
+    /// demotion reads one.
+    fn cells_off_astreams_demotion(cells: &[(DemotionCell, Delivered)]) -> Vec<DemotionCell> {
+        cells
+            .iter()
+            .filter(|&&((claimed, accepted, relayed, stray), delivered)| {
+                let reply = claimed.classify_for_sender(true, false, true)
+                    != claimed.classify_for_sender(true, false, false);
+                let kind = claimed.classify_for_sender(accepted, relayed, stray);
+                let demoted = (kind != claimed || relayed).then_some(claimed);
+                delivered != (kind, demoted, stray && reply)
+            })
+            .map(|&(cell, _)| cell)
+            .collect()
+    }
+
+    /// The relayed cells not delivered as §6.7 says, in aterm's own words rather than read back
+    /// from astream's function: a relayed record of any kind, from any sender, whatever
+    /// `--accept-from` says, lands `kind=note` with its claimed kind on `demoted=`.
+    fn relayed_cells_not_a_note(cells: &[(DemotionCell, Delivered)]) -> Vec<DemotionCell> {
+        cells
+            .iter()
+            .filter(|&&((claimed, _, relayed, _), (kind, demoted, _))| {
+                relayed && (kind, demoted) != (WakeClass::Note, Some(claimed))
+            })
+            .map(|&(cell, _)| cell)
+            .collect()
+    }
+
+    /// THE BRIDGE DELIVERS EVERY RECORD AT THE KIND ASTREAM'S SENDER DEMOTION GIVES IT (item
+    /// E13, astream claim `wire.wake-and-control-acks`): in every cell of the nine kinds x an
+    /// accepted sender x a relayed record x a stray reply, `classify_delivery` answers
+    /// [`WakeClass::classify_for_sender`]'s kind; the claimed kind rides `demoted=` when the
+    /// two differ and on every relayed record (§6.7); and the bridge reads a reply as stray
+    /// (the asks table, an `expired`'s node) for exactly the kinds whose demotion reads one. A
+    /// remote node's answer to an ask that went elsewhere is one of the stray cells. The
+    /// relayed law (§6.7: every relayed record lands `kind=note demoted=<k>`, whatever
+    /// `--accept-from` says) is held as well in aterm's own words, so an astream pin whose
+    /// demotion lets a relayed record keep its kind fails here by name, not only in astream.
+    ///
+    /// NEGATIVE CONTROL: a bridge whose own rule skips the relayed demotion
+    /// ([`crate::sim::world::Mutant::RelayedKeepsItsKind`]) is told by relayed cells alone,
+    /// against astream's function and against the relayed law, among them an accepted sender's
+    /// relayed `control`, delivered as a control.
+    #[test]
+    fn classify_delivery_is_astreams_sender_demotion_in_every_cell() {
+        let (_lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-mgr")]);
+        let cells = delivered_in_every_cell(&mut bridge);
+        assert_eq!(cells.len(), WakeClass::ALL.len() * 8);
+        assert_eq!(cells_off_astreams_demotion(&cells), []);
+        assert_eq!(relayed_cells_not_a_note(&cells), []);
+
+        bridge.fx = crate::fx::Fx::os_without(crate::sim::world::Mutant::RelayedKeepsItsKind);
+        let cells = delivered_in_every_cell(&mut bridge);
+        let off = cells_off_astreams_demotion(&cells);
+        assert!(
+            off.contains(&(WakeClass::Control, true, true, false)),
+            "NEGATIVE CONTROL: an accepted sender's relayed control keeps its kind: {off:?}"
         );
-        assert_eq!(
-            bridge.classify_delivery(&addr(&local, "expired"), &reply),
-            ("expired".to_string(), None, false),
-            "this node's own expired"
+        assert!(
+            off.iter().all(|&(_, _, relayed, _)| relayed),
+            "NEGATIVE CONTROL: only a relayed cell tells the local rule from astream's: {off:?}"
+        );
+        let unlawful = relayed_cells_not_a_note(&cells);
+        assert!(
+            unlawful.contains(&(WakeClass::Control, true, true, false)),
+            "NEGATIVE CONTROL: the relayed law misses a relayed control kept: {unlawful:?}"
         );
     }
 
@@ -16986,7 +17528,7 @@ mod tests {
             node: bridge.node.clone(),
             sid: SID.to_string(),
             src: "n-evil".to_string(),
-            kind: "note".to_string(),
+            kind: WakeClass::Note,
         };
         let mut body = Body::new(0);
         body.from = Some("s-y".to_string());
@@ -20430,7 +20972,7 @@ mod tests {
     /// `A` saw its one mail, then 1,500 mails each go to `B` and `C`, who saw their last, so
     /// nobody is owed anything. The shared read from `A`'s start carries `B`'s and `C`'s mail
     /// below their starts and saves no scan (only `A` reads there); once what it carried costs
-    /// more than [`REFILL_SPLIT_SLACK`] at [`REFILL_ROW_COST`] a record, each session reads on
+    /// more than astream's slack at its `REFILL_ROW_COST` a record, each session reads on
     /// alone, so it carries at most that and a page. CONTROL (`refill_never_hands_on`): the
     /// read carries all 3,000 to the head (lane by lane carried none).
     #[cfg(unix)]
@@ -20441,7 +20983,9 @@ mod tests {
         let order: Vec<Option<&'static str>> = std::iter::once(Some(a))
             .chain((0..EACH).flat_map(|_| [Some(b), Some(c)]))
             .collect();
-        let bound = REFILL_SPLIT_SLACK / REFILL_ROW_COST + u64::from(transport::POST_PAGE);
+        let bound = astream_broker::refill::DEFAULT_REFILL_SPLIT_SLACK
+            / astream_broker::refill::REFILL_ROW_COST
+            + u64::from(transport::POST_PAGE);
         for control in [false, true] {
             let (lane, mut bridge, _broker, _server, mails) = together_rig_with(None, &order);
             for sid in TOGETHER {
@@ -20464,6 +21008,90 @@ mod tests {
                     bridge.refill_carried <= bound,
                     "carried {} past the bound {bound}",
                     bridge.refill_carried
+                );
+            }
+        }
+    }
+
+    /// B09 — A SHARED READ'S PAGE THAT MAKES NO PROGRESS IS WEIGHED AS NONE: a page of the
+    /// node's inbox from 500 (its oldest 100) that ends at or below 500, short of the head, is
+    /// no progress, and [`weigh_shared_page`] answers no step; one at the head ends the read, one
+    /// past 500 reads on. CONTROL: astream's meter alone hands each session on to its own lane
+    /// there, so the check ahead of it is what keeps the step from handing on. That the read
+    /// then fails is held through [`Bridge::refill_node`] by
+    /// [`a_shared_refill_read_that_makes_no_progress_fails_with_its_sessions_still_owed`].
+    #[test]
+    fn a_shared_refill_page_that_makes_no_progress_is_weighed_as_none() {
+        let scan_max = astream_broker::broker::FETCH_SCAN_MAX as u64;
+        let meter = SharedRefillMeter::new(100, 500, scan_max);
+        for next in [500, 499] {
+            assert_eq!(
+                weigh_shared_page(&mut meter.clone(), next, 900, 0, 3),
+                None,
+                "a page ending at @{next} from @500 short of the head"
+            );
+            assert_eq!(
+                meter.clone().observe_page(next, 900, 0, 3),
+                RefillStep::HandOn {
+                    handoff_offset: 500
+                },
+                "CONTROL: the meter alone hands on from @500"
+            );
+        }
+        assert_eq!(
+            weigh_shared_page(&mut meter.clone(), 500, 500, 0, 3),
+            Some(RefillStep::Complete { head: 500 }),
+            "a page at the head ends the read"
+        );
+        assert_eq!(
+            weigh_shared_page(&mut meter.clone(), 756, 900, 0, 3),
+            Some(RefillStep::Continue {
+                next_cursor: 756,
+                active_debt: 0
+            }),
+            "a page that moves on reads on"
+        );
+    }
+
+    /// B09 — A SHARED REFILL READ THAT MAKES NO PROGRESS FAILS WITH ITS SESSIONS STILL OWED:
+    /// three sessions, each past its first of three mails, owed their refill, and a broker that
+    /// answers the shared read's page with no records, ending where it began
+    /// (`refill_page_stalls`). The refill fails, nothing is offered, and every session is still
+    /// owed its refill, as a lane's read that makes no progress leaves its session. Handing each
+    /// session on to its own lane there instead (the meter's step taken without
+    /// [`weigh_shared_page`]'s check, or its `None` taken as `HandedOn`) refills them all from
+    /// their lanes and fails this. CONTROL: the same rig, its pages answered, refills every
+    /// session.
+    #[cfg(unix)]
+    #[test]
+    fn a_shared_refill_read_that_makes_no_progress_fails_with_its_sessions_still_owed() {
+        for stalls in [true, false] {
+            let (lane, mut bridge, _broker, _server, mails) = together_rig(3);
+            for sid in TOGETHER {
+                bridge.state.set_seen_off(sid, mails[sid][0]).unwrap();
+            }
+            bridge.refill_page_stalls = stalls;
+
+            let refilled = bridge.refill_pending_admissions(false);
+            if stalls {
+                assert!(!refilled, "the read fails");
+                assert!(offered(&lane).is_empty(), "nothing is offered");
+                assert_eq!(
+                    bridge.per_sid.pending_admit.len(),
+                    3,
+                    "every session is still owed its refill"
+                );
+            } else {
+                assert!(refilled, "CONTROL: the read refills");
+                let mut want: Vec<u64> = TOGETHER
+                    .iter()
+                    .flat_map(|sid| mails[sid][1..].iter().copied())
+                    .collect();
+                want.sort_unstable();
+                assert_eq!(offered(&lane), want, "CONTROL: every mail past a watermark");
+                assert!(
+                    bridge.per_sid.pending_admit.is_empty(),
+                    "CONTROL: nobody is owed"
                 );
             }
         }
@@ -20828,7 +21456,7 @@ mod tests {
     }
 
     /// **A MIRROR SNAPSHOT INSIDE THE GRACE CARRIES THE HELD COMMIT IN ONE WRITE AND ONE
-    /// BATCH** (critic item C13). A delivery owes its commit; the delivery moves the
+    /// BATCH** (critic items C13 and E04). A delivery owes its commit; the delivery moves the
     /// session's mail count, so the endpoint's line for it wakes the bus mirror, whose take
     /// holds the session's snapshot. The mirror's send is the loop's next write: the commit
     /// goes out ahead of the batch's slots in one burst, and the broker takes them into one
@@ -20843,13 +21471,22 @@ mod tests {
     /// - [`MirrorPass::AfterAShortPark`]: the round held the commit with the mirror's pass due
     ///   now, so the park is cut short of the grace and takes nothing.
     ///
+    /// A paced note between two sessions of one node ([`a_paced_note_on_one_node`]) owes the
+    /// mirror the sender's snapshot before the delivery owes a commit: that take, which nothing
+    /// would carry, waits for the delivery ([`Bridge::mirror_rides_nothing`]), and the pass
+    /// behind the delivery takes both snapshots, its burst carrying the commit ahead of them:
+    /// `note | commit+evA+evB`, two writer batches.
+    ///
     /// NEGATIVE CONTROLS, one per order: with the mirror sending its slots bare
     /// ([`crate::sim::world::Mutant::MirrorSendsItsSlotsBare`], the bridge before C13), with
     /// its burst carrying only a commit already held
     /// ([`crate::sim::world::Mutant::MirrorRidesOnlyAHeldCommit`]), and with every park that
     /// takes nothing sending the held commit
-    /// ([`crate::sim::world::Mutant::ShortParkSendsTheHeldCommit`]), the burst carries no
-    /// commit and the commit costs a writer batch of its own.
+    /// ([`crate::sim::world::Mutant::ShortParkSendsTheHeldCommit`]), no write carries both the
+    /// commit and a slot, and the commit costs a writer batch of its own. With the sender's
+    /// take sent the round it falls due
+    /// ([`crate::sim::world::Mutant::MirrorSendsAnUnowedSlotAtOnce`], the bridge before E04),
+    /// the paced note is `note | evA | commit+evB`, three batches.
     #[cfg(unix)]
     #[test]
     fn a_mirror_snapshot_inside_the_grace_carries_the_held_commit_in_one_write_and_one_batch() {
@@ -20877,6 +21514,11 @@ mod tests {
                 "{pass:?}: every slot behind it, in the one burst: {:?}",
                 rode.owed
             );
+            assert_eq!(
+                rode.writes,
+                ["commit+evB"],
+                "{pass:?}: one write, the commit ahead of the session's slots"
+            );
             assert!(
                 rode.snapshot,
                 "{pass:?}: PRECONDITION: the take holds the snapshot"
@@ -20893,9 +21535,12 @@ mod tests {
 
             let bare = mirror_after_a_delivery(crate::fx::Fx::os_without(mutant), pass, true);
             assert!(
-                bare.owed.iter().all(|kind| *kind == "mirror") && !bare.owed.is_empty(),
-                "{pass:?}: NEGATIVE CONTROL ({mutant:?}): the slots went bare: {:?}",
-                bare.owed
+                bare.writes.contains(&"commit".to_string())
+                    && bare.writes.iter().any(|w| w.starts_with("ev"))
+                    && !bare.writes.iter().any(|w| w.contains('+')),
+                "{pass:?}: NEGATIVE CONTROL ({mutant:?}): the commit and the slots went in \
+                 writes of their own: {:?}",
+                bare.writes
             );
             assert_eq!(
                 bare.batches, 2,
@@ -20903,6 +21548,107 @@ mod tests {
                  its own"
             );
             assert!(bare.committed && bare.on_bus, "{pass:?} ({mutant:?})");
+        }
+
+        let paced = a_paced_note_on_one_node(crate::fx::Fx::os());
+        assert_eq!(
+            (paced.writes.as_slice(), paced.batches),
+            (["note", "commit+evA+evB"].map(String::from).as_slice(), 2),
+            "the sender's snapshot waited for the delivery's commit and rode it beside the \
+             recipient's"
+        );
+        assert!(paced.committed, "the group is through the note");
+        let at_once = a_paced_note_on_one_node(crate::fx::Fx::os_without(
+            Mutant::MirrorSendsAnUnowedSlotAtOnce,
+        ));
+        assert_eq!(
+            (at_once.writes.as_slice(), at_once.batches),
+            (
+                ["note", "evA", "commit+evB"].map(String::from).as_slice(),
+                3
+            ),
+            "NEGATIVE CONTROL (MirrorSendsAnUnowedSlotAtOnce): the sender's snapshot went in a \
+             batch of its own"
+        );
+        assert!(at_once.committed);
+    }
+
+    /// **A TAKE NOTHING CARRIES GOES ALONE ONCE ITS GRACE IS OUT** (critic item E04): a post to
+    /// a session on another node, or to a person, owes the mirror the sender's snapshot and no
+    /// delivery here owes a commit. The round that finds the take due holds it and parks no
+    /// longer than [`IDLE_ACK_GRACE`]; a later round takes it and sends it in a write of its
+    /// own, one writer batch. What ends the hold is the loop's clock, under a one-minute hang
+    /// detector, never a latency budget.
+    ///
+    /// NEGATIVE CONTROL: with the take sent the round it falls due
+    /// ([`crate::sim::world::Mutant::MirrorSendsAnUnowedSlotAtOnce`]) that round takes it.
+    #[cfg(unix)]
+    #[test]
+    fn a_take_nothing_carries_goes_alone_once_its_grace_is_out() {
+        for (fx, held) in [
+            (crate::fx::Fx::os(), true),
+            (
+                crate::fx::Fx::os_without(crate::sim::world::Mutant::MirrorSendsAnUnowedSlotAtOnce),
+                false,
+            ),
+        ] {
+            let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a")]);
+            bridge.fx = fx;
+            let (_records, _reader, _socket, broker, _server) =
+                burst_rig(&lane, &mut bridge, "s-a", 0);
+            bridge.mirror = Some(mirror_run::MirrorRun::acked_for_tests(
+                &bridge.state,
+                aterm_slog::TAKE_MAX,
+            ));
+            bridge.mirror_step();
+            assert!(
+                bridge.state.logpin_fence_held() && bridge.mirror_due(bridge.fx.now()).is_none(),
+                "PRECONDITION: the open's first pass made the fence and took nothing"
+            );
+            bridge.roster_due = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+            lane.mirror
+                .lock()
+                .unwrap()
+                .logs
+                .insert("s-a".to_string(), an_opened_session_log());
+            bridge.mirror_wake();
+            let batches = broker.stats().writer_batches;
+            let writes = tap_shapes(&mut bridge);
+            let takes = lane.mirror.lock().unwrap().takes;
+
+            assert!(bridge.mirror_then_round());
+            let first = lane.mirror.lock().unwrap().takes - takes;
+            if !held {
+                assert_eq!(
+                    first, 1,
+                    "NEGATIVE CONTROL: the round it fell due in took it"
+                );
+                continue;
+            }
+            assert_eq!(first, 0, "the round that found the take due held it");
+            assert!(
+                bridge.parked.is_some_and(|p| p <= IDLE_ACK_GRACE),
+                "and parked no longer than the grace: {:?}",
+                bridge.parked
+            );
+            let landed = || !lane.mirror.lock().unwrap().landings.is_empty();
+            let started = Instant::now();
+            while !landed() {
+                assert!(
+                    started.elapsed() < aterm_spec::wait::MUST_HAPPEN,
+                    "HANG: the held take never went: {:?}",
+                    writes.lock().unwrap()
+                );
+                assert!(bridge.mirror_then_round());
+            }
+            assert_eq!(
+                (
+                    writes.lock().unwrap().as_slice(),
+                    broker.stats().writer_batches - batches
+                ),
+                (["evA".to_string()].as_slice(), 1),
+                "the take went alone, in one write and one writer batch"
+            );
         }
     }
 
@@ -21254,6 +22000,9 @@ mod tests {
     struct MirrorRide {
         /// What the mirror's send left owed on the link, oldest first.
         owed: Vec<&'static str>,
+        /// Every write from the round's park (or the mirror's send) on, each one shape step
+        /// ([`shape_step`]).
+        writes: Vec<String>,
         /// Whether a slot of the take was a snapshot.
         snapshot: bool,
         /// Whether a commit was still held once the mirror's send went out.
@@ -21316,6 +22065,7 @@ mod tests {
         assert!(bridge.mailbox.is_idle());
         assert_eq!(bridge.conn.as_ref().map(Link::unacked), Some(0));
         let batches = broker.stats().writer_batches;
+        let writes = tap_shapes(&mut bridge);
         match pass {
             MirrorPass::AfterTheSettle => {
                 bridge.settle_owed();
@@ -21384,27 +22134,235 @@ mod tests {
                 _ => "other",
             })
             .collect();
-        let snapshot = bridge
-            .mirror
-            .as_deref()
-            .is_some_and(|m| m.batch().0.iter().any(|s| s.body.contains(" op=snap ")));
         let held_after_send = bridge.commit_held.is_some();
         bridge.settle_acks();
         bridge.flush_inbox_commit();
         bridge.settle_acks();
+        // A pass that found no commit to carry held its take (critic item E04): it is made once
+        // its hold is out.
+        if bridge
+            .mirror
+            .as_deref()
+            .is_some_and(|m| m.uncarried().is_some())
+        {
+            pass_past_its_hold(&mut bridge);
+            bridge.settle_acks();
+        }
+        let snapshot = bridge
+            .mirror
+            .as_deref()
+            .is_some_and(|m| m.batch().0.iter().any(|s| s.body.contains(" op=snap ")));
         let on_bus = bridge.mirror.as_deref().is_some_and(|m| {
-            m.batch()
-                .1
-                .iter()
-                .all(|o| matches!(o, mirror_run::Outcome::OnBus(_)))
+            !m.batch().1.is_empty()
+                && m.batch()
+                    .1
+                    .iter()
+                    .all(|o| matches!(o, mirror_run::Outcome::OnBus(_)))
         });
+        let writes = writes.lock().unwrap().clone();
         MirrorRide {
             owed,
+            writes,
             snapshot,
             held_after_send,
             batches: broker.stats().writer_batches - batches,
             committed: bridge.committed == Some(records[0].0) && bridge.inbox_pending.is_none(),
             on_bus,
+        }
+    }
+
+    /// The pass the loop owes now, made without waiting out the hold of a take nothing would
+    /// carry (critic item E04): the pass that finds it due holds it, and one whose hold is dated
+    /// a grace ago takes.
+    fn pass_past_its_hold(bridge: &mut Bridge) {
+        bridge.mirror_step();
+        if let Some(m) = bridge
+            .mirror
+            .as_deref_mut()
+            .filter(|m| m.uncarried().is_some())
+        {
+            m.date_uncarried_for_tests(
+                Instant::now()
+                    .checked_sub(IDLE_ACK_GRACE)
+                    .expect("a clock past its first grace"),
+            );
+            bridge.mirror_step();
+        }
+    }
+
+    /// One write's frames named as the fabric bench names a paced note's records in its shapes:
+    /// `note` a post, `commit` the inbox commit, `evA` and `evB` a mirror slot of `s-a`'s log
+    /// and of `s-b`'s, `ev` any other publish; a run of one name is one, and the names are
+    /// joined by `+`.
+    #[cfg(unix)]
+    fn shape_step(frames: &[(&Then, Option<&str>)]) -> String {
+        let mut names: Vec<&'static str> = Vec::new();
+        for (then, subject) in frames {
+            let name = match (then, subject) {
+                (Then::Commit { .. }, _) => "commit",
+                (Then::Post(_), _) => "note",
+                (Then::Mirror { .. }, Some(s)) if s.ends_with("/s-a/ev") => "evA",
+                (Then::Mirror { .. }, Some(s)) if s.ends_with("/s-b/ev") => "evB",
+                _ => "ev",
+            };
+            if names.last() != Some(&name) {
+                names.push(name);
+            }
+        }
+        names.join("+")
+    }
+
+    /// The writes `bridge`'s link makes from now on, each one shape step ([`shape_step`]).
+    #[cfg(unix)]
+    fn tap_shapes(bridge: &mut Bridge) -> Arc<std::sync::Mutex<Vec<String>>> {
+        let writes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let tapped = Arc::clone(&writes);
+        bridge
+            .conn
+            .as_mut()
+            .expect("the link stands")
+            .tap_writes(move |frames| tapped.lock().unwrap().push(shape_step(frames)));
+        writes
+    }
+
+    /// A session's log at the lane holding its open (a snapshot owed with it).
+    #[cfg(unix)]
+    fn an_opened_session_log() -> aterm_slog::Log {
+        let mut log = aterm_slog::Log::with_limits(
+            1,
+            aterm_slog::Limits::new(8, 1 << 20).expect("a small ring"),
+        );
+        log.open_session(
+            aterm_slog::Kind::Spawn,
+            aterm_slog::Src::Aterm,
+            aterm_slog::Conf::Exact,
+            aterm_slog::Actor::Aterm,
+            aterm_slog::Fields::new(),
+            aterm_slog::Stamp::new(1, 1),
+        )
+        .expect("the session opens");
+        log
+    }
+
+    /// What [`a_paced_note_on_one_node`] saw.
+    #[cfg(unix)]
+    struct PacedNote {
+        /// Every write from the post on, each one shape step ([`shape_step`]).
+        writes: Vec<String>,
+        /// The writer batches over the same span.
+        batches: u64,
+        /// Whether the group ended through the note's delivery.
+        committed: bool,
+    }
+
+    /// A PACED NOTE BETWEEN TWO SESSIONS OF ONE NODE, as the fabric bench's paced phase sends one
+    /// (critic item E04), in an open that holds the pin's fence: `s-a` posts to `s-b`. The post
+    /// moved A's mail count, so A's log at the lane owes its snapshot, and the endpoint's line
+    /// for the post wakes the mirror as it lists the post. The note's ack is read before the
+    /// next pass, so the note's write is a writer batch before anything the pass sends. The
+    /// note's record comes back on the inbox face while that round parks, and its delivery
+    /// moves B's mail count (B's log joins the lane's as the delivery is answered). Then the
+    /// loop's rounds run on `fx` until the group is through the note and both logs' takes have
+    /// landed, under a one-minute hang detector.
+    #[cfg(unix)]
+    fn a_paced_note_on_one_node(fx: crate::fx::Fx) -> PacedNote {
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-b")]);
+        bridge.fx = fx;
+        let (_records, mut reader, _socket, broker, _server) =
+            burst_rig(&lane, &mut bridge, "s-b", 0);
+        bridge.mirror = Some(mirror_run::MirrorRun::acked_for_tests(
+            &bridge.state,
+            aterm_slog::TAKE_MAX,
+        ));
+        bridge.mirror_step();
+        assert!(
+            bridge.state.logpin_fence_held(),
+            "PRECONDITION: the open's first pass made the pin's fence"
+        );
+        assert_eq!(
+            bridge.mirror_due(bridge.fx.now()),
+            None,
+            "PRECONDITION: and took nothing, so the mirror owes nothing"
+        );
+        lane.mirror
+            .lock()
+            .unwrap()
+            .logs
+            .insert("s-a".to_string(), an_opened_session_log());
+        let at_the_lane = Arc::clone(&lane.mirror);
+        let b_log = an_opened_session_log();
+        lane.on_first_deliver(move || {
+            at_the_lane
+                .lock()
+                .unwrap()
+                .logs
+                .insert("s-b".to_string(), b_log);
+        });
+        let node = bridge.node.clone();
+        let lane_face = subject::post_lane("f", &node, "s-b", &node, "note");
+        bridge.indexed_subjects.insert(lane_face.clone());
+        *lane.outbox.lock().unwrap() =
+            Some("post sid=s-a id=1 to=@s-b kind=note len=4\nnote".to_string());
+        bridge.mailbox.push_event("EVENT 1 post 1".to_string());
+        let batches = broker.stats().writer_batches;
+        let writes = tap_shapes(&mut bridge);
+
+        assert!(bridge.mirror_then_round());
+        bridge.settle_acks();
+        let off = lane
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|l| l.strip_prefix("outbox sent s-a 1 off="))
+            .and_then(|rest| rest.split_whitespace().next()?.parse::<u64>().ok())
+            .expect("PRECONDITION: the note landed");
+        let (rows, _) = reader
+            .fetch(off, &lane_face, 1)
+            .expect("the note reads back");
+        let record = rows.into_iter().next().expect("the note's record");
+
+        if !bridge.mirror_yields() {
+            bridge.mirror_step();
+        }
+        bridge.settle_owed();
+        let generation = bridge.mailbox.broker_generation(Source::Inbox);
+        assert_eq!(
+            bridge
+                .mailbox
+                .push(Source::Inbox, record, generation, bridge.fx.now()),
+            Pushed::Queued
+        );
+        let wait = bridge.park_wait(bridge.fx.now());
+        assert!(bridge.park_and_take(wait));
+        assert_eq!(
+            bridge.inbox_pending.max(bridge.committed),
+            Some(off),
+            "PRECONDITION: the note was delivered"
+        );
+
+        let landed = |sid: &str| {
+            lane.mirror
+                .lock()
+                .unwrap()
+                .landings
+                .iter()
+                .any(|l| l.split_whitespace().step_by(2).any(|word| word == sid))
+        };
+        let started = Instant::now();
+        while !(bridge.committed == Some(off) && landed("s-a") && landed("s-b")) {
+            assert!(
+                started.elapsed() < aterm_spec::wait::MUST_HAPPEN,
+                "HANG: the commit and both takes never landed: {:?}",
+                writes.lock().unwrap()
+            );
+            assert!(bridge.mirror_then_round());
+        }
+        let writes = writes.lock().unwrap().clone();
+        PacedNote {
+            writes,
+            batches: broker.stats().writer_batches - batches,
+            committed: bridge.inbox_pending.is_none(),
         }
     }
 
@@ -22596,7 +23554,11 @@ mod tests {
         kept
     }
 
-    fn retirements(lane: &FakeVerbLane) -> Vec<(String, u64, Option<u64>)> {
+    /// Every retirement aterm was told ([`retirements`]): the sender, the post's id, and the
+    /// offset it was retired at (`None` for `off=-`).
+    type Retired = Vec<(String, u64, Option<u64>)>;
+
+    fn retirements(lane: &FakeVerbLane) -> Retired {
         lane.sent
             .lock()
             .unwrap()
@@ -22805,6 +23767,759 @@ mod tests {
                 "{retired:#?}"
             );
         }
+    }
+
+    /// **BEHIND A BROKER'S GAP FENCE A SENDER'S POSTS GO OUT TOGETHER, AND A REFUSED ONE HOLDS
+    /// BACK EVERY POST SENT AFTER IT** (C12): the burst is on the wire before any answer is
+    /// read, several of a sender's posts at once; `a1`'s batch fails, so the broker refuses all
+    /// that went after it (`gap-fenced=`), whoever sent them, and the next drain lifts the fence
+    /// and sends them again at their pins, each sender's in its order, each post once. The
+    /// control is [`a_senders_post_refused_mid_burst_holds_its_later_posts_and_no_one_elses`]'s
+    /// broker, which does not gap-fence: there a sender's posts go one at a time.
+    #[cfg(unix)]
+    #[test]
+    fn behind_a_gap_fence_a_refused_post_holds_back_what_went_after_it_and_each_lands_once() {
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-b"), (3, "s-r")]);
+        assert!(bridge.refresh_sessions().is_ok());
+        let (broker, _server) = on_a_broker(&lane, &mut bridge, true);
+        let lane_of = format!("/f/f/in/{0}/s-r/{0}/note", bridge.node);
+        bridge.indexed_subjects.insert(lane_of.clone());
+        let posts = [
+            queued_note("s-a", 1, "@s-r", "a1"),
+            queued_note("s-a", 2, "@s-r", "a2"),
+            queued_note("s-b", 1, "@s-r", "b1"),
+            queued_note("s-a", 3, "@s-r", "a3"),
+            queued_note("s-b", 2, "@s-r", "b2"),
+        ]
+        .concat();
+        *lane.outbox.lock().unwrap() = Some(posts.clone());
+
+        broker.inject_faults(astream_broker::InjectedFaults {
+            sync: true,
+            truncate: false,
+        });
+        let held = broker.pause_next_acks();
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let writer = broker.clone();
+        std::thread::spawn(move || {
+            let tried = held.wait();
+            writer.inject_faults(astream_broker::InjectedFaults::default());
+            held.resume();
+            let _ = done_tx.send(tried);
+        });
+        bridge.drain_outbox();
+        assert_eq!(
+            done.recv_timeout(aterm_spec::wait::MUST_HAPPEN),
+            Ok(true),
+            "a1's batch was tried and held unanswered (a hang detector)"
+        );
+        let link = bridge
+            .conn
+            .as_ref()
+            .expect("a refusal is an answer, not a lost link");
+        assert_eq!(
+            link.peak(),
+            5,
+            "the burst went out before any answer was read, three of s-a's at once"
+        );
+        assert!(link.fenced(), "the refusals left the fence up");
+        assert!(retirements(&lane).is_empty(), "nothing landed behind a1");
+        let (mut reader, _) = bridge.connect().unwrap();
+        assert!(notes_on(&mut reader, &lane_of).is_empty());
+        for (sid, n) in [("s-a", 1), ("s-a", 2), ("s-b", 1), ("s-a", 3), ("s-b", 2)] {
+            assert!(
+                bridge.state.post_pin(sid, n).unwrap().is_some(),
+                "{sid} {n} keeps its sequence for the retry"
+            );
+        }
+        assert!(bridge.state.in_flight().unwrap().is_empty());
+
+        lane.sent.lock().unwrap().clear();
+        *lane.outbox.lock().unwrap() = Some(posts);
+        bridge.drain_outbox();
+        assert!(
+            !bridge.conn.as_ref().unwrap().fenced(),
+            "the drain lifted the fence"
+        );
+        let retired = retirements(&lane);
+        let notes = notes_on(&mut reader, &lane_of);
+        let texts: Vec<&str> = notes.iter().map(|(_, text)| text.as_str()).collect();
+        for sid in ["a", "b"] {
+            let mine: Vec<&str> = texts
+                .iter()
+                .copied()
+                .filter(|text| text.starts_with(sid))
+                .collect();
+            let posted: &[&str] = if sid == "a" {
+                &["a1", "a2", "a3"]
+            } else {
+                &["b1", "b2"]
+            };
+            assert_eq!(mine, posted, "s-{sid}'s notes once each, in its order");
+        }
+        assert_eq!(texts.len(), 5, "each note exactly once: {texts:?}");
+        for (sid, n, text) in [
+            ("s-a", 1, "a1"),
+            ("s-a", 2, "a2"),
+            ("s-a", 3, "a3"),
+            ("s-b", 1, "b1"),
+            ("s-b", 2, "b2"),
+        ] {
+            let at = notes.iter().find(|(_, t)| t == text).map(|(off, _)| *off);
+            assert!(retired.contains(&(sid.to_string(), n, at)), "{retired:#?}");
+        }
+    }
+    /// `bridge` connected to a broker that GAP-FENCES (`fenced`), as `aterm link broker` opens
+    /// every tier (`durability.rs`), or to one an older build opened, its `Hello` read and the
+    /// fence asked for where it offered it ([`Bridge::ask_gap_fences`]): only on the first does
+    /// the bridge keep several of a sender's posts in flight ([`Bridge::pipelines_posts`]).
+    #[cfg(unix)]
+    fn on_a_broker(
+        lane: &FakeVerbLane,
+        bridge: &mut Bridge,
+        fenced: bool,
+    ) -> (Arc<astream_broker::Broker>, astream_broker::BrokerHandle) {
+        let socket = lane.dir.path().join("bus.sock");
+        let broker = astream_broker::Broker::open_opts(
+            lane.dir.path().join("bus.log"),
+            astream_broker::OpenOptions::new(astream_broker::Durability::Strict)
+                .with_sticky_batch_refusal(fenced),
+            || Ok(astream_broker::Prepared::Nothing),
+        )
+        .unwrap();
+        let server = broker.serve(&socket).unwrap();
+        bridge.cfg.broker = socket.to_string_lossy().into_owned();
+        bridge.conn = Some(bridge.connect().unwrap().0.into());
+        let link = bridge.conn.as_mut().unwrap();
+        link.ready().unwrap().hello().unwrap();
+        assert!(
+            !bridge.pipelines_posts(),
+            "a Hello that offers the fence is not the fence, which the bridge has not asked for"
+        );
+        assert!(bridge.ask_gap_fences(), "the attach asks for the fence");
+        assert_eq!(
+            bridge.pipelines_posts(),
+            fenced,
+            "the bridge gap-fences where its Hello offered it, and only there"
+        );
+        (Arc::new(broker), server)
+    }
+
+    /// **A DRAIN THAT FINDS ITS ATERM GONE SENDS NO POST IT HAD NOT SENT** (the orphan of
+    /// `fabric_world`'s `an_orphaned_bridge_mid_drain_neither_publishes_more_nor_shares_the_node`).
+    /// The drain's look at aterm before a post is not the last call before its send: a blocking
+    /// one between reads an earlier post's answer, and that post's `outbox sent` meets aterm
+    /// gone. Each seam that reads one is driven. Behind a gap fence, where a sender's posts go
+    /// out without waiting for their answers: a new lane's subject-budget read, the full window
+    /// before a send, and the settle before a keyed post. On a broker that does not gap-fence,
+    /// where a sender's post waits only for the answer to its own last: the budget read that
+    /// takes another sender's answer. And a retry at a pin an older build made, which names no
+    /// head to read back from, so the settle before its send is the first to take another
+    /// sender's answer.
+    /// Only the posts sent before the loss are on the bus, and no in-flight entry is left for a
+    /// successor's attach to replay.
+    #[cfg(unix)]
+    #[test]
+    fn a_drain_that_finds_its_aterm_gone_sends_no_post_it_had_not_sent() {
+        struct Seam {
+            name: &'static str,
+            fenced: bool,
+            indexed: bool,
+            /// `s-a`'s post 1 waits at a pin an older build made (no head to read back from).
+            pinned: bool,
+            posts: Vec<(String, String)>,
+            /// How many of `posts`, in order, went before the loss.
+            sent: usize,
+        }
+        let note = |sid: &str, id: u64, key: Option<&str>| {
+            let text = format!("{}{id}", &sid[2..]);
+            let line = queued_note(sid, id, "@s-r", &text);
+            let line = match key {
+                Some(key) => line.replacen(" kind=", &format!(" key={key} kind="), 1),
+                None => line,
+            };
+            (line, text)
+        };
+        let window = u64::try_from(PIPELINE_WINDOW).unwrap();
+        let seams = [
+            Seam {
+                name: "a new lane's budget read",
+                fenced: true,
+                indexed: false,
+                pinned: false,
+                posts: vec![note("s-a", 1, None), note("s-a", 2, None)],
+                sent: 1,
+            },
+            Seam {
+                name: "a full window",
+                fenced: true,
+                indexed: true,
+                pinned: false,
+                posts: (1..=window + 1).map(|id| note("s-a", id, None)).collect(),
+                sent: PIPELINE_WINDOW,
+            },
+            Seam {
+                name: "the settle before a keyed post",
+                fenced: true,
+                indexed: true,
+                pinned: false,
+                posts: vec![note("s-b", 1, None), note("s-a", 1, Some("k"))],
+                sent: 1,
+            },
+            Seam {
+                name: "a new lane's budget read, unfenced",
+                fenced: false,
+                indexed: false,
+                pinned: false,
+                posts: vec![note("s-b", 1, None), note("s-a", 1, None)],
+                sent: 1,
+            },
+            Seam {
+                name: "the settle before a retry at an older build's pin",
+                fenced: true,
+                indexed: true,
+                pinned: true,
+                posts: vec![note("s-b", 1, None), note("s-a", 1, None)],
+                sent: 1,
+            },
+        ];
+        let mut wrong = Vec::new();
+        for seam in seams {
+            let name = seam.name;
+            let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-b"), (3, "s-r")]);
+            assert!(bridge.refresh_sessions().is_ok());
+            let (_broker, _server) = on_a_broker(&lane, &mut bridge, seam.fenced);
+            let lane_of = format!("/f/f/in/{0}/s-r/{0}/note", bridge.node);
+            if seam.indexed {
+                bridge.indexed_subjects.insert(lane_of.clone());
+            }
+            if seam.pinned {
+                let pin = PublishPin {
+                    seq: bridge.next_seq().unwrap(),
+                    via_key: false,
+                    identity: None,
+                    original: None,
+                    original_off: None,
+                    owner: Some(1),
+                    at: None,
+                };
+                bridge.state.set_post_pin("s-a", 1, &pin).unwrap();
+            }
+            *lane.outbox.lock().unwrap() =
+                Some(seam.posts.iter().map(|(line, _)| line.as_str()).collect());
+            lane.hang_up_at("outbox sent ");
+            bridge.drain_outbox();
+            assert!(
+                bridge.aterm_gone(),
+                "{name}: the first retirement met aterm gone"
+            );
+            let (mut reader, _) = bridge.connect().unwrap();
+            let landed: Vec<String> = notes_on(&mut reader, &lane_of)
+                .into_iter()
+                .map(|(_, text)| text)
+                .collect();
+            let before: Vec<String> = seam.posts[..seam.sent]
+                .iter()
+                .map(|(_, text)| text.clone())
+                .collect();
+            match landed.strip_prefix(before.as_slice()) {
+                Some([]) => {}
+                Some(after) => wrong.push(format!("{name}: sent after the loss {after:?}")),
+                None => wrong.push(format!("{name}: on the bus {landed:?}, not {before:?}")),
+            }
+            let in_flight = bridge.state.in_flight().unwrap();
+            if !in_flight.is_empty() {
+                wrong.push(format!(
+                    "{name}: {} in-flight entries left to replay",
+                    in_flight.len()
+                ));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "posts went out after aterm was gone: {wrong:#?}"
+        );
+    }
+
+    /// **A POST ITS SEND CONCLUDES UNSENT HAS NO IN-FLIGHT ENTRY, WHATEVER BECAME OF THE LINK**
+    /// (the orphan of `fabric_world`'s `an_orphaned_bridge_mid_drain_…`, its review): `s-b`'s 64
+    /// posts fill the window behind the gap fence, their answers unread, and `s-a`'s post's send
+    /// waits for one. The broker link is cut meanwhile, so the wait reads the cut, concludes
+    /// `b1` with its fate unknown and drops the link; and aterm goes in the same moment, as its
+    /// push lane can say at any time, or stays. `a1` is not sent: with aterm gone the send's look
+    /// at aterm stops it ([`Bridge::unsendable`]) and the bridge exits, and the next attach on
+    /// its state dir is its successor's; with aterm there the lost link stops it, and that attach
+    /// is this bridge's own. The attach's replay ([`Bridge::settle_in_flight`]) finds `s-b`'s 64
+    /// on the bus and publishes no copy, and finds no entry for `a1`, which no connection carried
+    /// ([`Unsent`]): the successor never sends it, and the live bridge's drain sends it once at
+    /// its pin.
+    #[cfg(unix)]
+    #[test]
+    fn a_post_its_send_concludes_unsent_has_no_in_flight_entry_whatever_became_of_the_link() {
+        let sessions = [(1, "s-a"), (2, "s-b"), (3, "s-r")];
+        let window = u64::try_from(PIPELINE_WINDOW).unwrap();
+        let note = |sid: &str, id: u64| queued_note(sid, id, "@s-r", &format!("{}{id}", &sid[2..]));
+        let window_full: String = (1..=window).map(|id| note("s-b", id)).collect();
+        let sent: Vec<String> = (1..=window).map(|id| format!("b{id}")).collect();
+        // A link as the attach opens one, the fence asked for; its closer cuts it.
+        let link = |bridge: &mut Bridge| {
+            let (conn, cut) = bridge.connect().unwrap();
+            bridge.conn = Some(conn.into());
+            bridge
+                .conn
+                .as_mut()
+                .unwrap()
+                .ready()
+                .unwrap()
+                .hello()
+                .unwrap();
+            assert!(bridge.ask_gap_fences() && bridge.pipelines_posts());
+            cut
+        };
+        for aterm_goes in [true, false] {
+            let (lane, mut bridge) = FakeVerbLane::bridge(&sessions);
+            assert!(bridge.refresh_sessions().is_ok());
+            let (_broker, _server) = on_a_broker(&lane, &mut bridge, true);
+            let cut = link(&mut bridge);
+            let lane_of = format!("/f/f/in/{0}/s-r/{0}/note", bridge.node);
+            bridge.indexed_subjects.insert(lane_of.clone());
+            *lane.outbox.lock().unwrap() = Some(window_full.clone());
+            // As the loop runs it: an answer is read when the loop reads it, not after the drain.
+            bridge.in_round = true;
+            bridge.drain_outbox();
+            assert_eq!(
+                bridge.conn.as_ref().map(Link::unacked),
+                Some(PIPELINE_WINDOW),
+                "aterm_goes={aterm_goes}: the window is full, no answer read"
+            );
+            cut.close();
+            if aterm_goes {
+                bridge.mailbox.push_aterm_closed();
+            }
+            let a1 = parse_drain(note("s-a", 1).as_bytes()).posts.remove(0);
+            bridge.drain_post(a1);
+            assert!(
+                bridge.conn.is_none(),
+                "aterm_goes={aterm_goes}: a1's wait read the cut"
+            );
+            let journaled: Vec<String> = bridge
+                .state
+                .in_flight()
+                .unwrap()
+                .into_iter()
+                .map(|(_, entry)| Body::decode(&entry.body).0.text)
+                .collect();
+            assert_eq!(
+                journaled, sent,
+                "aterm_goes={aterm_goes}: an entry stands for each post sent and none other"
+            );
+
+            let state = bridge.state.root().to_path_buf();
+            let broker = bridge.cfg.broker.clone();
+            let (_successor_lane, mut next) = if aterm_goes {
+                bridge.close_subscriptions();
+                drop(bridge);
+                let (successor_lane, mut successor) =
+                    FakeVerbLane::bridge_with_state(&sessions, Some(&state));
+                successor.cfg.broker = broker;
+                (Some(successor_lane), successor)
+            } else {
+                bridge.in_round = false;
+                (None, bridge)
+            };
+            let _cut = link(&mut next);
+            assert!(
+                next.settle_in_flight(),
+                "aterm_goes={aterm_goes}: the attach's replay"
+            );
+            let (mut reader, _) = next.connect().unwrap();
+            let on_bus = |reader: &mut Conn| -> Vec<String> {
+                notes_on(reader, &lane_of)
+                    .into_iter()
+                    .map(|(_, text)| text)
+                    .collect()
+            };
+            assert_eq!(
+                on_bus(&mut reader),
+                sent,
+                "aterm_goes={aterm_goes}: the attach replays no copy and nothing unsent"
+            );
+            if !aterm_goes {
+                *lane.outbox.lock().unwrap() = Some(format!("{window_full}{}", note("s-a", 1)));
+                next.drain_outbox();
+                next.settle_acks();
+                let mut once = sent.clone();
+                once.push("a1".to_string());
+                assert_eq!(
+                    on_bus(&mut reader),
+                    once,
+                    "the live bridge's drain sends a1 once, at its pin"
+                );
+            }
+            next.close_subscriptions();
+        }
+    }
+
+    /// **A LATER POST WHOSE ANSWER WAS NEVER READ WAITS FOR ITS SENDER'S REFUSED ONE** (C12s1's
+    /// review): `a1` and `a2` of `s-a` go out together behind the gap fence and their batch fails
+    /// its fsync. The bridge reads `a1`'s refusal, which drops `a2`'s entry with `a1`'s, and the
+    /// link is lost before `a2`'s answer is read. The attach's replay then has nothing of `s-a`'s
+    /// to publish, and the drain sends `a1`, then `a2`, each once. Before the fix `a2`'s entry
+    /// outlived `a1`'s refusal and the replay landed `a2` first.
+    #[cfg(unix)]
+    #[test]
+    fn a_later_post_whose_answer_was_never_read_waits_for_its_senders_refused_one() {
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-r")]);
+        assert!(bridge.refresh_sessions().is_ok());
+        let socket = lane.dir.path().join("unread.sock");
+        let broker = astream_broker::Broker::open_opts(
+            lane.dir.path().join("unread.log"),
+            astream_broker::OpenOptions::new(astream_broker::Durability::Strict)
+                .with_sticky_batch_refusal(true),
+            || Ok(astream_broker::Prepared::Nothing),
+        )
+        .unwrap();
+        let _server = broker.serve(&socket).unwrap();
+        bridge.cfg.broker = socket.to_string_lossy().into_owned();
+        let attach = |bridge: &mut Bridge| {
+            bridge.conn = Some(bridge.connect().unwrap().0.into());
+            bridge
+                .conn
+                .as_mut()
+                .unwrap()
+                .ready()
+                .unwrap()
+                .hello()
+                .unwrap();
+            assert!(bridge.ask_gap_fences());
+        };
+        attach(&mut bridge);
+        assert!(bridge.pipelines_posts());
+        let lane_of = format!("/f/f/in/{0}/s-r/{0}/note", bridge.node);
+        bridge.indexed_subjects.insert(lane_of.clone());
+        let posts = format!(
+            "{}{}",
+            queued_note("s-a", 1, "@s-r", "a1"),
+            queued_note("s-a", 2, "@s-r", "a2")
+        );
+        *lane.outbox.lock().unwrap() = Some(posts.clone());
+        broker.inject_faults(astream_broker::InjectedFaults {
+            sync: true,
+            truncate: false,
+        });
+        // As the loop runs it: an answer is read when the loop reads it, not after the drain.
+        bridge.in_round = true;
+        bridge.drain_outbox();
+        assert_eq!(
+            bridge.state.in_flight().unwrap().len(),
+            2,
+            "a1 and a2 are in flight together"
+        );
+        assert!(bridge.settle_one(bridge.fx.now()), "a1's refusal is read");
+        assert!(bridge.held_senders.contains("s-a"));
+        assert!(
+            bridge.state.in_flight().unwrap().is_empty(),
+            "a2's entry left the journal with a1's"
+        );
+
+        // The link lost, as a kill loses it, with a2's answer unread; the next attach starts
+        // with no sender held and a healthy disk.
+        bridge.conn = None;
+        bridge.in_round = false;
+        bridge.held_senders.clear();
+        broker.inject_faults(astream_broker::InjectedFaults::default());
+        attach(&mut bridge);
+        assert!(bridge.settle_in_flight());
+        *lane.outbox.lock().unwrap() = Some(posts);
+        bridge.drain_outbox();
+        let (mut reader, _) = bridge.connect().unwrap();
+        let texts: Vec<String> = notes_on(&mut reader, &lane_of)
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect();
+        assert_eq!(texts, ["a1", "a2"], "s-a's notes once each, in its order");
+    }
+
+    /// **AN `ev` A GAP FENCE REFUSED IS SENT AGAIN** (C12s1's review): `first`'s batch fails its
+    /// fsync, and `second`, written behind it once the disk is healthy again, is refused only
+    /// for the fence (`gap-fenced=`). The next round lifts the fence and sends `second` again,
+    /// so the node's `ev` face holds it, as it would on a broker that does not gap-fence;
+    /// `first`, refused for its own sake, is lost as it always was.
+    #[cfg(unix)]
+    #[test]
+    fn an_ev_a_gap_fence_refused_is_sent_again_once_the_fence_is_lifted() {
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[]);
+        let socket = lane.dir.path().join("evs.sock");
+        let broker = astream_broker::Broker::open_opts(
+            lane.dir.path().join("evs.log"),
+            astream_broker::OpenOptions::new(astream_broker::Durability::Strict)
+                .with_sticky_batch_refusal(true),
+            || Ok(astream_broker::Prepared::Nothing),
+        )
+        .unwrap();
+        let _server = broker.serve(&socket).unwrap();
+        bridge.cfg.broker = socket.to_string_lossy().into_owned();
+        bridge.conn = Some(bridge.connect().unwrap().0.into());
+        bridge
+            .conn
+            .as_mut()
+            .unwrap()
+            .ready()
+            .unwrap()
+            .hello()
+            .unwrap();
+        assert!(bridge.ask_gap_fences());
+        // As the loop runs it: an answer is read when the loop reads it, not at each write.
+        bridge.in_round = true;
+
+        broker.inject_faults(astream_broker::InjectedFaults {
+            sync: true,
+            truncate: false,
+        });
+        let held = broker.pause_next_acks();
+        bridge.publish_ev("first");
+        assert!(held.wait(), "first's batch was tried and held unanswered");
+        broker.inject_faults(astream_broker::InjectedFaults::default());
+        bridge.publish_ev("second");
+        held.resume();
+        bridge.settle_acks();
+        assert_eq!(
+            bridge.evs_fenced,
+            [(None, "second".to_string())],
+            "second was refused for the fence alone"
+        );
+        assert!(node_evs(&bridge).is_empty(), "nothing landed behind first");
+
+        bridge.settle_owed();
+        bridge.settle_acks();
+        assert!(bridge.evs_fenced.is_empty());
+        let evs = node_evs(&bridge);
+        assert_eq!(evs.len(), 1, "{evs:?}");
+        assert!(evs[0].ends_with("ev=second"), "{evs:?}");
+    }
+
+    /// **A SENDER'S SECOND POST IN THE SAME WORDS LANDS THOUGH THE FIRST LANDED JUST AHEAD OF
+    /// IT** (C12s1's review, `Bridge::settle_same_words`): `s-a` posts `ok` twice behind the gap
+    /// fence, and between them goes `s-b`'s post, which the broker refuses for its bytes (past
+    /// the byte rate's whole burst, so at every try), so the second `ok` is refused behind it
+    /// and retried at its pin. A retry reads back from its pin's head first, and takes the first record in its words above that head for its own: had the
+    /// second pin been made while the first `ok` was still owed, its head would lie below the
+    /// first, and the retry would settle on the first's record and never publish. Each lands,
+    /// and each is retired at its own record.
+    ///
+    /// NEGATIVE CONTROL: with the pin made ahead of the first `ok`'s answer
+    /// ([`crate::sim::world::Mutant::PinAheadOfSameWords`]), the retry takes the first `ok`'s
+    /// record for its own: one `ok` on the bus, both posts retired at it, the second lost.
+    #[cfg(unix)]
+    #[test]
+    fn a_senders_second_post_in_the_same_words_lands_after_the_first() {
+        let SameWordsOutcome { notes, retired } =
+            two_posts_in_the_same_words_behind_a_refusal(crate::fx::Fx::os());
+        let texts: Vec<&str> = notes.iter().map(|(_, text)| text.as_str()).collect();
+        assert_eq!(texts, ["ok", "ok"], "each `ok` once: {notes:?}");
+        for (n, (at, _)) in notes.iter().enumerate() {
+            let id = u64::try_from(n).unwrap() + 1;
+            assert!(
+                retired.contains(&("s-a".to_string(), id, Some(*at))),
+                "s-a {id} retired at @{at}: {retired:#?}"
+            );
+        }
+
+        let SameWordsOutcome { notes, retired } = two_posts_in_the_same_words_behind_a_refusal(
+            crate::fx::Fx::os_without(crate::sim::world::Mutant::PinAheadOfSameWords),
+        );
+        let [(first, text)] = notes.as_slice() else {
+            panic!("NEGATIVE CONTROL: one `ok` on the bus, the second lost: {notes:?}");
+        };
+        assert_eq!(text, "ok");
+        for id in [1, 2] {
+            assert!(
+                retired.contains(&("s-a".to_string(), id, Some(*first))),
+                "NEGATIVE CONTROL: s-a {id} retired at the first's @{first}: {retired:#?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    struct SameWordsOutcome {
+        notes: Vec<(u64, String)>,
+        retired: Retired,
+    }
+
+    /// The scenario of [`a_senders_second_post_in_the_same_words_lands_after_the_first`] under
+    /// `fx`: the notes on `s-r`'s lane, by offset, and every retirement aterm was told.
+    #[cfg(unix)]
+    fn two_posts_in_the_same_words_behind_a_refusal(fx: crate::fx::Fx) -> SameWordsOutcome {
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-b"), (3, "s-r")]);
+        bridge.fx = fx;
+        assert!(bridge.refresh_sessions().is_ok());
+        let socket = lane.dir.path().join("words.sock");
+        let broker = astream_broker::Broker::open_opts(
+            lane.dir.path().join("words.log"),
+            astream_broker::OpenOptions::new(astream_broker::Durability::Strict)
+                .with_sticky_batch_refusal(true)
+                .with_rate_limit(
+                    astream_broker::RateLimit::records(1000, 1000)
+                        .and_then(|limit| limit.with_bytes(1, 4096))
+                        .unwrap(),
+                ),
+            || Ok(astream_broker::Prepared::Nothing),
+        )
+        .unwrap();
+        let _server = broker.serve(&socket).unwrap();
+        bridge.cfg.broker = socket.to_string_lossy().into_owned();
+        bridge.conn = Some(bridge.connect().unwrap().0.into());
+        bridge
+            .conn
+            .as_mut()
+            .unwrap()
+            .ready()
+            .unwrap()
+            .hello()
+            .unwrap();
+        assert!(bridge.ask_gap_fences());
+        let lane_of = format!("/f/f/in/{0}/s-r/{0}/note", bridge.node);
+        let other = format!("/f/f/in/{0}/s-r/{0}/other", bridge.node);
+        bridge.indexed_subjects.insert(lane_of.clone());
+        bridge.indexed_subjects.insert(other);
+        let big = "z".repeat(16 * 1024);
+        let second = queued_note("s-a", 2, "@s-r", "ok");
+        *lane.outbox.lock().unwrap() = Some(format!(
+            "{}post sid=s-b id=1 to=@s-r kind=other len={}\n{big}{second}",
+            queued_note("s-a", 1, "@s-r", "ok"),
+            big.len(),
+        ));
+        bridge.drain_outbox();
+        bridge.settle_acks();
+        assert!(
+            bridge.state.post_pin("s-a", 2).unwrap().is_some(),
+            "PRECONDITION: the second `ok` was refused behind s-b's and keeps its pin"
+        );
+
+        broker.set_rate_limit(None).unwrap();
+        *lane.outbox.lock().unwrap() = Some(second);
+        bridge.drain_outbox();
+        bridge.settle_acks();
+        let (mut reader, _) = bridge.connect().unwrap();
+        SameWordsOutcome {
+            notes: notes_on(&mut reader, &lane_of),
+            retired: retirements(&lane),
+        }
+    }
+
+    /// **THE ATTACH'S REPLAY HOLDS THE FENCES A REFUSED ENTRY SET** (C12s1's review,
+    /// `Bridge::fences_held`): `s-a`'s `a1` and `a2` go out together behind the gap fence, and
+    /// the link is lost before either answer is read, so both entries stand. The broker refuses
+    /// `a1` for its bytes (past the byte rate's whole burst, so at every try), at its first
+    /// attempt and again at the attach's replay, which drops its entry and keeps the post
+    /// at its pin; the fence that refusal set is held through the replay, so `a2`'s entry is
+    /// refused behind it and dropped too. Once the byte rate is lifted the drain sends `a1`,
+    /// then `a2`, each at its pin: the log holds them in `s-a`'s order.
+    ///
+    /// NEGATIVE CONTROL: with the fences lifted mid-replay
+    /// ([`crate::sim::world::Mutant::LiftFencesDuringReplay`]), the replay's publish of `a2`
+    /// lifts `a1`'s fence and lands, and `a1`'s retry lands after it. The seeded worlds meet no
+    /// kill between two answers to one sender's posts whose first is refused again at the
+    /// replay, so this rule's control is here.
+    #[cfg(unix)]
+    #[test]
+    fn the_attachs_replay_holds_the_fences_a_refused_entry_set() {
+        let (replayed, drained) = replay_of_a_refused_entry_and_the_next(crate::fx::Fx::os());
+        assert!(
+            replayed.is_empty(),
+            "nothing of s-a's landed at the replay: {replayed:?}"
+        );
+        assert_eq!(drained, ["a1", "a2"], "s-a's posts once each, in its order");
+
+        let (replayed, drained) = replay_of_a_refused_entry_and_the_next(
+            crate::fx::Fx::os_without(crate::sim::world::Mutant::LiftFencesDuringReplay),
+        );
+        assert_eq!(
+            replayed,
+            ["a2"],
+            "NEGATIVE CONTROL: the replay lifted a1's fence and landed a2"
+        );
+        assert_eq!(
+            drained,
+            ["a2", "a1"],
+            "NEGATIVE CONTROL: a1's retry landed behind a2"
+        );
+    }
+
+    /// The scenario of [`the_attachs_replay_holds_the_fences_a_refused_entry_set`] under `fx`:
+    /// the posts of `s-a`'s on `s-r`'s lane, by offset, after the attach's replay, and after
+    /// the drain that follows it.
+    #[cfg(unix)]
+    fn replay_of_a_refused_entry_and_the_next(fx: crate::fx::Fx) -> (Vec<String>, Vec<String>) {
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-r")]);
+        bridge.fx = fx;
+        assert!(bridge.refresh_sessions().is_ok());
+        let socket = lane.dir.path().join("replay.sock");
+        let broker = astream_broker::Broker::open_opts(
+            lane.dir.path().join("replay.log"),
+            astream_broker::OpenOptions::new(astream_broker::Durability::Strict)
+                .with_sticky_batch_refusal(true)
+                .with_rate_limit(
+                    astream_broker::RateLimit::records(1000, 1000)
+                        .and_then(|limit| limit.with_bytes(1, 4096))
+                        .unwrap(),
+                ),
+            || Ok(astream_broker::Prepared::Nothing),
+        )
+        .unwrap();
+        let _server = broker.serve(&socket).unwrap();
+        bridge.cfg.broker = socket.to_string_lossy().into_owned();
+        let attach = |bridge: &mut Bridge| {
+            bridge.conn = Some(bridge.connect().unwrap().0.into());
+            bridge
+                .conn
+                .as_mut()
+                .unwrap()
+                .ready()
+                .unwrap()
+                .hello()
+                .unwrap();
+            assert!(bridge.ask_gap_fences());
+        };
+        attach(&mut bridge);
+        assert!(bridge.pipelines_posts());
+        let lane_of = format!("/f/f/in/{0}/s-r/{0}/note", bridge.node);
+        bridge.indexed_subjects.insert(lane_of.clone());
+        let a1 = format!("a1{}", "z".repeat(16 * 1024));
+        let posts = format!(
+            "{}{}",
+            queued_note("s-a", 1, "@s-r", &a1),
+            queued_note("s-a", 2, "@s-r", "a2")
+        );
+        *lane.outbox.lock().unwrap() = Some(posts.clone());
+        // As the loop runs it: an answer is read when the loop reads it, not after the drain.
+        bridge.in_round = true;
+        bridge.drain_outbox();
+        assert_eq!(
+            bridge.state.in_flight().unwrap().len(),
+            2,
+            "PRECONDITION: a1 and a2 are in flight together"
+        );
+
+        // The link lost, as a kill loses it, with both answers unread: both entries stand.
+        bridge.conn = None;
+        bridge.in_round = false;
+        attach(&mut bridge);
+        assert!(bridge.settle_in_flight());
+        let (mut reader, _) = bridge.connect().unwrap();
+        let posted = |reader: &mut Conn| -> Vec<String> {
+            notes_on(reader, &lane_of)
+                .into_iter()
+                .map(|(_, text)| text.chars().take(2).collect())
+                .collect()
+        };
+        let replayed = posted(&mut reader);
+
+        broker.set_rate_limit(None).unwrap();
+        *lane.outbox.lock().unwrap() = Some(posts);
+        bridge.drain_outbox();
+        bridge.settle_acks();
+        (replayed, posted(&mut reader))
     }
 
     #[cfg(unix)]
@@ -23749,7 +25464,7 @@ mod tests {
 
         let off = b"v=1 t=2 state=off";
         let (lift, _) = human.publish(91, 2, HALT, off).unwrap();
-        lane.hang_up_on_hold();
+        lane.hang_up_at("hold ");
         bridge.on_fleet_record(&(lift, HALT.to_string(), off.to_vec()));
         assert!(bridge.ctl.lost(), "the lane closed under the `hold`");
         assert!(

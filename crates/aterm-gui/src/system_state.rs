@@ -34,7 +34,7 @@ use crate::native_app::{
 use crate::native_text_input::{TextInputProjection, TextInputState, TextSelection};
 use crate::native_ui::{UiKey, UiTree};
 use crate::system_state_host::PhraseOutcome;
-use crate::workstation_setup::{OfferKind, Request, SetupAnswer, WorkstationSetupDecision};
+use crate::workstation_setup::{Request, SetupAnswer, WorkstationSetupDecision};
 
 pub(crate) use lockup::{LockupSpec, paint_lockup};
 #[cfg(any(test, feature = "bench-support"))]
@@ -1124,7 +1124,7 @@ pub fn clear_setup_unfinished() {
     crate::message_inbox::queue_exception_clear(setup_unfinished_key());
 }
 
-/// The exceptions digest's entry for aCaffiene, which aterm sets up to keep this Mac awake, that
+/// The exceptions digest's entry for aCaffeine, which aterm sets up to keep this Mac awake, that
 /// could not keep it awake for ten minutes (its mug cannot start, or macOS refuses its
 /// activity), while launchd starts it again and it asks macOS again by itself: a fact for later,
 /// never an alert. `why` is the trouble the mug recorded, which the log keeps.
@@ -1135,14 +1135,14 @@ pub fn keep_awake_failing_entry(why: &str) -> aterm_messages::exceptions::Entry 
         aterm_messages::exceptions::Family::Setup,
         "",
         "keep-awake",
-        "aCaffiene cannot keep this Mac awake",
+        "aCaffeine cannot keep this Mac awake",
         Why::Spent {
-            tried: Reason::new("kept this Mac awake with aCaffiene for ten minutes"),
+            tried: Reason::new("kept this Mac awake with aCaffeine for ten minutes"),
             reason: Reason::new("its mug keeps failing, and aterm starts it again by itself"),
         },
         Then::step("Run aterm doctor and read its awake row"),
     )
-    .log_line(format!("aCaffiene: not keeping this Mac awake: {why}"))
+    .log_line(format!("aCaffeine: not keeping this Mac awake: {why}"))
 }
 
 /// Raise [`keep_awake_failing_entry`] in the exceptions digest.
@@ -1522,7 +1522,7 @@ pub(crate) enum SystemStateAction {
     /// The GitHub repositories row's Install…: the terminal tab that installs Apple's Command
     /// Line Tools opens now (`App::press_developer_tools_install`).
     InstallDeveloperTools { by_person: bool },
-    /// The password headline's Go to tab: the Command Line Tools tab comes to the front
+    /// The password headline's Go to tab: the Mac Setup tab comes to the front
     /// (`App::go_to_developer_tools_tab`).
     GoToToolsTab,
     /// A Copy Command: the line a vault admin runs to save a new GitHub token
@@ -1816,7 +1816,7 @@ fn row_view_as(
     // THE ROW'S NOTE: the short line a probe gives (an approval code, what a
     // waiting row waits on), else, where the row needs a person, is not
     // needed or was opted out of, its description: the macOS step a person
-    // takes (the SamplingTools dialog), why the row is not needed, the
+    // takes, why the row is not needed, the
     // person's opt-out. A row that differs or waits shows its probe's note
     // alone: its value names the part that differs, and the description a
     // planned or blocked engine row carries is the engine's own line
@@ -1895,12 +1895,6 @@ fn row_view_as(
         now: from.clone(),
         wanted: wanted.clone(),
     };
-    // While macOS's administrator dialog for debugger access is up, or about to be (the
-    // window's debugger step), a press of Turn On… can start nothing: the row says what it
-    // waits for in place of the button (§3.4), and still needs the person, whose dialog may
-    // be behind other windows.
-    let asking = subject == Subject::Access(Access::Debugger)
-        && status.access_step == Some(Access::Debugger);
     // The review reads a row that will need a person as one that will change (§3.3).
     let standing = match standing {
         Some(Standing::NeedsYou)
@@ -1963,8 +1957,14 @@ fn row_view_as(
         }
         None => standing,
     };
+    // Debugger access has no page of its own to open: setup's one early elevation turns
+    // developer mode on (`aterm_machines::root_steps`), and Settings ▸ Security changes it.
     let open = match subject {
-        Subject::Access(access) if standing == Some(Standing::NeedsYou) && !asking => Some(access),
+        Subject::Access(access)
+            if standing == Some(Standing::NeedsYou) && access != Access::Debugger =>
+        {
+            Some(access)
+        }
         _ => None,
     };
     let token_refused = subject == Subject::Setting(Setting::Repositories)
@@ -2110,7 +2110,6 @@ fn row_view_as(
         }
         Some(Standing::NeedsYou) => {
             note = match tools {
-                _ if asking => Some(PASSWORD_NOTE.to_owned()),
                 Some(ToolsWait::Password) => Some(TOOLS_PASSWORD_NOTE.to_owned()),
                 Some(ToolsWait::Recovered) => Some(TOOLS_RECOVERED_NOTE.to_owned()),
                 Some(ToolsWait::AppleWindow) => Some(APPLE_WINDOW_NOTE.to_owned()),
@@ -2240,36 +2239,28 @@ fn retry_words(chip: Chip) -> &'static str {
 /// something, and nothing more can be said of it.
 pub(crate) const WAITING_NOTE: &str = "Can't be set up yet";
 
-/// The note of the Debugger access row while macOS's administrator dialog for it is up, which
-/// takes the place of its Turn On… button: nothing on the page moves it, and the dialog may be
-/// behind other windows.
-pub(crate) const PASSWORD_NOTE: &str =
-    "Waiting for your administrator password in the SamplingTools dialog";
-
-/// The headline while the Command Line Tools tab asks for the person's password
+/// The headline while the Mac Setup tab asks for the person's password
 /// ([`ToolsInstall::Password`]): they are needed there now (§3.2), and its Go to tab button
 /// ([`GO_TO_TOOLS_TAB`]) brings that tab to the front.
-pub(crate) const TOOLS_PASSWORD_HEADLINE: &str =
-    "Enter your password in the Command Line Tools tab";
+pub(crate) const TOOLS_PASSWORD_HEADLINE: &str = "Enter your password in the Mac Setup tab";
 
-/// The button of a headline that names the Command Line Tools tab (its password, or its restored
+/// The button of a headline that names the Mac Setup tab (its password, or its restored
 /// session): that tab comes to the front.
 pub(crate) const GO_TO_TOOLS_TAB: &str = "system-state/headline/go-to-tab";
 
-/// The GitHub repositories row's note while the Command Line Tools tab asks for the password,
+/// The GitHub repositories row's note while the Mac Setup tab asks for the password,
 /// which takes the place of its Install… button.
-pub(crate) const TOOLS_PASSWORD_NOTE: &str =
-    "Waiting for your password in the Command Line Tools tab";
+pub(crate) const TOOLS_PASSWORD_NOTE: &str = "Waiting for your password in the Mac Setup tab";
 
 /// The headline for a restored live installer tab: its command may not have started before
 /// recovery, so no particular prompt is claimed. Its Go to tab ([`GO_TO_TOOLS_TAB`]) brings that
 /// tab to the front.
-pub(crate) const TOOLS_RECOVERED_HEADLINE: &str = "Continue in the Command Line Tools tab";
+pub(crate) const TOOLS_RECOVERED_HEADLINE: &str = "Continue in the Mac Setup tab";
 
 /// The recovered tab remains the place to continue, or the person closes it before trying again.
 /// It names the tab as its title and the headline do.
 pub(crate) const TOOLS_RECOVERED_NOTE: &str =
-    "Command Line Tools tab restored. Continue there, or close it to try again.";
+    "Mac Setup tab restored. Continue there, or close it to try again.";
 
 /// The GitHub repositories row's calm note while `Install…` is queued behind a macOS permission
 /// gesture ([`ToolsInstall::Queued`]): nobody needs to press `Install…` again, and the tab opens
@@ -2482,7 +2473,7 @@ pub(crate) struct Headline {
     /// Its Set up now button runs the plan again: managed rows differ and
     /// nothing is going (a stopped run, a step that could not finish).
     pub(crate) start: bool,
-    /// Its Go to tab button brings the Command Line Tools tab, which the headline names, to the
+    /// Its Go to tab button brings the Mac Setup tab, which the headline names, to the
     /// front ([`GO_TO_TOOLS_TAB`]).
     pub(crate) go_to_tab: bool,
     /// A stage aterm parked waits for a Check (init-on-by-default design §6.5): the page's own,
@@ -2527,7 +2518,7 @@ impl Headline {
         }
     }
 
-    /// A headline that sends the person to the Command Line Tools tab, with Go to tab.
+    /// A headline that sends the person to the Mac Setup tab, with Go to tab.
     fn tools_tab(text: &str) -> Self {
         Self {
             go_to_tab: true,
@@ -2644,13 +2635,7 @@ impl Headline {
 
 /// THE HEADLINE RULE (§3.2, pure).
 pub(crate) fn headline(status: &SetupStatus, rows: &[RowView], plan: Option<&Plan>) -> Headline {
-    if status.access_step == Some(Access::Debugger) {
-        return Headline::line(format!(
-            "Enter your password for {}",
-            Access::Debugger.name()
-        ));
-    }
-    // The Command Line Tools tab needs the person (§3.3): at its known password prompt, or
+    // The Mac Setup tab needs the person (§3.3): at its known password prompt, or
     // continuing its restored session without claiming which prompt it has reached.
     let repositories = Subject::Setting(Setting::Repositories);
     if rows.iter().any(|row| {
@@ -3600,30 +3585,10 @@ impl SystemStateApp {
             && !self.vault_draft()
     }
 
-    /// Whether the page can take the offer of the plan an earlier process admitted
-    /// ([`OfferKind::Resume`]): no other offer waits and nothing the page sent waits for the
-    /// worker. The run it resumes may be going, and a vault draft stays: its answer is the
-    /// offered plan, never the page's groups or fields.
-    pub(crate) fn can_offer_resume(&self) -> bool {
-        !self.request.as_ref().is_some_and(Request::pending) && self.awaiting.is_none()
-    }
-
     pub(crate) fn offer(&mut self, request: Request) -> bool {
-        let resume = matches!(request.kind(), OfferKind::Resume);
-        let can = if resume {
-            self.can_offer_resume()
-        } else {
-            self.can_offer()
-        };
-        if !request.pending() || !can {
+        if !request.pending() || !self.can_offer() {
             request.finish(WorkstationSetupDecision::Unavailable);
             return false;
-        }
-        if resume {
-            // The page goes on as it reads: the plan, its fields and the run's status stay.
-            self.request = Some(request);
-            self.answer_waits = true;
-            return true;
         }
         self.plan = request.initial().clone();
         self.plan_known = true;
@@ -3647,7 +3612,7 @@ impl SystemStateApp {
     /// vault address being typed stays as typed.
     pub(crate) fn publish(&mut self, status: SetupStatus) -> bool {
         let mut changed = self.status != status;
-        if (self.request.is_none() || self.resuming())
+        if self.request.is_none()
             && self.awaiting.is_none()
             && let Some(plan) = &status.plan
         {
@@ -3691,46 +3656,9 @@ impl SystemStateApp {
         self.by_person = by_person;
     }
 
-    /// Whether the offer up still waits for the page's own answer ([`Self::answer_waits`]), and
-    /// is a review: the offer of a plan an earlier process admitted is none
-    /// ([`Self::resume_waits`]).
+    /// Whether the offer up still waits for the page's own answer ([`Self::answer_waits`]).
     fn reviewing(&self) -> bool {
-        self.pending() && self.answer_waits && !self.resuming()
-    }
-
-    /// Whether the offer up is the one of the plan an earlier process admitted, whose run this
-    /// launch resumes ([`OfferKind::Resume`]).
-    fn resuming(&self) -> bool {
-        self.pending()
-            && self
-                .request
-                .as_ref()
-                .is_some_and(|request| matches!(request.kind(), OfferKind::Resume))
-    }
-
-    /// Whether the offer of the plan an earlier process admitted still waits for the page's own
-    /// answer.
-    fn resume_waits(&self) -> bool {
-        self.resuming() && self.answer_waits
-    }
-
-    /// The page's own answer to the offer of the plan an earlier process admitted (design §3.3,
-    /// §6): that plan as offered, whatever the page shows or a person typed, so it changes
-    /// nothing of the plan, chooses nothing and sends no credential. It is this window's own
-    /// admission of the plan whose run goes on; the worker admits nothing new for it.
-    fn answer_resume(&mut self) {
-        let Some(plan) = self
-            .request
-            .as_ref()
-            .map(|request| request.initial().clone())
-        else {
-            return;
-        };
-        self.answer_waits = false;
-        self.actions.push_back(SystemStateAction::Apply(
-            WorkstationSetupDecision::Begin(plan).into(),
-            Admission::Automatic,
-        ));
+        self.pending() && self.answer_waits
     }
 
     /// A withdrawn offer is let go. An offer that waits for its answer is answered by the page
@@ -3738,21 +3666,14 @@ impl SystemStateApp {
     /// not, whatever was clicked or typed meanwhile: no review, no countdown, no confirmation and
     /// no wait for a person (init-on-by-default design §6.1, the owner's ruling of 2026-10-25),
     /// since only the person stages wait for one (`App::system_state_front_with_a_person`); a
-    /// status that says the page is busy holds it until it is not, but for the offer of a plan
-    /// an earlier process admitted, whose run is what keeps it busy ([`Self::answer_resume`]).
-    /// `true` when the page changed.
+    /// status that says the page is busy holds it until it is not. `true` when the page changed.
     pub(crate) fn tick(&mut self) -> bool {
         self.tick_at(aterm_time::Instant::now())
     }
 
     /// [`Self::tick`] at `now`, which also starts what the page does by itself ([`ByItself`]).
     pub(crate) fn tick_at(&mut self, now: aterm_time::Instant) -> bool {
-        let before = (
-            self.request.is_some(),
-            self.status.busy,
-            self.reviewing(),
-            self.resume_waits(),
-        );
+        let before = (self.request.is_some(), self.status.busy, self.reviewing());
         if self
             .request
             .as_ref()
@@ -3763,20 +3684,10 @@ impl SystemStateApp {
         }
         if self.reviewing() && !self.status.busy {
             self.apply(Admission::Automatic, Submission::Offer, None);
-        } else if self.resume_waits() && !self.stopping {
-            // The run it resumes is going: its busy status holds nothing here. A Stop asked of
-            // that run is no run to go on with, so the page gives no answer after one.
-            self.answer_resume();
         } else {
             self.go_on_by_itself(now);
         }
-        before
-            != (
-                self.request.is_some(),
-                self.status.busy,
-                self.reviewing(),
-                self.resume_waits(),
-            )
+        before != (self.request.is_some(), self.status.busy, self.reviewing())
     }
 
     /// Start what the page does by itself and is due at `now` ([`ByItself`]): a run of the plan
@@ -4279,7 +4190,7 @@ impl SystemStateApp {
     /// still waiting for its answer may be. A press then is sent even where it leaves the
     /// groups as they are, or the widen would set a group the person chose to leave as is.
     fn may_widen(&self) -> bool {
-        self.status.provisional || (self.pending() && !self.resuming())
+        self.status.provisional || self.pending()
     }
 
     /// Whether the vault's fields show: as the person last set the
@@ -4740,14 +4651,13 @@ pub(crate) const GITHUB_TOKEN_REFUSED: &str = aterm_types::macos_setup::GITHUB_T
 /// test that sweeps the scenarios sweeps it. `older-cancel` is a Cancel an older aterm recorded.
 /// Debug and dev-seam builds only.
 #[cfg(any(debug_assertions, feature = "dev-seams"))]
-pub(crate) const FIXTURES: [&str; 66] = [
+pub(crate) const FIXTURES: [&str; 65] = [
     "checking",
     "plan-unread",
     "vault-source-mismatch",
     "check-failed",
     "check-unconfirmed",
     "running",
-    "debugger",
     "needs-you",
     "vault",
     "vault-unreached",
@@ -5010,19 +4920,6 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
             status.running = vec![Setting::Permissions];
             status.access_step = Some(Access::LocalNetwork);
             status.observed = with(in_place(), vec![untold_lan()]);
-        }
-        "debugger" => {
-            status.busy = true;
-            status.running = vec![Setting::Permissions];
-            status.access_step = Some(Access::Debugger);
-            // As `macos_doctor` reads it: the reason is the description.
-            let mut debugger = access(Access::Debugger, NeedsYou, Some("Off"));
-            debugger.detail = Some(
-                "Turning it on lets debuggers attach without a password. macOS asks for an \
-                 administrator password in a dialog named SamplingTools."
-                    .to_owned(),
-            );
-            status.observed = with(in_place(), vec![debugger]);
         }
         "needs-you" => {
             // Each reason where its probe puts it: a grant's in the description, Developer
@@ -5306,13 +5203,12 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
             let mut accessibility = access(Access::Accessibility, NotNeeded, None);
             accessibility.detail =
                 Some("Only the Messages and FaceTime sign-outs need it.".to_owned());
-            // Permissions are managed, so a grant that is off needs the person.
-            let mut debugger = access(Access::Debugger, NeedsYou, Some("Off"));
-            debugger.detail = Some(
-                "Turning it on lets debuggers attach without a password. macOS asks for an \
-                 administrator password in a dialog named SamplingTools."
-                    .to_owned(),
-            );
+            // Debugger access reads off as the doctor reads a managed one on an admin account:
+            // waiting on setup's one early Mac password, never offered and never the person's.
+            let mut debugger = access(Access::Debugger, Waiting, Some("Off"));
+            debugger.note = Some(aterm_types::macos_setup::DEBUGGER_BY_ELEVATION.to_owned());
+            debugger.detail =
+                Some("Turning it on lets debuggers attach without a password.".to_owned());
             status.observed = with(
                 in_place(),
                 vec![

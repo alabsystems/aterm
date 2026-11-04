@@ -42,6 +42,11 @@ pub struct Record {
     pub frame: Option<String>,
     /// Active goal published by `codex-alab` for the primary thread, sanitized for one-line display.
     pub goal: Option<String>,
+    /// Background terminals codex-alab's footer counts for the thread it shows
+    /// (`backgroundTerminals`: its live unified exec processes, one a running tool call still waits
+    /// on included); `None` where the record names none (an older build, the busy initializer) or
+    /// names it in a form this reader does not know.
+    pub background_terminals: Option<u32>,
     /// Whether the record is in its pre-registration initializing frame.
     pub initializing: bool,
 }
@@ -103,6 +108,10 @@ pub fn parse(text: &str) -> Result<Record, Refusal> {
         goal: opt_str("goal")?
             .as_deref()
             .and_then(super::goal::objective_of),
+        background_terminals: v
+            .get("backgroundTerminals")
+            .and_then(Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok()),
         initializing: ["sessionId", "resumeArgv", "cwd", "state", "exit"]
             .iter()
             .all(|key| matches!(v.get(key), Some(Value::Null)))
@@ -236,7 +245,8 @@ pub struct Live {
     pub codex_auth_path: Option<String>,
     /// Current working directory of the process.
     pub cwd: Option<PathBuf>,
-    /// Managed `atpkg` Codex twin path (`<prefix>/agents/codex`), if configured.
+    /// Managed `atpkg` Codex twin path (`<prefix>/agents/codex`, `agents\codex.cmd` on Windows),
+    /// if configured.
     pub twin: Option<PathBuf>,
     /// Untrusted managed-launch fields from that same kernel snapshot and configured prefix.
     pub managed_launch: Option<atpkg::managed_launch::Hints>,
@@ -464,11 +474,8 @@ pub(super) fn codex_home_of(
 /// atpkg's managed Codex twin, where one is configured and the build it execs
 /// is ALab's ([`codex_alab::alab_bytes`]).
 fn managed_alab_twin() -> Option<PathBuf> {
-    alab_twin(
-        atpkg::store::resolve_configured()?
-            .agents_dir()
-            .join("codex"),
-    )
+    let codex = atpkg::store::ToolName::new("codex")?;
+    alab_twin(atpkg::store::resolve_configured()?.agent_shim(&codex))
 }
 
 /// The atpkg twin `twin`, where the build it execs is ALab's ([`codex_alab::alab_bytes`]).
@@ -526,6 +533,7 @@ pub fn inherited(typed: Option<&Resume>, pid: u32, live: &Live) -> Result<Resume
         draft_empty: None,
         frame: None,
         goal: None,
+        background_terminals: None,
         initializing: false,
     };
     validate(&record, pid, live)
@@ -600,19 +608,39 @@ fn read_record(path: &Path) -> Seen {
     }
 }
 
-/// Read the active goal published in `<home>/alab/sessions/<pid>.json` for live `pid` and `thread`.
+/// What the survey reads of a live codex-alab's own record for its thread ([`read_record_facts`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RecordFacts {
+    /// The primary thread's active goal ([`Record::goal`]).
+    pub goal: Option<String>,
+    /// The background terminals its footer counts ([`Record::background_terminals`]).
+    pub background_terminals: Option<u32>,
+}
+
+/// Read `<home>/alab/sessions/<pid>.json` once for live `pid` and `thread`: its goal and its
+/// background terminals, or neither when the record is another pid's, shows an exit, or names
+/// another thread.
 #[must_use]
-pub fn read_record_goal(home: &Path, pid: u32, thread: &str) -> Option<String> {
+pub fn read_record_facts(home: &Path, pid: u32, thread: &str) -> RecordFacts {
     match read_record(&record_path(home, pid)) {
         Seen::Present(record)
             if record.pid == pid
                 && record.exit.is_none()
                 && record.session_id.as_deref() == Some(thread) =>
         {
-            record.goal
+            RecordFacts {
+                goal: record.goal,
+                background_terminals: record.background_terminals,
+            }
         }
-        _ => None,
+        _ => RecordFacts::default(),
     }
+}
+
+/// The goal [`read_record_facts`] reads.
+#[must_use]
+pub fn read_record_goal(home: &Path, pid: u32, thread: &str) -> Option<String> {
+    read_record_facts(home, pid, thread).goal
 }
 
 /// Read and validate the live session record for `(pid, start)` while verifying process identity.

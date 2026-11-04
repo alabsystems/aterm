@@ -1305,7 +1305,7 @@ fn bounded_read(
 ) -> Result<(Vec<u8>, fs::Metadata), DocumentHostError> {
     let sentinel_limit = limit.saturating_add(1);
     let mut bytes = Vec::with_capacity(
-        usize::try_from(metadata.len())
+        usize::try_from(metadata.len().saturating_add(1))
             .unwrap_or(sentinel_limit)
             .min(sentinel_limit)
             .min(READ_RESERVE_CEILING),
@@ -2563,7 +2563,7 @@ mod tests {
 
     #[test]
     fn directory_listing_is_sorted_bounded_and_granted_read_only() {
-        let dir = aterm_tempfile::TempDir::new().unwrap();
+        let dir = crate::test_scratch_dir("dir-listing");
         let path = fs::canonicalize(dir.path()).unwrap();
         fs::write(path.join("z.txt"), "z").unwrap();
         fs::write(path.join(".hidden"), "h").unwrap();
@@ -2588,7 +2588,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn directory_labels_escape_control_characters_without_changing_targets() {
-        let dir = aterm_tempfile::TempDir::new().unwrap();
+        let dir = crate::test_scratch_dir("dir-labels");
         let path = fs::canonicalize(dir.path()).unwrap();
         let file = path.join("line\nbreak\tname");
         fs::write(&file, "content").unwrap();
@@ -2613,15 +2613,30 @@ mod tests {
         let _ = path;
     }
 
-    fn unique_file(name: &str, bytes: &[u8]) -> PathBuf {
-        let dir = aterm_tempfile::Builder::new()
-            .prefix(&format!("aterm-native-document-host-{name}-"))
-            .tempdir()
-            .unwrap()
-            .keep();
-        let path = dir.join("hello world.md");
+    struct UniqueFile {
+        _dir: aterm_tempfile::TempDir,
+        path: PathBuf,
+    }
+
+    impl std::ops::Deref for UniqueFile {
+        type Target = PathBuf;
+
+        fn deref(&self) -> &Self::Target {
+            &self.path
+        }
+    }
+
+    impl AsRef<Path> for UniqueFile {
+        fn as_ref(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    fn unique_file(name: &str, bytes: &[u8]) -> UniqueFile {
+        let dir = crate::test_scratch_dir(&format!("doc-host-{name}"));
+        let path = dir.path().join("hello world.md");
         fs::write(&path, bytes).unwrap();
-        path
+        UniqueFile { _dir: dir, path }
     }
 
     fn file_uri(path: &Path) -> String {
@@ -2650,7 +2665,6 @@ mod tests {
         }
         reject_symlink_components(&canonical).unwrap();
         assert!(logical_symlink_bindings(&canonical).unwrap().is_empty());
-        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     /// A temp-rooted document, as `normalize_process_temp_root` rewrites it, admits end to end.
@@ -2663,7 +2677,6 @@ mod tests {
         reject_symlink_components(&normalized).unwrap();
         let contents = read_config_atomic_file(&path, 1024, false).unwrap();
         assert_eq!(contents.bytes, b"walk\n");
-        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
@@ -2681,7 +2694,6 @@ mod tests {
         assert_eq!(first.text, "# hello\n");
         assert_eq!(first.grant.id, second.grant.id);
         assert_eq!(second.grant.access, GrantAccess::ReadWrite);
-        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     /// One document opened the way a face opens one: admitted, granted for
@@ -2792,7 +2804,6 @@ mod tests {
         opened.set_text("second\n");
         assert!(matches!(opened.save(), SaveReduction::Durable(_)));
         assert_eq!(fs::read(&path).unwrap(), b"second\n");
-        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     /// Creating the file externally after a missing-file admission causes an existence conflict on first save.
@@ -2808,7 +2819,6 @@ mod tests {
             SaveReduction::Conflict(crate::io::VersionConflict::Existence)
         );
         assert_eq!(fs::read(&path).unwrap(), b"theirs\n");
-        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     /// Missing files without `allow_missing` and missing parent directories with `allow_missing` are refused.
@@ -2830,7 +2840,6 @@ mod tests {
         let error = admit_local_file_opts(&file_uri(&nested), ALLOW_MISSING).unwrap_err();
         assert_eq!(error.refusal_word(), "missing", "{error}");
         assert!(!nested.parent().unwrap().exists());
-        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     /// A byte order mark is not in the text, and every save puts it back.
@@ -2866,7 +2875,6 @@ mod tests {
             .refresh_local(opened.granted.grant.id, DEFAULT_DOCUMENT_LIMIT)
             .unwrap();
         assert_eq!(refreshed.text, opened.text());
-        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     /// A file whose every line ends in CRLF is held with LF and saved with
@@ -2905,7 +2913,6 @@ mod tests {
                     .observed_text_matches(opened.document, &refreshed.text),
                 "{name}: the watch finds the buffer's own save unchanged"
             );
-            let _ = fs::remove_dir_all(path.parent().unwrap());
         }
     }
 
@@ -2953,7 +2960,6 @@ mod tests {
                 .unwrap();
             assert!(matches!(opened.save(), SaveReduction::Durable(_)), "{name}");
             assert_eq!(fs::read(&path).unwrap(), written, "{name}");
-            let _ = fs::remove_dir_all(path.parent().unwrap());
         }
     }
 
@@ -2978,7 +2984,6 @@ mod tests {
             opened.set_text(&edited);
             assert!(matches!(opened.save(), SaveReduction::Durable(_)));
             assert_eq!(fs::read(&path).unwrap(), edited.as_bytes(), "{name}");
-            let _ = fs::remove_dir_all(path.parent().unwrap());
         }
     }
 
@@ -2994,7 +2999,6 @@ mod tests {
         opened.set_text("a\r\nc\r\n");
         assert!(matches!(opened.save(), SaveReduction::Durable(_)));
         assert_eq!(fs::read(&path).unwrap(), b"a\r\nc\r\n");
-        let _ = fs::remove_dir_all(path.parent().unwrap());
 
         let path = unique_file("crlf-without-break", b"a\r\nb\r\n");
         let mut opened = open_document(&path, AdmitOptions::DOCUMENT);
@@ -3029,7 +3033,6 @@ mod tests {
         opened.set_text("x\ny\nz\n");
         assert!(matches!(opened.save(), SaveReduction::Durable(_)));
         assert_eq!(fs::read(&path).unwrap(), b"x\ny\nz\n");
-        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     /// A buffer held as it is can save bytes that a fresh read takes another
@@ -3164,7 +3167,6 @@ mod tests {
                 format!("{held}z").as_bytes(),
                 "{name}: an edit after the rebind"
             );
-            let _ = fs::remove_dir_all(path.parent().unwrap());
         }
     }
 
@@ -3197,7 +3199,6 @@ mod tests {
         opened.set_text("x\ny\nz\n");
         assert!(matches!(opened.save(), SaveReduction::Durable(_)));
         assert_eq!(fs::read(&path).unwrap(), b"x\r\ny\r\nz\r\n");
-        let _ = fs::remove_dir_all(path.parent().unwrap());
 
         let path = unique_file("reload-crlf-no-break", b"a\r\nb\r\n");
         let mut opened = open_document(&path, AdmitOptions::DOCUMENT);
@@ -3212,7 +3213,6 @@ mod tests {
             .accept_reloaded_observation(opened.document, refreshed.observed, &refreshed.text)
             .unwrap();
         assert_eq!(opened.encoding().eol, crate::io::LineEnding::CrLf);
-        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     /// The draft-journal fingerprint is the admitted text's, which is not the
@@ -3230,7 +3230,6 @@ mod tests {
                 .observed_text_fingerprint(opened.document),
             Some(ContentFingerprint::of(b"one\ntwo\n"))
         );
-        let _ = fs::remove_dir_all(path.parent().unwrap());
 
         let path = unique_file("text-fingerprint-missing", b"");
         fs::remove_file(&path).unwrap();
@@ -3242,7 +3241,6 @@ mod tests {
             None,
             "no file, no image"
         );
-        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     /// Document saves never create missing parent directories.
@@ -3286,7 +3284,6 @@ mod tests {
             SaveReduction::Conflict(crate::io::VersionConflict::Existence)
         );
         assert!(!dir.exists(), "a save made no folder");
-        let _ = fs::remove_dir_all(root.parent().unwrap());
     }
 
     /// A never-saved document's file is still absent on a refresh: no change,
@@ -3327,7 +3324,6 @@ mod tests {
             crate::io::detect_version_conflict(opened.granted.observed, appeared.observed),
             Some(crate::io::VersionConflict::Existence)
         );
-        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     /// `open_path` resolves symlinked parent directories for both existing and missing files.
@@ -3386,7 +3382,6 @@ mod tests {
             let (resolved, _) = open_path(&Path::new("/tmp").join(&name)).unwrap();
             assert_eq!(resolved, Path::new("/private/tmp").join(&name));
         }
-        let _ = fs::remove_dir_all(dir);
     }
 
     /// `EDEADLK` from `read(2)` on an evicted dataless file maps to `DocumentHostError::NotDownloaded`.
@@ -3450,7 +3445,6 @@ mod tests {
             ),
             "a missing file fails at admission, before any grant state exists"
         );
-        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
@@ -3478,7 +3472,6 @@ mod tests {
             grants.open_local(&file_uri(&path), GrantAccess::ReadOnly, 2),
             Err(DocumentHostError::TooLarge { limit: 2 })
         ));
-        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     /// `decode_utf8` strips at most one leading UTF-8 BOM and validates the remaining bytes.
@@ -3534,7 +3527,6 @@ mod tests {
             "the unbounded wait takes the lock once it is let go"
         );
         waiter.join().unwrap();
-        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[cfg(unix)]
@@ -3587,7 +3579,6 @@ mod tests {
                 .file_type()
                 .is_symlink()
         );
-        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     /// A lock holder that releases within the wait budget is ridden out without failing the save.
@@ -3611,7 +3602,6 @@ mod tests {
         drop(held);
 
         assert!(waiter.join().unwrap().is_ok());
-        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
@@ -3648,7 +3638,6 @@ mod tests {
             AtomicCommitResult::Committed(_)
         ));
         assert_eq!(fs::read(&path).unwrap(), b"after");
-        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     /// The save lock is free the instant its hold drops, even while a copy of the holder's
@@ -3675,7 +3664,6 @@ mod tests {
         );
         drop(next);
         drop(forked_copy);
-        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     /// Documents under `$TMPDIR` resolve cleanly across macOS's `/var` compatibility symlink.
@@ -3692,7 +3680,6 @@ mod tests {
             canonical_root
         );
         assert_eq!(target.logical_path(), path.as_path());
-        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     /// A path outside the temporary root claims no symlink exemption, so the rewrite
@@ -3748,7 +3735,6 @@ mod tests {
                 );
             }
         }
-        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[cfg(unix)]
@@ -3768,7 +3754,6 @@ mod tests {
                 if rejected == target.target_path()
         ));
         assert_eq!(fs::read(&displaced).unwrap(), b"original");
-        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
@@ -3818,7 +3803,6 @@ mod tests {
             } if message.contains("document limit")
         ));
         assert_eq!(fs::read(&path).unwrap(), b"old");
-        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
@@ -3877,7 +3861,6 @@ mod tests {
             ),
             AtomicCommitResult::Conflict { .. }
         ));
-        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
@@ -3905,7 +3888,6 @@ mod tests {
                 .to_string_lossy()
                 .contains(".tmp")
         }));
-        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
@@ -3922,7 +3904,6 @@ mod tests {
         };
         assert!(proof.observed.exists);
         assert_eq!(fs::read_to_string(&path).unwrap(), "theme = \"Nord\"\n");
-        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     /// A save the person makes is durable, file and entry; the empty config file a
@@ -3955,7 +3936,6 @@ mod tests {
         #[cfg(not(unix))]
         let expected_create = [Flush::Ordered];
         assert_eq!(recording.take(), expected_create, "a created config file");
-        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
@@ -3977,7 +3957,6 @@ mod tests {
             AtomicSaveResult::Conflict { .. }
         ));
         assert_eq!(fs::read_to_string(&path).unwrap(), "theirs");
-        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[cfg(unix)]
@@ -4000,7 +3979,6 @@ mod tests {
             "atomic replacement advances the regular-file identity even when bytes match"
         );
         refreshed.grant.validate_current_binding().unwrap();
-        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
@@ -4027,7 +4005,6 @@ mod tests {
             reduction,
             SaveReduction::Durable(checkpoint) if checkpoint.document == document
         ));
-        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
@@ -4054,7 +4031,6 @@ mod tests {
         ));
         assert_eq!(fs::read_to_string(&path).unwrap(), "new");
         assert_eq!(fs::read_to_string(&collision).unwrap(), "do not touch");
-        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[cfg(unix)]
@@ -4062,12 +4038,8 @@ mod tests {
     fn config_symlink_chain_is_bound_and_preserved_while_ordinary_grants_fail_closed() {
         use std::os::unix::fs::symlink;
 
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-native-document-retarget-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let scratch = crate::test_scratch_dir("retarget");
+        let dir = scratch.path();
         let first = dir.join("first.toml");
         let real_parent = dir.join("real");
         fs::create_dir_all(&real_parent).unwrap();
@@ -4186,7 +4158,6 @@ mod tests {
                 .is_symlink()
         );
         assert_eq!(fs::read_link(&parent_alias).unwrap(), real_parent);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
@@ -4194,12 +4165,8 @@ mod tests {
     fn final_symlink_swap_is_a_conflict_and_never_redirects_the_save() {
         use std::os::unix::fs::symlink;
 
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-native-document-link-swap-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let scratch = crate::test_scratch_dir("link-swap");
+        let dir = scratch.path();
         let first = dir.join("first.toml");
         let second = dir.join("second.toml");
         let logical = dir.join("aterm.toml");
@@ -4243,7 +4210,6 @@ mod tests {
             fs::read_link(&logical).unwrap(),
             PathBuf::from("second.toml")
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
@@ -4251,11 +4217,8 @@ mod tests {
     fn recreated_parent_symlink_to_same_destination_is_still_a_conflict() {
         use std::os::unix::fs::symlink;
 
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-native-document-parent-relink-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
+        let scratch = crate::test_scratch_dir("parent-relink");
+        let dir = scratch.path();
         let real = dir.join("real");
         let alias = dir.join("config");
         let displaced_alias = dir.join("config.previous");
@@ -4291,7 +4254,6 @@ mod tests {
             "theme = \"Default\"\n"
         );
         assert_eq!(fs::read_link(&alias).unwrap(), real);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// NEGATIVE CONTROL: a save lock owned by another UID must be refused with

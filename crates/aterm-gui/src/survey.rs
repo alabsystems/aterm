@@ -37,7 +37,7 @@ pub(crate) struct CodexSurvey {
     pub(crate) branch: Option<String>,
     /// Task prompt head from [`task_prompt_of_env`].
     pub(crate) task: Option<String>,
-    /// The thread's active goal, from codex-alab's live session record ([`aterm_agent::harness::self_claimed::read_record_goal`]).
+    /// The thread's active goal, from codex-alab's live session record ([`aterm_agent::harness::self_claimed::read_record_facts`]).
     pub(crate) goal: Option<String>,
 }
 
@@ -115,10 +115,12 @@ fn task_prompt_at(path: &Path, tasks: &Path) -> Option<String> {
         }
         std::fs::File::open(path).ok()?
     };
-    if !file.metadata().ok()?.is_file() {
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() {
         return None;
     }
-    let mut head = Vec::new();
+    let cap = usize::try_from(meta.len().min(TASK_HEAD_BYTES).saturating_add(1)).unwrap_or(0);
+    let mut head = Vec::with_capacity(cap);
     file.take(TASK_HEAD_BYTES).read_to_end(&mut head).ok()?;
     let text = String::from_utf8_lossy(&head);
     let text = if head.len() as u64 == TASK_HEAD_BYTES {

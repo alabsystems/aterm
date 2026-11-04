@@ -654,10 +654,12 @@ fn open_native_monitor_tab_in_aterm() -> Option<String> {
             }
         }
     }
-    open_native_monitor_tab_in_candidates(&candidates)
+    open_native_monitor_tab_in_candidates(&candidates, Duration::from_millis(250))
 }
 
-fn open_native_monitor_tab_in_candidates(candidates: &[PathBuf]) -> Option<String> {
+/// Each candidate's write and its one-line answer wait at most `wait`: the opener's 250 ms, or a
+/// test's one-minute hang detector where the test's own server always answers.
+fn open_native_monitor_tab_in_candidates(candidates: &[PathBuf], wait: Duration) -> Option<String> {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::os::unix::net::UnixStream;
     for sock_path in candidates {
@@ -670,8 +672,8 @@ fn open_native_monitor_tab_in_candidates(candidates: &[PathBuf]) -> Option<Strin
         if !crate::sessions::same_user_peer(&stream) {
             continue;
         }
-        let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
-        let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));
+        let _ = stream.set_read_timeout(Some(wait));
+        let _ = stream.set_write_timeout(Some(wait));
         if stream
             .write_all(format!("AUTH {token}\nopen app settings /monitor\n").as_bytes())
             .and_then(|()| stream.flush())
@@ -3729,10 +3731,11 @@ pub fn here(
 }
 
 /// [`here`]'s run: the host and its report to print, `None` when a plain run finished, or the
-/// exit code it ends on (a plain run's class of why it did not finish). A plain run with `name`
-/// (a [`crate::init_clt::plain_name`]) also gives the Mac that name; whether those rows changed
-/// or failed goes to the journal, and the exit says the tools alone, so a name macOS refused
-/// never reads as tools that did not install.
+/// exit code it ends on (a plain run's class of why it did not finish). A plain run also turns
+/// developer mode on and puts the rule in place that names the Mac after admission
+/// ([`crate::root_steps`]), and with `name` (a [`crate::init_clt::plain_name`]) gives the Mac
+/// that name; whether those rows changed or failed goes to the journal, and the exit says the
+/// tools alone, so a step macOS refused never reads as tools that did not install.
 fn here_report(
     sys: &dyn System,
     mode: Mode,
@@ -3850,16 +3853,14 @@ fn here_report(
         Err(refused) => refuse!(ExitCode::FAILURE, "aterm machines here: {refused}"),
     };
     if plain {
-        // Done once no row is left short of what the baseline asks: a row that stood aside, or
-        // whose probe was blocked, did not finish either.
+        // Done once the tools' row is not left short of what the baseline asks: a row that stood
+        // aside, or whose probe was blocked, did not finish either. The elevation's other root
+        // steps (the names, the rule, developer mode) go to the journal alone, so a step macOS
+        // refused never reads as tools that did not install, and the next launch that reads it
+        // still owed asks again (`crate::root_steps::owed`).
         let unfinished = rows
             .iter()
-            .filter(|row| {
-                items
-                    .iter()
-                    .find(|item| item.id() == row.id)
-                    .is_none_or(|item| item.family() != "names")
-            })
+            .filter(|row| row.id == crate::items::github::CLT_ITEM)
             .find(|row| {
                 !matches!(
                     row.outcome,
@@ -6170,16 +6171,21 @@ mod tests {
              binary = \"/usr/local/bin/gh\"\nversion = \"2.102.0\"\n\n";
         let pointer = "# Other software is yours to add: a [homebrew] table installs Homebrew and its \
              formulae,\n# an [[app]] row one signed app (docs/DESIGN-machines-2026-10-16.md §8). For \
-             keeping a Mac\n# awake and editing a file, aterm has its own `aterm acaffiene` and \
+             keeping a Mac\n# awake and editing a file, aterm has its own `aterm acaffeine` and \
              `aterm edit`.\n\n";
         assert!(templates::DEFAULT_BASELINE.contains(pointer));
-        let before_vault_daemon = templates::DEFAULT_BASELINE.replace("vault_server = true\n", "");
+        // What every build from the vault server's starter (b88705c068) to the aCaffeine rename
+        // (388f2736e4) wrote, and so what their controllers hold: the rename changed only this word.
+        let before_rename =
+            templates::DEFAULT_BASELINE.replace("`aterm acaffeine`", "`aterm acaffiene`");
+        assert_ne!(before_rename, templates::DEFAULT_BASELINE);
         assert!(
-            templates::EARLIER_DEFAULT_BASELINES
-                .contains(&text_sha256(&before_vault_daemon).as_str()),
-            "the digest is of the starter before vault_server = true"
+            templates::EARLIER_DEFAULT_BASELINES.contains(&text_sha256(&before_rename).as_str()),
+            "the digest is of the starter before the aCaffeine rename"
         );
-        let previous = before_vault_daemon.replace(pointer, HOMEBREW_AND_APPS);
+        let previous = templates::DEFAULT_BASELINE
+            .replace("vault_server = true\n", "")
+            .replace(pointer, HOMEBREW_AND_APPS);
         assert!(
             templates::EARLIER_DEFAULT_BASELINES.contains(&text_sha256(&previous).as_str()),
             "the digest is of the starter as a6c1342e82 wrote it"
@@ -6208,6 +6214,10 @@ mod tests {
         );
         let default = format!("{ROOT}/baselines/default.toml");
         for (on_disk, after) in [
+            (
+                before_rename.clone(),
+                templates::DEFAULT_BASELINE.to_owned(),
+            ),
             (previous.clone(), templates::DEFAULT_BASELINE.to_owned()),
             (earlier.clone(), templates::DEFAULT_BASELINE.to_owned()),
             (format!("{previous}# mine\n"), format!("{previous}# mine\n")),
@@ -6581,10 +6591,10 @@ mod tests {
         assert!(plain(&unread).err() == class(Unfinished::Other));
     }
 
-    /// `--name` gives the Mac its swarm label as Computer Name and Local hostname under the one
-    /// password the tools take, journaled; a name macOS refuses leaves the exit saying the tools
-    /// alone. NEGATIVE CONTROLS: with no name the root half runs no `scutil --set`, and with the tools
-    /// out of reach the exit is still theirs.
+    /// `--name` gives the Mac its swarm label as Computer Name, Local hostname and host name
+    /// under the one password the tools take, journaled; a name macOS refuses leaves the exit
+    /// saying the tools alone. NEGATIVE CONTROLS: with no name the root half runs no `scutil
+    /// --set`, and with the tools out of reach the exit is still theirs.
     #[test]
     fn here_apply_plain_names_the_mac_and_exits_on_the_tools_alone() {
         use crate::init_clt::Unfinished;
@@ -6647,19 +6657,27 @@ mod tests {
                 Ran::ok("Andrews-MacBook-Pro\n"),
             )
             .on("/usr/sbin/scutil --get LocalHostName", Ran::ok("m42\n"))
+            .on(
+                "/usr/sbin/scutil --get HostName",
+                Ran::exit(1, "HostName: not set\n"),
+            )
+            .on("/usr/sbin/scutil --get HostName", Ran::ok("m42\n"))
             .on("/usr/sbin/scutil --set ComputerName m42", Ran::ok(""))
-            .on("/usr/sbin/scutil --set LocalHostName m42", Ran::ok(""));
+            .on("/usr/sbin/scutil --set LocalHostName m42", Ran::ok(""))
+            .on("/usr/sbin/scutil --set HostName m42", Ran::ok(""));
         assert!(matches!(plain(&named, Some("m42")), Ok(None)));
         assert_eq!(
             sets(&named),
             [
                 "/usr/sbin/scutil --set ComputerName m42",
-                "/usr/sbin/scutil --set LocalHostName m42"
+                "/usr/sbin/scutil --set LocalHostName m42",
+                "/usr/sbin/scutil --set HostName m42"
             ]
         );
         let said = journal(&named);
         assert!(said.contains("names.computer-name"), "{said}");
         assert!(said.contains("names.local-host-name"), "{said}");
+        assert!(said.contains("names.host-name"), "{said}");
 
         // Already named: nothing is set again.
         let already = tools();
@@ -6836,7 +6854,11 @@ mod tests {
             conn.write_all(b"OK\n").unwrap();
         });
 
-        let opened = open_native_monitor_tab_in_candidates(&[sym_sock, explicit_sock.clone()]);
+        // The server above always answers: a hang detector, never the opener's 250 ms.
+        let opened = open_native_monitor_tab_in_candidates(
+            &[sym_sock, explicit_sock.clone()],
+            Duration::from_secs(60),
+        );
         server.join().unwrap();
         assert_eq!(opened.as_deref(), explicit_sock.to_str());
         assert_eq!(

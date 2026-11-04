@@ -640,7 +640,7 @@ pub(super) struct Loaded {
 /// none, or one a newer aterm wrote of this revision or of none it names (then
 /// [`Loaded::frozen`]).
 pub(super) fn load(root: &Path, revision: u64) -> Loaded {
-    let read = match std::fs::read(root.join(LEDGER)) {
+    let read = match crate::macos_doctor::read_record_bytes(&root.join(LEDGER)) {
         Ok(bytes) => match aterm_json::from_slice::<Value>(&bytes) {
             Ok(value) => match Ledger::parse(&value) {
                 Err(Unread::Newer)

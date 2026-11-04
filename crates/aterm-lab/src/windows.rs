@@ -22,6 +22,10 @@ use crate::{Fail, LAB, Res};
 #[path = "windows_observe.rs"]
 mod observe;
 
+/// The paths a build stamp is of, as `crates/aterm/build.rs` asks git of them.
+#[path = "../../aterm/stamp_paths.rs"]
+mod stamp_paths;
+
 /// The VM's name (QEMU's `-name`).
 pub const VM: &str = "aterm-windows";
 
@@ -2851,7 +2855,7 @@ pub fn build_facts(repo: &Path) -> Vec<(String, String)> {
     ) else {
         return Vec::new();
     };
-    let dirty = git(&["status", "--porcelain"]).is_some();
+    let dirty = git(&[&["status", "--porcelain"][..], &stamp_paths::PATHSPEC].concat()).is_some();
     let dev = git(&["describe", "--tags", "--match", "v*.*.0", "--abbrev=0"])
         .and_then(|tag| git(&["rev-list", "--count", &format!("{tag}..HEAD")]))
         .unwrap_or_else(|| "0".into());

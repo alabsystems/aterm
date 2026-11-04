@@ -466,16 +466,26 @@ pub(crate) fn ground_cell(theme: Theme, default_bg: u32) -> RenderCell {
     chrome_band::cell(' ', unpack(theme.fg), unpack(bg), false, false)
 }
 
-/// Repaint fingerprint for the open tab menu (`0` when closed).
+/// Structural repaint key for an open [`TabMenu`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TabMenuRepaintKey {
+    pub(crate) index: usize,
+    pub(crate) anchor_col: u16,
+    pub(crate) highlight: Option<usize>,
+    pub(crate) rect: Option<MenuRect>,
+    pub(crate) entries_len: usize,
+    pub(crate) entries_hash: u64,
+}
+
+/// Structural repaint key for the open tab menu (`None` when closed).
 #[must_use]
-pub(crate) fn fingerprint(menu: Option<&TabMenu>, rect: Option<MenuRect>) -> u64 {
+pub(crate) fn fingerprint(
+    menu: Option<&TabMenu>,
+    rect: Option<MenuRect>,
+) -> Option<TabMenuRepaintKey> {
     use std::hash::{Hash, Hasher};
-    let Some(menu) = menu else { return 0 };
+    let menu = menu?;
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    menu.index.hash(&mut h);
-    menu.anchor_col.hash(&mut h);
-    menu.highlight.hash(&mut h);
-    menu.entries.len().hash(&mut h);
     for e in &menu.entries {
         match e {
             TabMenuEntry::Header(t) => (0u8, t.as_str()).hash(&mut h),
@@ -529,8 +539,14 @@ pub(crate) fn fingerprint(menu: Option<&TabMenu>, rect: Option<MenuRect>) -> u64
             }
         }
     }
-    rect.hash(&mut h);
-    h.finish() | 1
+    Some(TabMenuRepaintKey {
+        index: menu.index,
+        anchor_col: menu.anchor_col,
+        highlight: menu.highlight,
+        rect,
+        entries_len: menu.entries.len(),
+        entries_hash: h.finish(),
+    })
 }
 
 #[cfg(test)]
@@ -753,10 +769,11 @@ mod tests {
         assert_eq!(row[2 + H_PAD].ch, ' ', "the continuation has no glyph");
     }
 
+    /// NEGATIVE CONTROL: closed is `None`, open is `Some(...)`, and `highlight` is compared structurally.
     #[test]
     fn fingerprint_is_zero_closed_nonzero_open_and_moves_with_the_highlight() {
         let rect = place(&model(), 0, 80, 24, 1);
-        assert_eq!(fingerprint(None, rect), 0, "closed is the byte-identical 0");
+        assert_eq!(fingerprint(None, rect), None, "closed is None");
         let mut menu = TabMenu {
             tab: crate::tab_model::TabId::from_stored(1),
             index: 0,
@@ -766,7 +783,7 @@ mod tests {
             keyboard: false,
         };
         let open = fingerprint(Some(&menu), rect);
-        assert_ne!(open, 0);
+        assert_ne!(open, None);
         menu.highlight = Some(4);
         let lit = fingerprint(Some(&menu), rect);
         assert_ne!(open, lit, "a highlight step must force the repaint");

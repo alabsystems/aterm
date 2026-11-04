@@ -217,7 +217,7 @@ fn handover_bundle_until(
     }
     let joiner_rec = allowed.binding().recipient();
     let joiner_rec_str = joiner_rec.to_bech32();
-    if super::roster::swarm_roster_held(paths, lock)?.is_some_and(|r| {
+    if super::roster::swarm_roster_for_denial_held(paths, lock)?.is_some_and(|r| {
         r.member_by_recipient(&joiner_rec_str).is_none() && r.is_label_denied(allowed.name())
     }) {
         return Err(Error::new(
@@ -292,10 +292,16 @@ fn handover_bundle_until(
         if verdict != Verdict::Unchanged || !matches!(pinned, Pin::Same) {
             return Err(none());
         }
-        if let Some((log, _)) =
-            super::log_entries::readable_log(paths, &config, &envelope, &identity)?
+        let seeded = super::log_entries::trusted_seeded_log(paths, &config, &envelope)?;
+        if !super::log_entries::applied_log_available(&state, seeded.as_ref()) {
+            return Err(none());
+        }
+        if let Some((log, _)) = &seeded
+            && super::log_entries::log_base(Some(log), &envelope, &identity)?
+                == super::log_entries::LogBase::Covers
+            && super::log_entries::reads_log(log, &identity)
         {
-            check_log(&log)?;
+            check_log(log)?;
             let opened = log.open_audience_entries(&identity)?.ok_or_else(none)?;
             if opened
                 .fully_unwrapped_audiences

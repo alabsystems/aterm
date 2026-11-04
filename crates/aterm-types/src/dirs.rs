@@ -55,7 +55,7 @@ pub const PASSWD_FILE_SEAM: &str = "ATERM_PASSWD_FILE";
 fn passwd_home_dir(uid: u32) -> Option<PathBuf> {
     use std::io::Read as _;
     const MAX_PASSWD_BYTES: u64 = 16 * 1024 * 1024;
-    let file = crate::fs_restricted::open_regular_nonblock(&passwd_file()).ok()?;
+    let (file, _) = crate::fs_restricted::open_regular_nonblock_with_meta(&passwd_file()).ok()?;
     let mut contents = Vec::new();
     file.take(MAX_PASSWD_BYTES + 1)
         .read_to_end(&mut contents)
@@ -327,15 +327,33 @@ pub fn not_own_account_with(
     if euid == 0 {
         return Some("it runs as root");
     }
-    let same = match (home, account_home) {
-        (Some(home), Some(account)) => {
-            home == account
-                || std::fs::canonicalize(home)
-                    .is_ok_and(|home| std::fs::canonicalize(account).is_ok_and(|a| a == home))
-        }
-        _ => false,
-    };
+    let same = home
+        .zip(account_home)
+        .is_some_and(|(home, account)| same_directory(home, account));
     (!same).then_some("its HOME is not this account's home")
+}
+
+/// Whether `a` and `b` name one directory: the same path, or, on Unix, one file system object
+/// (device and inode), which also joins the aliases `canonicalize` keeps apart, such as macOS's
+/// firmlink `/System/Volumes/Data/Users/<user>` for `/Users/<user>`; elsewhere, one path once
+/// both resolve. A path that cannot be read matches only its own spelling.
+#[must_use]
+pub fn same_directory(a: &std::path::Path, b: &std::path::Path) -> bool {
+    if a == b {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::metadata(a)
+            .ok()
+            .zip(std::fs::metadata(b).ok())
+            .is_some_and(|(a, b)| (a.dev(), a.ino()) == (b.dev(), b.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::canonicalize(a).is_ok_and(|a| std::fs::canonicalize(b).is_ok_and(|b| a == b))
+    }
 }
 
 /// Aterm's own state root.
@@ -550,6 +568,43 @@ mod tests {
             Some("its HOME is not this account's home"),
             "no HOME is no match"
         );
+    }
+
+    /// One directory under every spelling: its path, a link to it and, on macOS, its data
+    /// volume firmlink, which `canonicalize` keeps apart; two directories, or a missing path
+    /// beside a real one, are not one.
+    /// NEGATIVE CONTROL: the firmlink alias and the directory resolve to different paths, so a
+    /// comparison of resolved paths (the rule before this one) calls them two.
+    #[cfg(unix)]
+    #[test]
+    fn same_directory_is_one_directory_under_every_spelling() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(scratch.path()).unwrap().join("home");
+        let other = home.with_file_name("other");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        let link = home.with_file_name("home-link");
+        std::os::unix::fs::symlink(&home, &link).unwrap();
+        let missing = home.with_file_name("missing");
+        assert!(same_directory(&home, &home));
+        assert!(same_directory(&link, &home));
+        assert!(same_directory(&missing, &missing), "a spelling is itself");
+        assert!(!same_directory(&home, &other));
+        assert!(!same_directory(&missing, &home));
+        assert_eq!(
+            not_own_account_with(false, 501, Some(&other), Some(&home)),
+            Some("its HOME is not this account's home")
+        );
+        if cfg!(target_os = "macos") {
+            let alias =
+                std::path::Path::new("/System/Volumes/Data").join(home.strip_prefix("/").unwrap());
+            assert_ne!(std::fs::canonicalize(&alias).unwrap(), home);
+            assert!(same_directory(&alias, &home), "{}", alias.display());
+            assert_eq!(
+                not_own_account_with(false, 501, Some(&alias), Some(&home)),
+                None
+            );
+        }
     }
 
     /// An item's journal goes where its account is. A test's `aterm doctor` or `atpkg

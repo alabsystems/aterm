@@ -106,12 +106,12 @@ fn the_repaint_key_term_moves_on_open_highlight_and_close() {
         let ws = &app.windows[&wid];
         crate::tab_menu::fingerprint(ws.tab_menu.as_ref(), ws.tab_menu_rect)
     };
-    assert_eq!(fp(&app), 0, "closed is the byte-identical sentinel");
+    assert_eq!(fp(&app), None, "closed is None");
     assert!(app.open_tab_context_menu(wid, 0, 0, false));
     composed_frame(&mut app, wid);
     app.splice_tab_menu(wid);
     let open = fp(&app);
-    assert_ne!(open, 0);
+    assert_ne!(open, None);
     app.windows
         .get_mut(&wid)
         .unwrap()
@@ -121,7 +121,7 @@ fn the_repaint_key_term_moves_on_open_highlight_and_close() {
         .highlight = Some(0);
     assert_ne!(fp(&app), open, "a highlight step forces its own frame");
     app.close_tab_menu(wid);
-    assert_eq!(fp(&app), 0);
+    assert_eq!(fp(&app), None);
 }
 
 #[test]

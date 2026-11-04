@@ -186,9 +186,8 @@ mod bounded_lock_tests {
     /// A held lock times out `acquire_within` and is immediately free once dropped.
     #[test]
     fn acquire_within_times_out_while_another_holder_has_it() {
-        let dir = std::env::temp_dir().join(format!("aterm-bounded-lock-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let path = dir.join("apply.lock");
+        let dir = crate::test_scratch_dir("bounded-lock");
+        let path = dir.path().join("apply.lock");
 
         let held = FileLock::acquire(&path).expect("first holder takes the lock");
         let error = match FileLock::acquire_within(&path, Duration::from_millis(50)) {
@@ -200,7 +199,6 @@ mod bounded_lock_tests {
         drop(held);
         FileLock::acquire_within(&path, Duration::ZERO)
             .expect("the dropped lock must be free at the first try");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -212,7 +210,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_dropped_lock_is_free_while_a_copy_of_its_descriptor_lives() {
-        let p = std::env::temp_dir().join(format!("aterm-lock-dup-{}", std::process::id()));
+        let dir = crate::test_scratch_dir("lock-dup");
+        let p = dir.path().join("dup.lock");
         let held = FileLock::acquire(&p).expect("acquire");
         let childs_copy = held._file.try_clone().expect("dup the lock's descriptor");
         drop(held);
@@ -231,7 +230,6 @@ mod tests {
         drop(held);
         FileLock::acquire_within(&p, std::time::Duration::ZERO).expect("free");
         drop(childs_copy);
-        let _ = std::fs::remove_file(&p);
     }
 
     /// `FileLock::acquire` sets `FD_CLOEXEC` on its descriptor.
@@ -240,7 +238,8 @@ mod tests {
     fn file_lock_is_close_on_exec() {
         use std::os::fd::AsRawFd;
 
-        let p = std::env::temp_dir().join(format!("aterm-lock-cloexec-{}", std::process::id()));
+        let dir = crate::test_scratch_dir("lock-cloexec");
+        let p = dir.path().join("cloexec.lock");
         let lock = FileLock::acquire(&p).expect("acquire");
         // SAFETY: F_GETFD only reads descriptor flags from this live File.
         let flags = unsafe { libc::fcntl(lock._file.as_raw_fd(), libc::F_GETFD) };
@@ -251,9 +250,8 @@ mod tests {
             "successful exec must release the apply transaction atomically"
         );
         drop(lock);
-        let _ = std::fs::remove_file(&p);
-        let decoy = std::env::temp_dir().join(format!("aterm-lock-decoy-{}", std::process::id()));
-        let _ = std::fs::remove_file(&decoy);
+        std::fs::remove_file(&p).expect("remove lock before symlink");
+        let decoy = dir.path().join("decoy.lock");
         std::os::unix::fs::symlink(&decoy, &p).expect("symlink");
         assert!(
             FileLock::acquire(&p).is_err(),
@@ -263,15 +261,13 @@ mod tests {
             !decoy.exists(),
             "symlinked lock target must never be created"
         );
-        let _ = std::fs::remove_file(&p);
     }
 
     #[cfg(windows)]
     #[test]
     fn acquire_fails_fast_on_permanent_error() {
-        let missing = std::env::temp_dir()
-            .join(format!("aterm-no-such-dir-{}", std::process::id()))
-            .join("lock");
+        let dir = crate::test_scratch_dir("no-such-dir");
+        let missing = dir.path().join("absent").join("lock");
         let err = match FileLock::acquire_within(&missing, std::time::Duration::from_secs(120)) {
             Ok(_) => panic!("acquire must fail on a missing parent"),
             Err(e) => e,
@@ -282,9 +278,14 @@ mod tests {
 
     #[test]
     fn same_volume_true_within_a_dir_false_for_missing() {
-        let d = std::env::temp_dir();
-        let a = d.join(format!("aterm-sv-a-{}", std::process::id()));
-        let b = d.join(format!("aterm-sv-b-{}", std::process::id()));
+        let d = crate::test_scratch_dir("utf8-tag-with-émoji-🚀-exceeding-twenty-bytes");
+        assert!(
+            d.path().to_string_lossy().ends_with(".noindex"),
+            "scratch dir must carry .noindex suffix: {}",
+            d.path().display()
+        );
+        let a = d.path().join("sv-a");
+        let b = d.path().join("sv-b");
         std::fs::write(&a, b"x").unwrap();
         std::fs::write(&b, b"y").unwrap();
         assert!(
@@ -295,13 +296,10 @@ mod tests {
             !same_volume(&a, Path::new("/no/such/path-aterm-xyz")),
             "a missing path is not same-volume (fail closed)"
         );
-        let free_lock = d.join(format!("aterm-sv-max-lock-{}", std::process::id()));
+        let free_lock = d.path().join("sv-max.lock");
         drop(
             FileLock::acquire_within(&free_lock, std::time::Duration::MAX)
                 .expect("Duration::MAX must not overflow Instant::now() + limit"),
         );
-        let _ = std::fs::remove_file(&free_lock);
-        let _ = std::fs::remove_file(&a);
-        let _ = std::fs::remove_file(&b);
     }
 }

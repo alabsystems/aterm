@@ -47,6 +47,13 @@ impl Default for HyperlinkAuth {
     }
 }
 
+impl super::checkpoint_heap::Heap for HyperlinkAuth {
+    fn heap(&self) -> usize {
+        let Self { extra_schemes } = self;
+        extra_schemes.heap()
+    }
+}
+
 impl HyperlinkAuth {
     /// Creates an empty extra-scheme set.
     #[inline]

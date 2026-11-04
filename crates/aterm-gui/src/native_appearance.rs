@@ -307,13 +307,12 @@ impl SystemAccent {
         }
     }
 
-    #[cfg(all(any(windows, target_os = "macos"), not(test)))]
+    #[cfg(any(windows, target_os = "macos", test))]
     fn pack(self) -> u64 {
         let rgb = |c: [u8; 3]| (u64::from(c[0]) << 16) | (u64::from(c[1]) << 8) | u64::from(c[2]);
         (rgb(self.on_dark) << 24) | rgb(self.on_light)
     }
 
-    #[cfg(not(test))]
     fn unpack(v: u64) -> Self {
         let rgb = |v: u64| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
         Self {
@@ -324,7 +323,6 @@ impl SystemAccent {
 }
 
 /// [`SYSTEM_ACCENT`]'s "the OS gives no accent" value (48 bits hold a pair).
-#[cfg(not(test))]
 const NO_SYSTEM_ACCENT: u64 = u64::MAX;
 
 /// The installed [`SystemAccent`], packed; process-wide like the preferences.
@@ -1172,6 +1170,29 @@ mod tests {
             cursor_accent
         );
         let _ = take_chrome_inputs_moved();
+    }
+
+    /// The installed accent is stored packed and reads back as the pair it was, each shade on
+    /// its own surface; no pair packs to the "no accent" value.
+    #[test]
+    fn a_packed_accent_reads_back_as_its_pair_and_never_as_none() {
+        for accent in [
+            SystemAccent {
+                on_dark: [0x12, 0x34, 0x56],
+                on_light: [0xAB, 0xCD, 0xEF],
+            },
+            SystemAccent {
+                on_dark: [0xFF; 3],
+                on_light: [0xFF; 3],
+            },
+            SystemAccent {
+                on_dark: [0; 3],
+                on_light: [0; 3],
+            },
+        ] {
+            assert_eq!(SystemAccent::unpack(accent.pack()), accent);
+            assert_ne!(accent.pack(), NO_SYSTEM_ACCENT, "{accent:?}");
+        }
     }
 
     /// THE CONTROL ACCENT FOLLOWS THE SYSTEM'S (init-on-by-default design §4.4, D1): the

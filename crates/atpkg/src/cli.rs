@@ -3764,6 +3764,8 @@ fn lease_run_name(args: &LeaseArgs) -> String {
 enum LeaseRun {
     Ran(std::process::ExitStatus),
     Missing(crate::lease::Missing),
+    NoPrefix,
+    NotHeld(crate::lease::Subject, crate::lease::LeaseError),
     NotStarted(std::io::Error),
     Lost(std::io::Error),
 }
@@ -3775,18 +3777,31 @@ fn lease_and_run(
     wait: std::time::Duration,
     say: &mut dyn FnMut(&str),
 ) -> LeaseRun {
-    let hold = match prefix {
-        Some(prefix) => match crate::lease::hold_for(prefix, &args.dir, who, wait) {
-            Ok(hold) => Some(hold),
-            Err(missing) => return LeaseRun::Missing(missing),
-        },
-        None => None,
+    let Some(prefix) = prefix else {
+        return LeaseRun::NoPrefix;
     };
-    say(&lease_hold_line(
-        hold.as_ref(),
-        &args.dir,
-        &lease_run_name(args),
-    ));
+    let hold = match crate::lease::hold_for(prefix, &args.dir, who, wait) {
+        Ok(hold) => hold,
+        Err(missing) => return LeaseRun::Missing(missing),
+    };
+    let (hold, line) = match hold {
+        crate::lease::Hold::Held(lease) => {
+            let line = lease_hold_line(lease.subject(), &lease_run_name(args));
+            (Some(lease), line)
+        }
+        crate::lease::Hold::Unmanaged => (
+            None,
+            format!(
+                "atpkg lease: {} is no build atpkg manages \u{2014} nothing of atpkg's reclaims \
+                 it, so nothing is held",
+                args.dir.display()
+            ),
+        ),
+        crate::lease::Hold::NotTaken(subject, error) => {
+            return LeaseRun::NotHeld(subject, error);
+        }
+    };
+    say(&line);
     let forwarding = crate::platform::arm_forwarding();
     let mut command = aterm_uds::spawnfd::transparent(&args.command[0]);
     let mut child = match command.args(&args.command[1..]).spawn() {
@@ -3801,37 +3816,19 @@ fn lease_and_run(
     }
 }
 
-fn lease_hold_line(hold: Option<&crate::lease::Hold>, dir: &std::path::Path, run: &str) -> String {
-    match hold {
-        Some(crate::lease::Hold::Held(lease)) => {
-            let keeps = match lease.subject() {
-                crate::lease::Subject::Build { .. } => {
-                    "gc keeps it, and an unattended update waits while it is the live build"
-                }
-                crate::lease::Subject::View { .. } => {
-                    "it is not re-laid, and an unattended trust update waits for it"
-                }
-            };
-            format!(
-                "atpkg lease: holding {} while {run} runs \u{2014} {keeps}",
-                lease.subject().describe()
-            )
+fn lease_hold_line(subject: &crate::lease::Subject, run: &str) -> String {
+    let keeps = match subject {
+        crate::lease::Subject::Build { .. } => {
+            "gc keeps it, and an unattended update waits while it is the live build"
         }
-        Some(crate::lease::Hold::Unmanaged) => format!(
-            "atpkg lease: {} is no build atpkg manages \u{2014} nothing of atpkg's reclaims \
-             it, so nothing is held",
-            dir.display()
-        ),
-        Some(crate::lease::Hold::NotTaken(subject, e)) => format!(
-            "atpkg lease: warn \u{2014} the lease on {} was NOT taken ({e}); {run} runs \
-             unprotected: an update landing meanwhile can reclaim or re-lay it",
-            subject.describe()
-        ),
-        None => format!(
-            "atpkg lease: warn \u{2014} no package prefix resolves, so nothing was leased; \
-             {run} runs unprotected"
-        ),
-    }
+        crate::lease::Subject::View { .. } => {
+            "it is not re-laid, and an unattended trust update waits for it"
+        }
+    };
+    format!(
+        "atpkg lease: holding {} while {run} runs \u{2014} {keeps}",
+        subject.describe()
+    )
 }
 
 fn cmd_lane(rest: &[String]) -> ExitCode {
@@ -3899,16 +3896,27 @@ fn cmd_lease(rest: &[String]) -> ExitCode {
     );
     match run {
         LeaseRun::Ran(status) => crate::platform::exit_code_like(status),
+        LeaseRun::NoPrefix => {
+            eprintln!("atpkg lease: no package prefix resolves \u{2014} nothing ran");
+            ExitCode::from(1)
+        }
+        LeaseRun::NotHeld(subject, error) => {
+            eprintln!(
+                "atpkg lease: could not hold {} ({error}) \u{2014} nothing ran",
+                subject.describe()
+            );
+            ExitCode::from(1)
+        }
         LeaseRun::Missing(crate::lease::Missing { dir, managed }) => {
             if managed {
                 eprintln!(
-                    "atpkg lease: {} is gone (cleaned up, or never installed) \u{2014} nothing \
+                    "atpkg lease: {} is not a usable toolchain directory \u{2014} nothing \
                      ran; look up the toolchain path again and rerun",
                     dir.display()
                 );
             } else {
                 eprintln!(
-                    "atpkg lease: {} does not exist \u{2014} nothing ran",
+                    "atpkg lease: {} is not a usable toolchain directory \u{2014} nothing ran",
                     dir.display()
                 );
             }
@@ -13282,10 +13290,11 @@ fn admit_for_verify(
         return Err(usage_error(verb, None));
     };
     let read = |path: &String| {
-        std::fs::read(path).map_err(|e| {
-            eprintln!("atpkg {verb}: cannot read {path}: {e}");
-            ExitCode::from(1)
-        })
+        crate::metadata_io::read_bounded_regular(std::path::Path::new(path), 4 * 1024 * 1024)
+            .map_err(|e| {
+                eprintln!("atpkg {verb}: cannot read {path}: {e}");
+                ExitCode::from(1)
+            })
     };
     let raw = read(doc)?;
     let sig_bytes = read(sig)?;

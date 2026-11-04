@@ -5,9 +5,12 @@
 
 use super::*;
 
+#[path = "accounts_sync_rerun_tests.rs"]
+mod rerun;
+
 const NOW: i64 = 1_792_660_000;
-const A: &str = "a@example.test";
-const B: &str = "b@example.test";
+const A: &str = "a@example.com";
+const B: &str = "b@example.com";
 
 struct World {
     _scratch: aterm_tempfile::TempDir,
@@ -367,7 +370,7 @@ fn codex_sync_reassigns_the_default_without_moving_account_history_or_sessions()
         let world = World::new("codex-default-reassignment-");
         if alias {
             let mut rows = world.rows();
-            rows.rows[1].email = Some("b-alias@example.test".into());
+            rows.rows[1].email = Some("b-alias@example.com".into());
             rows.rows[1].identity_email = Some(B.into());
             world.save_rows(&rows);
         }
@@ -462,7 +465,7 @@ fn codex_sync_reassigns_the_default_without_moving_account_history_or_sessions()
         assert_eq!(roster.row("b").unwrap().expected_identity_email(), Some(B));
         assert_eq!(
             roster.row("b").unwrap().email.as_deref(),
-            Some(if alias { "b-alias@example.test" } else { B })
+            Some(if alias { "b-alias@example.com" } else { B })
         );
         assert_eq!(store.load(NOW).unwrap().0, state_before);
         assert_eq!(fs::read(store.state_file()).unwrap(), state_image_before);
@@ -579,10 +582,10 @@ fn codex_reassignment_needs_unambiguous_native_identity_and_current_local_policy
                 "cli_auth_credentials_store='keyring'\n",
             )
             .unwrap(),
-            "unlisted" => world.login("unlisted@example.test"),
+            "unlisted" => world.login("unlisted@example.com"),
             "ambiguous" => {
                 let mut text = fs::read_to_string(&world.roster).unwrap();
-                text.push_str("\n[[account]]\nlabel='c'\nemail='alias@example.test'\nidentity_email='b@example.test'\ndir='/synthetic/c'\n");
+                text.push_str("\n[[account]]\nlabel='c'\nemail='alias@example.com'\nidentity_email='b@example.com'\ndir='/synthetic/c'\n");
                 fs::write(&world.roster, text).unwrap();
             }
             "held" => {
@@ -631,7 +634,7 @@ fn codex_reassignment_rechecks_policy_auth_and_record_custody_before_publication
             .unwrap(),
             "roster" => {
                 let mut rows = world.rows();
-                rows.rows[1].identity_email = Some("other@example.test".into());
+                rows.rows[1].identity_email = Some("other@example.com".into());
                 world.save_rows(&rows);
             }
             "binding" => {
@@ -669,12 +672,12 @@ fn codex_reassignment_cannot_take_another_owner_or_an_occupied_login_directory()
         world.login(B);
         let directory = world.store().login_dir("a").unwrap();
         if case == "occupied" {
-            write_login(&directory, "unrelated@example.test");
+            write_login(&directory, "unrelated@example.com");
         } else {
             let mut rows = world.rows();
             rows.rows.push(Row {
                 label: "other".into(),
-                email: Some("other@example.test".into()),
+                email: Some("other@example.com".into()),
                 dir: Some(
                     if case == "owner" {
                         directory
@@ -887,7 +890,7 @@ fn a_default_login_moved_back_takes_the_rows_own_directory_back() {
         };
         let refused = synced.default_login.refused.expect(case);
         assert!(
-            refused.contains("holds a login that is not its own"),
+            refused.contains("`b`'s managed directory") && refused.ends_with("no row moved"),
             "{case}: {refused}"
         );
         assert_eq!(
@@ -905,7 +908,7 @@ fn sync_words(world: &World) -> (ExitCode, String, String) {
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let code = run_cli_accounts_sync_with(
         Cli::Codex,
-        &world.env(),
+        (&world.env(), None),
         (None, None, false),
         (&mut out, &mut err),
         &fetch,
@@ -939,7 +942,10 @@ fn a_sync_with_no_source_still_follows_the_default_login() {
         out.contains("default login: it names far@example.com"),
         "{out}"
     );
-    assert!(out.contains("`codex login`"), "{out}");
+    assert!(
+        out.contains("`aterm harness accounts login a --cli codex`"),
+        "{out}"
+    );
     assert_eq!(world.rows(), before, "nothing holds that address");
     let step = "aterm harness accounts add <label> --cli codex --email far@example.com";
     assert!(out.contains(step), "{out}");

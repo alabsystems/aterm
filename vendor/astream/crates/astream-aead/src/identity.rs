@@ -125,6 +125,58 @@ impl Drop for IdentityKeypair {
     }
 }
 
+#[inline(always)]
+const fn id_ctx_lo(ctx: &[u8; SIG_CTX_LEN]) -> [u8; 16] {
+    [
+        ctx[0], ctx[1], ctx[2], ctx[3], ctx[4], ctx[5], ctx[6], ctx[7], ctx[8], ctx[9], ctx[10],
+        ctx[11], ctx[12], ctx[13], ctx[14], ctx[15],
+    ]
+}
+
+#[inline(always)]
+const fn id_ctx_hi(ctx: &[u8; SIG_CTX_LEN]) -> [u8; 15] {
+    [
+        ctx[16], ctx[17], ctx[18], ctx[19], ctx[20], ctx[21], ctx[22], ctx[23], ctx[24], ctx[25],
+        ctx[26], ctx[27], ctx[28], ctx[29], ctx[30],
+    ]
+}
+
+#[inline(always)]
+const fn id_transcript_ec_lo(ec_pub: &[u8; 32]) -> [u8; 16] {
+    [
+        ec_pub[0], ec_pub[1], ec_pub[2], ec_pub[3], ec_pub[4], ec_pub[5], ec_pub[6], ec_pub[7],
+        ec_pub[8], ec_pub[9], ec_pub[10], ec_pub[11], ec_pub[12], ec_pub[13], ec_pub[14],
+        ec_pub[15],
+    ]
+}
+
+#[inline(always)]
+const fn id_transcript_ec_hi(ec_pub: &[u8; 32]) -> [u8; 16] {
+    [
+        ec_pub[16], ec_pub[17], ec_pub[18], ec_pub[19], ec_pub[20], ec_pub[21], ec_pub[22],
+        ec_pub[23], ec_pub[24], ec_pub[25], ec_pub[26], ec_pub[27], ec_pub[28], ec_pub[29],
+        ec_pub[30], ec_pub[31],
+    ]
+}
+
+#[inline(always)]
+const fn id_transcript_es_lo(es_pub: &[u8; 32]) -> [u8; 16] {
+    [
+        es_pub[0], es_pub[1], es_pub[2], es_pub[3], es_pub[4], es_pub[5], es_pub[6], es_pub[7],
+        es_pub[8], es_pub[9], es_pub[10], es_pub[11], es_pub[12], es_pub[13], es_pub[14],
+        es_pub[15],
+    ]
+}
+
+#[inline(always)]
+const fn id_transcript_es_hi(es_pub: &[u8; 32]) -> [u8; 16] {
+    [
+        es_pub[16], es_pub[17], es_pub[18], es_pub[19], es_pub[20], es_pub[21], es_pub[22],
+        es_pub[23], es_pub[24], es_pub[25], es_pub[26], es_pub[27], es_pub[28], es_pub[29],
+        es_pub[30], es_pub[31],
+    ]
+}
+
 /// The exact bytes each side signs: a role-tagged context over both ephemeral
 /// public keys, in the fixed order (client then server) both sides agree on.
 const fn transcript(
@@ -132,23 +184,28 @@ const fn transcript(
     ec_pub: &[u8; 32],
     es_pub: &[u8; 32],
 ) -> [u8; SIG_CTX_LEN + 64] {
+    let [x0, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15] = id_ctx_lo(ctx);
+    let [x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30] =
+        id_ctx_hi(ctx);
+    let [c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13, c14, c15] =
+        id_transcript_ec_lo(ec_pub);
+    let [c16, c17, c18, c19, c20, c21, c22, c23, c24, c25, c26, c27, c28, c29, c30, c31] =
+        id_transcript_ec_hi(ec_pub);
+    let [s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15] =
+        id_transcript_es_lo(es_pub);
+    let [s16, s17, s18, s19, s20, s21, s22, s23, s24, s25, s26, s27, s28, s29, s30, s31] =
+        id_transcript_es_hi(es_pub);
     [
-        ctx[0], ctx[1], ctx[2], ctx[3], ctx[4], ctx[5], ctx[6], ctx[7], ctx[8], ctx[9], ctx[10],
-        ctx[11], ctx[12], ctx[13], ctx[14], ctx[15], ctx[16], ctx[17], ctx[18], ctx[19], ctx[20],
-        ctx[21], ctx[22], ctx[23], ctx[24], ctx[25], ctx[26], ctx[27], ctx[28], ctx[29], ctx[30],
-        ec_pub[0], ec_pub[1], ec_pub[2], ec_pub[3], ec_pub[4], ec_pub[5], ec_pub[6], ec_pub[7],
-        ec_pub[8], ec_pub[9], ec_pub[10], ec_pub[11], ec_pub[12], ec_pub[13], ec_pub[14],
-        ec_pub[15], ec_pub[16], ec_pub[17], ec_pub[18], ec_pub[19], ec_pub[20], ec_pub[21],
-        ec_pub[22], ec_pub[23], ec_pub[24], ec_pub[25], ec_pub[26], ec_pub[27], ec_pub[28],
-        ec_pub[29], ec_pub[30], ec_pub[31], es_pub[0], es_pub[1], es_pub[2], es_pub[3], es_pub[4],
-        es_pub[5], es_pub[6], es_pub[7], es_pub[8], es_pub[9], es_pub[10], es_pub[11], es_pub[12],
-        es_pub[13], es_pub[14], es_pub[15], es_pub[16], es_pub[17], es_pub[18], es_pub[19],
-        es_pub[20], es_pub[21], es_pub[22], es_pub[23], es_pub[24], es_pub[25], es_pub[26],
-        es_pub[27], es_pub[28], es_pub[29], es_pub[30], es_pub[31],
+        x0, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19,
+        x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, c0, c1, c2, c3, c4, c5, c6, c7, c8,
+        c9, c10, c11, c12, c13, c14, c15, c16, c17, c18, c19, c20, c21, c22, c23, c24, c25, c26,
+        c27, c28, c29, c30, c31, s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14,
+        s15, s16, s17, s18, s19, s20, s21, s22, s23, s24, s25, s26, s27, s28, s29, s30, s31,
     ]
 }
 
-const fn build_id_info(ec_pub: &[u8; 32], es_pub: &[u8; 32]) -> [u8; 83] {
+#[inline(always)]
+const fn id_info_label_lo() -> [u8; 16] {
     [
         ID_LABEL[0],
         ID_LABEL[1],
@@ -166,73 +223,67 @@ const fn build_id_info(ec_pub: &[u8; 32], es_pub: &[u8; 32]) -> [u8; 83] {
         ID_LABEL[13],
         ID_LABEL[14],
         ID_LABEL[15],
-        ID_LABEL[16],
-        ID_LABEL[17],
-        ID_LABEL[18],
-        ec_pub[0],
-        ec_pub[1],
-        ec_pub[2],
-        ec_pub[3],
-        ec_pub[4],
-        ec_pub[5],
-        ec_pub[6],
-        ec_pub[7],
-        ec_pub[8],
-        ec_pub[9],
-        ec_pub[10],
-        ec_pub[11],
-        ec_pub[12],
-        ec_pub[13],
-        ec_pub[14],
+    ]
+}
+
+#[inline(always)]
+const fn id_info_label_hi() -> [u8; 3] {
+    [ID_LABEL[16], ID_LABEL[17], ID_LABEL[18]]
+}
+
+#[inline(always)]
+const fn id_info_ec_lo(ec_pub: &[u8; 32]) -> [u8; 16] {
+    [
+        ec_pub[0], ec_pub[1], ec_pub[2], ec_pub[3], ec_pub[4], ec_pub[5], ec_pub[6], ec_pub[7],
+        ec_pub[8], ec_pub[9], ec_pub[10], ec_pub[11], ec_pub[12], ec_pub[13], ec_pub[14],
         ec_pub[15],
-        ec_pub[16],
-        ec_pub[17],
-        ec_pub[18],
-        ec_pub[19],
-        ec_pub[20],
-        ec_pub[21],
-        ec_pub[22],
-        ec_pub[23],
-        ec_pub[24],
-        ec_pub[25],
-        ec_pub[26],
-        ec_pub[27],
-        ec_pub[28],
-        ec_pub[29],
-        ec_pub[30],
-        ec_pub[31],
-        es_pub[0],
-        es_pub[1],
-        es_pub[2],
-        es_pub[3],
-        es_pub[4],
-        es_pub[5],
-        es_pub[6],
-        es_pub[7],
-        es_pub[8],
-        es_pub[9],
-        es_pub[10],
-        es_pub[11],
-        es_pub[12],
-        es_pub[13],
-        es_pub[14],
+    ]
+}
+
+#[inline(always)]
+const fn id_info_ec_hi(ec_pub: &[u8; 32]) -> [u8; 16] {
+    [
+        ec_pub[16], ec_pub[17], ec_pub[18], ec_pub[19], ec_pub[20], ec_pub[21], ec_pub[22],
+        ec_pub[23], ec_pub[24], ec_pub[25], ec_pub[26], ec_pub[27], ec_pub[28], ec_pub[29],
+        ec_pub[30], ec_pub[31],
+    ]
+}
+
+#[inline(always)]
+const fn id_info_es_lo(es_pub: &[u8; 32]) -> [u8; 16] {
+    [
+        es_pub[0], es_pub[1], es_pub[2], es_pub[3], es_pub[4], es_pub[5], es_pub[6], es_pub[7],
+        es_pub[8], es_pub[9], es_pub[10], es_pub[11], es_pub[12], es_pub[13], es_pub[14],
         es_pub[15],
-        es_pub[16],
-        es_pub[17],
-        es_pub[18],
-        es_pub[19],
-        es_pub[20],
-        es_pub[21],
-        es_pub[22],
-        es_pub[23],
-        es_pub[24],
-        es_pub[25],
-        es_pub[26],
-        es_pub[27],
-        es_pub[28],
-        es_pub[29],
-        es_pub[30],
-        es_pub[31],
+    ]
+}
+
+#[inline(always)]
+const fn id_info_es_hi(es_pub: &[u8; 32]) -> [u8; 16] {
+    [
+        es_pub[16], es_pub[17], es_pub[18], es_pub[19], es_pub[20], es_pub[21], es_pub[22],
+        es_pub[23], es_pub[24], es_pub[25], es_pub[26], es_pub[27], es_pub[28], es_pub[29],
+        es_pub[30], es_pub[31],
+    ]
+}
+
+const fn build_id_info(ec_pub: &[u8; 32], es_pub: &[u8; 32]) -> [u8; 83] {
+    let [l0, l1, l2, l3, l4, l5, l6, l7, l8, l9, l10, l11, l12, l13, l14, l15] = id_info_label_lo();
+    let [l16, l17, l18] = id_info_label_hi();
+    let [c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13, c14, c15] =
+        id_info_ec_lo(ec_pub);
+    let [c16, c17, c18, c19, c20, c21, c22, c23, c24, c25, c26, c27, c28, c29, c30, c31] =
+        id_info_ec_hi(ec_pub);
+    let [s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15] =
+        id_info_es_lo(es_pub);
+    let [s16, s17, s18, s19, s20, s21, s22, s23, s24, s25, s26, s27, s28, s29, s30, s31] =
+        id_info_es_hi(es_pub);
+    [
+        l0, l1, l2, l3, l4, l5, l6, l7, l8, l9, l10, l11, l12, l13, l14, l15, l16, l17, l18, c0,
+        c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13, c14, c15, c16, c17, c18, c19, c20,
+        c21, c22, c23, c24, c25, c26, c27, c28, c29, c30, c31, s0, s1, s2, s3, s4, s5, s6, s7, s8,
+        s9, s10, s11, s12, s13, s14, s15, s16, s17, s18, s19, s20, s21, s22, s23, s24, s25, s26,
+        s27, s28, s29, s30, s31,
     ]
 }
 
@@ -245,19 +296,76 @@ fn session_key(dh: &[u8; 32], ec_pub: &[u8; 32], es_pub: &[u8; 32]) -> [u8; KEY_
     hkdf_sha256_32(&[], dh, &info)
 }
 
-const fn join_auth_message(id_pub: &[u8; ID_PUB_LEN], sig: &[u8; SIG_LEN]) -> [u8; AUTH_MSG_LEN] {
+#[inline(always)]
+const fn auth_join_id_lo(id_pub: &[u8; ID_PUB_LEN]) -> [u8; 16] {
     [
         id_pub[0], id_pub[1], id_pub[2], id_pub[3], id_pub[4], id_pub[5], id_pub[6], id_pub[7],
         id_pub[8], id_pub[9], id_pub[10], id_pub[11], id_pub[12], id_pub[13], id_pub[14],
-        id_pub[15], id_pub[16], id_pub[17], id_pub[18], id_pub[19], id_pub[20], id_pub[21],
-        id_pub[22], id_pub[23], id_pub[24], id_pub[25], id_pub[26], id_pub[27], id_pub[28],
-        id_pub[29], id_pub[30], id_pub[31], sig[0], sig[1], sig[2], sig[3], sig[4], sig[5], sig[6],
-        sig[7], sig[8], sig[9], sig[10], sig[11], sig[12], sig[13], sig[14], sig[15], sig[16],
-        sig[17], sig[18], sig[19], sig[20], sig[21], sig[22], sig[23], sig[24], sig[25], sig[26],
-        sig[27], sig[28], sig[29], sig[30], sig[31], sig[32], sig[33], sig[34], sig[35], sig[36],
-        sig[37], sig[38], sig[39], sig[40], sig[41], sig[42], sig[43], sig[44], sig[45], sig[46],
-        sig[47], sig[48], sig[49], sig[50], sig[51], sig[52], sig[53], sig[54], sig[55], sig[56],
-        sig[57], sig[58], sig[59], sig[60], sig[61], sig[62], sig[63],
+        id_pub[15],
+    ]
+}
+
+#[inline(always)]
+const fn auth_join_id_hi(id_pub: &[u8; ID_PUB_LEN]) -> [u8; 16] {
+    [
+        id_pub[16], id_pub[17], id_pub[18], id_pub[19], id_pub[20], id_pub[21], id_pub[22],
+        id_pub[23], id_pub[24], id_pub[25], id_pub[26], id_pub[27], id_pub[28], id_pub[29],
+        id_pub[30], id_pub[31],
+    ]
+}
+
+#[inline(always)]
+const fn auth_join_sig_q0(sig: &[u8; SIG_LEN]) -> [u8; 16] {
+    [
+        sig[0], sig[1], sig[2], sig[3], sig[4], sig[5], sig[6], sig[7], sig[8], sig[9], sig[10],
+        sig[11], sig[12], sig[13], sig[14], sig[15],
+    ]
+}
+
+#[inline(always)]
+const fn auth_join_sig_q1(sig: &[u8; SIG_LEN]) -> [u8; 16] {
+    [
+        sig[16], sig[17], sig[18], sig[19], sig[20], sig[21], sig[22], sig[23], sig[24], sig[25],
+        sig[26], sig[27], sig[28], sig[29], sig[30], sig[31],
+    ]
+}
+
+#[inline(always)]
+const fn auth_join_sig_q2(sig: &[u8; SIG_LEN]) -> [u8; 16] {
+    [
+        sig[32], sig[33], sig[34], sig[35], sig[36], sig[37], sig[38], sig[39], sig[40], sig[41],
+        sig[42], sig[43], sig[44], sig[45], sig[46], sig[47],
+    ]
+}
+
+#[inline(always)]
+const fn auth_join_sig_q3(sig: &[u8; SIG_LEN]) -> [u8; 16] {
+    [
+        sig[48], sig[49], sig[50], sig[51], sig[52], sig[53], sig[54], sig[55], sig[56], sig[57],
+        sig[58], sig[59], sig[60], sig[61], sig[62], sig[63],
+    ]
+}
+
+const fn join_auth_message(id_pub: &[u8; ID_PUB_LEN], sig: &[u8; SIG_LEN]) -> [u8; AUTH_MSG_LEN] {
+    let [k0, k1, k2, k3, k4, k5, k6, k7, k8, k9, k10, k11, k12, k13, k14, k15] =
+        auth_join_id_lo(id_pub);
+    let [k16, k17, k18, k19, k20, k21, k22, k23, k24, k25, k26, k27, k28, k29, k30, k31] =
+        auth_join_id_hi(id_pub);
+    let [g0, g1, g2, g3, g4, g5, g6, g7, g8, g9, g10, g11, g12, g13, g14, g15] =
+        auth_join_sig_q0(sig);
+    let [g16, g17, g18, g19, g20, g21, g22, g23, g24, g25, g26, g27, g28, g29, g30, g31] =
+        auth_join_sig_q1(sig);
+    let [g32, g33, g34, g35, g36, g37, g38, g39, g40, g41, g42, g43, g44, g45, g46, g47] =
+        auth_join_sig_q2(sig);
+    let [g48, g49, g50, g51, g52, g53, g54, g55, g56, g57, g58, g59, g60, g61, g62, g63] =
+        auth_join_sig_q3(sig);
+    [
+        k0, k1, k2, k3, k4, k5, k6, k7, k8, k9, k10, k11, k12, k13, k14, k15, k16, k17, k18, k19,
+        k20, k21, k22, k23, k24, k25, k26, k27, k28, k29, k30, k31, g0, g1, g2, g3, g4, g5, g6, g7,
+        g8, g9, g10, g11, g12, g13, g14, g15, g16, g17, g18, g19, g20, g21, g22, g23, g24, g25,
+        g26, g27, g28, g29, g30, g31, g32, g33, g34, g35, g36, g37, g38, g39, g40, g41, g42, g43,
+        g44, g45, g46, g47, g48, g49, g50, g51, g52, g53, g54, g55, g56, g57, g58, g59, g60, g61,
+        g62, g63,
     ]
 }
 
@@ -275,22 +383,77 @@ fn auth_message(
     msg
 }
 
+#[inline(always)]
+const fn auth_split_id_lo(msg: &[u8; AUTH_MSG_LEN]) -> [u8; 16] {
+    [
+        msg[0], msg[1], msg[2], msg[3], msg[4], msg[5], msg[6], msg[7], msg[8], msg[9], msg[10],
+        msg[11], msg[12], msg[13], msg[14], msg[15],
+    ]
+}
+
+#[inline(always)]
+const fn auth_split_id_hi(msg: &[u8; AUTH_MSG_LEN]) -> [u8; 16] {
+    [
+        msg[16], msg[17], msg[18], msg[19], msg[20], msg[21], msg[22], msg[23], msg[24], msg[25],
+        msg[26], msg[27], msg[28], msg[29], msg[30], msg[31],
+    ]
+}
+
+#[inline(always)]
+const fn auth_split_sig_q0(msg: &[u8; AUTH_MSG_LEN]) -> [u8; 16] {
+    [
+        msg[32], msg[33], msg[34], msg[35], msg[36], msg[37], msg[38], msg[39], msg[40], msg[41],
+        msg[42], msg[43], msg[44], msg[45], msg[46], msg[47],
+    ]
+}
+
+#[inline(always)]
+const fn auth_split_sig_q1(msg: &[u8; AUTH_MSG_LEN]) -> [u8; 16] {
+    [
+        msg[48], msg[49], msg[50], msg[51], msg[52], msg[53], msg[54], msg[55], msg[56], msg[57],
+        msg[58], msg[59], msg[60], msg[61], msg[62], msg[63],
+    ]
+}
+
+#[inline(always)]
+const fn auth_split_sig_q2(msg: &[u8; AUTH_MSG_LEN]) -> [u8; 16] {
+    [
+        msg[64], msg[65], msg[66], msg[67], msg[68], msg[69], msg[70], msg[71], msg[72], msg[73],
+        msg[74], msg[75], msg[76], msg[77], msg[78], msg[79],
+    ]
+}
+
+#[inline(always)]
+const fn auth_split_sig_q3(msg: &[u8; AUTH_MSG_LEN]) -> [u8; 16] {
+    [
+        msg[80], msg[81], msg[82], msg[83], msg[84], msg[85], msg[86], msg[87], msg[88], msg[89],
+        msg[90], msg[91], msg[92], msg[93], msg[94], msg[95],
+    ]
+}
+
 /// Split a received auth message into (identity public key, signature).
 const fn split_auth(msg: &[u8; AUTH_MSG_LEN]) -> ([u8; ID_PUB_LEN], [u8; SIG_LEN]) {
+    let [k0, k1, k2, k3, k4, k5, k6, k7, k8, k9, k10, k11, k12, k13, k14, k15] =
+        auth_split_id_lo(msg);
+    let [k16, k17, k18, k19, k20, k21, k22, k23, k24, k25, k26, k27, k28, k29, k30, k31] =
+        auth_split_id_hi(msg);
+    let [g0, g1, g2, g3, g4, g5, g6, g7, g8, g9, g10, g11, g12, g13, g14, g15] =
+        auth_split_sig_q0(msg);
+    let [g16, g17, g18, g19, g20, g21, g22, g23, g24, g25, g26, g27, g28, g29, g30, g31] =
+        auth_split_sig_q1(msg);
+    let [g32, g33, g34, g35, g36, g37, g38, g39, g40, g41, g42, g43, g44, g45, g46, g47] =
+        auth_split_sig_q2(msg);
+    let [g48, g49, g50, g51, g52, g53, g54, g55, g56, g57, g58, g59, g60, g61, g62, g63] =
+        auth_split_sig_q3(msg);
     let id = [
-        msg[0], msg[1], msg[2], msg[3], msg[4], msg[5], msg[6], msg[7], msg[8], msg[9], msg[10],
-        msg[11], msg[12], msg[13], msg[14], msg[15], msg[16], msg[17], msg[18], msg[19], msg[20],
-        msg[21], msg[22], msg[23], msg[24], msg[25], msg[26], msg[27], msg[28], msg[29], msg[30],
-        msg[31],
+        k0, k1, k2, k3, k4, k5, k6, k7, k8, k9, k10, k11, k12, k13, k14, k15, k16, k17, k18, k19,
+        k20, k21, k22, k23, k24, k25, k26, k27, k28, k29, k30, k31,
     ];
     let sig = [
-        msg[32], msg[33], msg[34], msg[35], msg[36], msg[37], msg[38], msg[39], msg[40], msg[41],
-        msg[42], msg[43], msg[44], msg[45], msg[46], msg[47], msg[48], msg[49], msg[50], msg[51],
-        msg[52], msg[53], msg[54], msg[55], msg[56], msg[57], msg[58], msg[59], msg[60], msg[61],
-        msg[62], msg[63], msg[64], msg[65], msg[66], msg[67], msg[68], msg[69], msg[70], msg[71],
-        msg[72], msg[73], msg[74], msg[75], msg[76], msg[77], msg[78], msg[79], msg[80], msg[81],
-        msg[82], msg[83], msg[84], msg[85], msg[86], msg[87], msg[88], msg[89], msg[90], msg[91],
-        msg[92], msg[93], msg[94], msg[95],
+        g0, g1, g2, g3, g4, g5, g6, g7, g8, g9, g10, g11, g12, g13, g14, g15, g16, g17, g18, g19,
+        g20, g21, g22, g23, g24, g25, g26, g27, g28, g29, g30, g31, g32, g33, g34, g35, g36, g37,
+        g38, g39, g40, g41, g42, g43, g44, g45, g46, g47, g48, g49, g50, g51, g52, g53, g54, g55,
+        g56, g57, g58, g59, g60, g61, g62, g63,
     ];
     (id, sig)
 }

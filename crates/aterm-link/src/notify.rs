@@ -997,7 +997,7 @@ fn read_bounded_text(path: &Path, max_bytes: usize) -> io::Result<String> {
             format!("{}: exceeds {max_bytes} bytes", path.display()),
         ));
     }
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
     f.take(bound as u64).read_to_end(&mut bytes)?;
     if bytes.len() > max_bytes {
         return Err(io::Error::new(

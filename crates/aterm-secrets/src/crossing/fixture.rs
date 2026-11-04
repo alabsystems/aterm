@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! What the crossing tests serve and read: a vault whose log sits at the legacy bound with a
-//! removal batch past it, and a 0.148-0.151 member's view of what it reads ([`Legacy`]).
+//! removal batch past it, and a 0.148-0.152 member's view of what it reads ([`Legacy`]).
 //!
 //! The vault's founders are F, A, B and C. Its base log ([`Batch::base`]) is the genesis, an
 //! `[everyone]` epoch wrapped to all four, and F's `Name` records up to [`BASE`] records: three
@@ -36,7 +36,7 @@ pub(crate) const RAISED: RecordBudgets = RecordBudgets {
     ..RecordBudgets::PRODUCTION
 };
 
-/// The bound a 0.146-0.151 build holds its log within.
+/// The bound a 0.146-0.152 build holds its log within.
 pub(crate) const LEGACY: RecordBudgets = RecordBudgets {
     held: LEGACY_RECORDS,
     ..RecordBudgets::PRODUCTION
@@ -206,7 +206,7 @@ fn build() -> Batch {
     }
 }
 
-/// A 0.148-0.151 member: a store at the legacy bound ([`LEGACY`]), which takes a records stream
+/// A 0.148-0.152 member: a store at the legacy bound ([`LEGACY`]), which takes a records stream
 /// whole only where it holds at most [`LEGACY_RECORDS`] records, inserting what fits, and reads
 /// standing as those builds do (aterm-agent `fleet_log::log_member_keys`, and a Mac's own
 /// `Revoked` where its log removes it or its newest `[everyone]` epoch leaves it out).

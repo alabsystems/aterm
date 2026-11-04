@@ -505,7 +505,7 @@ fn read_input(file: &str) -> Result<Value> {
     if meta.len() > MAX {
         return Err(invalid("JSON input exceeds 8 MiB"));
     }
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
     opened
         .take(MAX + 1)
         .read_to_end(&mut bytes)

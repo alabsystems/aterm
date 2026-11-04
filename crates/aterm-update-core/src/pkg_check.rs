@@ -308,7 +308,8 @@ fn read_text_bounded(path: &Path, cap: u64, nofollow: bool) -> Option<String> {
     if !meta.is_file() || meta.len() > cap {
         return None;
     }
-    let mut text = String::new();
+    let mut text =
+        String::with_capacity(usize::try_from(meta.len()).unwrap_or(0).saturating_add(1));
     file.take(cap.saturating_add(1))
         .read_to_string(&mut text)
         .ok()?;
@@ -353,16 +354,15 @@ pub fn rfc3339_to_unix(s: &str) -> Option<i64> {
 mod tests {
     use super::*;
 
-    fn scratch(name: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("aterm-pkg-check-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d.join("status.toml")
+    fn scratch(name: &str) -> (aterm_tempfile::TempDir, std::path::PathBuf) {
+        let d = crate::test_scratch_dir(&format!("pkg-{name}"));
+        let status = d.path().join("status.toml");
+        (d, status)
     }
 
     #[test]
     fn the_stamps_are_read_off_the_record() {
-        let p = scratch("stamps");
+        let (_dir, p) = scratch("stamps");
         assert_eq!(Stamps::read(&p), Stamps::default(), "absent file");
         std::fs::write(
             &p,
@@ -411,7 +411,6 @@ mod tests {
         assert_eq!(Stamps::read(&p).last_outcome, None);
         std::fs::write(&p, "not = [valid toml").unwrap();
         assert_eq!(Stamps::read(&p), Stamps::default());
-        let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 
     #[test]
@@ -641,8 +640,8 @@ mod tests {
 
     #[test]
     fn a_lane_slot_is_claimed_once_per_period() {
-        let dir = scratch("claim");
-        let stamp = dir.parent().unwrap().join("machine-apply.stamp");
+        let (dir, _) = scratch("claim");
+        let stamp = dir.path().join("machine-apply.stamp");
         let now = 1_790_000_000_i64;
         let day: u64 = 24 * 60 * 60;
         let day_secs = i64::try_from(day).unwrap();
@@ -659,7 +658,7 @@ mod tests {
         assert!(claim(&stamp, now, day), "an unreadable stamp is claimable");
         std::fs::write(&stamp, format!("{}\n", now + 3 * day_secs)).unwrap();
         assert!(claim(&stamp, now, day), "a far-future stamp is claimable");
-        let nowhere = dir.parent().unwrap().join("absent/dir/x.stamp");
+        let nowhere = dir.path().join("absent/dir/x.stamp");
         assert!(
             claim(&nowhere, now, day),
             "no directory: nothing to hold it"
@@ -667,9 +666,9 @@ mod tests {
         assert!(claim(&nowhere, now, day), "…and nothing refuses either");
         #[cfg(unix)]
         {
-            let target = dir.parent().unwrap().join("symlink-target.txt");
+            let target = dir.path().join("symlink-target.txt");
             std::fs::write(&target, format!("{now}\n")).unwrap();
-            let linked = dir.parent().unwrap().join("linked.stamp");
+            let linked = dir.path().join("linked.stamp");
             std::os::unix::fs::symlink(&target, &linked).unwrap();
             assert!(
                 claim(&linked, now + 60, day),
@@ -681,13 +680,12 @@ mod tests {
                 "symlink target must never be overwritten by claim"
             );
         }
-        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 
     #[test]
     fn a_claim_held_elsewhere_is_not_taken_twice() {
-        let dir = scratch("claim-held");
-        let stamp = dir.parent().unwrap().join("session-pass.stamp");
+        let (dir, _) = scratch("claim-held");
+        let stamp = dir.path().join("session-pass.stamp");
         let held = crate::FileLock::acquire(&stamp.with_extension("lock")).unwrap();
         let started = std::time::Instant::now();
         assert!(!claim(&stamp, 1_790_000_000, PASS_SPACING_SECS));
@@ -697,7 +695,6 @@ mod tests {
         );
         drop(held);
         assert!(claim(&stamp, 1_790_000_000, PASS_SPACING_SECS));
-        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 
     #[test]

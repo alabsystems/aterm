@@ -478,6 +478,14 @@ const CODEX_STEPS: Shape = Shape::Object(&[
                     ("last_token_usage", CODEX_TOKENS),
                 ]),
             ),
+            (
+                "item",
+                Shape::Record(&[("id", Shape::Scalar), ("exit_code", Shape::Scalar)]),
+            ),
+            (
+                "turn_attribution",
+                Shape::Record(&[("turn_trigger", Shape::Scalar)]),
+            ),
         ]),
     ),
 ]);

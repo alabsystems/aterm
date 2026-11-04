@@ -489,37 +489,17 @@ pub fn violated_invariants(m: &Model) -> BTreeSet<&'static str> {
         "{}: duplicate action/invariant name",
         m.name
     );
-    walk!(violated_invariants_on(m, false))
-}
-
-/// [`violated_invariants`] over at most the interpreter's state budget.
-/// # Panics
-/// On an expression the interpreter cannot evaluate (a function-valued model).
-#[must_use]
-#[cfg_attr(trust_verify, trust::skip)]
-pub fn violated_within_budget(m: &Model) -> BTreeSet<&'static str> {
-    if m.invariants.is_empty() {
-        return BTreeSet::new();
-    }
-    walk!(violated_invariants_on(m, true))
+    walk!(violated_invariants_on(m))
 }
 
 #[cfg_attr(trust_verify, trust::skip)]
-fn violated_invariants_on<W: Walker>(
-    m: &Model,
-    w: &W,
-    stop_at_budget: bool,
-) -> BTreeSet<&'static str> {
+fn violated_invariants_on<W: Walker>(m: &Model, w: &W) -> BTreeSet<&'static str> {
     let mut violated: BTreeSet<&'static str> = BTreeSet::new();
     let mut live: Vec<usize> = (0..m.invariants.len()).collect();
     let mut walk = Walk::new(w);
     while walk.pop(w) {
-        let n = walk.expanded;
-        if stop_at_budget && n >= MAX_STATES {
-            return violated;
-        }
         assert!(
-            n < MAX_STATES,
+            walk.expanded < MAX_STATES,
             "{} state space unexpectedly large — tighten bounds",
             m.name
         );
@@ -592,7 +572,27 @@ fn fired_actions_on<W: Walker>(m: &Model, w: &W) -> BTreeSet<&'static str> {
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn violation_steps(m: &Model, actions: &[&str]) -> Vec<Option<bool>> {
-    let watched: Vec<usize> = actions
+    let watched = watched_actions(m, actions);
+    walk!(mutant_report_on(m, &watched, false)).1
+}
+
+/// What the non-vacuity sweep asks of one mutant, in one walk where asking each costs a walk of
+/// its own: the invariants some reachable state violates ([`violated_invariants`], but that past
+/// [`MAX_STATES`] it answers for the states walked so far), and [`violation_steps`] of `actions`.
+/// # Panics
+/// If `m` declares no action named one of `actions`, if its reachable space exceeds [`MAX_STATES`]
+/// while one of them has not yet landed lawful, whose verdict the walk then cannot give, or on an
+/// expression the interpreter cannot evaluate (a function-valued model).
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn mutant_report(m: &Model, actions: &[&str]) -> (BTreeSet<&'static str>, Vec<Option<bool>>) {
+    let watched = watched_actions(m, actions);
+    walk!(mutant_report_on(m, &watched, true))
+}
+
+#[cfg_attr(trust_verify, trust::skip)]
+fn watched_actions(m: &Model, actions: &[&str]) -> Vec<usize> {
+    actions
         .iter()
         .map(|action| {
             m.actions
@@ -600,22 +600,29 @@ pub fn violation_steps(m: &Model, actions: &[&str]) -> Vec<Option<bool>> {
                 .position(|act| act.name == *action)
                 .unwrap_or_else(|| panic!("{} declares no action `{action}`", m.name))
         })
-        .collect();
-    walk!(violation_steps_on(m, &watched))
+        .collect()
 }
 
+/// [`mutant_report`], where `laws` says whether to read the invariants' side at all. The walk stops
+/// early only once neither reader has anything left to learn (every law seen broken, every watched
+/// action landed lawful), or at [`MAX_STATES`] once every watched action has landed lawful: the
+/// laws then answer for the states walked so far.
 #[cfg_attr(trust_verify, trust::skip)]
-fn violation_steps_on<W: Walker>(m: &Model, w: &W, watched: &[usize]) -> Vec<Option<bool>> {
+fn mutant_report_on<W: Walker>(
+    m: &Model,
+    w: &W,
+    watched: &[usize],
+    laws: bool,
+) -> (BTreeSet<&'static str>, Vec<Option<bool>>) {
     let lawful = |env: &W::Env, s: &W::S| upto(m.invariants.len()).all(|i| w.holds(env, s, i));
+    let mut violated: BTreeSet<&'static str> = BTreeSet::new();
+    let mut live: Vec<usize> = if laws {
+        (0..m.invariants.len()).collect()
+    } else {
+        Vec::new()
+    };
     let mut fired = vec![false; watched.len()];
     let mut landed_lawful = vec![false; watched.len()];
-    let verdicts = |fired: &[bool], landed_lawful: &[bool]| -> Vec<Option<bool>> {
-        fired
-            .iter()
-            .zip(landed_lawful)
-            .map(|(&f, &l)| if l { Some(false) } else { f.then_some(true) })
-            .collect()
-    };
     let mut open = watched.len();
     // Whether each action is watched: asked of every action of every lawful state.
     let watches: Vec<bool> = upto(m.actions.len())
@@ -623,14 +630,31 @@ fn violation_steps_on<W: Walker>(m: &Model, w: &W, watched: &[usize]) -> Vec<Opt
         .collect();
     let mut walk = Walk::new(w);
     while walk.pop(w) {
-        assert!(
-            walk.expanded < MAX_STATES,
-            "{} state space unexpectedly large — tighten bounds",
-            m.name
-        );
+        if walk.expanded >= MAX_STATES {
+            assert!(
+                open == 0,
+                "{} state space unexpectedly large — tighten bounds",
+                m.name
+            );
+            break;
+        }
         let st = walk.held.borrow();
         let env = w.env(st);
-        let from_lawful = lawful(&env, st);
+        let before = live.len();
+        live.retain(|&i| {
+            let keep = w.holds(&env, st, i);
+            if !keep {
+                violated.insert(m.invariants[i].name);
+            }
+            keep
+        });
+        if open == 0 && live.is_empty() {
+            break;
+        }
+        // Where every law is still live and none just fell, each held here already.
+        let from_lawful = open > 0
+            && before == live.len()
+            && (live.len() == m.invariants.len() || lawful(&env, st));
         for a in upto(m.actions.len()) {
             let watching = from_lawful && watches[a];
             let made = w.successors(&env, st, a, &mut walk.next);
@@ -647,15 +671,17 @@ fn violation_steps_on<W: Walker>(m: &Model, w: &W, watched: &[usize]) -> Vec<Opt
                             open -= 1;
                         }
                     }
-                    if open == 0 {
-                        return verdicts(&fired, &landed_lawful);
-                    }
                 }
                 walk.reached.number(ns);
             }
         }
     }
-    verdicts(&fired, &landed_lawful)
+    let verdicts = fired
+        .iter()
+        .zip(&landed_lawful)
+        .map(|(&f, &l)| if l { Some(false) } else { f.then_some(true) })
+        .collect();
+    (violated, verdicts)
 }
 
 /// Every state reachable in `m`'s bounded space, each once, in BFS order.
@@ -1690,6 +1716,109 @@ mod tests {
         );
     }
 
+    /// One walk answers what both walks would, whichever is done first: every law fallen does not
+    /// end a walk with a watched action still open (`Far` fires from a lawful state only after
+    /// `Unbroken` fell), nor every watched action landed lawful one with a law still to fall
+    /// (`Deep`, past `Count`'s first lawful landing); and a step from a state a law already fell
+    /// counts for nothing (`Three`, from a state past the one where `Low` fell).
+    #[test]
+    fn a_mutant_report_is_the_laws_and_the_steps_in_one_walk() {
+        let laws_first = crate::ty_model! {
+            LawsFirst {
+                var broke = 0;
+                var n = 0;
+                action Count when (n <= 1) { n = n + 1; }
+                action Break when (broke == 0) { broke = 1; }
+                action Far when (n == 2 && broke == 0) { n = 0; }
+                invariant Unbroken: broke == 0;
+            }
+        };
+        let steps_first = crate::ty_model! {
+            StepsFirst {
+                var broke = 0;
+                var n = 0;
+                action Count when (n <= 2) { n = n + 1; }
+                action Break when (broke == 0) { broke = 1; }
+                invariant Unbroken: broke == 0;
+                invariant Deep: n <= 2;
+            }
+        };
+        let past_the_fall = crate::ty_model! {
+            PastTheFall {
+                var n = 0;
+                action One when (n == 0) { n = 1; }
+                action Two when (n == 1) { n = 2; }
+                action Three when (n == 2) { n = 3; }
+                invariant Low: n == 0;
+            }
+        };
+        assert_eq!(
+            mutant_report(&past_the_fall, &["Three"]),
+            (BTreeSet::from(["Low"]), vec![None])
+        );
+        assert_eq!(
+            mutant_report(&laws_first, &["Far"]),
+            (BTreeSet::from(["Unbroken"]), vec![Some(false)])
+        );
+        assert_eq!(
+            mutant_report(&steps_first, &["Count"]),
+            (BTreeSet::from(["Deep", "Unbroken"]), vec![Some(false)])
+        );
+        for m in [
+            ring_model(),
+            subscribe_model(),
+            config_catalog_snapshot_model(),
+            laws_first,
+            steps_first,
+            past_the_fall,
+        ] {
+            let actions: Vec<&str> = m.actions.iter().map(|a| a.name).collect();
+            for b in m.mutant_dials().into_iter().chain([0]) {
+                let mutant = with_buggy(&m, b);
+                for watched in [&actions[..], &actions[..1], &[]] {
+                    assert_eq!(
+                        mutant_report(&mutant, watched),
+                        (
+                            violated_invariants(&mutant),
+                            violation_steps(&mutant, watched)
+                        ),
+                        "{} at Buggy = {b}, watching {watched:?}",
+                        m.name
+                    );
+                }
+            }
+        }
+    }
+
+    /// Past the budget a walk answers for what it walked, unless a watched action has no verdict
+    /// yet, which it cannot give.
+    fn runaway() -> Model {
+        crate::ty_model! {
+            Runaway {
+                var n = 0;
+                var broke = 0;
+                action Up { n = n + 1; }
+                action Break when (broke == 0) { broke = 1; }
+                invariant Unbroken: broke == 0;
+                invariant Forever: 0 <= n;
+            }
+        }
+    }
+
+    #[test]
+    fn a_mutant_report_past_the_budget_answers_for_what_it_walked() {
+        assert_eq!(
+            mutant_report(&runaway(), &["Up"]),
+            (BTreeSet::from(["Unbroken"]), vec![Some(false)])
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "state space unexpectedly large")]
+    fn a_mutant_report_past_the_budget_with_a_step_open_cannot_answer() {
+        let _ = mutant_report(&runaway(), &["Break"]);
+    }
+
     #[test]
     fn bmc_fired_is_bmc_and_fired_actions_in_one_walk() {
         for m in [
@@ -1783,8 +1912,8 @@ mod tests {
             m.name
         );
         assert_eq!(
-            violated_invariants_on(m, &c, false),
-            violated_invariants_on(m, &by, false),
+            violated_invariants_on(m, &c),
+            violated_invariants_on(m, &by),
             "{}: violated",
             m.name
         );

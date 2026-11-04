@@ -1203,7 +1203,7 @@ impl Drop for AnyHostsGuard {
 #[test]
 fn host_any_follows_a_spawned_workers_sid_to_its_mac() {
     static DIALLED: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
-    let tmp = aterm_tempfile::tempdir().unwrap();
+    let tmp = crate::test_scratch_dir("any-follow");
     let _guard = AnyHostsGuard::set(tmp.path().join("driven-any-hosts.tsv"));
 
     fn fleet_survey(_: &survey::FleetAsk<'_>) -> Result<survey::FleetRead, survey::FleetRefused> {
@@ -1353,7 +1353,7 @@ fn host_any_follows_a_spawned_workers_sid_to_its_mac() {
 /// peers list the same unrecorded sid.
 #[test]
 fn host_any_table_hardens_injection_permissions_recorded_bindings_and_ambiguous_sids() {
-    let tmp = aterm_tempfile::tempdir().unwrap();
+    let tmp = crate::test_scratch_dir("any-harden");
     let table_path = tmp.path().join("driven-any-hosts.tsv");
     let _guard = AnyHostsGuard::set(table_path.clone());
 

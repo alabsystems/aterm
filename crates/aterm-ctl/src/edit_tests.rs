@@ -372,9 +372,8 @@ fn edit_and_await_edit_over_a_real_socket() {
         }
     }
 
-    let dir = std::env::temp_dir().join(format!("aterm-ctl-edit-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("private dir");
+    let scratch = crate::test_scratch_dir("edit");
+    let dir = scratch.path();
     std::fs::write(dir.join("mock.sock.token"), "deadbeef\n").expect("token");
     let sock = dir.join("mock.sock");
     let listener = UnixListener::bind(&sock).expect("bind the mock window");
@@ -419,7 +418,6 @@ fn edit_and_await_edit_over_a_real_socket() {
     assert_eq!(heard[5], "@s-ab await edit ticket=9 timeout=600000\n");
     assert_eq!(heard[6..8], probe);
     assert_eq!(heard[8], "@s-ab await edit ticket=9 timeout=600000\n");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// NEGATIVE CONTROL: `await_over` must reject unsendable keys or fallback URIs before dialing and

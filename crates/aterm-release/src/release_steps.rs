@@ -13,7 +13,7 @@ use crate::ledger::{BYTE_EXACT, GitCli, GitRunner};
 use crate::provision::{AskWords, Finding};
 use crate::release::{
     AfterCut, Answer, Artifact, Backend, Built, Candidate, CutState, EngineNow, EngineRows, Facts,
-    Prover, RELEASE_COMMAND, Ran, Refusal, Reservation, Step,
+    Prover, RELEASE_COMMAND, Ran, Refusal, Reservation, StageTarget, Step,
 };
 
 #[path = "release_scanner_tools.rs"]
@@ -1275,8 +1275,13 @@ impl Real {
             })
     }
 
-    fn stage_run(&mut self, c: &Candidate, prover: &Prover) -> Result<Ran, Refusal> {
-        self.stage_run_with(c, prover, Self::source_export_preflight)
+    fn stage_run(
+        &mut self,
+        c: &Candidate,
+        prover: &Prover,
+        target: StageTarget,
+    ) -> Result<Ran, Refusal> {
+        self.stage_run_with(c, prover, Self::source_export_preflight, target)
     }
 
     fn source_export_preflight(&mut self, c: &Candidate) -> Result<(), Refusal> {
@@ -1309,6 +1314,7 @@ impl Real {
         c: &Candidate,
         prover: &Prover,
         source_scan: impl FnOnce(&mut Self, &Candidate) -> Result<(), Refusal>,
+        target: StageTarget,
     ) -> Result<Ran, Refusal> {
         // Scan the exact export before compiling. The ordinary stage still runs
         // its guards and public build; this dry run grants no reusable verdict.
@@ -1319,7 +1325,7 @@ impl Real {
         self.compile_tests(c, prover)?;
         self.compat_check(c)?;
         self.engine_sync()?;
-        let (mut cmd, handed) = self.stage_command(&c.commit, prover);
+        let (mut cmd, handed) = self.stage_command(&c.commit, prover, target);
         if let Ok(mut file) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -1328,6 +1334,20 @@ impl Real {
             let _ = writeln!(file, "{handed}");
         }
         let ran = self.logged(self.step, &mut cmd);
+        if target == StageTarget::Local && ran.code == 0 {
+            let path = self.repo.join("publish/.out/attestation.json");
+            let qualified = crate::gates::read_bounded_string(&path, 16 << 20)
+                .is_ok_and(|text| attestation_qualifies(&text, &c.commit));
+            if !qualified {
+                return Err(Refusal::new(
+                    "the local export check returned success without a complete passing attestation for this candidate",
+                    format!(
+                        "read {} and the stage log before qualifying again",
+                        path.display()
+                    ),
+                ));
+            }
+        }
         self.engine_sync()?;
         Ok(ran)
     }
@@ -1439,10 +1459,18 @@ impl Real {
     /// The stage step's `pub stage aterm --commit <commit> --repo-path <repo>`, a [`Real::child`]
     /// with `prover`'s bin, handed this cutter for its transforms only as `commit`'s own build
     /// ([`hand_transforms_cutter`], whose line it returns beside it).
-    fn stage_command(&self, commit: &str, prover: &Prover) -> (Command, String) {
+    fn stage_command(
+        &self,
+        commit: &str,
+        prover: &Prover,
+        target: StageTarget,
+    ) -> (Command, String) {
         let mut cmd = self.child(self.engine.join("bin/pub"), Some(prover));
         cmd.args(["stage", "aterm", "--commit", commit, "--repo-path"])
             .arg(&self.repo);
+        if target == StageTarget::Local {
+            cmd.arg("--dry-run");
+        }
         let handed = if crate::cutter::running()
             .is_ok_and(|built| crate::accepted_measure::policy_cutter(&self.git(), commit, built))
         {
@@ -3940,8 +3968,13 @@ impl Backend for Real {
         blocks
     }
 
-    fn cut_gates(&mut self, c: &Candidate, creds: &Path) -> Vec<Refusal> {
-        let gates = crate::publish::pre_publish_gates(&self.repo, &c.version, creds);
+    fn cut_gates(
+        &mut self,
+        c: &Candidate,
+        creds: &Path,
+        kind: crate::publish::CutKind,
+    ) -> Vec<Refusal> {
+        let gates = crate::publish::pre_cut_gates(&self.repo, &c.version, creds, kind);
         let mut found: Vec<Refusal> = gates
             .into_iter()
             .map(|(gate, why)| cut_refusal(gate, &why))
@@ -4176,8 +4209,13 @@ impl Backend for Real {
         Ok(ran)
     }
 
-    fn stage(&mut self, c: &Candidate, prover: &Prover) -> Result<Ran, Refusal> {
-        self.stage_run(c, prover)
+    fn stage(
+        &mut self,
+        c: &Candidate,
+        prover: &Prover,
+        target: StageTarget,
+    ) -> Result<Ran, Refusal> {
+        self.stage_run(c, prover, target)
     }
 
     fn publish(&mut self, prover: &Prover) -> Result<Ran, Refusal> {
@@ -4353,9 +4391,9 @@ pub fn engine_rows_in(mappings: &str, commit: Option<&str>) -> EngineRows {
     }
 }
 
-/// A promotable attestation of `commit`: its source is `commit`, `public_clone` passed (or was skipped on a source-only repo), and it names the engine commit that staged it ([`attested_engine`]), which promote also requires; one that names none is staged again rather than carried to a publish that refuses it.
+/// A checked export of `commit`, including a full public clone check, its candidate tree and the checking engine.
 #[must_use]
-pub fn attestation_promotes(json: &str, commit: &str) -> bool {
+pub fn attestation_qualifies(json: &str, commit: &str) -> bool {
     let Ok(a) = aterm_json::from_str::<aterm_json::Value>(json) else {
         return false;
     };
@@ -4371,6 +4409,29 @@ pub fn attestation_promotes(json: &str, commit: &str) -> bool {
     source == Some(commit)
         && (gate == Some("pass") || (gate == Some("skipped") && mode == Some("source-only")))
         && attested_engine(json).is_some()
+        && a.get("staging")
+            .and_then(|s| s.get("candidate_rev"))
+            .and_then(aterm_json::Value::as_str)
+            .is_some_and(|s| !s.is_empty())
+        && a.get("export")
+            .and_then(|e| e.get("tree"))
+            .and_then(aterm_json::Value::as_str)
+            .is_some_and(|s| !s.is_empty())
+}
+
+/// A checked export whose candidate was also attested on the remote staging tier.
+#[must_use]
+pub fn attestation_promotes(json: &str, commit: &str) -> bool {
+    if !attestation_qualifies(json, commit) {
+        return false;
+    }
+    let Ok(a) = aterm_json::from_str::<aterm_json::Value>(json) else {
+        return false;
+    };
+    let stage = &a["staging"];
+    stage["attested_rev"]
+        .as_str()
+        .is_some_and(|attested| Some(attested) == stage["candidate_rev"].as_str())
 }
 
 /// The engine commit an attestation names (`engine.commit`): the engine that staged it.
@@ -5685,7 +5746,9 @@ mod tests {
         let attestation = |gate: &str, mode: &str| {
             format!(
                 "{{\"source\":{{\"commit\":\"{a}\"}},\"guards\":{{\"public_clone\":\"{gate}\"}},\
-                 \"release_mode\":\"{mode}\",\"engine\":{{\"commit\":\"{b}\"}}}}"
+                 \"release_mode\":\"{mode}\",\"engine\":{{\"commit\":\"{b}\"}},\
+                 \"staging\":{{\"candidate_rev\":\"{b}\",\"attested_rev\":\"{b}\"}},\
+                 \"export\":{{\"tree\":\"{a}\"}}}}"
             )
         };
         assert!(attestation_promotes(&attestation("pass", "full"), &a));
@@ -5703,6 +5766,28 @@ mod tests {
             attestation("pass", "full").replace(&format!(",\"engine\":{{\"commit\":\"{b}\"}}"), "");
         assert_eq!(attested_engine(&engineless), None);
         assert!(!attestation_promotes(&engineless, &a));
+        let private = attestation("pass", "full").replace(
+            &format!("\"attested_rev\":\"{b}\""),
+            "\"attested_rev\":null",
+        );
+        assert!(attestation_qualifies(&private, &a));
+        assert!(!attestation_promotes(&private, &a));
+        for invalid in [
+            private.replace(
+                &format!("\"candidate_rev\":\"{b}\""),
+                "\"candidate_rev\":null",
+            ),
+            private.replace(&format!("\"tree\":\"{a}\""), "\"tree\":null"),
+            private.replace("\"public_clone\":\"pass\"", "\"public_clone\":\"skipped\""),
+        ] {
+            assert!(!attestation_qualifies(&invalid, &a), "{invalid}");
+            assert!(!attestation_promotes(&invalid, &a), "{invalid}");
+        }
+        let mismatch = attestation("pass", "full").replace(
+            &format!("\"attested_rev\":\"{b}\""),
+            &format!("\"attested_rev\":\"{a}\""),
+        );
+        assert!(!attestation_promotes(&mismatch, &a));
     }
 
     #[test]
@@ -5963,7 +6048,7 @@ mod tests {
             Real::new(&repo, Some(&dir.path().join("missing-engine")), true, false).unwrap();
         real.home = dir.path().join("empty-home");
         let scanner_failure = real
-            .stage_run_with(&candidate, &prover, |_, _| Ok(()))
+            .stage_run_with(&candidate, &prover, |_, _| Ok(()), StageTarget::Remote)
             .unwrap_err();
         assert!(
             scanner_failure
@@ -5973,7 +6058,7 @@ mod tests {
         assert!(real.scanner_tools.is_none());
         real.scanner_probe = |_| Ok(scanner_tools::test_output());
         let unready = real
-            .stage_run_with(&candidate, &prover, |_, _| Ok(()))
+            .stage_run_with(&candidate, &prover, |_, _| Ok(()), StageTarget::Remote)
             .unwrap_err();
         assert!(
             unready.why.starts_with("source signing preflight:"),
@@ -5987,10 +6072,15 @@ mod tests {
                 expected = expected.could_not_run();
             }
             let failure = real
-                .stage_run_with(&candidate, &prover, |_, given| {
-                    assert_eq!(given.commit, candidate.commit);
-                    Err(expected.clone())
-                })
+                .stage_run_with(
+                    &candidate,
+                    &prover,
+                    |_, given| {
+                        assert_eq!(given.commit, candidate.commit);
+                        Err(expected.clone())
+                    },
+                    StageTarget::Remote,
+                )
                 .unwrap_err();
             assert_eq!(failure.why, expected.why);
             assert_eq!(failure.detail, expected.detail);
@@ -6002,7 +6092,7 @@ mod tests {
             );
         }
         let failure = real
-            .stage_run_with(&candidate, &prover, |_, _| Ok(()))
+            .stage_run_with(&candidate, &prover, |_, _| Ok(()), StageTarget::Remote)
             .unwrap_err();
         assert!(
             failure
@@ -6030,7 +6120,8 @@ mod tests {
         real.compile_tests(&candidate, &prover).unwrap();
         let report = real.logs.canonicalize().unwrap().join("scanner-tools.json");
         for cmd in [
-            real.stage_command(&candidate.commit, &prover).0,
+            real.stage_command(&candidate.commit, &prover, StageTarget::Remote)
+                .0,
             real.publish_command(&prover),
         ] {
             assert!(cmd.get_envs().any(
@@ -6142,7 +6233,7 @@ mod tests {
             source: "the store".into(),
         };
         let commit = "c".repeat(40);
-        let (stage, handed) = real.stage_command(&commit, &prover);
+        let (stage, handed) = real.stage_command(&commit, &prover, StageTarget::Remote);
         assert_eq!(
             stage.get_program(),
             std::ffi::OsStr::new("/other/publication/bin/pub")
@@ -6157,6 +6248,12 @@ mod tests {
                 .chain([repo])
                 .collect::<Vec<_>>()
         );
+        let local = real.stage_command(&commit, &prover, StageTarget::Local).0;
+        let local_args: Vec<_> = local.get_args().collect();
+        let mut expected_local = args.clone();
+        expected_local.push(std::ffi::OsStr::new("--dry-run"));
+        assert_eq!(local_args, expected_local);
+        assert!(!local_args.contains(&std::ffi::OsStr::new("--no-check")));
         let envs: Vec<_> = stage.get_envs().collect();
         for kv in [
             ("PUBLICATION_ENGINE", Some("/other/publication")),

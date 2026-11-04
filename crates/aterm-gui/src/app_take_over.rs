@@ -677,8 +677,8 @@ impl App {
 
     /// Whether System State is the active view of `wid`: its buttons hold the
     /// person's own acts — an Apply that admits a setup plan as the window's
-    /// own, and the Permissions rows' `Turn On…` — which only a person's press
-    /// may take (`docs/DESIGN-system-state-2026-10-21.md` §6, the standing yes).
+    /// own, a Permissions row's `Open …` and the vault row's `Turn On Sync` —
+    /// which only a person's press may take (`docs/DESIGN-system-state-2026-10-21.md` §6, the standing yes).
     pub(crate) fn system_state_active_in(&self, wid: WindowId) -> bool {
         self.active_native_view(wid).is_some_and(|(instance, _)| {
             matches!(

@@ -1238,7 +1238,8 @@ pub(crate) mod scripts {
         ]
     }
 
-    /// PUBLISH: a resend, pipelined publishes, the reserved and malformed subjects, the ack half.
+    /// PUBLISH: a resend, pipelined publishes, the reserved and malformed subjects, the ack half,
+    /// and the gap fence on a connection that asked for it.
     pub(crate) fn publishing() -> Vec<Step> {
         let mut s = vec![
             Step::Dial(1),
@@ -1302,6 +1303,14 @@ pub(crate) mod scripts {
             Step::End(1),
             Step::Dial(2),
             Step::Send(2, Request::Hello),
+            // The fence, on the connection that asks for it (connection 1 never did, so its
+            // refused publishes above fence nothing): a refused publish holds back the next of
+            // its producer until the lift, and the next lands after it.
+            Step::Send(2, Request::FenceGaps),
+            Step::Send(2, publish(P, seq(1, 7), "no-slash", "x")),
+            Step::Send(2, publish(P, seq(1, 8), LANE, "fenced")),
+            Step::Send(2, Request::ClearGapFences),
+            Step::Send(2, publish(P, seq(1, 8), LANE, "lifted")),
         ];
         s.extend(look(2));
         s
@@ -1993,12 +2002,14 @@ fn every_script() -> [(&'static str, Vec<Step>); 9] {
     ]
 }
 
-/// **A SEALED LOG ANSWERS AS A PLAINTEXT ONE**: every script on every tier the host serves, the
-/// real broker's log sealed at rest as `aterm link broker` opens one with its `rest.key`, retained
-/// by aterm's rules. The seal lives below everything a client can see, and each run's files show it
-/// was there: a `.seal`, and no subject in the clear in the log or a sidecar. NEGATIVE CONTROLS: the
-/// plaintext arm of a script has no `.seal` and holds its subjects, and a model that forgets its
-/// dedup is still caught through the keyed arm, so the arm compares.
+/// **A SEALED LOG ANSWERS AS A PLAINTEXT ONE**: every hand-written script, each where its
+/// plaintext run plays it ([`every_script`] on every tier the host serves, [`long_scripts`] on
+/// Relaxed), the real broker's log sealed at rest as `aterm link broker` opens one with its
+/// `rest.key`, retained by aterm's rules. The seal lives below everything a client can see, and
+/// each run's files show it was there: a `.seal`, and no subject in the clear in the log or a
+/// sidecar. NEGATIVE CONTROLS: the plaintext arm of a script has no `.seal` and holds its
+/// subjects, and a model that forgets its dedup, or its subject budget, is still caught through
+/// the keyed arm, so the arm compares, at the budget too.
 #[test]
 fn a_sealed_log_answers_every_script_as_the_model_does() {
     const KEY: [u8; 32] = *b"conform-broker-at-rest-key-32-by";
@@ -2011,22 +2022,22 @@ fn a_sealed_log_answers_every_script_as_the_model_does() {
             script,
         )
     };
-    let mut failed = Vec::new();
-    for tier in [Tier::Strict, Tier::Ordered, Tier::Relaxed]
+    let runs = [Tier::Strict, Tier::Ordered, Tier::Relaxed]
         .into_iter()
         .filter(|&tier| served_here(tier))
-    {
-        for (name, script) in every_script() {
-            match arm(tier, Some(KEY), ArmMutant::None, &script) {
-                Err(e) => failed.push(format!("{name}: {e}")),
-                Ok(real) if !real.bound_at_rest() => {
-                    failed.push(format!("{name} at {tier}: no `.seal`: nothing sealed it"));
-                }
-                Ok(real) => {
-                    let holding = real.holding_subjects();
-                    if !holding.is_empty() {
-                        failed.push(format!("{name} at {tier}: in the clear in {holding:?}"));
-                    }
+        .flat_map(|tier| every_script().map(|(name, script)| (tier, name, script)))
+        .chain(long_scripts().map(|(name, script)| (Tier::Relaxed, name, script)));
+    let mut failed = Vec::new();
+    for (tier, name, script) in runs {
+        match arm(tier, Some(KEY), ArmMutant::None, &script) {
+            Err(e) => failed.push(format!("{name}: {e}")),
+            Ok(real) if !real.bound_at_rest() => {
+                failed.push(format!("{name} at {tier}: no `.seal`: nothing sealed it"));
+            }
+            Ok(real) => {
+                let holding = real.holding_subjects();
+                if !holding.is_empty() {
+                    failed.push(format!("{name} at {tier}: in the clear in {holding:?}"));
                 }
             }
         }
@@ -2054,18 +2065,33 @@ fn a_sealed_log_answers_every_script_as_the_model_does() {
         .is_err(),
         "CONTROL: the keyed arm answered a forgetful model's resend as astream answers it"
     );
+    assert!(
+        arm(
+            Tier::Relaxed,
+            Some(KEY),
+            ArmMutant::PublishPastTheBudget,
+            &long::budgets()
+        )
+        .is_err(),
+        "CONTROL: the keyed arm answered a model with no subject budget as astream answers it"
+    );
+}
+
+/// The scripts that need a long log ([`long`]), played on Relaxed alone: the bounds are the same
+/// on every tier, and a Strict flush per batch would only cost time.
+fn long_scripts() -> [(&'static str, Vec<Step>); 2] {
+    [
+        ("budgets", long::budgets()),
+        ("scan bound", long::scan_bound()),
+    ]
 }
 
 /// **THE MODEL HOLDS ASTREAM'S SUBJECT BUDGET AND FETCH SCAN BOUND**, on a
-/// log long enough to reach each (Relaxed: the bounds are the same on every
-/// tier, and a Strict flush per batch would only cost time).
+/// log long enough to reach each, on Relaxed ([`long_scripts`]).
 #[test]
 fn the_model_holds_astreams_subject_budget_and_fetch_scan_bound() {
     let mut failed = Vec::new();
-    for (name, script) in [
-        ("budgets", long::budgets()),
-        ("scan bound", long::scan_bound()),
-    ] {
+    for (name, script) in long_scripts() {
         if let Err(e) = run(Tier::Relaxed, ArmMutant::None, &script) {
             failed.push(format!("{name}: {e}"));
         }
@@ -2311,6 +2337,16 @@ fn drift() -> Vec<(ArmMutant, Vec<Step>, &'static str)> {
             ArmMutant::Unretained,
             scripts::publishing(),
             "a retained broker's Hello with no retention",
+        ),
+        (
+            ArmMutant::NoGapFence,
+            scripts::publishing(),
+            "a publish refused behind its producer's refused one",
+        ),
+        (
+            ArmMutant::FenceUnasked,
+            scripts::publishing(),
+            "a publish fenced on a connection that never asked",
         ),
     ]
 }

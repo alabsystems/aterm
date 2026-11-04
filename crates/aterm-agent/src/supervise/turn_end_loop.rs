@@ -10,11 +10,11 @@ use super::super::policy::sleeps::InTurn;
 use super::super::policy::trace::{Outcome as TraceOutcome, TraceStep};
 use super::super::policy::turn_end::{
     ANSWERS_OFF, AccountAnswer, AccountAt, CREDITS_HOLD_MODEL_TOLD, CREDITS_HOLD_TOLD, Composer,
-    ComposerRead, Conversation, CreditsCarry, GoAheadVerdict, LOGIN_SHARED_LOOK, MENU_DIVERTS,
-    OWN_WORDS_STAND, ProbeGate, RULE_ACCOUNT, RULE_INPUT_LOST, RULE_LAND, RULE_LEFT, RULE_LOGIN,
-    RULE_USAGE_PROBE, RecordTurn, Restart, RestartAsk, TRY_ANSWER_SLACK, WAKE_KEPT, account_hold,
-    act_turn_work, budget_frees, conversation_mark, decide_turn_end, decide_turn_end_traced,
-    done_row_work, is_wait_resume, outage_of, reads_conversation,
+    ComposerRead, Conversation, CreditsCarry, GoAheadVerdict, LOGIN_SHARED_LOOK, OWN_WORDS_STAND,
+    ProbeGate, RULE_ACCOUNT, RULE_INPUT_LOST, RULE_LAND, RULE_LEFT, RULE_LOGIN, RULE_USAGE_PROBE,
+    RecordTurn, Restart, RestartAsk, TRY_ANSWER_SLACK, WAKE_KEPT, account_hold, act_turn_work,
+    budget_frees, conversation_mark, decide_turn_end, decide_turn_end_traced, done_row_work,
+    is_wait_resume, outage_of, reads_conversation,
 };
 use super::super::tap_clock::{TapClock, TapSays, Timed, UsageWindow, timed};
 use super::wall_confirm::{Check, LeftRead};
@@ -82,7 +82,7 @@ fn draft_holds(composer: &Composer, action: &TurnEndAction) -> bool {
     let told = |why: &str| matches!(action, TurnEndAction::Escalate { reason } if reason == why);
     match composer {
         Composer::Own => told(OWN_WORDS_STAND),
-        Composer::Diverted => told(MENU_DIVERTS),
+        Composer::Diverted(by) => told(by.reason()),
         Composer::Unknown => matches!(action, TurnEndAction::Nothing),
         Composer::Absent | Composer::Empty | Composer::Placeholder(_) | Composer::Typed => false,
     }
@@ -462,6 +462,18 @@ pub(super) fn echo_of(reader: &dyn ScreenReader, screen: &Screen, text: &str) ->
     }
 }
 
+/// WHAT A GLYPH'S CELL HAS TOLD OF A DRAFT THE LOOP'S READS FOUND ([`Session::draft_seen`],
+/// [`Session::cell_saw`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DraftCell {
+    /// No read has asked it: the rows found this text, and a cell's first word may yet agree.
+    Unasked,
+    /// A read asked and it could not say, and no read has said typed since.
+    Unsaid,
+    /// A read said typed.
+    Typed,
+}
+
 /// A line this loop wrote and did not submit ([`Session::left_line_look`]).
 #[derive(Debug, Clone)]
 pub(super) struct LeftLine {
@@ -805,6 +817,7 @@ impl<C: Ctl> Session<'_, C> {
             approvals::relaunch_waiting_in(body, self.setup.sid.as_deref()).or(journaled.waiting)
         {
             self.restart_run = Some((fallback.word(), made));
+            self.restart_floor = self.restart_floor.max(made);
         }
         let Some(open) = approvals::open_model_switch_in(body, self.setup.sid.as_deref()) else {
             return;
@@ -1272,29 +1285,34 @@ impl<C: Ctl> Session<'_, C> {
         );
     }
 
-    /// When a person last typed into the session ([`Self::person_ago`]): their last key, or the
-    /// draft a read saw, unless that draft is this loop's own words ([`Self::own_words`]), which are
-    /// no person's however late its program draws them.
+    /// When a person last typed into the session ([`Self::person_ago`]): their last key, the draft a
+    /// read saw, unless that draft is this loop's own words ([`Self::own_words`]), which are no
+    /// person's however late its program draws them, or the read that found a held draft gone
+    /// ([`Self::draft_left`]).
     pub(super) fn person_at(&self) -> Option<Instant> {
         let draft = self
             .draft_seen
             .as_ref()
-            .filter(|(draft, _)| !self.own_words(draft))
-            .map(|(_, at)| *at);
-        self.person.max(draft)
+            .filter(|(draft, ..)| !self.own_words(draft))
+            .map(|(_, at, _)| *at);
+        self.person.max(draft).max(self.draft_left)
     }
 
     /// WHETHER `shown` (A DRAFT A READ SAW) IS THIS LOOP'S OWN WORDS: the line it wrote and left
     /// ([`OwnLine`]) or holds in [`Custody`], whitespace aside, or a line headed by aterm's own
-    /// upgrade words (`upgrade::own_words`). No person typed them, so no person's grace waits on
-    /// them; the policy's draft step finishes the loop's own act or asks about it. Text that is only
+    /// upgrade words (`upgrade::own_words`). No person's grace waits on them while they stand; the
+    /// policy's draft step finishes the loop's own act or asks about it. Text that is only
     /// a part of such a line is not among them: a person's draft can be (a `k`, a `keep going` under
     /// a longer line left, a `[a` before an upgrade's head), and a line still drawing is the echo's
     /// to wait out (`Echo::Arriving`). A person's key still holds what stands (`Session::person`),
     /// and words a person joined to such a line make it none of these ([`OwnLine::joined_in`]).
     fn own_words(&self, shown: &str) -> bool {
-        crate::harness::upgrade::own_words(shown)
-            || self.own_line.as_ref().is_some_and(|own| own.is(shown))
+        crate::harness::upgrade::own_words(shown) || self.own_line_shown(shown)
+    }
+
+    /// Whether `shown` is the line this loop wrote and left or holds in [`Custody`], whitespace aside.
+    pub(super) fn own_line_shown(&self, shown: &str) -> bool {
+        self.own_line.as_ref().is_some_and(|own| own.is(shown))
             || self.custody.as_ref().is_some_and(|c| c.is(shown))
     }
 
@@ -2606,6 +2624,13 @@ impl<C: Ctl> Session<'_, C> {
         let Some((caret, lines)) = composer else {
             return Some(false);
         };
+        // THE PROMPT-HISTORY SEARCH OVER THE COMPOSER: its row shows the search's match, nothing,
+        // or a suggestion, none of them a draft Enter would send or an empty composer to type into,
+        // so no read says what stands until the search goes (the policy reads it as
+        // `Composer::Diverted`).
+        if self.reader(&screen.rows).history_search(&screen.rows) {
+            return None;
+        }
         if lines.first().is_none_or(String::is_empty) {
             return Some(lines.iter().skip(1).any(|l| !l.is_empty()));
         }
@@ -2621,7 +2646,7 @@ impl<C: Ctl> Session<'_, C> {
         })?;
         match crate::supervise::screen::cell_is_placeholder(&cell, hint_fg)? {
             false => Some(true),
-            true if cursor_home(*caret, lines, screen) => Some(false),
+            true if screen_cursor_home(*caret, lines, screen) => Some(false),
             true => None,
         }
     }
@@ -2629,7 +2654,13 @@ impl<C: Ctl> Session<'_, C> {
     /// [`Self::composer_draft`] of `reading`'s composer, and what its glyph's cell told is what the
     /// loop saw ([`Self::cell_saw`]): the read a decision makes ([`Self::composer_read`]) and a break
     /// of the agent's own background work (`Session::host_steps_in_background`), where what the
-    /// host's guards hold ([`Self::occupancy_guards`]) is no decision's to set.
+    /// host's guards hold ([`Self::occupancy_guards`]) is no decision's to set. Under the
+    /// prompt-history search the composer's row is the search's, no text of the composer's, so this
+    /// read records nothing of it: what the screen's own read made of its rows stands
+    /// (`Session::see_draft`, which lets a draft seen go where the row shows other text, marking its
+    /// leaving where a hold stood on it). Else the search's match, or the empty row under a query
+    /// matching nothing, would be a draft seen at this read, holding a grace nobody's key started
+    /// and, empty, holding the host's guards after the search goes until text next shows.
     pub(super) fn composer_typed(
         &mut self,
         reading: &aterm_phase::Reading,
@@ -2642,7 +2673,9 @@ impl<C: Ctl> Session<'_, C> {
             reader.placeholder_fg(),
             screen,
         );
-        self.cell_saw(reading.composer.as_ref(), typed);
+        if !reader.history_search(&screen.rows) {
+            self.cell_saw(reading.composer.as_ref(), typed);
+        }
         typed
     }
 
@@ -2670,41 +2703,45 @@ impl<C: Ctl> Session<'_, C> {
     /// WHAT THE GLYPH'S CELL SAW ([`Self::composer_typed`]) of the composer's text, `typed` its verdict.
     /// Typed text is a draft seen (`Session::draft_seen`) from this read on, the same text keeping
     /// its first sight: else the policy, which reads the same cell, would judge a draft no grace
-    /// holds, and its draft step would send it. Text the cell reads as a grey suggestion or a hint,
-    /// the cursor home on it, is no draft, whatever an earlier read took it for (a read with the
-    /// cursor past it, or over a row its redraw had not yet cleared): the draft seen goes, so neither
-    /// the policy's grace nor the host's guards hold it. A read that could not say changes no draft
-    /// seen, and with none seen its text stands as one: the host's guards hold as the door does, which
-    /// reads no verdict as a draft (`Session::door_draft`). Whether a draft seen is a person's is
+    /// holds, and its draft step would send it. The exception is text the first read to ask could not
+    /// say of ([`DraftCell::Unsaid`]): a read saying typed is the first sign of a person's text there,
+    /// as a transcript's last word is (`Self::composer_draft`), and its grace starts at that read.
+    /// Text the cell reads as a grey suggestion or a hint, the cursor home on it, is no draft, whatever
+    /// an earlier read took it for (a read with the cursor past it, or over a row its redraw had not
+    /// yet cleared): the draft seen goes, so neither the policy's grace nor the host's guards hold it.
+    /// A read that could not say keeps a draft seen and the first sight of one a read has said typed,
+    /// and with none seen its text stands as one: the host's guards hold as the door does, which reads
+    /// no verdict as a draft (`Session::door_draft`). Whether a draft seen is a person's is
     /// [`Self::person_at`]'s to say.
     fn cell_saw(&mut self, composer: Option<&(usize, Vec<String>)>, typed: Option<bool>) {
         let Some((_, lines)) = composer else {
             return;
         };
         let text = lines.join("\n");
-        match typed {
-            Some(true) => {
-                let at = match self.draft_seen.take() {
-                    Some((seen, at)) if seen == text => at,
-                    _ => self.fx.mono(),
-                };
-                self.draft_seen = Some((text, at));
+        self.draft_seen = match (typed, self.draft_seen.take()) {
+            (Some(true), Some((seen, at, DraftCell::Unasked | DraftCell::Typed)))
+                if seen == text =>
+            {
+                Some((seen, at, DraftCell::Typed))
             }
-            Some(false) if !text.is_empty() => self.draft_seen = None,
-            Some(false) => {}
-            None => {
-                if self.draft_seen.is_none() {
-                    self.draft_seen = Some((text, self.fx.mono()));
-                }
+            (Some(true), _) => Some((text, self.fx.mono(), DraftCell::Typed)),
+            (Some(false), _) if !text.is_empty() => None,
+            (None, Some((seen, at, DraftCell::Unasked))) if seen == text => {
+                Some((seen, at, DraftCell::Unsaid))
             }
-        }
+            (None, None) => Some((text, self.fx.mono(), DraftCell::Unsaid)),
+            (_, seen) => seen,
+        };
     }
 
     /// THE COMPOSER AS THE HOST'S GUARDS ARE TO HOLD IT ([`Self::occupancy_guards`], `draft_seen`) at
     /// a step no decision reads it: [`Self::composer_typed`] of `reading`'s composer on `screen`, once
     /// for a text and a cursor its cell has said of ([`Self::guards_told`]), so a screen ticking over
     /// the same composer asks no cell at each move. A read that could not say is asked again, and so
-    /// is a composer whose draft a read has since let go: the text may have left and come back.
+    /// is a composer whose draft a read has since let go: the text may have left and come back. Grey
+    /// text turning plain under the same words and cursor goes unasked until one of them moves, and
+    /// these guards hold nothing over it till then: no write rests on them alone, as the door
+    /// (`Session::door_draft`) and the upgrade's gate each read the cell at the write.
     pub(super) fn composer_for_guards(&mut self, reading: &aterm_phase::Reading, screen: &Screen) {
         let told = |s: &Self| {
             reading.composer.as_ref().map(|(_, lines)| {
@@ -2864,7 +2901,10 @@ impl<C: Ctl> Session<'_, C> {
         )
     }
 
-    /// A DRAFT THAT HELD THE POINT ([`Self::draft_held`]).
+    /// A COMPOSER THAT HELD THE POINT ([`Self::draft_held`]), read again. While it still holds, what
+    /// stands is what the hold is on ([`Self::held_text`]). Anything else decides the point again; a
+    /// read that found that text gone has left its mark (`Session::see_draft`), so nothing is typed
+    /// there for a whole grace, and a draft that comes back in it is read afresh.
     pub(super) fn draft_look(
         &mut self,
         seen: &Turn,
@@ -2883,6 +2923,7 @@ impl<C: Ctl> Session<'_, C> {
         self.left_composer(&mut r, &opts.policy, &seen.screen);
         let now = r.composer;
         if now == held || now == Composer::Unknown {
+            self.hold_on(&now, true);
             return Ok(false);
         }
         self.draft_held = None;
@@ -2891,6 +2932,23 @@ impl<C: Ctl> Session<'_, C> {
         }
         self.turn_end_now(seen, opts, allow, review)?;
         Ok(true)
+    }
+
+    /// The text a read of `composer` holds the point on ([`Self::held_text`]), where it `holds`: the
+    /// draft seen, unless it is the loop's own line. A line headed by aterm's upgrade words
+    /// ([`Self::own_words`]) is held on like any text: no read tells it from a person's quote of one,
+    /// so its leaving marks a grace, a wait of 120 s at most against words typed over a quote. A frame
+    /// with no composer drawn says nothing of the text, so what was held stays held until a composer
+    /// is read (`Session::see_draft`).
+    fn hold_on(&mut self, composer: &Composer, holds: bool) {
+        if *composer == Composer::Absent {
+            return;
+        }
+        self.held_text = self
+            .draft_seen
+            .as_ref()
+            .filter(|(text, ..)| holds && !self.own_line_shown(text))
+            .map(|(text, _, cell)| (text.clone(), *cell));
     }
 
     /// AN UNAUTHORITATIVE READ THAT HELD THE POINT ([`Self::unauthoritative_held`]): once the
@@ -2966,6 +3024,9 @@ impl<C: Ctl> Session<'_, C> {
         if !self.held {
             self.turn_end_due = None;
             self.edge_moved = false;
+        }
+        if worked.is_some() {
+            self.draft_left = None;
         }
         // A `/login` DIALOG'S ERROR STATE NAMES NO PROGRAM (`aterm_phase::identify` knows Claude
         // Code's dialog by its own words, which the failure lacks): where no `status` named the
@@ -3239,7 +3300,10 @@ impl<C: Ctl> Session<'_, C> {
                 .as_ref()
                 .and_then(|e| e.notice.as_ref())
                 .is_some_and(|n| notice::DRAFT_HOLDS.contains(&n.id));
-        self.draft_held = (draft_holds(&composer, &action) || told_draft).then_some(composer);
+        let holds = draft_holds(&composer, &action) || told_draft;
+        let grace = matches!(&action, TurnEndAction::WaitUntil { why, .. } if why == PERSON_TYPING);
+        self.hold_on(&composer, holds || grace);
+        self.draft_held = holds.then_some(composer);
         self.unauthoritative_held =
             !authoritative && !self.decided_withheld && matches!(action, TurnEndAction::Nothing);
         if let Some(steps) = steps {
@@ -4251,7 +4315,10 @@ impl<C: Ctl> Session<'_, C> {
         let asked_unix = match self.restart_run {
             Some((kind, at)) if kind == why.word() => at,
             _ => {
-                let at = self.now_unix();
+                // A new run's second: now, or one past the last run's where that is this second
+                // or later, so two runs asked in one second are two asks (`RestartAsk::of`).
+                let at = self.now_unix().max(self.restart_floor.saturating_add(1));
+                self.restart_floor = at;
                 self.restart_waits = 0;
                 self.restart_run = Some((why.word(), at));
                 at
@@ -4263,8 +4330,9 @@ impl<C: Ctl> Session<'_, C> {
             && restart_note_due(self.restart_waits)
         {
             review.note(&format!(
-                "HOST seq={seq} restart:{} step={step}",
-                why.word()
+                "HOST seq={seq} restart:{} ask={} step={step}",
+                why.word(),
+                ask.word()
             ));
         }
         let word = step
@@ -4442,7 +4510,16 @@ impl<C: Ctl> Session<'_, C> {
                     why.word()
                 ));
                 let otherwise = self.ahead_deferred(seq, why, otherwise, opts);
-                self.turn_end_execute(point, otherwise, opts, allow, review)
+                // The act the point goes on with is the deferral's own, no other act: the run is
+                // kept, so the move asked again at a later turn end is the same ask
+                // (`RestartAsk`) and meets the record any of its asks claimed
+                // (`relaunch::its_own`), never superseding the relaunch that ask made.
+                let run = self.restart_run;
+                let went = self.turn_end_execute(point, otherwise, opts, allow, review);
+                if self.restart_run.is_none() {
+                    self.restart_run = run;
+                }
+                went
             }
             (Some("wait"), Some(step)) => {
                 if self.restart_waits == 0 && matches!(why, Restart::Model { .. }) {
@@ -7099,14 +7176,44 @@ pub(super) struct JournaledRelaunch {
     pub(super) waiting: Option<i64>,
 }
 
-/// THE FALLBACK'S RELAUNCH, read from the journal beside `sid`'s ledger (`journal`).
+/// A `HOST … restart:<kind> ask=<ask> step=…` note of `rec` (`Session::restart_agent` writes it
+/// once the host answers a run's first asks): its kind and the Unix second of the run it asked,
+/// the second its ask carries (`<kind>@<second>`, [`RestartAsk`]), which a run minted past the
+/// wall clock (`Session::restart_floor`) holds ahead of the note's own; else the note's own
+/// second, as for a lost line's ask (`line:…`), which is its line's and carries none.
+fn restart_note(rec: &crate::supervise::journal::JournalRecord) -> Option<(&str, i64)> {
+    let (_, rest) = rec.summary.strip_prefix("HOST ")?.split_once(" restart:")?;
+    let (kind, rest) = rest.split_once(' ')?;
+    let (asked, _) = rest.split_once("step=")?;
+    let second = asked
+        .trim_end()
+        .strip_prefix("ask=")
+        .and_then(|ask| ask.rsplit_once('@'))
+        .and_then(|(_, at)| at.parse().ok());
+    Some((kind, second.unwrap_or_else(|| rec.t.div_euclid(1000))))
+}
+
+/// THE NEWEST UNIX SECOND A RESTART RUN WAS ASKED AT, read from the journal beside `sid`'s ledger
+/// (`journal`): the newest run's second its `HOST … restart:<kind> ask=<ask> step=` notes name
+/// ([`restart_note`]). `None` where it notes no restart.
+pub(super) fn journaled_restart_floor(journal: &str, sid: Option<&str>) -> Option<i64> {
+    let sid = sid.map(|s| s.trim_start_matches('@'));
+    journal
+        .lines()
+        .filter_map(|text| crate::supervise::journal::JournalRecord::from_json(text).ok())
+        .filter(|rec| rec.sid.as_deref() == sid)
+        .filter_map(|rec| restart_note(&rec).map(|(_, at)| at))
+        .max()
+}
+
+/// THE FALLBACK'S RELAUNCH, read from the journal beside `sid`'s ledger (`journal`): the run of
+/// the restart `word` each relaunch was asked in, at its second ([`restart_note`]).
 pub(super) fn journaled_relaunch(
     journal: &str,
     sid: Option<&str>,
     word: &str,
 ) -> JournaledRelaunch {
     let sid = sid.map(|s| s.trim_start_matches('@'));
-    let step = format!(" restart:{word} step=");
     let mut run: Option<i64> = None;
     let mut made = None;
     for rec in journal
@@ -7116,19 +7223,19 @@ pub(super) fn journaled_relaunch(
     {
         match rec.kind.as_str() {
             "restarted" if rec.phase == crate::supervise::policy::turn_end::RULE_MODEL_FALLBACK => {
-                made = Some(run.take().unwrap_or(rec.t));
+                made = Some(run.take().unwrap_or_else(|| rec.t.div_euclid(1000)));
             }
             "continued" | "typed" => run = None,
-            _ if rec.summary.starts_with("HOST ") && rec.summary.contains(&step) => {
-                run.get_or_insert(rec.t);
+            _ => {
+                if let Some((kind, at)) = restart_note(&rec)
+                    && kind == word
+                {
+                    run.get_or_insert(at);
+                }
             }
-            _ => {}
         }
     }
-    JournaledRelaunch {
-        made: made.map(|ms: i64| ms.div_euclid(1000)),
-        waiting: run.map(|ms| ms.div_euclid(1000)),
-    }
+    JournaledRelaunch { made, waiting: run }
 }
 
 #[cfg(test)]

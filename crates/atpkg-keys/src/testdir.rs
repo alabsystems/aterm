@@ -19,10 +19,12 @@ pub(crate) struct Dir {
     _dir: TempDir,
 }
 
-/// A fresh scratch directory under the temp dir, named `<prefix><unique>`.
+/// A fresh `.noindex` scratch directory under the temp dir.
 pub(crate) fn dir(prefix: &str) -> Dir {
+    let end = prefix.floor_char_boundary(32);
     let dir = aterm_tempfile::Builder::new()
-        .prefix(prefix)
+        .prefix(&prefix[..end])
+        .suffix(".noindex")
         .tempdir()
         .expect("create a scratch directory under the temp dir");
     Dir {

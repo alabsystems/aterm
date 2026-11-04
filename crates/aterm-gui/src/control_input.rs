@@ -317,7 +317,7 @@ pub(crate) fn control_fence(
     let Some(ev) = control_press(verb, rest) else {
         return Some(false);
     };
-    let fence = crate::app_input::press_fence(&ev);
+    let fence = crate::app_input::press_fence(&ev, false);
     if fenced_write {
         Some(fence == Some(true))
     } else {

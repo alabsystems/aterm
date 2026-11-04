@@ -1849,7 +1849,7 @@ fn answered(ctx: &crate::SessionCtx, p: Node) {
 
 /// The harness's `meta set|unset attention owner=supervisor [kind=…] <text>`, through the one
 /// writer that marks the log ([`crate::session_timeline::SessionTimeline::record_meta_change`]).
-fn supervisor_asks(
+pub(super) fn supervisor_asks(
     ctx: &crate::SessionCtx,
     text: Option<&str>,
     kind: Option<aterm_types::needs::AttentionKind>,
@@ -1867,7 +1867,7 @@ fn supervisor_asks(
 }
 
 /// Each escalation mark's head: `mark <node> need|clear`.
-fn escalation_marks(ctx: &crate::SessionCtx) -> Vec<String> {
+pub(super) fn escalation_marks(ctx: &crate::SessionCtx) -> Vec<String> {
     lines_of(&ctx.timeline)
         .into_iter()
         .filter(|l| l.contains(" word=escalated "))

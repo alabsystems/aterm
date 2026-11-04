@@ -8,6 +8,7 @@ use crate::ai::permission::Level;
 use crate::ai::state::{Mark, State};
 use crate::ai::store::Record;
 use crate::ai::testing::{FakeRunner, machine, ran};
+use crate::harness::accounts_overlay::links_here;
 
 fn change() -> Change {
     Change {
@@ -249,6 +250,7 @@ fn row_of(c: &'static Connector, state: State) -> Row {
 
 fn claude_account(login: Option<&str>) -> ClaudeAccounts {
     ClaudeAccounts {
+        pool_picks: false,
         store: None,
         roster: None,
         label: "main".into(),
@@ -307,8 +309,8 @@ fn a_reviewer_that_cannot_authenticate_gives_way_to_the_next_and_a_timeout_does_
     let b = machine(&["claude", "codex"]);
     let store = Store::at(&b.state);
     let facts = vec![
-        facts_of(&CODEX, b.pkg.agents_dir().join("codex")),
-        facts_of(&CLAUDE, b.pkg.agents_dir().join("claude")),
+        facts_of(&CODEX, b.twin("codex")),
+        facts_of(&CLAUDE, b.twin("claude")),
     ];
     let rows = [row_of(&CODEX, State::Idle), row_of(&CLAUDE, State::Idle)];
     let reviewers: Vec<&'static Connector> = vec![&CODEX, &CLAUDE];
@@ -392,9 +394,9 @@ fn a_reviewer_that_cannot_authenticate_gives_way_to_the_next_and_a_timeout_does_
 fn a_reviewer_runs_from_its_shim_in_the_repository_with_the_askers_environment_and_level() {
     let b = machine(&["claude", "codex"]);
     let store = Store::at(&b.state);
-    let mut claude = facts_of(&CLAUDE, b.pkg.agents_dir().join("claude"));
+    let mut claude = facts_of(&CLAUDE, b.twin("claude"));
     claude.accounts = Some(claude_account(Some("/state/accounts/logins/main+1")));
-    let facts = vec![claude, facts_of(&CODEX, b.pkg.agents_dir().join("codex"))];
+    let facts = vec![claude, facts_of(&CODEX, b.twin("codex"))];
     let rows = [row_of(&CLAUDE, State::Ok), row_of(&CODEX, State::Ok)];
     let reviewers: Vec<&'static Connector> = vec![&CLAUDE, &CODEX];
     let cands = candidates(&reviewers, Some(&["claude", "codex"]), "agy", &rows, 0);
@@ -521,7 +523,7 @@ fn the_primers_marker_never_reaches_the_asker_and_a_failure_says_why() {
     );
     let b = machine(&["codex"]);
     let store = Store::at(&b.state);
-    let facts = vec![facts_of(&CODEX, b.pkg.agents_dir().join("codex"))];
+    let facts = vec![facts_of(&CODEX, b.twin("codex"))];
     let rows = [row_of(&CODEX, State::Idle)];
     let reviewers: Vec<&'static Connector> = vec![&CODEX];
     let cands = candidates(&reviewers, None, "claude", &rows, 0);
@@ -697,7 +699,7 @@ fn change_with(diff: &str) -> Change {
 fn an_outcome_under_another_home_is_recorded_nowhere() {
     let b = machine(&["codex"]);
     let store = Store::at(&b.state);
-    let facts = vec![facts_of(&CODEX, b.pkg.agents_dir().join("codex"))];
+    let facts = vec![facts_of(&CODEX, b.twin("codex"))];
     let rows = [row_of(&CODEX, State::Idle)];
     let reviewers: Vec<&'static Connector> = vec![&CODEX];
     let cands = candidates(&reviewers, None, "claude", &rows, 0);
@@ -748,7 +750,7 @@ fn an_outcome_under_another_home_is_recorded_nowhere() {
 fn a_limit_keeps_the_cli_out_of_reviews_for_a_while() {
     let b = machine(&["codex"]);
     let store = Store::at(&b.state);
-    let facts = vec![facts_of(&CODEX, b.pkg.agents_dir().join("codex"))];
+    let facts = vec![facts_of(&CODEX, b.twin("codex"))];
     let rows = [row_of(&CODEX, State::Idle)];
     let reviewers: Vec<&'static Connector> = vec![&CODEX];
     let cands = candidates(&reviewers, None, "claude", &rows, 0);
@@ -788,7 +790,7 @@ fn review_auth_after_login(replacement_at: Option<i64>) -> (Record, Option<Recor
     store
         .note_scope("codex", Some("file"), How::Login, Outcome::Worked, 100)
         .expect("initial login");
-    let mut fact = facts_of(&CODEX, b.pkg.agents_dir().join("codex"));
+    let mut fact = facts_of(&CODEX, b.twin("codex"));
     fact.record = store
         .load()
         .expect("initial record")
@@ -901,7 +903,7 @@ fn args_at(c: &'static Connector, level: Level) -> Vec<String> {
 fn review_at(c: &'static Connector, level: Level) -> (Vec<Answer>, Vec<Vec<String>>) {
     let b = machine(&[c.id]);
     let store = Store::at(&b.state);
-    let facts = vec![facts_of(c, b.pkg.agents_dir().join(c.id))];
+    let facts = vec![facts_of(c, b.twin(c.id))];
     let rows = [row_of(c, State::Idle)];
     let reviewers: Vec<&'static Connector> = vec![c];
     let cands = candidates(&reviewers, Some(&[c.id]), "nobody", &rows, 0);
@@ -1029,8 +1031,12 @@ fn kimi_reviews_at_yolo_alone_with_no_level_flag() {
     let yolo = args_at(&KIMI, Level::Yolo);
     assert_eq!(yolo.len(), 4, "{yolo:?}");
     assert_eq!(yolo[..3], ["--output-format", "text", "-p"], "{yolo:?}");
+    let request = yolo[3]
+        .strip_prefix("Read the file ")
+        .and_then(|rest| rest.split_once(" and do what it asks"))
+        .map(|(path, _)| Path::new(path));
     assert!(
-        yolo[3].starts_with("Read the file /") && yolo[3].contains("request.txt"),
+        request.is_some_and(|p| p.is_absolute() && p.ends_with("request.txt")),
         "the prompt points at the request by its absolute path: {yolo:?}"
     );
     for flag in ["--yolo", "--auto", "--plan", "-y", "--add-dir"] {
@@ -1140,6 +1146,45 @@ fn claude_under_a_home_of_its_own_gets_no_login_variable() {
     );
 }
 
+/// A REVIEW RUNS ON THE LOGIN IT WAS STARTED WITH WHERE THE POOL PICKS NOTHING, AND ON THE POOL'S
+/// CHOICE WHERE IT PICKS: rotation off leaves a chooser's login as a new session does. CONTROL: a
+/// pool that picks, with no row, runs on none of that start's.
+#[test]
+fn a_review_keeps_the_login_it_was_started_with_only_where_the_pool_picks_nothing() {
+    let mut f = facts_of(&CLAUDE, PathBuf::from("/pkg/agents/claude"));
+    let started = |k: &str| {
+        (k == crate::harness::accounts::LOGIN_ENV).then(|| "/me/logins/started".to_string())
+    };
+    let login_of = |f: &crate::ai::facts::Facts| {
+        reviewer_env(&CLAUDE, f, &started, &[])
+            .into_iter()
+            .find(|(k, _)| k == crate::harness::accounts::LOGIN_ENV)
+            .map(|(_, v)| v)
+    };
+    f.accounts = Some(claude_account(None));
+    assert_eq!(login_of(&f).as_deref(), Some("/me/logins/started"));
+    f.accounts.as_mut().unwrap().pool_picks = true;
+    assert_eq!(login_of(&f).as_deref(), Some(""), "CONTROL");
+    f.accounts.as_mut().unwrap().login = Some("/me/logins/picked".into());
+    assert_eq!(login_of(&f).as_deref(), Some("/me/logins/picked"));
+}
+
+/// A REVIEW'S REFRESHED ROW SAYS WHETHER THE POOL PICKS, which is what keeps the login a review was
+/// started with: rotation on picks, and rotation off does not.
+#[test]
+fn a_reviews_refreshed_row_says_whether_the_pool_picks() {
+    let pool = ReviewPool::new(crate::harness::accounts::Cli::Claude, None);
+    let config = pool.config.join("aterm.toml");
+    let picks = |text: &str| {
+        std::fs::write(&config, text).unwrap();
+        let mut facts = pool.facts();
+        review_row(&mut facts, ReviewPool::NOW, Some(&config)).unwrap();
+        facts.accounts.unwrap().pool_picks
+    };
+    assert!(picks(""));
+    assert!(!picks("[harness]\naccounts = \"off\"\n"));
+}
+
 #[test]
 fn escaped_keys_and_more_token_shapes_are_redacted() {
     let json = concat!(
@@ -1187,7 +1232,7 @@ fn a_live_limit_skips_a_cli_whatever_its_state() {
 fn a_skipped_reviewer_names_what_a_person_does_first() {
     let b = machine(&["claude"]);
     let store = Store::at(&b.state);
-    let facts = vec![facts_of(&CLAUDE, b.pkg.agents_dir().join("claude"))];
+    let facts = vec![facts_of(&CLAUDE, b.twin("claude"))];
     let step = "mend accounts.toml (`aterm harness accounts` says how), then sign claude in";
     for (fix, mend, want) in [
         (None, Some(step), step),
@@ -1228,7 +1273,7 @@ fn a_skipped_reviewer_names_what_a_person_does_first() {
 fn scripted_claude_answer(exit: i32, stdout: String, stderr: String) -> Answer {
     let b = machine(&["claude"]);
     let store = Store::at(&b.state);
-    let facts = vec![facts_of(&CLAUDE, b.pkg.agents_dir().join("claude"))];
+    let facts = vec![facts_of(&CLAUDE, b.twin("claude"))];
     let rows = [row_of(&CLAUDE, State::Ok)];
     let reviewers: Vec<&'static Connector> = vec![&CLAUDE];
     let cands = candidates(&reviewers, Some(&["claude"]), "codex", &rows, 0);
@@ -1306,7 +1351,7 @@ fn review_on_frozen_login_with_env(
     store
         .note_scope(c.id, scope, How::Login, Outcome::Worked, 100)
         .expect("initial login");
-    let mut fact = facts_of(c, b.pkg.agents_dir().join(c.id));
+    let mut fact = facts_of(c, b.twin(c.id));
     fact.record = store.load().expect("record").of_scope(c.id, scope);
     fact.env_credentials = key.into_iter().collect();
     let facts = [fact];
@@ -1426,7 +1471,7 @@ fn a_pooled_codex_reviewer_exports_serving_auth_path_unless_custom_home_or_keyri
     use crate::ai::facts::CliAccounts;
 
     let b = machine(&["codex"]);
-    let shim = b.pkg.agents_dir().join("codex");
+    let shim = b.twin("codex");
     let home = b.home.display().to_string();
     let staged_auth = "/state/logins/codex/work+1/auth.json";
 
@@ -1502,11 +1547,7 @@ fn a_pooled_codex_reviewer_exports_serving_auth_path_unless_custom_home_or_keyri
 /// `reads`.
 fn alab_launcher(b: &crate::ai::testing::Box3, reads: bool) {
     let exe = crate::harness::codex_alab::lay_package(&b.dir.path().join("store/codex"), reads);
-    std::fs::write(
-        b.pkg.agents_dir().join("codex"),
-        crate::harness::codex_alab::twin_text(&exe),
-    )
-    .expect("launcher");
+    std::fs::write(b.twin("codex"), crate::harness::codex_alab::twin_text(&exe)).expect("launcher");
 }
 
 /// A POOLED CODEX REVIEW ON A ROW OF ITS OWN RUNS ONLY ON A BUILD THAT KEEPS `CODEX_AUTH_PATH`'S
@@ -1524,7 +1565,7 @@ fn a_pooled_codex_review_on_a_row_of_its_own_needs_a_build_that_reads_codex_auth
     let store = Store::at(&b.state);
     let serves = DefaultRow::Serves("main".into());
     let on_with = |login: Option<&str>, default: &DefaultRow| {
-        let mut f = facts_of(&CODEX, b.pkg.agents_dir().join("codex"));
+        let mut f = facts_of(&CODEX, b.twin("codex"));
         f.pool = Some(CliAccounts {
             roster: PathBuf::from("/config/accounts-codex.toml"),
             rows: 2,
@@ -3927,7 +3968,7 @@ fn preparation_case(scope: i64, changed: i64) -> [bool; 4] {
     use crate::harness::accounts::Cli;
     let observed = preparation_case_for(Cli::Claude, scope, changed);
     for cli in [Cli::Codex, Cli::Grok, Cli::Kimi] {
-        if cli == Cli::Kimi && !cfg!(unix) && (scope == 2 || changed == 1) {
+        if !links_here(cli) && (scope == 2 || changed == 1) {
             continue;
         }
         assert_eq!(
@@ -4068,13 +4109,15 @@ fn a_claude_review_skips_a_prepared_credential_for_an_authorized_one() {
 #[test]
 fn a_prepared_pin_never_falls_through_to_another_account() {
     use crate::harness::accounts::Cli;
+    // Where aterm makes no overlay home, a pin on Kimi's row of its own is refused before any
+    // preparation (`accounts_overlay::links_here`).
     for (cli, reads) in [
         (Cli::Claude, None),
         (Cli::Kimi, None),
         (Cli::Grok, None),
         (Cli::Codex, Some(true)),
     ] {
-        if !atpkg::vendor_direct::served_here(cli.id()) || (cli == Cli::Kimi && !cfg!(unix)) {
+        if !atpkg::vendor_direct::served_here(cli.id()) || !links_here(cli) {
             continue;
         }
         let pool = ReviewPool::new(cli, reads);
@@ -4256,13 +4299,15 @@ fn a_lone_default_keeps_its_existing_sign_out_and_lease_policy() {
 #[test]
 fn healthy_shared_accounts_remain_healthy_without_local_sign_in() {
     use crate::harness::accounts::Cli;
+    // Where aterm makes no overlay home, a pin on Kimi's row of its own is refused, which the
+    // doctor names (`accounts_overlay::links_here`).
     for (cli, reads) in [
         (Cli::Claude, None),
         (Cli::Kimi, None),
         (Cli::Grok, None),
         (Cli::Codex, Some(true)),
     ] {
-        if !atpkg::vendor_direct::served_here(cli.id()) {
+        if !atpkg::vendor_direct::served_here(cli.id()) || !links_here(cli) {
             continue;
         }
         let pool = ReviewPool::new(cli, reads);
@@ -4306,7 +4351,7 @@ fn isolated_claude_review_outcomes_preserve_default_health() {
         for outcome in 0..3 {
             let root = aterm_tempfile::TempDir::new().unwrap();
             let store = Store::at(root.path());
-            let mut fact = facts_of(&CLAUDE, b.pkg.agents_dir().join("claude"));
+            let mut fact = facts_of(&CLAUDE, b.twin("claude"));
             fact.accounts = Some(claude_account(isolated.then_some("/isolated/login")));
             let rows = [row_of(&CLAUDE, State::Ok)];
             let cands = candidates(&[&CLAUDE], Some(&["claude"]), "codex", &rows, 0);

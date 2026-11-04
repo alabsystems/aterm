@@ -332,8 +332,11 @@ fn worker_report(store: &Store, sid: &str) -> Vec<String> {
         return Vec::new();
     };
     let mut text = String::new();
-    let read = crate::logging::open_regular_nonblock(&path)
-        .and_then(|f| f.take(REPORT_MAX_BYTES).read_to_string(&mut text));
+    let read = crate::logging::open_regular_nonblock_with_meta(&path).and_then(|(f, meta)| {
+        let cap = usize::try_from(meta.len().min(REPORT_MAX_BYTES).saturating_add(1)).unwrap_or(0);
+        text.reserve(cap);
+        f.take(REPORT_MAX_BYTES).read_to_string(&mut text)
+    });
     if let Err(e) = read {
         aterm_log::debug!(
             "harness disk watch: the disk worker's result {} could not be read ({e})",
@@ -3045,6 +3048,65 @@ mod tests {
         assert!(
             matches!(&said, ask::Said::Owed { pick: p, .. } if *p == pick),
             "CONTROL: mid-turn, owed until its turn break: {said:?} {entry:?}"
+        );
+    }
+
+    /// A monitor the turn left running under a workflow's progress row its workflow outlived
+    /// (2.1.304 leaves the row drawn at its full bar,
+    /// `claude-2.1.304-agents-panel-workflow-done-3m20s-120col.txt`) is a break of the agent's
+    /// own background work to the look as to its loop, which offers its line there and refuses it
+    /// for a draft: a draft standing there holds the tab. Before, the look read the break by the
+    /// reader's one rule, the progress row's `a workflow running`, read ahead of the monitor's,
+    /// so it saw no break there and a draft standing held nothing. The row alone names nothing
+    /// the turn left: no break.
+    #[test]
+    fn a_monitor_under_an_outlived_progress_row_is_a_background_break_to_the_look() {
+        const DRAFT: &str = "and then land the merge";
+        let on = |monitor: bool| {
+            let mut rows = aterm_phase::prompt::fixtures::screen(include_str!(
+                "../../aterm-phase/src/fixtures/claude-2.1.304-agents-panel-workflow-done-3m20s-120col.txt"
+            ));
+            if monitor {
+                rows.iter_mut()
+                    .find(|r| r.starts_with("✻ Brewed for 3m 20s"))
+                    .expect("the done row")
+                    .push_str(" · 1 monitor still running");
+            }
+            let caret = rows.iter().position(|r| r == "❯").expect("the composer");
+            rows[caret] = format!("❯ {DRAFT}");
+            let mut t = aterm_core::terminal::Terminal::new(
+                u16::try_from(rows.len() + 2).expect("rows"),
+                120,
+            );
+            t.process(
+                format!(
+                    "\x1b[2J\x1b[H{}\x1b[{};{}H",
+                    rows.join("\r\n"),
+                    caret + 1,
+                    DRAFT.chars().count() + 3
+                )
+                .as_bytes(),
+            );
+            draft_on(&t)
+        };
+        let monitored = on(true);
+        assert_eq!(monitored, (Draft::Text(DRAFT.to_owned()), true));
+        // A second look reads it unchanged, as a look holds a draft by.
+        let kept = Kept {
+            text: DRAFT.to_owned(),
+            at_break: false,
+        };
+        let drafted = Drafted::of_reading(&monitored.0, Some(&kept), monitored.1);
+        assert_eq!(drafted, Drafted::AtBackgroundBreak);
+        assert_eq!(
+            held_of("busy", false, None, None, false, drafted, 0),
+            Some(ask::HeldBy::Draft),
+            "the draft holds the tab at its break"
+        );
+        assert_eq!(
+            on(false),
+            (Draft::Text(DRAFT.to_owned()), false),
+            "CONTROL: the row alone"
         );
     }
 

@@ -16,18 +16,27 @@ use std::process::{Child, Command, Output, Stdio};
 use aterm_link::ctl::Ctl;
 use aterm_link::fabric::kv;
 
+/// A test's own directory under the short `/tmp` (its sockets must fit `sun_path`), removed when
+/// dropped unless `ATERM_LINK_KEEP` is set.
 struct Scratch {
     dir: PathBuf,
+    held: Option<aterm_tempfile::TempDir>,
 }
 
 impl Scratch {
     fn new(tag: &str) -> Self {
-        let dir = PathBuf::from(format!("/tmp/atfo-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let held = aterm_tempfile::Builder::new()
+            .prefix(&format!("atfo-{tag}-"))
+            .tempdir_in("/tmp")
+            .expect("scratch dir");
+        let dir = held.path().to_path_buf();
         for sub in ["home", "cfg/aterm", "run", "root", "bin"] {
             std::fs::create_dir_all(dir.join(sub)).expect("scratch dir");
         }
-        Self { dir }
+        Self {
+            dir,
+            held: Some(held),
+        }
     }
 
     fn path(&self, rel: &str) -> String {
@@ -87,8 +96,10 @@ impl Scratch {
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        if std::env::var_os("ATERM_LINK_KEEP").is_none() {
-            let _ = std::fs::remove_dir_all(&self.dir);
+        if std::env::var_os("ATERM_LINK_KEEP").is_some()
+            && let Some(held) = self.held.take()
+        {
+            eprintln!("KEPT fabric_on scratch {}", held.keep().display());
         }
     }
 }
@@ -578,7 +589,7 @@ fn on_provisions_arms_proves_and_a_second_on_changes_nothing() {
         ls.lines().any(|l| l.contains(&format!(" {sid} "))),
         "and the session's presence row:\n{ls}"
     );
-    let (code, _, err) = s.link(&["ls", "--broker", "/tmp/atfo-nowhere.sock"]);
+    let (code, _, err) = s.link(&["ls", "--broker", &s.path("nowhere.sock")]);
     assert_ne!(code, 0, "{err}");
     std::fs::write(
         s.config(),

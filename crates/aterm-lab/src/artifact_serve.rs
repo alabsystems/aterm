@@ -20,7 +20,12 @@ const MAX_TOTAL: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_SENT: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_HEADERS: usize = 8192;
 const MAX_CONNECTION: Duration = Duration::from_secs(60);
+#[cfg(not(test))]
 const IO_WAIT: Duration = Duration::from_secs(5);
+/// A unit test's client is its own and reads every byte it asked for, so each read and write
+/// waits on the hang detector.
+#[cfg(test)]
+const IO_WAIT: Duration = aterm_spec::wait::MUST_HAPPEN;
 
 struct Config {
     bind: SocketAddr,
@@ -351,6 +356,9 @@ fn serve_one(
     budget: &mut u64,
 ) -> io::Result<()> {
     let deadline = deadline.min(Instant::now() + MAX_CONNECTION);
+    // Darwin accepts inherit the listener's nonblocking mode. The bounded
+    // reader and writer below use socket timeouts, so normalize every stream.
+    stream.set_nonblocking(false)?;
     set_wait(&stream, deadline)?;
     let selected = if stream.peer_addr()?.ip() == peer {
         read_head(&mut DeadlineReader {
@@ -432,6 +440,7 @@ fn status(
     let (temporary, mut file) = aterm_uds::atomic_file::create_temp_beside(path, 0o600)?;
     let result = (|| {
         file.write_all(&bytes)?;
+        file.write_all(b"\n")?;
         file.flush()?;
         std::fs::hard_link(&temporary, path)
     })();
@@ -458,6 +467,7 @@ fn pause() -> Result<(), Fail> {
 /// # Errors
 /// Invalid options, an unreadable or changing input, refused socket/status creation,
 /// or an interrupted run. Request-specific refusals close only that connection.
+/// Transfer I/O failures are reported and make the completed run exit with 1.
 pub fn cmd(args: &[String]) -> Res {
     if matches!(args, [flag] if flag == "--help" || flag == "-h") {
         println!("{USAGE}");
@@ -506,23 +516,29 @@ pub fn cmd(args: &[String]) -> Res {
         files.len()
     );
     let mut requests = 0;
+    let mut failed_requests = 0;
     let mut budget = MAX_SENT;
     while requests < config.requests && budget != 0 && Instant::now() < deadline {
         check_stop()?;
         match listener.accept() {
             Ok((stream, _)) => {
                 requests += 1;
-                let _ = serve_one(stream, config.peer, &token, &files, deadline, &mut budget);
+                if let Err(error) =
+                    serve_one(stream, config.peer, &token, &files, deadline, &mut budget)
+                {
+                    failed_requests += 1;
+                    eprintln!("artifact-serve request failed: {error}");
+                }
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => pause()?,
             Err(e) => return Err(Fail::die(format!("artifact accept: {e}"))),
         }
     }
     println!(
-        "artifact-serve done requests={requests} payload_bytes={}",
+        "artifact-serve done requests={requests} failed_requests={failed_requests} reserved_payload_bytes={}",
         MAX_SENT - budget
     );
-    Ok(0)
+    Ok(i32::from(failed_requests != 0))
 }
 
 #[cfg(test)]
@@ -625,10 +641,10 @@ mod tests {
     }
 
     #[test]
-    fn transfer_uses_exact_immutable_snapshot_with_declared_length() {
+    fn transfer_keeps_large_immutable_snapshot_complete_on_a_nonblocking_accept() {
         let tmp = aterm_tempfile::TempDir::new().unwrap();
         let input = tmp.path().join("input");
-        let expected: Vec<u8> = (0..200_000).map(|i| (i % 251) as u8).collect();
+        let expected: Vec<u8> = (0..8 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
         std::fs::write(&input, &expected).unwrap();
         let file = snapshot(
             "one",
@@ -644,9 +660,13 @@ mod tests {
         );
         std::fs::write(&input, b"changed after snapshot").unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(address).unwrap();
         let server = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
+            // Darwin inherits the listener's mode. Exercise it on every host.
+            stream.set_nonblocking(true).unwrap();
             let mut budget = MAX_SENT;
             serve_one(
                 stream,
@@ -658,7 +678,6 @@ mod tests {
             )
             .unwrap();
         });
-        let mut client = TcpStream::connect(address).unwrap();
         client
             .set_read_timeout(Some(Duration::from_secs(60)))
             .unwrap();
@@ -669,7 +688,7 @@ mod tests {
         client.read_to_end(&mut bytes).unwrap();
         server.join().unwrap();
         let end = bytes.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
-        assert!(String::from_utf8_lossy(&bytes[..end]).contains("Content-Length: 200000\r\n"));
+        assert!(String::from_utf8_lossy(&bytes[..end]).contains("Content-Length: 8388608\r\n"));
         assert_eq!(&bytes[end..], expected);
     }
 
@@ -707,6 +726,8 @@ mod tests {
             0o600
         );
         let before = std::fs::read(&status_path).unwrap();
+        assert!(before.ends_with(b"\n"));
+        assert!(aterm_json::from_slice::<aterm_json::Value>(&before).is_ok());
         assert!(
             status(
                 &status_path,

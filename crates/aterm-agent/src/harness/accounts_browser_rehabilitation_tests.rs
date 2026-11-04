@@ -12,6 +12,7 @@ enum Fault {
     None,
     PermanentExclusion,
     TolerantLedger,
+    UnscopedWindow,
 }
 
 fn window(at: i64, end: &str, session: &str) -> accounts::Event {
@@ -41,6 +42,18 @@ fn image(dir: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
 fn read(case: i64, fault: Fault) -> [(&'static str, i64); 5] {
     let root = aterm_tempfile::tempdir().unwrap();
     let store = accounts::Store::at(root.path()).bounded_by(&[]);
+    let path = root.path().join("accounts.toml");
+    let mut raw = accounts::Row {
+        label: LABEL.into(),
+        email: Some(EMAIL.into()),
+        identity_email: (case >= 34).then(|| "owner-a@example.test".into()),
+        ..Default::default()
+    };
+    fs::write(
+        &path,
+        accounts::append_rows_for(Cli::Claude, "", &[raw.clone()]).unwrap(),
+    )
+    .unwrap();
     let no_wrong = matches!(case, 0 | 22 | 25 | 26);
     store
         .transact_logins(NOW, &mut None, |state, logins| {
@@ -54,7 +67,6 @@ fn read(case: i64, fault: Fault) -> [(&'static str, i64); 5] {
             Ok(events)
         })
         .unwrap();
-    let logins = store.load_logins(NOW + 10).unwrap().0;
     let profile = super::super::headless_oauth::resolve_browser_profile_dir(
         &store.dir,
         Some(LABEL),
@@ -118,9 +130,59 @@ fn read(case: i64, fault: Fault) -> [(&'static str, i64); 5] {
             wrong(NOW - 1),
             window(NOW + 2, "done", "session-kept"),
         ],
+        34..=36 => vec![successful()],
         _ => vec![successful()],
     };
-    store.append(&events).unwrap();
+    if case >= 34 {
+        // Legacy A history has no writer-issued custody. B retains the same label,
+        // delivery address and profile while its expected provider identity changes.
+        store.append(&events).unwrap();
+        let legacy = store.tail_validated(10).unwrap().pop().unwrap();
+        assert_eq!(legacy.workflow, None);
+        raw.identity_email = Some("owner-b@example.test".into());
+        fs::write(
+            &path,
+            accounts::append_rows_for(Cli::Claude, "", &[raw.clone()]).unwrap(),
+        )
+        .unwrap();
+        store
+            .transact_pool_logins_within(&[], &path, NOW + 2, &mut None, |_, _, _| Ok(Vec::new()))
+            .unwrap();
+        if case >= 35 {
+            store
+                .transact_pool_logins_within(&[], &path, NOW + 3, &mut None, |roster, _, logins| {
+                    assert_eq!(roster.row(LABEL), Some(&raw));
+                    accounts::admit_workflow(logins, LABEL)?;
+                    Ok(vec![window(NOW + 3, "done", "session-kept")])
+                })
+                .unwrap();
+        }
+        if case == 36 {
+            store.append(&[wrong(NOW + 4)]).unwrap();
+        }
+        let retained = store.tail_validated(10).unwrap();
+        assert!(
+            retained.contains(&legacy),
+            "A's raw history is retained, never relabelled"
+        );
+        if case >= 35 {
+            assert!(
+                retained
+                    .iter()
+                    .any(|event| event.t == NOW + 3 && event.workflow.is_some()),
+                "B's positive is a writer-scoped event"
+            );
+        }
+    } else {
+        store
+            .transact_pool_logins_within(&[], &path, NOW + 10, &mut None, |roster, _, logins| {
+                assert_eq!(roster.row(LABEL), Some(&raw));
+                accounts::admit_workflow(logins, LABEL)?;
+                Ok(events)
+            })
+            .unwrap();
+    }
+    let logins = store.load_logins(NOW + 10).unwrap().0;
     match case {
         0 | 2 => fs::remove_file(store.ledger_path()).unwrap(),
         17 | 22 => {
@@ -154,7 +216,12 @@ fn read(case: i64, fault: Fault) -> [(&'static str, i64); 5] {
     let before = image(root.path());
     let captured_logins = logins.clone();
     let ready = match fault {
-        Fault::None => claude_browser_profile_ready(&store, &logins, LABEL, Some(EMAIL)),
+        Fault::None => claude_browser_profile_ready(&store, &logins, &raw),
+        Fault::UnscopedWindow => {
+            super::super::headless_oauth::has_browser_profile(&store.dir, LABEL, Some(EMAIL))
+                && browser_window_signed_in_token(&store, LABEL, NOW)
+                    .is_some_and(|(at, _)| at > NOW)
+        }
         Fault::PermanentExclusion => {
             // The previous routing predicate excluded every retained wrong-account binding.
             logins
@@ -269,8 +336,8 @@ fn browser_readiness_refines_ordered_rehabilitation_evidence() {
             }
         }
     }
-    assert_eq!(reads, 34);
-    assert_eq!(fixtures, 33);
+    assert_eq!(reads, 37);
+    assert_eq!(fixtures, 36);
     let mut before = model.init_state();
     before.insert("case", 1);
     let mut obsolete = before.clone();
@@ -284,8 +351,13 @@ fn browser_readiness_refines_ordered_rehabilitation_evidence() {
         assert!(!admits(&model, &before, &tolerant, "Read"));
         assert!(!model.check_invariant("UnreadableOrMissingEvidenceRefused", &tolerant));
     }
+    before.insert("case", 34);
+    let mut unscoped = before.clone();
+    unscoped.extend(read(34, Fault::UnscopedWindow));
+    assert!(!admits(&model, &before, &unscoped, "Read"));
+    assert!(!model.check_invariant("WorkflowScopedReceiptRequired", &unscoped));
     eprintln!(
-        "{}: {reads} production reads, {fixtures} fixture transitions, 4 executable negative controls; {coverage:?}",
+        "{}: {reads} production reads, {fixtures} fixture transitions, 5 executable negative controls; {coverage:?}",
         model.name
     );
 }

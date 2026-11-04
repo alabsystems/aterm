@@ -49,15 +49,26 @@ pub(crate) struct RelaunchNotice {
     pub(crate) version: String,
 }
 
+/// Structural repaint key for [`RelaunchNotice`], folded into `RepaintKey::relaunch_fp`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RelaunchRepaintKey {
+    /// Staged build number (stored verbatim so build changes never collide).
+    pub(crate) build: u64,
+    /// Byte length of [`RelaunchNotice::version`].
+    pub(crate) version_len: usize,
+    /// Deterministic FNV-1a digest of [`RelaunchNotice::version`].
+    pub(crate) version_hash: u64,
+}
+
 impl RelaunchNotice {
-    /// A repaint fingerprint folded into `RepaintKey::relaunch_fp` so the `↻` alert's
-    /// appear / build-change forces exactly one present. Never `0` while shown.
-    pub(crate) fn fingerprint(&self) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        self.build.hash(&mut h);
-        self.version.hash(&mut h);
-        h.finish() | 1
+    /// Structural repaint key folded into `RepaintKey::relaunch_fp` so the `↻` alert's
+    /// appear / build-change forces a present (`None` when hidden).
+    pub(crate) fn fingerprint(&self) -> RelaunchRepaintKey {
+        RelaunchRepaintKey {
+            build: self.build,
+            version_len: self.version.len(),
+            version_hash: aterm_hash::fnv1a_64(self.version.as_bytes()),
+        }
     }
 }
 
@@ -65,6 +76,7 @@ impl RelaunchNotice {
 mod tests {
     use super::*;
 
+    /// NEGATIVE CONTROL: `Some(notice.fingerprint())` is disjoint from `None` and stores `build` structurally.
     #[test]
     fn fingerprint_tracks_build_and_is_nonzero() {
         let a = RelaunchNotice {
@@ -72,7 +84,9 @@ mod tests {
             version: "0.5.14".into(),
         }
         .fingerprint();
-        assert_ne!(a, 0);
+        assert_ne!(Some(a), None);
+        assert_eq!(a.build, 828);
+        assert_eq!(a.version_len, "0.5.14".len());
         let b = RelaunchNotice {
             build: 999,
             version: "0.5.14".into(),

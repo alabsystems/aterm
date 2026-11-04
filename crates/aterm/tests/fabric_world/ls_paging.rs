@@ -10,7 +10,6 @@
 use crate::harness;
 
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
 use std::process::Command;
 
 use astream_broker::proto::{
@@ -58,20 +57,6 @@ fn aterm_link() -> (Command, aterm_tempfile::TempDir) {
     (c, runtime)
 }
 
-fn sock_path(tag: &str) -> (aterm_tempfile::TempDir, PathBuf) {
-    let dir = aterm_tempfile::Builder::new()
-        .prefix("atl-")
-        .tempdir_in("/tmp")
-        .expect("a scratch dir under /tmp");
-    let p = dir.path().join(format!("{tag}.sock"));
-    assert!(
-        p.as_os_str().len() < 100,
-        "socket path too long for sun_path: {}",
-        p.display()
-    );
-    (dir, p)
-}
-
 fn answer(mut s: UnixStream, pages: &[Page]) {
     let mut i = 0usize;
     while let Ok(Some(frame)) = read_frame(&mut s) {
@@ -104,7 +89,8 @@ fn answer(mut s: UnixStream, pages: &[Page]) {
 }
 
 fn ls(tag: &str, pages: Vec<Page>, extra: &[&str]) -> (String, String, bool) {
-    let (_dir, path) = sock_path(tag);
+    let dir = harness::sock_dir("lsp");
+    let path = dir.path().join(format!("{tag}.sock"));
     let listener = harness::kept(UnixListener::bind(&path).expect("bind the stub broker"));
     let server = std::thread::spawn(move || {
         if let Ok((s, _)) = listener.accept() {

@@ -29,6 +29,78 @@ use super::transcript;
 pub const CODEX_MEASURED_BUILDS: &[&str] =
     include!(concat!(env!("OUT_DIR"), "/codex_measured_builds.rs"));
 
+/// What each build [`CODEX_MEASURED_BUILDS`] names showed in its committed reductions: its keys
+/// (`exit_code`) and each kept closed word beside its key (`turn_trigger=alab_autopilot`), read by
+/// `build.rs` from the files the checkout holds, as [`CODEX_MEASURED_BUILDS`] is
+/// ([`super::codex_shown::words`]). Sorted by build.
+pub const CODEX_SHOWN: &[(&str, &str)] = include!(concat!(env!("OUT_DIR"), "/codex_shown.rs"));
+
+/// codex-alab's Autopilot's own `turn_trigger` (codex-alab `TURN_TRIGGER`,
+/// `codex-rs/alab-autopilot/src/extension.rs`), set on every submission its Autopilot makes.
+pub const AUTOPILOT_TRIGGER: &str = "alab_autopilot";
+
+/// The closed words a gated read reads, beside their key: what a measurement notes when a build
+/// drops one (`lab codex-measure`'s drift).
+pub const GATED_WORDS: [(&str, &str); 1] = [(KEY_TURN_TRIGGER, AUTOPILOT_TRIGGER)];
+
+/// THE GATE OF THE FOLD'S LATER READS (gaps 20, 25): each applies only while the rows are read
+/// [`StepState::On`] and both the rollout's build and its writer's show what it reads
+/// ([`CODEX_SHOWN`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Gate {
+    /// `exit_code`: a command's completion fails its step.
+    pub exit: bool,
+    /// `turn_trigger=alab_autopilot`: the turn is the harness's.
+    pub autopilot: bool,
+}
+
+impl Gate {
+    /// No gated read: an unmeasured build's, and every build's while its rows read `Partial`.
+    pub const NONE: Gate = Gate {
+        exit: false,
+        autopilot: false,
+    };
+    /// Every gated read: the lab reducer's fold ([`CodexStepFold::ungated`]).
+    pub const ALL: Gate = Gate {
+        exit: true,
+        autopilot: true,
+    };
+
+    /// The gate `build`'s committed reductions open ([`Gate::NONE`] for a build [`CODEX_SHOWN`]
+    /// does not name).
+    #[must_use]
+    pub fn of(build: Option<&str>) -> Gate {
+        build
+            .and_then(|b| CODEX_SHOWN.iter().find(|(n, _)| *n == b))
+            .map_or(Gate::NONE, |(_, w)| Gate::from_words(w))
+    }
+
+    /// The gate a build whose reductions show `words` ([`super::codex_shown::words`]) opens.
+    #[must_use]
+    pub fn from_words(words: &str) -> Gate {
+        Gate {
+            exit: shows(words, KEY_EXIT_CODE, None),
+            autopilot: shows(words, GATED_WORDS[0].0, Some(GATED_WORDS[0].1)),
+        }
+    }
+
+    const fn and(self, o: Gate) -> Gate {
+        Gate {
+            exit: self.exit && o.exit,
+            autopilot: self.autopilot && o.autopilot,
+        }
+    }
+}
+
+/// Whether `words` ([`super::codex_shown::words`]) hold the key `key`, or, with `value`, the
+/// closed word `value` beside it.
+fn shows(words: &str, key: &str, value: Option<&str>) -> bool {
+    words.split('\n').any(|t| match value {
+        None => t == key,
+        Some(v) => t.split_once('=') == Some((key, v)),
+    })
+}
+
 /// The build `build` as the log says it (`ver=`).
 #[must_use]
 pub fn log_build(build: &str) -> Option<StepId> {
@@ -72,6 +144,16 @@ const USAGE_LIMIT: &str = aterm_phase::anchor!("rollout.usage_limit_exceeded");
 const COLLABORATION: &str = aterm_phase::anchor!("rollout.collaboration");
 const SPAWN_AGENT: &str = aterm_phase::anchor!("rollout.spawn_agent");
 const EXEC_COMMAND: &str = aterm_phase::anchor!("rollout.exec_command");
+const ITEM_COMPLETED: &str = aterm_phase::anchor!("rollout.item_completed");
+const KEY_ITEM: &str = aterm_phase::anchor!("rollout.item");
+const KEY_EXIT_CODE: &str = aterm_phase::anchor!("rollout.exit_code");
+const TASK_STARTED: &str = aterm_phase::anchor!("rollout.task_started");
+const KEY_TURN_ATTRIBUTION: &str = aterm_phase::anchor!("rollout.turn_attribution");
+const KEY_TURN_TRIGGER: &str = aterm_phase::anchor!("rollout.turn_trigger");
+
+/// The most open calls the exit read keeps (codex_facts' `PENDING_KEPT`): past it the oldest is
+/// dropped, and reads `ok` at its output.
+const CALLS_MAX: usize = 64;
 
 /// The kinds of row past a copy the fold opens: any other is skipped by its
 /// raw bytes, unparsed (a quote inside a JSON string is escaped, so a
@@ -148,6 +230,18 @@ pub struct CodexStepFold {
     model: Option<(StepId, Option<StepId>)>,
     /// Latched off for the bound rollout.
     broken: bool,
+    /// THE EXIT READ'S CALLS (gap 20): each open call's `call_id` fingerprint, and whether a
+    /// completion read before its output failed, oldest first, at most [`CALLS_MAX`].
+    calls: VecDeque<(u64, bool)>,
+    /// What the rollout's own build showed ([`Gate::of`]).
+    shown: Gate,
+    /// What the writer's build showed ([`Gate::of`], [`Self::set_writer`]).
+    writer_shown: Gate,
+    /// Every gated read applies whatever the build ([`Self::ungated`]).
+    ungated: bool,
+    /// THE HARNESS'S TURN (gap 25): the turn whose `task_started` said the Autopilot began it,
+    /// read before its `turn_context`.
+    harness: Option<u64>,
     queue: VecDeque<Step>,
     overflow: u64,
     lost: u64,
@@ -173,10 +267,24 @@ impl CodexStepFold {
             tok_out: 0,
             model: None,
             broken: false,
+            calls: VecDeque::new(),
+            shown: Gate::NONE,
+            writer_shown: Gate::NONE,
+            ungated: false,
+            harness: None,
             queue: VecDeque::new(),
             overflow: 0,
             lost: 0,
         }
+    }
+
+    /// A fold whose gated reads ([`Gate`]) read on every build: the lab reducer's, since a build
+    /// is measured from what this reads; never the tap's.
+    #[must_use]
+    pub const fn ungated(floor_ms: u64) -> CodexStepFold {
+        let mut f = CodexStepFold::new(floor_ms);
+        f.ungated = true;
+        f
     }
 
     /// Bind the rollout at `fp` (its identity `id`).
@@ -193,7 +301,10 @@ impl CodexStepFold {
             bound: Some((fp, id)),
             seed,
             state: state_for(CODEX_MEASURED_BUILDS, build),
+            shown: Gate::of(build),
             writer: self.writer,
+            writer_shown: self.writer_shown,
+            ungated: self.ungated,
             ..CodexStepFold::new(self.floor_ms)
         };
         let at_ms = self.floor_ms;
@@ -230,6 +341,7 @@ impl CodexStepFold {
             self.model = None;
         }
         self.writer = Some(writer);
+        self.writer_shown = Gate::of(build);
     }
 
     /// THE STATE ITS ROWS ARE READ AT NOW: [`StepState::On`] only while the rollout's own build and
@@ -278,11 +390,14 @@ impl CodexStepFold {
             return;
         };
         let t = text.trim();
-        if t.is_empty()
-            || (self.prefix == Prefix::Own
-                && !OPENED.iter().any(|k| quoted(t, k))
-                && !t.contains("\\u"))
-        {
+        let gate = self.gate();
+        let opens = OPENED.iter().any(|k| quoted(t, k))
+            || (gate.exit
+                && !self.calls.is_empty()
+                && quoted(t, ITEM_COMPLETED)
+                && quoted(t, KEY_EXIT_CODE))
+            || (gate.autopilot && quoted(t, TASK_STARTED));
+        if t.is_empty() || (self.prefix == Prefix::Own && !opens && !t.contains("\\u")) {
             return;
         }
         let Ok(v) = transcript::codex_steps(t) else {
@@ -331,6 +446,7 @@ impl CodexStepFold {
                 if kind == Some(SESSION_META) {
                     let build = word(payload, KEY_CLI_VERSION);
                     self.state = state_for(CODEX_MEASURED_BUILDS, build);
+                    self.shown = Gate::of(build);
                     self.version = build.and_then(log_build);
                     let fork = word(payload, KEY_FORKED_FROM).is_some_and(|p| !p.is_empty());
                     if !fork {
@@ -396,6 +512,9 @@ impl CodexStepFold {
                     self.opened.push_back(f);
                     self.open = Some(f);
                     out.push(StepEvent::Prompt { vref });
+                    if self.harness.take() == Some(f) {
+                        out.push(StepEvent::HarnessTurn { vref });
+                    }
                 }
                 if let Some(model) = word(payload, KEY_MODEL)
                     .filter(|m| live && super::upgrade::is_model_id(m))
@@ -444,6 +563,8 @@ impl CodexStepFold {
                     self.ended();
                 }
             }
+            (Some(EVENT_MSG), Some(TASK_STARTED)) => self.task_started(payload, out),
+            (Some(EVENT_MSG), Some(ITEM_COMPLETED)) => self.item_completed(payload),
             (Some(EVENT_MSG), Some(TOKEN_COUNT)) => {
                 if let Some((_, total, last)) = counts_of(payload)
                     && total > self.top
@@ -463,6 +584,13 @@ impl CodexStepFold {
                 };
                 let name = word(payload, KEY_NAME).unwrap_or("");
                 let (cls, subagent) = tool_class(word(payload, KEY_NAMESPACE), name);
+                let f = fingerprint(call);
+                if self.gate().exit && !self.calls.iter().any(|(c, _)| *c == f) {
+                    if self.calls.len() == CALLS_MAX {
+                        self.calls.pop_front();
+                    }
+                    self.calls.push_back((f, false));
+                }
                 out.push(StepEvent::ToolUse {
                     id,
                     tool: ToolName::new(name),
@@ -474,8 +602,18 @@ impl CodexStepFold {
                 let Some(call) = word(payload, KEY_CALL_ID) else {
                     return true;
                 };
+                let f = fingerprint(call);
+                let failed = self
+                    .calls
+                    .iter()
+                    .position(|(c, _)| *c == f)
+                    .and_then(|i| self.calls.remove(i))
+                    .is_some_and(|(_, failed)| failed);
                 match StepId::new(call) {
-                    Some(id) => out.push(StepEvent::ToolResult { id, error: false }),
+                    Some(id) => out.push(StepEvent::ToolResult {
+                        id,
+                        error: failed && self.gate().exit,
+                    }),
                     None => self.lost = self.lost.saturating_add(u64::from(fresh)),
                 }
             }
@@ -485,11 +623,82 @@ impl CodexStepFold {
         false
     }
 
-    /// The open turn ended or was interrupted: its tokens start over.
-    const fn ended(&mut self) {
+    /// THE EXIT READ (gap 20): a command's completion (`item_completed`) whose `item.id` is an
+    /// open call's `call_id`, read before that call's output, fails the call when its
+    /// `item.exit_code` is a non-zero integer (`-1` for a decline), and clears it otherwise: the
+    /// last completion before the output wins. One read after the output finds no open call and
+    /// changes nothing. It never latches and emits nothing.
+    fn item_completed(&mut self, payload: Option<&Value>) {
+        if !self.gate().exit {
+            return;
+        }
+        let item = payload.and_then(|p| p.get(KEY_ITEM));
+        let Some(f) = word(item, KEY_ID).map(fingerprint) else {
+            return;
+        };
+        let failed = item
+            .and_then(|i| i.get(KEY_EXIT_CODE))
+            .and_then(Value::as_i64)
+            .is_some_and(|x| x != 0);
+        if let Some(call) = self.calls.iter_mut().find(|(c, _)| *c == f) {
+            call.1 = failed;
+        }
+    }
+
+    /// THE HARNESS'S TURN (gap 25): a `task_started` whose `turn_attribution.turn_trigger` is
+    /// [`AUTOPILOT_TRIGGER`] says the agent's own harness began its turn: a
+    /// [`StepEvent::HarnessTurn`] after that turn's `Prompt`. Where the `task_started` comes
+    /// first it is held and follows the `Prompt` directly, at its `turn_context`; where the
+    /// `turn_context` came first it is pushed now, at the `task_started` row, after the `Prompt`
+    /// and anything read between (the turn's `Model`). Any other trigger, `null`, or a missing
+    /// attribution says nothing, and so does a turn that opened and ended already. It never
+    /// latches.
+    fn task_started(&mut self, payload: Option<&Value>, out: &mut Vec<StepEvent>) {
+        if !self.gate().autopilot {
+            return;
+        }
+        let trigger = word(
+            payload.and_then(|p| p.get(KEY_TURN_ATTRIBUTION)),
+            KEY_TURN_TRIGGER,
+        );
+        if trigger != Some(AUTOPILOT_TRIGGER) {
+            return;
+        }
+        let Some(turn) = word(payload, KEY_TURN_ID) else {
+            return;
+        };
+        let f = fingerprint(turn);
+        if self.open == Some(f) {
+            if let Some(vref) = StepId::new(turn) {
+                out.push(StepEvent::HarnessTurn { vref });
+            }
+        } else if !self.opened.contains(&f) {
+            self.harness = Some(f);
+        }
+    }
+
+    /// The open turn ended or was interrupted: its tokens start over, and its calls close.
+    fn ended(&mut self) {
         self.open = None;
         self.tok_in = 0;
         self.tok_out = 0;
+        self.calls.clear();
+    }
+
+    /// THE GATE THE ROWS ARE READ AT NOW ([`Gate`]): every read for an ungated fold; none while
+    /// [`Self::state`] is not [`StepState::On`]; else what the rollout's build showed and, once
+    /// its writer is known, what the writer's showed too (as [`Self::state`] ignores a writer
+    /// none named yet).
+    fn gate(&self) -> Gate {
+        if self.ungated {
+            Gate::ALL
+        } else if !matches!(self.state(), StepState::On) {
+            Gate::NONE
+        } else if self.writer.is_some() {
+            self.shown.and(self.writer_shown)
+        } else {
+            self.shown
+        }
     }
 
     fn latch(&mut self, fp: u64, id: Option<(u64, u64)>, end: u64) {

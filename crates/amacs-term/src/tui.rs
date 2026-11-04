@@ -1238,7 +1238,7 @@ mod tests {
             authority.grant(aterm_cap::Tier::Trusted),
             Options::default(),
         );
-        let scratch = aterm_tempfile::TempDir::new().unwrap();
+        let scratch = crate::test_scratch_dir("dir-refresh");
         let path = std::fs::canonicalize(scratch.path()).unwrap();
         let mut buffer = tui
             .open(&Target {
@@ -1318,7 +1318,7 @@ mod tests {
             authority.grant(aterm_cap::Tier::Trusted),
             Options::default(),
         );
-        let scratch = aterm_tempfile::TempDir::new().unwrap();
+        let scratch = crate::test_scratch_dir("crlf-kill-yank");
         let path = scratch.path().join("held.txt");
         std::fs::write(&path, "a\r\nb\r\n").unwrap();
         let mut buffer = tui.open(&Target { path, line: None }).unwrap();
@@ -1346,7 +1346,7 @@ mod tests {
             authority.grant(aterm_cap::Tier::Trusted),
             Options::default(),
         );
-        let scratch = aterm_tempfile::TempDir::new().unwrap();
+        let scratch = crate::test_scratch_dir("macro-commits");
         let path = scratch.path().join("publication.txt");
         std::fs::write(&path, "base").unwrap();
         let mut buffer = tui.open(&Target { path, line: None }).unwrap();

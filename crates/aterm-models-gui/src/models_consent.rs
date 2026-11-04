@@ -5,7 +5,9 @@
 
 use aterm_spec::derive::*;
 
-/// Formal state-machine model for the macOS debugger-access change workflow: the owner's press in aterm's alert, and System State's standing yes (`PlanConsent`, the window's own admission, once per Mac; `docs/DESIGN-system-state-2026-10-21.md` §6).
+/// Formal state-machine model for the macOS debugger-access change workflow: the owner's press
+/// in aterm's alert on Settings ▸ Security. Setup's one early elevation turns developer mode on
+/// by itself (`aterm_machines::root_steps`), so no other gesture starts a change.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn debugger_access_change_model() -> Model {
@@ -13,17 +15,6 @@ pub fn debugger_access_change_model() -> Model {
         DebuggerAccessChange {
             const Buggy = 0;
             const Cap = 2;
-            // The window itself admitted a plan with its Permissions group in
-            // this process (system-state design §6): its automatic admission,
-            // or a person's press on the page. The scenario is a process with
-            // none — a later launch, or one whose only plan came from a
-            // control client's `act` or `key`, a status poll or a hand-edited
-            // record. A constant rather than a variable: an admission only
-            // enables `PlanConsent`, so a process that admits midway reaches
-            // nothing the committed config does not, and a variable would
-            // double the `Buggy = 1` space past the interpreter's budget.
-            const Admitted = 1;
-            scenario Admitted = 0;
             var phase = 0;
             var world = 0;
             var obs = 3;
@@ -39,10 +30,6 @@ pub fn debugger_access_change_model() -> Model {
             var clobbered = 0;
             var stale = 0;
             var misadopted = 0;
-            var asked = 0;
-            var reasked = 0;
-            var overlapped = 0;
-            var unadmitted = 0;
 
             action Probe when (phase == 0 || phase == 6) {
                 obs = world;
@@ -61,34 +48,6 @@ pub fn debugger_access_change_model() -> Model {
             }
             action PressWhileInFlight when (Buggy == 1 && phase == 4) {
                 phase = 1;
-            }
-            // The standing yes: once per Mac, the window's own admission is the yes, the record written ahead of the change.
-            action PlanConsent when (phase == 0 && obs == 0 && lock == 0 && stale == 0 && asked == 0 && Admitted == 1 && launches <= Cap - 1) {
-                asked = 1;
-                fresh = 1;
-                polling = 1;
-                phase = 2;
-            }
-            action PlanConsentAgain when (Buggy == 2 && phase == 0 && obs == 0 && lock == 0 && stale == 0 && asked == 1 && Admitted == 1 && launches <= Cap - 1) {
-                reasked = 1;
-                fresh = 1;
-                polling = 1;
-                phase = 2;
-            }
-            action PlanConsentWhileInFlight when (Buggy == 2 && phase == 4 && asked == 0 && Admitted == 1) {
-                asked = 1;
-                overlapped = 1;
-            }
-            // MUTANT: `PlanConsent` without its `Admitted == 1` guard.
-            action ConsentUnadmitted when (Buggy == 2 && phase == 0 && obs == 0 && lock == 0 && stale == 0 && asked == 0 && Admitted == 0 && launches <= Cap - 1) {
-                asked = 1;
-                fresh = 1;
-                polling = 1;
-                phase = 2;
-                unadmitted = 1;
-            }
-            action Forgo when (asked == 0) {
-                asked = 1;
             }
             action Decline when (phase == 1) {
                 phase = if (polling == 1) { 4 } else { 0 };
@@ -211,9 +170,6 @@ pub fn debugger_access_change_model() -> Model {
             invariant EveryLaunchFollowsAFreshRead: unarmed == 0;
             invariant UnderWayIsPolled: (phase <= 1 && (lock == 0 || lock == 2)) || polling == 1;
             invariant ReReadsOnlyAnEndedChange: misadopted == 0;
-            invariant AtMostOneOffer: reasked == 0;
-            invariant NoOfferOverAChange: overlapped == 0;
-            invariant ConsentOnlyWhenAdmitted: unadmitted == 0;
         }
     }
 }

@@ -99,17 +99,8 @@ fn read_torn_after_first(
     (facts, reads.get())
 }
 
-#[cfg(unix)]
-fn cache_test_dir(name: &str) -> PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let root = std::env::temp_dir().join(format!(
-        "aterm-footer-{name}-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&root).unwrap();
-    root
+fn cache_test_dir(name: &str) -> crate::supervise::ScratchDir {
+    crate::supervise::ScratchDir::new("footer", name)
 }
 
 #[cfg(unix)]
@@ -1544,8 +1535,7 @@ fn an_answer_past_the_tail_window_is_carried_for_the_same_process() {
 
 #[test]
 fn facts_floor_at_the_kernel_else_the_registry_start() {
-    let root = std::env::temp_dir().join(format!("aterm-footer-floor-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let root = cache_test_dir("floor");
     let cwd = root.join("work");
     std::fs::create_dir_all(&cwd).unwrap();
     let claude = root.join("claude");
@@ -1648,8 +1638,7 @@ fn facts_floor_at_the_kernel_else_the_registry_start() {
 
 #[test]
 fn a_clear_keeps_the_model_the_process_chose() {
-    let root = std::env::temp_dir().join(format!("aterm-footer-clear-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let root = cache_test_dir("clear");
     let cwd = root.join("work");
     std::fs::create_dir_all(&cwd).unwrap();
     let claude = root.join("claude");
@@ -1753,8 +1742,7 @@ fn a_head_names_its_branch_or_a_short_commit() {
 
 #[test]
 fn git_head_follows_a_worktree_file_and_climbs_to_the_top() {
-    let root = std::env::temp_dir().join(format!("aterm-footer-git-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let root = cache_test_dir("git");
     let main = root.join("repo");
     std::fs::create_dir_all(main.join(".git")).unwrap();
     std::fs::write(main.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
@@ -1779,9 +1767,12 @@ fn git_head_follows_a_worktree_file_and_climbs_to_the_top() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-fn repo_under(tag: &str, place: &str, branch: &str) -> (PathBuf, PathBuf, PathBuf) {
-    let root = std::env::temp_dir().join(format!("aterm-footer-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+fn repo_under(
+    tag: &str,
+    place: &str,
+    branch: &str,
+) -> (crate::supervise::ScratchDir, PathBuf, PathBuf) {
+    let root = cache_test_dir(tag);
     let home = root.join("home");
     let repo = home.join(place).join("repo");
     std::fs::create_dir_all(repo.join(".git")).unwrap();
@@ -1877,8 +1868,7 @@ fn only_an_eperm_refusal_reads_as_denied() {
     assert!(!is_eperm(&std::io::Error::from_raw_os_error(libc::ENOENT)));
 
     use std::os::unix::fs::PermissionsExt as _;
-    let root = std::env::temp_dir().join(format!("aterm-footer-eacces-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let root = cache_test_dir("eacces");
     let repo = root.join("repo");
     std::fs::create_dir_all(repo.join(".git")).unwrap();
     std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
@@ -1889,7 +1879,6 @@ fn only_an_eperm_refusal_reads_as_denied() {
     std::fs::set_permissions(repo.join(".git"), std::fs::Permissions::from_mode(0o000)).unwrap();
     let locked = read_git_head(&repo);
     std::fs::set_permissions(repo.join(".git"), std::fs::Permissions::from_mode(0o755)).unwrap();
-    let _ = std::fs::remove_dir_all(&root);
     assert_eq!(
         locked,
         GitHeadRead::Absent,
@@ -2721,15 +2710,12 @@ fn the_claude_dir_is_the_processs_own() {
 #[cfg(unix)]
 #[test]
 fn a_fifo_is_not_read() {
-    let dir = std::env::temp_dir().join(format!("aterm-footer-fifo-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = cache_test_dir("fifo");
     let fifo = dir.join("HEAD");
     let c = std::ffi::CString::new(fifo.to_string_lossy().as_bytes()).unwrap();
     // SAFETY: a NUL-terminated path we own; mkfifo only creates a node.
     assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
     assert_eq!(read_small(&fifo, MAX_GIT_FILE_BYTES), None);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -4327,8 +4313,7 @@ fn the_last_cwd_is_the_newest_main_thread_rows() {
 
 #[test]
 fn shell_cwds_reads_the_live_sessions_launched_in_the_directory() {
-    let root = std::env::temp_dir().join(format!("aterm-footer-shell-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let root = cache_test_dir("shell");
     let claude = root.join("claude");
     let launch = root.join("w");
     std::fs::create_dir_all(claude.join("sessions")).expect("sessions");
@@ -6704,6 +6689,7 @@ fn the_advertised_chip_budget_agrees_with_the_shortest_recovery_that_fits() {
     let mut controls_alone = 0;
     let mut recovery_alone = 0;
     let mut together = 0;
+    let mut between = 0;
     for facts in cases {
         let before = facts.clone();
         // Measure the fitter's actual floor, independently of the allocator's calculation.
@@ -6730,7 +6716,26 @@ fn the_advertised_chip_budget_agrees_with_the_shortest_recovery_that_fits() {
                     recovery_alone += 1;
                 }
             }
-            for chips in 1..=budget {
+            // Beside chips the fit is the first rung that fits `room - chips`, and what yields
+            // to chips takes no less room for fewer of them: the budget's edges at every room walk
+            // each slack the rooms reach, and each rung's tightest fit at the widest room the
+            // rest. What this does not read: a count between those, so a defect in a band of counts
+            // above `chips_room(.., 96)`, off the budgets at 120, 160 and 256 and off every tight
+            // fit, shows nowhere here. `rule_width` is linear in chips today; `chips_room` only
+            // sets the budget.
+            let mut counts = vec![1, budget];
+            if room == 256 {
+                for rung in plain_ladder(&facts) {
+                    let width = rule_width(&rung, TitleFit::None, false, None);
+                    let tight = room.saturating_sub(width + RULE_SEP + 2);
+                    counts.extend([tight, tight + 1]);
+                }
+            }
+            counts.retain(|chips| (1..=budget).contains(chips));
+            counts.sort_unstable();
+            counts.dedup();
+            for chips in counts {
+                between += usize::from(chips != 1 && chips != budget);
                 let lights = Some(LightsWidth {
                     chips,
                     title: 0,
@@ -6758,7 +6763,7 @@ fn the_advertised_chip_budget_agrees_with_the_shortest_recovery_that_fits() {
         }
         assert_eq!(facts, before, "budgeting never changes the observation");
     }
-    assert!(controls_alone > 0 && recovery_alone > 0 && together > 0);
+    assert!(controls_alone > 0 && recovery_alone > 0 && together > 0 && between > 0);
 }
 
 #[test]

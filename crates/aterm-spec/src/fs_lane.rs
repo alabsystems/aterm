@@ -44,7 +44,14 @@ pub const PLACES: usize = 4;
 /// s in the kernel) at 5 s and 175 s (395 s) at 120 s, three places; with them, 162 s (480 s) at
 /// 60 s and 160 s (472 s) at 30 s, four places. A test whose first call here comes inside one of
 /// its own deadlines keeps what this wait leaves of it.
+#[cfg(not(test))]
 pub const LET_IN_AFTER: Duration = Duration::from_secs(30);
+
+/// [`LET_IN_AFTER`] under this crate's own tests, whose holders always give their places back: the
+/// one-minute hang detector ([`crate::wait::MUST_HAPPEN`]), so a stalled holder is not let in over,
+/// which the tests that count the places would read as the lane failing.
+#[cfg(test)]
+pub const LET_IN_AFTER: Duration = crate::wait::MUST_HAPPEN;
 
 /// The places taken now.
 static TAKEN: Mutex<usize> = Mutex::new(0);
@@ -86,6 +93,38 @@ pub fn join() {
 pub fn each<T: Sync, R: Send>(items: &[T], work: impl Fn(&T) -> R + Sync) -> Vec<R> {
     let _ = HELD.try_with(|held| held.borrow_mut().take());
     crate::check::each_after(PLACES, |spent| take(spent), items, work)
+}
+
+/// Remove `dir` when this process exits normally: for a fixture a `static` keeps for the whole
+/// run, whose `Drop` never runs. libtest's exit, failed tests included, is one; a kill leaves it.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn remove_at_exit(dir: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        static DIRS: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
+        static ARMED: std::sync::Once = std::sync::Once::new();
+        extern "C" fn at_exit() {
+            for dir in DIRS
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .drain(..)
+            {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+        unsafe extern "C" {
+            fn atexit(cb: extern "C" fn()) -> std::ffi::c_int;
+        }
+        DIRS.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(dir.to_path_buf());
+        ARMED.call_once(|| {
+            // SAFETY: registers a plain `extern "C"` function with no captured state; a failed registration leaves `dir` for the next temporary-folder sweep.
+            unsafe { atexit(at_exit) };
+        });
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
 }
 
 /// How often a thread waiting for a place reads whether it still wants one.

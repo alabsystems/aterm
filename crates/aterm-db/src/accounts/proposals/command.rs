@@ -42,7 +42,9 @@ pub(super) fn run_at(
         None
     };
     let collection = if matches!(command, "accounts-get" | "accounts-scan") {
-        Some(take(&mut options, "--collection")?)
+        let collection = take(&mut options, "--collection")?;
+        validate_collection(collection)?;
+        Some(collection)
     } else {
         None
     };

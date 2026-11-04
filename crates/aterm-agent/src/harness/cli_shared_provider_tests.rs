@@ -115,3 +115,18 @@ fn shared_provider_retry_requires_typed_no_start_not_a_failure_string() {
         Execution::Completed
     ));
 }
+
+/// A SIGN-IN WHOSE PAGE DID NOT OPEN MAY HAVE STARTED AT THE VENDOR, SO ITS RENEWAL'S OUTCOME IS
+/// UNKNOWN; one that did not run did not start.
+#[test]
+fn a_page_that_did_not_open_leaves_a_codex_renewal_unknown() {
+    use super::super::super::login_drive::Outcome;
+    assert!(matches!(
+        codex_execution(Outcome::PageNotOpened("no page".into())),
+        Execution::Unknown(_)
+    ));
+    assert!(matches!(
+        codex_execution(Outcome::NotRun("no run".into())),
+        Execution::NotStarted(_)
+    ));
+}

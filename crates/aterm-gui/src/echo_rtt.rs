@@ -334,9 +334,7 @@ pub(crate) struct EchoSnapshot {
 /// Read the live echo facts.
 #[must_use]
 pub(crate) fn snapshot() -> EchoSnapshot {
-    let mut window = RING
-        .lock()
-        .map_or_else(|_| RingCopy::EMPTY, |ring| ring.copy_out());
+    let mut window = RING.lock().map_or(RingCopy::EMPTY, |ring| ring.copy_out());
     let (p50_us, p95_us, p99_us) = window.percentiles();
     EchoSnapshot {
         n: window.len as u64,

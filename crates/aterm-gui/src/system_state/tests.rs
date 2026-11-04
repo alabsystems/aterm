@@ -92,7 +92,7 @@ fn fresh_with_grants() -> SetupStatus {
 }
 
 /// The `mixed` scenario once its Debugger access is on: one managed row (Rust in Spotlight)
-/// still differs, which a run changes.
+/// still differs, which a run changes, and nothing waits on the elevation.
 fn to_change() -> SetupStatus {
     let mut status = status_of("mixed");
     let debugger = Subject::Access(Access::Debugger);
@@ -171,29 +171,24 @@ fn mark_on(status: &SetupStatus, setting: Setting) -> lines::Mark {
 
 #[test]
 fn an_untouched_setup_offer_can_restart_without_being_answered() {
-    for kind in [OfferKind::Launch, OfferKind::Resume] {
-        let (send, receive) = mpsc::channel();
-        let request = match kind {
-            OfferKind::Launch => Request::new(Plan::default(), send),
-            OfferKind::Resume => Request::resume(Plan::default(), send),
-        };
-        let mut page = SystemStateApp::new(Plan::default());
-        assert!(page.offer(request.clone()));
-        assert!(page.offer_can_restart(&request));
-        assert!(
-            receive.try_recv().is_err(),
-            "checking never answers the offer"
-        );
-        assert!(request.pending());
-        drop(page);
-        assert_eq!(
-            receive
-                .recv_timeout(Duration::from_secs(60))
-                .unwrap()
-                .decision,
-            WorkstationSetupDecision::Unavailable,
-        );
-    }
+    let (send, receive) = mpsc::channel();
+    let request = Request::new(Plan::default(), send);
+    let mut page = SystemStateApp::new(Plan::default());
+    assert!(page.offer(request.clone()));
+    assert!(page.offer_can_restart(&request));
+    assert!(
+        receive.try_recv().is_err(),
+        "checking never answers the offer"
+    );
+    assert!(request.pending());
+    drop(page);
+    assert_eq!(
+        receive
+            .recv_timeout(Duration::from_secs(60))
+            .unwrap()
+            .decision,
+        WorkstationSetupDecision::Unavailable,
+    );
 }
 
 #[test]
@@ -476,7 +471,7 @@ fn a_rows_description_is_its_note_wherever_it_explains_the_row() {
             ..reading(subject, standing, now)
         };
     let debugger = Subject::Access(Access::Debugger);
-    let sampling = "macOS asks for an administrator password in a dialog named SamplingTools.";
+    let sampling = "Turning it on lets debuggers attach without a password.";
     let widgets = Subject::Setting(Setting::Widgets);
     let dock = Subject::Setting(Setting::Dock);
     let accessibility = Subject::Access(Access::Accessibility);
@@ -561,23 +556,6 @@ fn a_rows_description_is_its_note_wherever_it_explains_the_row() {
             no_sign_out
         ),
         None
-    );
-
-    // On the page: the card, which holds the Debugger row while macOS asks for the password,
-    // names the dialog macOS shows, and a screen reader hears it.
-    let mut app = SystemStateApp::new(Plan::default());
-    app.publish(status_of("debugger"));
-    let compiled = compile(&app, &SystemStateViewState::default(), 999.0, 900.0);
-    assert!(
-        compiled.semantics.iter().any(|node| {
-            node.key.as_str().starts_with("system-state/card/debugger")
-                && (node.label.contains("SamplingTools")
-                    || node
-                        .description
-                        .as_deref()
-                        .is_some_and(|words| words.contains("SamplingTools")))
-        }),
-        "the card explains the SamplingTools dialog"
     );
 }
 
@@ -1428,10 +1406,6 @@ fn headlines_say_the_state_in_the_designs_words() {
         line(&status_of("running")).text,
         "Setting up this Mac… 11 of 16"
     );
-    assert_eq!(
-        line(&status_of("debugger")).text,
-        "Enter your password for Debugger access"
-    );
     let needs = line(&status_of("needs-you"));
     assert_eq!(needs.text, "Needs you: Full Disk Access");
     assert_eq!(needs.open, Some(Access::FullDiskAccess));
@@ -1459,9 +1433,11 @@ fn headlines_say_the_state_in_the_designs_words() {
     );
     assert_eq!(line(&status_of("set-up")).text, "This Mac is set up");
     assert_eq!(line(&status_of("non-alab")).text, "Permissions are set up");
+    // Debugger access waiting on setup's one early Mac password is no person's step and no
+    // change a run makes: the line counts Rust in Spotlight alone, as once it is on.
     let mixed = line(&status_of("mixed"));
-    assert_eq!(mixed.text, "Needs you: Debugger access");
-    assert_eq!(mixed.open, Some(Access::Debugger));
+    assert_eq!(mixed.text, "1 change to make");
+    assert_eq!(mixed.open, None);
     let differs = line(&to_change());
     assert_eq!(differs.text, "1 change to make");
     assert!(differs.start, "a run would change the rows that differ");
@@ -2112,8 +2088,8 @@ fn only_a_managed_row_that_needs_a_person_or_failed_lights_the_tab() {
         ("failed", true),
         ("set-up", false),
         ("non-alab", false),
-        // Its Debugger access is off, which Permissions manage: a person turns it on.
-        ("mixed", true),
+        // Its Debugger access is off and waits on setup's one early Mac password, never a person.
+        ("mixed", false),
         ("fresh", false),
         ("widened", false),
         ("vault-unreached", false),
@@ -2786,34 +2762,6 @@ fn an_accepted_plan_does_not_undo_a_choice_made_while_it_waited() {
     assert!(app.awaiting.is_none());
 }
 
-/// The offer of a plan an earlier process admitted is answered by the page itself on its first
-/// tick, while the run it resumes keeps the page busy; a page asked to Stop that
-/// run gives no answer to the offer still up, in that frame or later.
-#[test]
-fn a_page_asked_to_stop_gives_the_resumed_offer_no_answer() {
-    let running = || SetupStatus {
-        busy: true,
-        plan: Some(Plan::default()),
-        ..SetupStatus::default()
-    };
-    for stop in [false, true] {
-        let (send, _receive) = mpsc::channel();
-        let mut app = SystemStateApp::new(Plan::default());
-        app.publish(running());
-        assert!(app.offer(Request::resume(Plan::default(), send)));
-        if stop {
-            act(&mut app, "system-state/stop");
-            assert!(matches!(app.take_action(), Some(SystemStateAction::Stop)));
-        }
-        app.tick();
-        let answered = matches!(
-            app.take_action(),
-            Some(SystemStateAction::Apply(_, Admission::Automatic))
-        );
-        assert_eq!(answered, !stop, "stop {stop}");
-    }
-}
-
 /// The launch's offer is answered by the page itself, as the plan stands, at its first tick,
 /// shown or not and whoever is at this Mac (init-on-by-default design §6.1: only the person stages
 /// wait for a person). The answer is aterm's own, never a choice, and carries no typed vault.
@@ -3407,7 +3355,6 @@ fn every_scenario_lays_out_at_every_width_with_the_designs_labels() {
     for scenario in [
         "checking",
         "running",
-        "debugger",
         "needs-you",
         "vault",
         "set-up",
@@ -3807,7 +3754,6 @@ fn every_word_and_button_face_is_whole_in_a_narrow_pane_at_every_text_size() {
         for scenario in [
             "checking",
             "running",
-            "debugger",
             "needs-you",
             "vault",
             "set-up",
@@ -4282,7 +4228,6 @@ fn page_states() -> Vec<(String, SetupStatus, bool)> {
     for name in [
         "checking",
         "running",
-        "debugger",
         "needs-you",
         "vault",
         "set-up",
@@ -5322,49 +5267,43 @@ fn a_line_marks_a_failed_step_failed_and_a_retried_one_waiting() {
     );
 }
 
-/// While macOS's administrator dialog for debugger access is up, Turn On… can start nothing
-/// (design §3.4): the row says what it waits for in its place, with no button, and still needs
-/// the person, whose dialog may be behind other windows, so the menu line and the diamond
-/// stay. Once the step ends, Turn On… is back.
+/// Debugger access offers no Turn On… of its own: setup's one early elevation turns developer
+/// mode on (`aterm_machines::root_steps`), and Settings ▸ Security changes it. A row that reads
+/// off, as the doctor reads it on an admin account, waits on that elevation with its note: it
+/// needs nobody, has no button, and a press of its key starts nothing. Negative control: the
+/// same row read as an administrator's (`Needs you`) is the person's, still with no button.
 #[test]
-fn the_debugger_row_waits_for_the_password_without_a_button() {
+fn the_debugger_row_waits_on_the_elevation_without_a_button() {
     let open = "system-state/row/debugger/open";
+    let debugger = Subject::Access(Access::Debugger);
     let mut app = SystemStateApp::new(Plan::default());
-    app.publish(status_of("debugger"));
+    app.publish(status_of("mixed"));
+    let row = app.reviewed_row(debugger);
+    assert_eq!(row.standing, Some(Standing::Waiting));
+    assert_eq!(
+        row.note.as_deref(),
+        Some(aterm_types::macos_setup::DEBUGGER_BY_ELEVATION)
+    );
+    assert!(!row.attention(), "the elevation's, never the person's");
     let compiled = compile(&app, &SystemStateViewState::default(), 999.0, 900.0);
     assert!(
         compiled.semantic(&UiKey::new(open)).is_none(),
-        "no Turn On… while the dialog is up"
-    );
-    assert!(
-        compiled
-            .semantics
-            .iter()
-            .any(|node| !node.offscreen && node.label == PASSWORD_NOTE)
+        "no Turn On…"
     );
     app.gesture(true);
     act(&mut app, open);
     assert!(app.take_action().is_none(), "a press starts nothing");
-    assert!(app.needs_attention());
-    assert_eq!(
-        crate::system_state_access::menu_line(&app.status, false).map(|line| line.label),
-        Some("System State: Debugger access needs you".to_owned())
-    );
-    let mut ended = status_of("debugger");
-    ended.access_step = None;
-    app.publish(ended);
+
+    let mut admin = status_of("mixed");
+    if let Some(reading) = admin.observed.iter_mut().find(|o| o.subject == debugger) {
+        reading.standing = Standing::NeedsYou;
+        reading.note = None;
+    }
+    let mut app = SystemStateApp::new(Plan::default());
+    app.publish(admin);
+    assert!(app.reviewed_row(debugger).attention());
     let compiled = compile(&app, &SystemStateViewState::default(), 999.0, 900.0);
-    assert!(
-        compiled
-            .semantic(&UiKey::new(open))
-            .is_some_and(|node| node.state.is_some_and(|state| state.enabled))
-    );
-    assert!(
-        compiled
-            .semantics
-            .iter()
-            .all(|node| node.label != PASSWORD_NOTE)
-    );
+    assert!(compiled.semantic(&UiKey::new(open)).is_none());
 }
 
 /// Where no look at the local network answered aterm, Local Network reads as macOS leaves it
@@ -6829,7 +6768,7 @@ fn the_tools_row_names_them_and_its_button_says_it_whole_where_it_fits() {
     );
 }
 
-/// The Command Line Tools tab a restore brought back is named as its title and the headline
+/// The Mac Setup tab a restore brought back is named as its title and the headline
 /// name it.
 #[test]
 fn a_restored_tools_tab_is_named_as_its_title_names_it() {

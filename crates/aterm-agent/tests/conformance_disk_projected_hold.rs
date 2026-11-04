@@ -103,25 +103,19 @@ fn the_models_places_are_the_leases() {
     );
 }
 
-struct Scratch(PathBuf);
+struct Scratch(
+    PathBuf,
+    #[expect(dead_code, reason = "RAII cleanup guard")] aterm_tempfile::TempDir,
+);
 
 impl Scratch {
     fn new(name: &str) -> Self {
-        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-conformance-diskhold-{name}-{}-{n}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch");
-        Self(dir)
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        let dir = aterm_tempfile::Builder::new()
+            .prefix(&format!("aterm-conformance-diskhold-{name}-"))
+            .suffix(".noindex")
+            .tempdir()
+            .expect("scratch");
+        Self(dir.path().to_path_buf(), dir)
     }
 }
 

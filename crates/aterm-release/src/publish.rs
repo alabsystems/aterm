@@ -317,7 +317,7 @@ pub fn repo_slug(cargo_toml: &str) -> Option<String> {
 
 fn workspace_repo_slug(repo: &Path) -> Result<String> {
     let path = repo.join("Cargo.toml");
-    let cargo_text = fs::read_to_string(&path)
+    let cargo_text = gates::read_bounded_string(&path, 16 << 20)
         .map_err(|error| Error::new(format!("read {}: {error}", path.display())))?;
     repo_slug(&cargo_text).ok_or_else(|| {
         Error::new(format!(
@@ -343,7 +343,7 @@ pub fn channel_slug(cargo_toml: &str) -> Result<String> {
 /// [`channel_slug`] of the checkout at `repo`.
 pub fn workspace_channel_slug(repo: &Path) -> Result<String> {
     let path = repo.join("Cargo.toml");
-    let cargo_text = fs::read_to_string(&path)
+    let cargo_text = gates::read_bounded_string(&path, 16 << 20)
         .map_err(|error| Error::new(format!("read {}: {error}", path.display())))?;
     channel_slug(&cargo_text)
 }
@@ -623,11 +623,12 @@ fn publisher_fence_self_version() -> Option<String> {
     FENCE_SELF_VERSION.lock().ok().and_then(|slot| slot.clone())
 }
 
+/// Keep each field on one line. Display-width truncation can remove an executable's
+/// basename and make a live publisher look like a reused pid.
 fn fence_field(value: &str) -> String {
     let out: String = value
         .chars()
         .map(|c| if c.is_control() { '_' } else { c })
-        .take(200)
         .collect();
     let out = out.trim().to_string();
     if out.is_empty() {
@@ -637,7 +638,7 @@ fn fence_field(value: &str) -> String {
     }
 }
 
-fn fence_identity_block(probe: &dyn PublisherProbe) -> String {
+pub(crate) fn fence_identity_block(probe: &dyn PublisherProbe) -> String {
     let mut out = format!(
         "fence-format: {FENCE_IDENTITY_FORMAT}\nfence-pid: {}\n",
         std::process::id()
@@ -1339,11 +1340,12 @@ pub fn preflight_release_lease(git: &dyn GitRunner) -> Result<()> {
     Ok(())
 }
 
-/// The cut's pre-claim gates that need nothing `pub publish` makes.
-pub fn pre_publish_gates(
+/// The cut's pre-claim gates that need nothing `pub publish` makes. A private cut does not require the public publisher's lease to be idle.
+pub fn pre_cut_gates(
     repo: &Path,
     version: &str,
     creds_path: &Path,
+    kind: CutKind,
 ) -> Vec<(&'static str, String)> {
     let mut out: Vec<(&'static str, String)> = Vec::new();
     let git = GitCli::new(repo);
@@ -1352,7 +1354,9 @@ pub fn pre_publish_gates(
     {
         out.push(("staged bundle", e.to_string()));
     }
-    if let Err(e) = preflight_release_lease(&git) {
+    if kind == CutKind::Real
+        && let Err(e) = preflight_release_lease(&git)
+    {
         out.push(("release lease", e.to_string()));
     }
     let slug = match workspace_channel_slug(repo) {
@@ -2402,7 +2406,7 @@ fn release_body_post_failure_detail(out: &RunOut, body: &ReleaseBody) -> String 
 }
 
 fn release_body_for_post(label: &str, path: &Path) -> Result<ReleaseBody> {
-    let raw = fs::read_to_string(path)
+    let raw = gates::read_bounded_string(path, 64 << 20)
         .map_err(|error| Error::new(format!("read {label} release notes: {error}")))?;
     let bounded = changelog::bound_release_body(&raw);
     if bounded.len() != raw.len() {
@@ -4377,7 +4381,7 @@ fn sign_manifest_with_policy(ctx: &CutCtx, manifest: &Path) -> Result<PathBuf> {
         ));
     }
     let signature = manifest.with_extension("toml.sig");
-    let manifest_bytes = fs::read(manifest)
+    let manifest_bytes = gates::read_bounded_bytes(manifest, 16 << 20)
         .map_err(|error| Error::new(format!("read {}: {error}", manifest.display())))?;
     let signature_bytes = creds.sign(&manifest_bytes).map_err(Error::new)?;
     fs::write(&signature, &signature_bytes)
@@ -5376,7 +5380,7 @@ pub fn run_recover_lost(
         ));
     }
     let owner = owner.to_ascii_lowercase();
-    let cargo_text = fs::read_to_string(repo.join("Cargo.toml"))
+    let cargo_text = gates::read_bounded_string(&repo.join("Cargo.toml"), 16 << 20)
         .map_err(|error| Error::new(format!("read Cargo.toml: {error}")))?;
     let origin_slug = repo_slug(&cargo_text)
         .ok_or_else(|| Error::new("Cargo.toml repository is not an exact GitHub OWNER/REPO URL"))?;
@@ -5614,8 +5618,8 @@ fn published_manifest_signature_pubkey(
 fn refuse_roster_downgrade(dist: &Path, incoming_seq: u64) -> Result<()> {
     let local = dist.join(roster::ROSTER_ASSET);
     let (Ok(bytes), Ok(sig)) = (
-        fs::read(&local),
-        fs::read(dist.join(roster::ROSTER_SIG_ASSET)),
+        gates::read_bounded_bytes(&local, 16 << 20),
+        gates::read_bounded_bytes(&dist.join(roster::ROSTER_SIG_ASSET), 16 << 20),
     ) else {
         return Ok(());
     };
@@ -6251,7 +6255,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         .as_ref()
         .map_or_else(|| repo.to_path_buf(), |checkout| checkout.tree.clone());
     let git = GitCli::new(&tree);
-    let cargo_text = fs::read_to_string(tree.join("Cargo.toml"))
+    let cargo_text = gates::read_bounded_string(&tree.join("Cargo.toml"), 16 << 20)
         .map_err(|e| Error::new(format!("read {}: {e}", tree.join("Cargo.toml").display())))?;
     let full = workspace_version(&cargo_text)?;
     let origin_slug = repo_slug(&cargo_text).ok_or_else(|| {
@@ -6275,8 +6279,9 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         .transpose()?;
     let apple = resolve_apple_tier(aterm_update_core::pins::APPLE_TEAM_ID, credentials)?;
 
-    let changelog_text = fs::read_to_string(tree.join(changelog::CHANGELOG_FILE))
-        .map_err(|e| Error::new(format!("read {}: {e}", changelog::CHANGELOG_FILE)))?;
+    let changelog_text =
+        gates::read_bounded_string(&tree.join(changelog::CHANGELOG_FILE), 64 << 20)
+            .map_err(|e| Error::new(format!("read {}: {e}", changelog::CHANGELOG_FILE)))?;
     let main_changelog = if kind == CutKind::Real {
         String::from_utf8(
             git_ok(
@@ -6487,7 +6492,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     let ledger_text = if kind == CutKind::Real {
         ledger::show_origin_ledger(&git)?
     } else {
-        fs::read_to_string(tree.join(ledger::LEDGER_FILE))
+        gates::read_bounded_string(&tree.join(ledger::LEDGER_FILE), 64 << 20)
             .map_err(|e| Error::new(format!("read {}: {e}", ledger::LEDGER_FILE)))?
     };
     let tail = ledger::tail(&ledger_text)?;
@@ -6771,7 +6776,7 @@ fn run_pipeline(ctx: &mut CutCtx, t0: Instant) -> Result<()> {
             handoff.verify_staged(&ctx.dist, &ctx.version, ctx.build, &ctx.commit)?;
         }
         let manifest = Manifest::parse(
-            &fs::read_to_string(ctx.manifest_path())
+            &gates::read_bounded_string(&ctx.manifest_path(), 16 << 20)
                 .map_err(|e| Error::new(format!("read resumed appcast: {e}")))?,
         )?;
         buildplan::linux::verify_manifest_handoff(&manifest, ctx.linux.as_ref())?;
@@ -7234,12 +7239,13 @@ fn step_sign(ctx: &mut CutCtx) -> Result<()> {
         let fingerprint = ctx
             .expected_embedded_pin()?
             .ok_or_else(|| Error::new("signed build has no pinned paper master"))?;
-        let mut provenance = fs::read_to_string(&provenance_path).map_err(|error| {
-            Error::new(format!(
-                "read {} for update-pin provenance: {error}",
-                provenance_path.display()
-            ))
-        })?;
+        let mut provenance =
+            gates::read_bounded_string(&provenance_path, 16 << 20).map_err(|error| {
+                Error::new(format!(
+                    "read {} for update-pin provenance: {error}",
+                    provenance_path.display()
+                ))
+            })?;
         provenance.push_str(&format!("update_pubkey_fingerprint_sha256={fingerprint}\n"));
         fs::write(&provenance_path, provenance).map_err(|error| {
             Error::new(format!(
@@ -7297,7 +7303,7 @@ fn step_sign(ctx: &mut CutCtx) -> Result<()> {
         "`.sha256` sidecars staged for every container and every stable twin \
          (shasum -a 256 -c)",
     );
-    let cl_text = fs::read_to_string(ctx.tree.join(changelog::CHANGELOG_FILE))
+    let cl_text = gates::read_bounded_string(&ctx.tree.join(changelog::CHANGELOG_FILE), 64 << 20)
         .map_err(|e| Error::new(format!("read {}: {e}", changelog::CHANGELOG_FILE)))?;
     let body = changelog::rolled_body(&cl_text, &ctx.notes_section)?;
     fs::write(
@@ -7306,7 +7312,7 @@ fn step_sign(ctx: &mut CutCtx) -> Result<()> {
     )
     .map_err(|e| Error::new(format!("write {}: {e}", ctx.notes_path().display())))?;
 
-    let plist_text = fs::read_to_string(app.join("Contents/Info.plist"))
+    let plist_text = gates::read_bounded_string(&app.join("Contents/Info.plist"), 16 << 20)
         .map_err(|e| Error::new(format!("read stamped Info.plist: {e}")))?;
     let min_os = manifest_out::plist_string(&plist_text, "LSMinimumSystemVersion")
         .unwrap_or_else(|| "11.0".to_string());
@@ -7414,7 +7420,7 @@ fn prove_artifacts_on_disk(ctx: &CutCtx) -> Result<Manifest> {
 fn prove_bundle_on_disk(ctx: &CutCtx) -> Result<()> {
     let app = ctx.app_path();
 
-    let plist_text = fs::read_to_string(app.join("Contents/Info.plist"))
+    let plist_text = gates::read_bounded_string(&app.join("Contents/Info.plist"), 16 << 20)
         .map_err(|e| Error::new(format!("read stamped Info.plist: {e}")))?;
     let cf = manifest_out::plist_string(&plist_text, "CFBundleVersion")
         .ok_or_else(|| Error::new("stamped Info.plist has no CFBundleVersion".to_string()))?;
@@ -7466,7 +7472,7 @@ fn prove_publication_on_disk(ctx: &CutCtx) -> Result<Manifest> {
     )?;
 
     if ctx.artifact.is_some() {
-        let provenance = fs::read(ctx.provenance_path())
+        let provenance = gates::read_bounded_bytes(&ctx.provenance_path(), 16 << 20)
             .map_err(|error| Error::new(format!("read release provenance: {error}")))?;
         validate_claim_provenance(&provenance, &ctx.version, ctx.build, &ctx.commit)?;
 
@@ -7474,7 +7480,7 @@ fn prove_publication_on_disk(ctx: &CutCtx) -> Result<Manifest> {
             let fingerprint = ctx
                 .expected_embedded_pin()?
                 .ok_or_else(|| Error::new("signed channel has no pinned paper master"))?;
-            let provenance = fs::read_to_string(ctx.provenance_path())
+            let provenance = gates::read_bounded_string(&ctx.provenance_path(), 16 << 20)
                 .map_err(|error| Error::new(format!("read update-pin provenance: {error}")))?;
             let expected = format!("update_pubkey_fingerprint_sha256={fingerprint}");
             if !provenance.lines().any(|line| line == expected) {
@@ -7485,7 +7491,7 @@ fn prove_publication_on_disk(ctx: &CutCtx) -> Result<Manifest> {
         }
     }
 
-    let mtext = fs::read_to_string(ctx.manifest_path())
+    let mtext = gates::read_bounded_string(&ctx.manifest_path(), 16 << 20)
         .map_err(|e| Error::new(format!("read {}: {e}", ctx.manifest_path().display())))?;
     let manifest = Manifest::parse(&mtext)
         .map_err(|e| Error::new(format!("self-check: manifest re-parse failed: {e}")))?;
@@ -7512,7 +7518,7 @@ fn prove_publication_on_disk(ctx: &CutCtx) -> Result<Manifest> {
                 "self-check failed: signed-channel journal does not record a signature",
             ));
         }
-        let signature = fs::read(&sig_path)
+        let signature = gates::read_bounded_bytes(&sig_path, 16 << 20)
             .map_err(|error| Error::new(format!("read {}: {error}", sig_path.display())))?;
         verify_detached_manifest_signature(
             ctx.verification_pubkey().ok_or_else(|| {
@@ -7626,7 +7632,7 @@ fn prove_publication_on_disk(ctx: &CutCtx) -> Result<Manifest> {
             fs::write(&path, &expected)
                 .map_err(|e| Error::new(format!("self-check: write {}: {e}", path.display())))?;
         }
-        let observed = fs::read_to_string(&path)
+        let observed = gates::read_bounded_string(&path, 16 << 20)
             .map_err(|e| Error::new(format!("self-check: read {}: {e}", path.display())))?;
         if observed != expected {
             return Err(Error::new(format!(
@@ -7770,7 +7776,7 @@ fn cut_roster_seq(ctx: &CutCtx) -> Result<Option<u64>> {
     if !ctx.attaches_roster() {
         return Ok(None);
     }
-    let text = fs::read_to_string(ctx.manifest_path()).map_err(|e| {
+    let text = gates::read_bounded_string(&ctx.manifest_path(), 16 << 20).map_err(|e| {
         Error::new(format!(
             "read {} to learn which machine-roster generation this cut carries: {e}",
             ctx.manifest_path().display()
@@ -7787,7 +7793,9 @@ fn cut_roster_seq(ctx: &CutCtx) -> Result<Option<u64>> {
 fn shipped_roster(ctx: &CutCtx) -> Option<Vec<u8>> {
     match &ctx.roster {
         Some(document) => Some(document.bytes.clone()),
-        None if ctx.attaches_roster() => fs::read(ctx.dist.join(roster::ROSTER_ASSET)).ok(),
+        None if ctx.attaches_roster() => {
+            gates::read_bounded_bytes(&ctx.dist.join(roster::ROSTER_ASSET), 16 << 20).ok()
+        }
         None => None,
     }
 }
@@ -8029,7 +8037,7 @@ fn prove_roster_on_disk_at(
         )));
     }
     let read = |name: &str| {
-        fs::read(ctx.dist.join(name))
+        gates::read_bounded_bytes(&ctx.dist.join(name), 16 << 20)
             .map_err(|e| Error::new(format!("read dist/{name} before publishing it: {e}")))
     };
     let roster_bytes = read(roster::ROSTER_ASSET)?;
@@ -8664,7 +8672,7 @@ pub fn prove_pointer_serves(
 
 fn prove_evergreen_pointer_serves_this_cut(ctx: &CutCtx, slug: &str) -> Result<()> {
     let asset = manifest_out::MANIFEST_ASSET;
-    let local = fs::read(ctx.manifest_path()).map_err(|error| {
+    let local = gates::read_bounded_bytes(&ctx.manifest_path(), 16 << 20).map_err(|error| {
         Error::new(format!(
             "read journaled manifest {} for the pointer gate: {error}",
             ctx.manifest_path().display()
@@ -9059,12 +9067,13 @@ fn prove_client_elects_this_cut(ctx: &CutCtx, slug: &str, release_id: u64) -> Re
             manifest_out::MANIFEST_ASSET
         )));
     }
-    let local_manifest = fs::read_to_string(ctx.manifest_path()).map_err(|error| {
-        Error::new(format!(
-            "read local manifest for the head proof {}: {error}",
-            ctx.manifest_path().display()
-        ))
-    })?;
+    let local_manifest =
+        gates::read_bounded_string(&ctx.manifest_path(), 16 << 20).map_err(|error| {
+            Error::new(format!(
+                "read local manifest for the head proof {}: {error}",
+                ctx.manifest_path().display()
+            ))
+        })?;
     if head.text != local_manifest {
         return Err(Error::new(format!(
             "the manifest served by the channel {slug} is not byte-identical to this cut's \

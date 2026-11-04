@@ -981,10 +981,14 @@ fn open_shared(layout: &Layout, spec: &VendorSpec) -> SharedFile {
 
 fn read_shared(file: &mut File, spec: &VendorSpec) -> SharedState {
     let empty = || SharedState::empty(spec);
-    if file.metadata().map_or(true, |m| m.len() > MAX_SHARED_BYTES) {
+    let Ok(meta) = file.metadata() else {
+        return empty();
+    };
+    if meta.len() > MAX_SHARED_BYTES {
         return empty();
     }
-    let mut text = String::new();
+    let mut text =
+        String::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
     if file.seek(std::io::SeekFrom::Start(0)).is_err()
         || file
             .take(MAX_SHARED_BYTES)

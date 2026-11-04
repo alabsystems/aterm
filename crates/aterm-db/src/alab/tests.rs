@@ -17,7 +17,7 @@ use crate::{
         Session,
         tests::{
             Lab,
-            frontier::{receive, wide_lab, wires},
+            frontier::{first_records, receive, wide_lab, wires},
             repair_commons,
         },
     },
@@ -254,6 +254,9 @@ fn birth(model: &str) -> Vec<Change> {
 
 /// One remaining automatic slot cannot hold a causal join and a seed record. Refusal
 /// appends neither; another writer with room still seeds the registry and shares its rows.
+/// Macs 1 and the last, past `LEGACY_MAX_MEMBERS`, write through the product; the others seal what
+/// a first `Registry::write` appends, since a seed's reservation depends on the frontier's width
+/// and not on how its peers wrote.
 /// NEGATIVE CONTROLS: counting only the seed grows 87 retained records to 89 on refusal;
 /// reserving new joins but ignoring pending ones grows 89 to 90 on the interrupted retry.
 #[test]
@@ -268,14 +271,24 @@ fn seeding_reserves_causal_joins_within_the_remaining_automatic_quota() {
                 .collect(),
         )
         .unwrap();
-    for (n, paths) in lab.paths.iter().enumerate().skip(1) {
-        Registry::at(paths.clone())
+    let last = lab.paths.len() - 1;
+    for n in [1, last] {
+        Registry::at(lab.paths[n].clone())
             .write(vec![birth(&format!("vm-peer-{n}"))])
             .unwrap();
     }
-    let originals: Vec<_> = (0..lab.paths.len())
+    let mut originals: Vec<_> = [0, 1, last]
+        .into_iter()
         .flat_map(|n| wires(&lab, n, scope))
         .collect();
+    originals.extend(first_records(&lab, 2..last, scope, |n, _| {
+        crate::database::Command::Write {
+            request: [u8::try_from(n).unwrap(); 16],
+            changes: birth(&format!("vm-peer-{n}")),
+        }
+        .encode()
+        .unwrap()
+    }));
     for n in 0..2 {
         receive(&lab, n, scope, &originals);
     }
@@ -495,4 +508,98 @@ fn a_preference_is_born_from_its_pair_and_an_account_reads_its_label() {
         registry::account_label(&account, &row).as_deref(),
         Some("research")
     );
+}
+
+/// What one read of the registry gives the harness: a partial history before anything else is
+/// read, nothing new where the inventory is the one the caller holds, else the projection and
+/// the inventory it was made from. `Registry::lab`'s own answer on a real partial history is
+/// [`a_registry_lab_read_is_partial_while_an_operation_awaits_its_parent`]'s.
+/// NEGATIVE CONTROL: with the `!complete` check after `inventory()`, `unread` panics.
+#[test]
+fn a_registry_read_is_partial_before_anything_else_and_projects_only_a_moved_inventory() {
+    let unread = || -> Inventory { panic!("a partial history reads no inventory") };
+    let unprojected = || -> view::LabView { panic!("nothing is projected where nothing moved") };
+    let held = Inventory([3; 32]);
+    assert!(
+        matches!(
+            store::lab_read(false, unread, Some(held), unprojected),
+            LabRead::Partial
+        ),
+        "a partial history"
+    );
+    assert!(
+        matches!(
+            store::lab_read(true, || held, Some(held), unprojected),
+            LabRead::Unchanged
+        ),
+        "the held inventory"
+    );
+    let moved = Inventory([4; 32]);
+    let mut named = view::LabView::default();
+    named.me = Some("pk-me".into());
+    match store::lab_read(true, || moved, Some(held), || named.clone()) {
+        LabRead::Projected(view, inventory) => {
+            assert_eq!(*view, named, "the projection");
+            assert_eq!(inventory, moved, "the inventory it was made from");
+        }
+        other => panic!("a moved inventory projects: {other:?}"),
+    }
+    assert!(
+        matches!(
+            store::lab_read(true, || held, None, view::LabView::default),
+            LabRead::Projected(_, inventory) if inventory == held
+        ),
+        "a first read projects"
+    );
+}
+
+/// On a real lab, a Mac that holds an operation of the registry but not its predecessor reads a
+/// partial history (`LabRead::Partial`), never no lab, and projects once the predecessor arrives.
+/// NEGATIVE CONTROL: with `Registry::lab` reading a partial history as no lab
+/// (`if !view.complete { return Ok(None) }` before `lab_read`, as before), `` a partial
+/// history `` fails, and the harness drops its lab where it should go pending.
+#[test]
+fn a_registry_lab_read_is_partial_while_an_operation_awaits_its_parent() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let first = Registry::at(lab.paths[0].clone());
+    let scope = first.open().unwrap();
+    first.write(vec![birth("vm-held")]).unwrap();
+    repair_commons(&lab, 6);
+    let second = Registry::at(lab.paths[1].clone());
+    let config = lab.paths[1].home.join("config.toml");
+    let projects = |what: &str| {
+        assert!(
+            matches!(second.lab(&config, None), Ok(Some(LabRead::Projected(..)))),
+            "{what}"
+        );
+    };
+    projects("a complete history projects");
+
+    let new_since = |before: &[Vec<u8>]| -> Vec<Vec<u8>> {
+        wires(&lab, 0, scope)
+            .into_iter()
+            .filter(|wire| !before.contains(wire))
+            .collect()
+    };
+    let held = wires(&lab, 0, scope);
+    first.write(vec![birth("vm-parent")]).unwrap();
+    let parent = new_since(&held);
+    first.write(vec![birth("vm-child")]).unwrap();
+    let child: Vec<_> = new_since(&held)
+        .into_iter()
+        .filter(|wire| !parent.contains(wire))
+        .collect();
+    assert!(!parent.is_empty() && !child.is_empty());
+    receive(&lab, 1, scope, &child);
+    assert!(
+        !second.view().unwrap().complete,
+        "the child waits on its parent"
+    );
+    assert!(
+        matches!(second.lab(&config, None), Ok(Some(LabRead::Partial))),
+        "a partial history"
+    );
+    receive(&lab, 1, scope, &parent);
+    assert!(second.view().unwrap().complete, "the parent arrived");
+    projects("a history made whole projects");
 }

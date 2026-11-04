@@ -137,7 +137,7 @@ impl std::error::Error for LaunchError {
 
 // The private binder seam lets runtime controls fail after real birth, without installing a
 // callback in the public launch API or a pre-exec callback in the child's command.
-fn launch_with(
+pub(crate) fn launch_with(
     claim: &mut Claim,
     command: &mut Command,
     bind: impl FnOnce(&mut Claim, &mut Spawned) -> io::Result<Cohort>,

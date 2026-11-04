@@ -241,7 +241,7 @@ pub(crate) enum Vault {
 pub(crate) enum Clt {
     NotHere,
     Present,
-    /// aterm's own Command Line Tools tab is installing them (`clt-shim.installing`).
+    /// aterm's own Mac Setup tab is installing them (`clt-shim.installing`).
     Installing,
     /// Missing, and nothing installs them now: no tab of aterm's is on its way (never opened, a
     /// person stopped it, or this account may not install them). `may_install`: the account is

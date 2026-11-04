@@ -713,7 +713,7 @@ pub fn stats(tape: &Tape) -> Stats {
         doors,
         decisions,
         span_ns,
-        kb_per_hour: (span_ns > 0).then(|| tape.bytes as f64 / 1000.0 / hours),
+        kb_per_hour: (span_ns > 0).then_some(tape.bytes as f64 / 1000.0 / hours),
         end,
     }
 }

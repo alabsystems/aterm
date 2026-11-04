@@ -46,6 +46,7 @@ fn said(ev: &StepEvent) -> String {
     match ev {
         StepEvent::Bind { len } => format!("bind {len}"),
         StepEvent::Prompt { vref } => format!("prompt {}", vref.as_str()),
+        StepEvent::HarnessTurn { vref } => format!("harness {}", vref.as_str()),
         StepEvent::Interrupt => "interrupt".into(),
         StepEvent::ToolUse {
             id,
@@ -1013,9 +1014,12 @@ fn shape(said: &str) -> String {
 }
 
 /// The steps the rollout `text` of a build said as `release` gives by its own rows, read apart from the fold.
-fn rollout_says(text: &str, release: &str) -> Result<Vec<String>, String> {
+fn rollout_says(text: &str, release: &str, shown: Gate) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     let mut opened: Vec<String> = Vec::new();
+    let mut open: Option<String> = None;
+    let mut begun: Option<String> = None;
+    let mut calls: Vec<(String, bool)> = Vec::new();
     let mut model: Option<(String, String)> = None;
     let mut tokens: std::collections::HashMap<String, (u64, u64)> = Default::default();
     for row in rows(text) {
@@ -1028,7 +1032,11 @@ fn rollout_says(text: &str, release: &str) -> Result<Vec<String>, String> {
                 if !opened.iter().any(|o| o == t) {
                     opened.push(t.to_string());
                     out.push(format!("prompt {t}"));
+                    if begun.take().as_deref() == Some(t) {
+                        out.push(format!("harness {t}"));
+                    }
                 }
+                open = Some(t.to_string());
                 if let Some(m) = s("model") {
                     let now = (m.to_string(), s("effort").unwrap_or("-").to_string());
                     if model.as_ref() != Some(&now) {
@@ -1049,7 +1057,36 @@ fn rollout_says(text: &str, release: &str) -> Result<Vec<String>, String> {
                 };
                 tokens.insert(t.to_string(), (i, o));
             }
+            (Some("event_msg"), Some("task_started")) if shown.autopilot => {
+                let trigger = p
+                    .and_then(|p| p.get("turn_attribution"))
+                    .and_then(|a| a.get("turn_trigger"))
+                    .and_then(Value::as_str);
+                if let (Some("alab_autopilot"), Some(t)) = (trigger, s("turn_id")) {
+                    if open.as_deref() == Some(t) {
+                        out.push(format!("harness {t}"));
+                    } else if !opened.iter().any(|o| o == t) {
+                        begun = Some(t.to_string());
+                    }
+                }
+            }
+            (Some("event_msg"), Some("item_completed")) if shown.exit => {
+                let item = p.and_then(|p| p.get("item"));
+                let id = item.and_then(|i| i.get("id")).and_then(Value::as_str);
+                let code = item.and_then(|i| i.get("exit_code"));
+                if let (Some(id), Some(code)) = (id, code)
+                    && let Some(call) = calls.iter_mut().find(|(c, _)| c == id)
+                {
+                    call.1 = code.as_i64().is_some_and(|x| x != 0);
+                }
+            }
+            (Some("event_msg"), Some("turn_aborted")) => {
+                open = None;
+                calls.clear();
+            }
             (Some("event_msg"), Some("task_complete")) => {
+                open = None;
+                calls.clear();
                 let t = s("turn_id").ok_or("a task_complete names its turn")?;
                 let dur = p
                     .and_then(|p| p.get("duration_ms"))
@@ -1074,15 +1111,61 @@ fn rollout_says(text: &str, release: &str) -> Result<Vec<String>, String> {
                     _ => "other",
                 };
                 out.push(format!("call {id} {name} {cls}"));
+                if shown.exit && !calls.iter().any(|(c, _)| c == id) {
+                    calls.push((id.to_string(), false));
+                }
             }
             (Some("response_item"), Some("function_call_output")) => {
                 let id = s("call_id").ok_or("an output has its call")?;
-                out.push(format!("result {id}"));
+                let failed = calls
+                    .iter()
+                    .position(|(c, _)| c == id)
+                    .is_some_and(|i| calls.remove(i).1);
+                out.push(format!("result {id}{}", if failed { " error" } else { "" }));
             }
             _ => {}
         }
     }
     Ok(out)
+}
+
+/// T11, THE ACCOUNT'S GATED READS: the rollout's own account reads a failed command and an
+/// Autopilot turn as the fold does where the build shows them, and neither where it does not.
+#[test]
+fn the_rollout_account_reads_the_gated_reads_as_the_fold() {
+    let release = "0.166.0-dev.13766";
+    let failed = exit_planted(&alab_leg_of(L13766, "approval"), 3);
+    let read = saids(&fold(&failed));
+    let said = rollout_says(&failed, release, Gate::from_words(&recounted(L13766))).expect("read");
+    assert_eq!(read[1..], said);
+    assert!(
+        said.contains(&"result call_r0010 error".to_string()),
+        "{said:?}"
+    );
+    let shut = rollout_says(&failed, release, Gate::NONE).expect("read");
+    assert!(shut.contains(&"result call_r0010".to_string()), "{shut:?}");
+    let planted = trigger_planted(AUTOPILOT_TRIGGER);
+    let both = rollout_says(&planted, release, Gate::ALL).expect("read");
+    assert_eq!(saids(&fold_ungated(&planted))[1..], both);
+    assert!(both.contains(&format!("harness {CONTINUED}")), "{both:?}");
+    let ahead = trigger_planted(AUTOPILOT_TRIGGER);
+    let mut lines: Vec<&str> = ahead.lines().collect();
+    let started = lines
+        .iter()
+        .position(|l| l.contains("\"task_started\"") && l.contains(CONTINUED))
+        .expect("the continuation's start");
+    let context = lines
+        .iter()
+        .position(|l| l.contains("\"turn_context\"") && l.contains(CONTINUED))
+        .expect("the continuation's context");
+    let row = lines.remove(started);
+    lines.insert(context, row);
+    let swapped: String = lines.iter().map(|l| format!("{l}\n")).collect();
+    assert_eq!(
+        saids(&fold_ungated(&swapped))[1..],
+        rollout_says(&swapped, release, Gate::ALL).expect("read"),
+        "in either row order"
+    );
 }
 
 /// What the standing check holds the leg `name` (`text`) of the measured `build` to: the fold
@@ -1104,7 +1187,7 @@ fn leg_holds(build: &str, name: &str, text: &str) -> Result<Vec<String>, String>
     if !batch.steps[1..].iter().all(|s| s.state == StepState::On) {
         return Err(format!("{name}: a step of a measured build is not On"));
     }
-    let own = rollout_says(text, release.as_str())?;
+    let own = rollout_says(text, release.as_str(), Gate::from_words(&recounted(build)))?;
     if !own.iter().any(|s| s.starts_with("model ")) {
         return Err(format!("{name}: the rollout names no model"));
     }
@@ -1172,9 +1255,14 @@ fn the_codex_alab_legs_fold_exact() {
             "{build} has a golden and is not measured"
         );
     }
-    assert_eq!(
-        kinds.into_iter().collect::<Vec<_>>(),
-        ["call", "end", "model", "prompt", "result", "wall"]
+    let kinds: Vec<String> = kinds.into_iter().collect();
+    let read = ["call", "end", "model", "prompt", "result", "wall"];
+    assert!(
+        read.iter().all(|k| kinds.iter().any(|s| s == k))
+            && kinds
+                .iter()
+                .all(|k| read.contains(&k.as_str()) || k == "harness"),
+        "{kinds:?}"
     );
     let approval = alab_leg("approval");
     let off = approval.replacen(
@@ -1190,7 +1278,12 @@ fn the_codex_alab_legs_fold_exact() {
         "a golden cannot see the plant: only the rollout's own account does"
     );
     assert_ne!(
-        rollout_says(&off, "0.164.0-dev.12521").expect("read"),
+        rollout_says(
+            &off,
+            "0.164.0-dev.12521",
+            Gate::from_words(&recounted(ALAB))
+        )
+        .expect("read"),
         folded[1..]
     );
     let next = alab_leg("first").replace(
@@ -1229,7 +1322,12 @@ fn a_moved_duration_fails_the_exact_golden() {
     let read = saids(&fold(&moved));
     assert_eq!(
         read[1..],
-        rollout_says(&moved, "0.164.0-dev.12521").expect("read"),
+        rollout_says(
+            &moved,
+            "0.164.0-dev.12521",
+            Gate::from_words(&recounted(ALAB))
+        )
+        .expect("read"),
         "the rollout's own account reads the moved number too"
     );
     let e = leg_holds(ALAB, &name, &moved).expect_err("the exact golden sees the moved duration");
@@ -1367,4 +1465,487 @@ fn the_writer_holds_the_rows_to_its_build() {
     named.set_writer(Some(ALAB));
     named.bind_build(FP, ID, 0, Some(ALAB));
     assert_eq!(named.reads_at(), StepState::On, "NEGATIVE CONTROL");
+}
+
+/// The newest measured build: its legs carry gaps 20 and 25's rows (`item_completed`'s `exit_code`
+/// under its call's id, `task_started`'s `turn_trigger`).
+const L13766: &str = "0.166.0-dev.13766+gcd79a420c";
+
+/// The committed command's completion row in a leg's text, `"exit_code":0` under `call_r0010`.
+const EXITED: &str = "\"exit_code\":0";
+
+/// `text` with its one command's `exit_code` planted to `code`.
+fn exit_planted(text: &str, code: i64) -> String {
+    assert_eq!(text.matches(EXITED).count(), 1, "the leg's one completion");
+    text.replacen(EXITED, &format!("\"exit_code\":{code}"), 1)
+}
+
+/// `saids` with `result <id>` read as `result <id> error`.
+fn failing(said: &[String], id: &str) -> Vec<String> {
+    said.iter()
+        .map(|s| {
+            if *s == format!("result {id}") {
+                format!("{s} error")
+            } else {
+                s.clone()
+            }
+        })
+        .collect()
+}
+
+/// [`fold`] by the lab reducer's fold, whose gated reads read on every build.
+fn fold_ungated(text: &str) -> StepBatch {
+    let mut fold = CodexStepFold::ungated(0);
+    fold.bind(FP, ID, 0);
+    let mut end = 0u64;
+    for row in rows(text) {
+        end += row.len() as u64 + 1;
+        fold.push(row.as_bytes(), end);
+    }
+    fold.take()
+}
+
+/// GAP 20: a command the build's completion row says exited non-zero is a failed step at its
+/// output. NEGATIVE CONTROL: the committed exit 0 reads ok (a read of the key alone would fail it).
+#[test]
+fn a_failed_command_fails_its_step() {
+    let approval = alab_leg_of(L13766, "approval");
+    let plain = saids(&fold(&approval));
+    assert!(
+        plain.contains(&"result call_r0010".to_string()),
+        "the committed exit 0 reads ok: {plain:?}"
+    );
+    let failed = exit_planted(&approval, 3);
+    let batch = fold(&failed);
+    assert_eq!(saids(&batch), failing(&plain, "call_r0010"));
+    assert!(batch.steps[1..].iter().all(|s| s.state == StepState::On));
+    assert_eq!((batch.lost, batch.overflow), (0, 0));
+}
+
+/// A declined command's completion says `-1` (codex-rs/core/src/tools/events.rs): a failed step.
+#[test]
+fn a_declined_command_fails_its_step() {
+    let approval = alab_leg_of(L13766, "approval");
+    let plain = saids(&fold(&approval));
+    assert_eq!(
+        saids(&fold(&exit_planted(&approval, -1))),
+        failing(&plain, "call_r0010")
+    );
+}
+
+/// The exit read is gated: a build nobody measured, a writer nobody measured, rows read short of
+/// `On`, and a writer whose reductions show no `exit_code` each read the failed command `ok`.
+#[test]
+fn an_unmeasured_builds_failed_command_reads_ok() {
+    let failed = exit_planted(&alab_leg_of(L13766, "approval"), 3);
+    let unmeasured = failed.replace(
+        "\"cli_version\":\"0.166.0-dev.13766+gcd79a420c\"",
+        "\"cli_version\":\"0.166.0-dev.13767+g0000000\"",
+    );
+    assert_ne!(unmeasured, failed, "the plant took");
+    let batch = fold(&unmeasured);
+    let said = saids(&batch);
+    assert!(said.contains(&"result call_r0010".to_string()), "{said:?}");
+    assert!(batch.steps.iter().all(|s| s.state == StepState::Partial));
+    let by = |prepare: &dyn Fn(&mut CodexStepFold, usize)| {
+        let mut fold = CodexStepFold::new(0);
+        fold.bind(FP, ID, 0);
+        let mut end = 0u64;
+        for (i, row) in rows(&failed).enumerate() {
+            prepare(&mut fold, i);
+            end += row.len() as u64 + 1;
+            fold.push(row.as_bytes(), end);
+        }
+        saids(&fold.take())
+    };
+    let none = |_: &mut CodexStepFold, _: usize| {};
+    assert!(
+        by(&none).contains(&"result call_r0010 error".to_string()),
+        "NEGATIVE CONTROL: measured, the plant fails its step"
+    );
+    let writer = |f: &mut CodexStepFold, i: usize| {
+        if i == 0 {
+            f.set_writer(Some("0.166.0-dev.13767+g0000000"));
+        }
+    };
+    assert!(by(&writer).contains(&"result call_r0010".to_string()));
+    let short_of_on = |f: &mut CodexStepFold, i: usize| {
+        if i == 1 {
+            assert_eq!(
+                f.shown,
+                Gate::of(Some(L13766)),
+                "the meta row named the build"
+            );
+            f.state = StepState::Partial;
+        }
+    };
+    assert!(
+        by(&short_of_on).contains(&"result call_r0010".to_string()),
+        "a build's gate opens only while its rows read On"
+    );
+    let unshown = |f: &mut CodexStepFold, i: usize| {
+        if i == 0 {
+            f.set_writer(Some(L13766));
+            assert_eq!(
+                f.reads_at(),
+                StepState::Partial,
+                "no rollout bound a build yet"
+            );
+            f.writer_shown = Gate::NONE;
+        }
+    };
+    assert!(
+        by(&unshown).contains(&"result call_r0010".to_string()),
+        "a writer whose reductions show no exit_code reads none"
+    );
+}
+
+/// A completion read after its call's output (a long-running exec's,
+/// codex-rs/core/src/unified_exec/async_watcher.rs) changes nothing: the step is the call.
+#[test]
+fn a_completion_after_its_output_changes_nothing() {
+    let approval = alab_leg_of(L13766, "approval");
+    let plain = saids(&fold(&approval));
+    let failed = exit_planted(&approval, 3);
+    let mut lines: Vec<&str> = failed.lines().collect();
+    let done = lines
+        .iter()
+        .position(|l| l.contains("\"exit_code\":3"))
+        .expect("the completion");
+    let output = lines
+        .iter()
+        .position(|l| l.contains("\"function_call_output\"") && l.contains("call_r0010"))
+        .expect("its output");
+    assert_eq!(
+        done + 1,
+        output,
+        "the completion is read just before its output"
+    );
+    lines.swap(done, output);
+    let late: String = lines.iter().map(|l| format!("{l}\n")).collect();
+    assert_eq!(saids(&fold(&late)), plain);
+    assert_eq!(saids(&fold_ungated(&late)), plain);
+}
+
+/// A completion pairs with its own call by id, never with the newest open one.
+#[test]
+fn a_completion_of_another_id_changes_nothing() {
+    let approval = alab_leg_of(L13766, "approval");
+    let plain = saids(&fold(&approval));
+    let other: String = exit_planted(&approval, 3)
+        .lines()
+        .map(|l| {
+            if l.contains("\"exit_code\":3") {
+                l.replacen("\"id\":\"call_r0010\"", "\"id\":\"call_r9999\"", 1)
+            } else {
+                l.to_string()
+            }
+        })
+        .map(|l| format!("{l}\n"))
+        .collect();
+    assert!(other.contains("call_r9999"), "the plant took");
+    assert_eq!(saids(&fold(&other)), plain);
+}
+
+/// The 13766 continue leg's continuation (its second turn), its `turn_trigger` planted to
+/// `word`.
+fn trigger_planted(word: &str) -> String {
+    let text = alab_leg_of(L13766, "continue");
+    let mut planted = 0;
+    let out: String = text
+        .lines()
+        .map(|l| {
+            if l.contains("\"task_started\"") && l.contains("8000-00000000000b\"") {
+                planted += 1;
+                l.replacen(
+                    "\"turn_trigger\":\"\"",
+                    &format!("\"turn_trigger\":\"{word}\""),
+                    1,
+                )
+            } else {
+                l.to_string()
+            }
+        })
+        .map(|l| format!("{l}\n"))
+        .collect();
+    assert_eq!(planted, 1, "the continuation's one task_started");
+    out
+}
+
+const CONTINUED: &str = "00000000-0000-4000-8000-00000000000b";
+
+/// GAP 25: a turn codex-alab's Autopilot began says so in its `task_started`: a `harness` step
+/// right after its prompt, where the build's reductions showed the word. 13766's show none (the
+/// reducer blanked every trigger while nothing read one), so its gated fold reads the planted
+/// rows exactly as the committed ones.
+#[test]
+fn an_autopilot_trigger_begins_a_harness_turn() {
+    let committed = alab_leg_of(L13766, "continue");
+    let plain = saids(&fold(&committed));
+    let planted = trigger_planted(AUTOPILOT_TRIGGER);
+    let read = saids(&fold_ungated(&planted));
+    let at = plain
+        .iter()
+        .position(|s| *s == format!("prompt {CONTINUED}"))
+        .expect("the continuation's prompt");
+    let mut want = plain.clone();
+    want.insert(at + 1, format!("harness {CONTINUED}"));
+    assert_eq!(read, want);
+    assert_eq!(saids(&fold_ungated(&committed)), plain);
+    assert!(!Gate::of(Some(L13766)).autopilot);
+    assert_eq!(
+        saids(&fold(&planted)),
+        plain,
+        "13766 showed no alab_autopilot"
+    );
+    let batch = fold_ungated(&planted);
+    let (prompt, harness) = (&batch.steps[at], &batch.steps[at + 1]);
+    assert_eq!(
+        prompt.pos.off + 1,
+        harness.pos.off,
+        "one row, the second after the first"
+    );
+}
+
+/// A `task_started` row of turn `id` whose attribution is `attribution` (`None`: no
+/// `turn_attribution` key).
+fn started(ms: i64, id: &str, attribution: Option<&str>) -> String {
+    let attribution =
+        attribution.map_or_else(String::new, |a| format!(",\"turn_attribution\":{a}"));
+    format!(
+        "{{\"timestamp\":\"{}\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\
+         \"turn_id\":\"{id}\"{attribution},\"model_context_window\":258400}}}}\n",
+        stamp(ms)
+    )
+}
+
+fn trigger(word: &str) -> String {
+    format!("{{\"turn_id\":\"turn-1\",\"turn_trigger\":\"{word}\",\"parent_turn_id\":null}}")
+}
+
+/// One synthetic turn begun by a `task_started` attributed `attribution`.
+fn one_turn(attribution: Option<&str>) -> String {
+    [
+        opening(),
+        started(T0 + 1, "turn-1", attribution),
+        ctx(T0 + 2, "turn-1", "gpt-6.1-sol"),
+        done(T0 + 3, "turn-1", 5, ""),
+    ]
+    .concat()
+}
+
+fn harnessed(batch: &StepBatch) -> usize {
+    batch
+        .steps
+        .iter()
+        .filter(|s| matches!(s.ev, StepEvent::HarnessTurn { .. }))
+        .count()
+}
+
+/// A turn whose row names no trigger, a `null` one or a blanked one is nobody's: the fold reads
+/// the trigger as saying nothing (codex_facts' survey rule, absent = a person's, is not this).
+#[test]
+fn a_turn_naming_no_trigger_is_nobodys() {
+    let mut read = 0;
+    for e in std::fs::read_dir(STEPS_DIR)
+        .expect("the testdata")
+        .filter_map(Result::ok)
+    {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !name.starts_with("codex-") {
+            continue;
+        }
+        let text = std::fs::read_to_string(e.path()).expect("a reduction");
+        assert_eq!(harnessed(&fold_ungated(&text)), 0, "{name}");
+        read += 1;
+    }
+    assert!(read > 40, "every committed codex reduction ({read})");
+    for attribution in [
+        None,
+        Some("{\"turn_id\":\"turn-1\",\"turn_trigger\":null}"),
+        Some("{\"turn_id\":\"turn-1\"}"),
+        Some("null"),
+        Some("\"alab_autopilot\""),
+        Some(&*trigger("")),
+    ] {
+        let batch = fold_ungated(&one_turn(attribution));
+        assert_eq!(harnessed(&batch), 0, "{attribution:?}");
+        assert_eq!(
+            saids(&batch)[1..],
+            ["prompt turn-1", "model gpt-6.1-sol - 0.163.0", "end 5 0 0"],
+            "{attribution:?}"
+        );
+    }
+    let control = fold_ungated(&one_turn(Some(&trigger(AUTOPILOT_TRIGGER))));
+    assert_eq!(harnessed(&control), 1, "NEGATIVE CONTROL");
+}
+
+/// Only codex-alab's Autopilot's own word begins a harness turn: every other trigger codex
+/// writes (a person's at the TUI, a queued message, `codex exec`, realtime, a goal, a daemon's
+/// recovery, a memory consolidation, a guardian review) says nothing.
+#[test]
+fn only_the_autopilots_word_begins_a_harness_turn() {
+    for word in [
+        "user",
+        "queue",
+        "exec",
+        "realtime",
+        "safety_recourse_follow_up",
+        "goal",
+        "daemon_recovery",
+        "memory_consolidation",
+        "guardian_review",
+        "alab_autopilot_v2",
+        "ALAB_AUTOPILOT",
+    ] {
+        let batch = fold_ungated(&one_turn(Some(&trigger(word))));
+        assert_eq!(harnessed(&batch), 0, "{word}");
+    }
+    let batch = fold_ungated(&one_turn(Some(&trigger(AUTOPILOT_TRIGGER))));
+    assert_eq!(
+        saids(&batch)[1..],
+        [
+            "prompt turn-1",
+            "harness turn-1",
+            "model gpt-6.1-sol - 0.163.0",
+            "end 5 0 0"
+        ]
+    );
+}
+
+/// A trigger read after its turn's `turn_context` still names it, at its own row, after the
+/// prompt; one read after its turn ended names nothing.
+#[test]
+fn a_trigger_read_after_its_prompt_follows_it() {
+    let row = started(T0 + 3, "turn-1", Some(&trigger(AUTOPILOT_TRIGGER)));
+    let text = [
+        opening(),
+        ctx(T0 + 2, "turn-1", "gpt-6.1-sol"),
+        row.clone(),
+        done(T0 + 4, "turn-1", 5, ""),
+    ]
+    .concat();
+    let batch = fold_ungated(&text);
+    assert_eq!(
+        saids(&batch)[1..],
+        [
+            "prompt turn-1",
+            "model gpt-6.1-sol - 0.163.0",
+            "harness turn-1",
+            "end 5 0 0"
+        ]
+    );
+    let at = (opening().len() + ctx(T0 + 2, "turn-1", "gpt-6.1-sol").len() + row.len()) as u64;
+    assert_eq!(batch.steps[3].pos.off, at, "at the task_started row");
+    let ended = [
+        opening(),
+        ctx(T0 + 2, "turn-1", "gpt-6.1-sol"),
+        done(T0 + 3, "turn-1", 5, ""),
+        started(T0 + 4, "turn-1", Some(&trigger(AUTOPILOT_TRIGGER))),
+        ctx(T0 + 5, "turn-2", "gpt-6.1-sol"),
+        done(T0 + 6, "turn-2", 5, ""),
+    ]
+    .concat();
+    let batch = fold_ungated(&ended);
+    assert_eq!(harnessed(&batch), 0, "{:?}", saids(&batch));
+}
+
+/// What a reduction's rows show, recounted apart from `codex_shown::words`'s byte scanner: each
+/// row parsed, every object walked; its snake-case keys, and `key=value` where the value is a
+/// string closed word (snake case, no digit).
+fn recount(texts: &[&str]) -> std::collections::BTreeSet<String> {
+    fn snake(s: &str, digits: bool) -> bool {
+        s.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+            && s.chars()
+                .all(|c| c.is_ascii_lowercase() || c == '_' || (digits && c.is_ascii_digit()))
+    }
+    fn walk(v: &Value, out: &mut std::collections::BTreeSet<String>) {
+        match v {
+            Value::Object(m) => {
+                for (k, v) in m {
+                    if snake(k, true) {
+                        out.insert(k.clone());
+                        if let Some(w) = v.as_str().filter(|w| snake(w, false)) {
+                            out.insert(format!("{k}={w}"));
+                        }
+                    }
+                    walk(v, out);
+                }
+            }
+            Value::Array(a) => a.iter().for_each(|v| walk(v, out)),
+            _ => {}
+        }
+    }
+    let mut out = std::collections::BTreeSet::new();
+    for text in texts {
+        for row in rows(text) {
+            let v: Value = aterm_json::from_str(row).unwrap_or_else(|e| panic!("{e}: {row}"));
+            walk(&v, &mut out);
+        }
+    }
+    out
+}
+
+/// [`recount`] of the committed reductions of `build`, as `codex_shown::words` says them.
+fn recounted(build: &str) -> String {
+    let legs = committed_of(build);
+    let texts: Vec<&str> = legs.iter().map(|(_, t)| t.as_str()).collect();
+    let mut said = String::from("\n");
+    for t in recount(&texts) {
+        said.push_str(&t);
+        said.push('\n');
+    }
+    said
+}
+
+/// CODEX_SHOWN IS WHAT EACH MEASURED BUILD'S REDUCTIONS HOLD: one entry per measured build, each
+/// what its committed reductions show by an independent recount; every one shows the exit key
+/// and the shell's name; no upstream build is named; and the scanner the lab reads the checkout
+/// with says the same.
+#[test]
+fn codex_shown_is_what_each_measured_builds_reductions_hold() {
+    let builds: Vec<&str> = CODEX_SHOWN.iter().map(|(b, _)| *b).collect();
+    assert_eq!(
+        builds, CODEX_MEASURED_BUILDS,
+        "one entry per measured build, sorted"
+    );
+    assert!(!builds.contains(&"0.163.0"), "no upstream build");
+    for (build, words) in CODEX_SHOWN {
+        assert_eq!(*words, recounted(build), "{build}");
+        let shown = |t: &str| words.contains(&format!("\n{t}\n"));
+        assert!(shown("exit_code") && shown("name=exec_command"), "{build}");
+        assert!(
+            !shown("call_id=call_r0010"),
+            "{build}: an id is no closed word"
+        );
+        assert_eq!(
+            super::super::codex_shown::shown_in(std::path::Path::new(STEPS_DIR), build),
+            *words,
+            "{build}"
+        );
+        assert_eq!(Gate::of(Some(build)), Gate::from_words(words));
+        assert!(Gate::of(Some(build)).exit, "{build}");
+    }
+    assert_eq!(Gate::of(Some("0.163.0")), Gate::NONE);
+    assert_eq!(Gate::of(None), Gate::NONE);
+    let upstream = super::super::codex_shown::shown_in(std::path::Path::new(STEPS_DIR), "0.163.0");
+    assert_eq!(
+        upstream, "\n",
+        "codex_shown reads codex-alab reductions only"
+    );
+    let probe = super::super::codex_shown::words(&[
+        "# codex 9.9.9 · lab reduce",
+        "{\"type\":\"event_msg\",\"payload\":{\"turn_attribution\":{\"turn_trigger\":\"alab_autopilot\"},\"exit_code\":3,\"id\":\"call_r1\",\"s\":\"a\\\"b:\\\"c\"}}",
+    ]);
+    assert_eq!(
+        probe,
+        "\nexit_code\nid\npayload\ns\nturn_attribution\nturn_trigger\nturn_trigger=alab_autopilot\ntype\ntype=event_msg\n"
+    );
+    assert_eq!(
+        Gate::from_words(&probe),
+        Gate {
+            exit: true,
+            autopilot: true
+        }
+    );
 }

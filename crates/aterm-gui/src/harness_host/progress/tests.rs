@@ -7,7 +7,7 @@ const SID: &str = "s-progress";
 const CONVERSATION: &str = "conversation-a";
 const BORN: u64 = 100;
 
-fn snapshot() -> Snapshot {
+pub(super) fn snapshot() -> Snapshot {
     Snapshot {
         tab: SID.into(),
         pid: 4242,
@@ -55,7 +55,7 @@ fn hooks() -> Hooks {
     }
 }
 
-fn fixture() -> (HostHandle, Arc<Mutex<Kept>>) {
+pub(super) fn fixture() -> (HostHandle, Arc<Mutex<Kept>>) {
     let switches = Arc::new(Switches::default());
     switches
         .account_controls
@@ -362,6 +362,40 @@ fn recent_login_activity_keeps_the_blocker_and_filters_unrelated_or_invalid_time
             }),
             "the activity time must survive the menu's content-width cap"
         );
+    }
+}
+
+#[test]
+fn different_accounts_keep_the_earliest_available_login_retry() {
+    use aterm_agent::harness::accounts_sync::{LoginActivity, LoginIdentity};
+    let rows: Vec<_> = ["earlier", "later"]
+        .into_iter()
+        .map(|label| accounts::Row {
+            label: label.into(),
+            email: Some(format!("{label}@example.test")),
+            ..Default::default()
+        })
+        .collect();
+    let labels = rows.iter().map(|row| row.label.clone()).collect();
+    for deadlines in [[150, 190], [190, 150]] {
+        let mut value = AccountProgress::unknown(100);
+        value.phase = ProgressPhase::Waiting;
+        let activity = rows
+            .iter()
+            .zip(deadlines)
+            .map(|(row, next)| LoginActivity {
+                label: row.label.clone(),
+                route: None,
+                active: false,
+                observed_at: 90,
+                next_at: Some(next),
+                diagnostic: None,
+                identity: Some(LoginIdentity::for_test(row)),
+            })
+            .collect();
+        apply_login_activity(&mut value, &labels, &rows, activity, 100);
+        assert_eq!(value.next_at, Some(150));
+        assert_eq!(value.phase, ProgressPhase::Waiting);
     }
 }
 

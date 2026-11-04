@@ -42,17 +42,115 @@ const fn load_u32_le(b0: u8, b1: u8, b2: u8, b3: u8) -> u32 {
     (b0 as u32) | ((b1 as u32) << 8) | ((b2 as u32) << 16) | ((b3 as u32) << 24)
 }
 
+#[inline(always)]
+const fn column_round_lo(s: &mut [u32; 16]) {
+    (s[0], s[4], s[8], s[12]) = quarter_round(s[0], s[4], s[8], s[12]);
+    (s[1], s[5], s[9], s[13]) = quarter_round(s[1], s[5], s[9], s[13]);
+}
+
+#[inline(always)]
+const fn column_round_hi(s: &mut [u32; 16]) {
+    (s[2], s[6], s[10], s[14]) = quarter_round(s[2], s[6], s[10], s[14]);
+    (s[3], s[7], s[11], s[15]) = quarter_round(s[3], s[7], s[11], s[15]);
+}
+
+#[inline(always)]
+const fn diag_round_lo(s: &mut [u32; 16]) {
+    (s[0], s[5], s[10], s[15]) = quarter_round(s[0], s[5], s[10], s[15]);
+    (s[1], s[6], s[11], s[12]) = quarter_round(s[1], s[6], s[11], s[12]);
+}
+
+#[inline(always)]
+const fn diag_round_hi(s: &mut [u32; 16]) {
+    (s[2], s[7], s[8], s[13]) = quarter_round(s[2], s[7], s[8], s[13]);
+    (s[3], s[4], s[9], s[14]) = quarter_round(s[3], s[4], s[9], s[14]);
+}
+
 /// One column round and one diagonal round, RFC 8439 §2.3.
 #[inline(always)]
 const fn double_round(s: &mut [u32; 16]) {
-    (s[0], s[4], s[8], s[12]) = quarter_round(s[0], s[4], s[8], s[12]);
-    (s[1], s[5], s[9], s[13]) = quarter_round(s[1], s[5], s[9], s[13]);
-    (s[2], s[6], s[10], s[14]) = quarter_round(s[2], s[6], s[10], s[14]);
-    (s[3], s[7], s[11], s[15]) = quarter_round(s[3], s[7], s[11], s[15]);
-    (s[0], s[5], s[10], s[15]) = quarter_round(s[0], s[5], s[10], s[15]);
-    (s[1], s[6], s[11], s[12]) = quarter_round(s[1], s[6], s[11], s[12]);
-    (s[2], s[7], s[8], s[13]) = quarter_round(s[2], s[7], s[8], s[13]);
-    (s[3], s[4], s[9], s[14]) = quarter_round(s[3], s[4], s[9], s[14]);
+    column_round_lo(s);
+    column_round_hi(s);
+    diag_round_lo(s);
+    diag_round_hi(s);
+}
+
+#[inline(always)]
+const fn load_sigma(s: &mut [u32; 16]) {
+    s[0] = SIGMA[0];
+    s[1] = SIGMA[1];
+    s[2] = SIGMA[2];
+    s[3] = SIGMA[3];
+}
+
+#[inline(always)]
+const fn load_key_q0(s: &mut [u32; 16], key: &[u8; KEY_LEN]) {
+    s[4] = load_u32_le(key[0], key[1], key[2], key[3]);
+    s[5] = load_u32_le(key[4], key[5], key[6], key[7]);
+}
+
+#[inline(always)]
+const fn load_key_q1(s: &mut [u32; 16], key: &[u8; KEY_LEN]) {
+    s[6] = load_u32_le(key[8], key[9], key[10], key[11]);
+    s[7] = load_u32_le(key[12], key[13], key[14], key[15]);
+}
+
+#[inline(always)]
+const fn load_key_q2(s: &mut [u32; 16], key: &[u8; KEY_LEN]) {
+    s[8] = load_u32_le(key[16], key[17], key[18], key[19]);
+    s[9] = load_u32_le(key[20], key[21], key[22], key[23]);
+}
+
+#[inline(always)]
+const fn load_key_q3(s: &mut [u32; 16], key: &[u8; KEY_LEN]) {
+    s[10] = load_u32_le(key[24], key[25], key[26], key[27]);
+    s[11] = load_u32_le(key[28], key[29], key[30], key[31]);
+}
+
+#[inline(always)]
+const fn load_input_lo(s: &mut [u32; 16], input: &[u8; HCHACHA_INPUT_LEN]) {
+    s[12] = load_u32_le(input[0], input[1], input[2], input[3]);
+    s[13] = load_u32_le(input[4], input[5], input[6], input[7]);
+}
+
+#[inline(always)]
+const fn load_input_hi(s: &mut [u32; 16], input: &[u8; HCHACHA_INPUT_LEN]) {
+    s[14] = load_u32_le(input[8], input[9], input[10], input[11]);
+    s[15] = load_u32_le(input[12], input[13], input[14], input[15]);
+}
+
+#[inline(always)]
+const fn store_u32_le(w: u32) -> (u8, u8, u8, u8) {
+    (
+        (w & 0xFF) as u8,
+        ((w >> 8) & 0xFF) as u8,
+        ((w >> 16) & 0xFF) as u8,
+        ((w >> 24) & 0xFF) as u8,
+    )
+}
+
+#[inline(always)]
+const fn store_words_q0(raw: &mut [u8; KEY_LEN], words: &[u32; 8]) {
+    (raw[0], raw[1], raw[2], raw[3]) = store_u32_le(words[0]);
+    (raw[4], raw[5], raw[6], raw[7]) = store_u32_le(words[1]);
+}
+
+#[inline(always)]
+const fn store_words_q1(raw: &mut [u8; KEY_LEN], words: &[u32; 8]) {
+    (raw[8], raw[9], raw[10], raw[11]) = store_u32_le(words[2]);
+    (raw[12], raw[13], raw[14], raw[15]) = store_u32_le(words[3]);
+}
+
+#[inline(always)]
+const fn store_words_q2(raw: &mut [u8; KEY_LEN], words: &[u32; 8]) {
+    (raw[16], raw[17], raw[18], raw[19]) = store_u32_le(words[4]);
+    (raw[20], raw[21], raw[22], raw[23]) = store_u32_le(words[5]);
+}
+
+#[inline(always)]
+const fn store_words_q3(raw: &mut [u8; KEY_LEN], words: &[u32; 8]) {
+    (raw[24], raw[25], raw[26], raw[27]) = store_u32_le(words[6]);
+    (raw[28], raw[29], raw[30], raw[31]) = store_u32_le(words[7]);
 }
 
 /// HChaCha20 of `key` and `input`: the XChaCha20 subkey for a nonce whose first 16
@@ -63,24 +161,14 @@ pub(crate) fn hchacha20(
     input: &[u8; HCHACHA_INPUT_LEN],
 ) -> Zeroizing<[u8; KEY_LEN]> {
     // Words 0-3 the constants, 4-11 the key, 12-15 the input, each little-endian.
-    let mut s = [
-        SIGMA[0],
-        SIGMA[1],
-        SIGMA[2],
-        SIGMA[3],
-        load_u32_le(key[0], key[1], key[2], key[3]),
-        load_u32_le(key[4], key[5], key[6], key[7]),
-        load_u32_le(key[8], key[9], key[10], key[11]),
-        load_u32_le(key[12], key[13], key[14], key[15]),
-        load_u32_le(key[16], key[17], key[18], key[19]),
-        load_u32_le(key[20], key[21], key[22], key[23]),
-        load_u32_le(key[24], key[25], key[26], key[27]),
-        load_u32_le(key[28], key[29], key[30], key[31]),
-        load_u32_le(input[0], input[1], input[2], input[3]),
-        load_u32_le(input[4], input[5], input[6], input[7]),
-        load_u32_le(input[8], input[9], input[10], input[11]),
-        load_u32_le(input[12], input[13], input[14], input[15]),
-    ];
+    let mut s = [0u32; 16];
+    load_sigma(&mut s);
+    load_key_q0(&mut s, key);
+    load_key_q1(&mut s, key);
+    load_key_q2(&mut s, key);
+    load_key_q3(&mut s, key);
+    load_input_lo(&mut s, input);
+    load_input_hi(&mut s, input);
     let mut round = 0usize;
     while round < 10 {
         double_round(&mut s);
@@ -88,16 +176,10 @@ pub(crate) fn hchacha20(
     }
     let mut words = [s[0], s[1], s[2], s[3], s[12], s[13], s[14], s[15]];
     let mut raw = [0u8; KEY_LEN];
-    let mut idx = 0usize;
-    while idx < 8 {
-        let w = words[idx];
-        let base = idx * 4;
-        raw[base] = (w & 0xFF) as u8;
-        raw[base + 1] = ((w >> 8) & 0xFF) as u8;
-        raw[base + 2] = ((w >> 16) & 0xFF) as u8;
-        raw[base + 3] = ((w >> 24) & 0xFF) as u8;
-        idx += 1;
-    }
+    store_words_q0(&mut raw, &words);
+    store_words_q1(&mut raw, &words);
+    store_words_q2(&mut raw, &words);
+    store_words_q3(&mut raw, &words);
     let subkey = Zeroizing::new(raw);
     raw.zeroize();
     s.zeroize();

@@ -99,9 +99,20 @@ impl App {
     }
 
     pub(crate) fn publish_allocation(&mut self) {
+        #[cfg(target_os = "macos")]
+        let host = self
+            .store
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .allocation_monitor();
+        #[cfg(target_os = "macos")]
+        let monitor = host.take_view();
         let Some(instance) = self.native_runtime.instance_by_kind(AppKind::Allocation) else {
             return;
         };
+        #[cfg(target_os = "macos")]
+        self.native_runtime
+            .publish_allocation_monitor(instance, monitor);
         self.native_runtime.publish_allocation(
             instance,
             self.vitals.cpu_leases.clone(),

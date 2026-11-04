@@ -37,7 +37,7 @@ use super::policy::turn_end::{
 use super::prompt::{
     CancelEffect, Prompt, PromptKind, PromptV2, parse_prompt, prompt_box_first_row, prompt_box_span,
 };
-use super::screen::{HumanInput, Screen, parse_text_json};
+use super::screen::{COMPOSER_COL, HumanInput, Screen, cursor_home, parse_text_json};
 use crate::harness::agent_image::Act;
 use crate::harness::contract::Scope;
 use aterm_phase::{Program, ScreenReader};
@@ -2192,6 +2192,13 @@ pub struct Session<'a, C: Ctl> {
     sleep_window: turn_end_loop::SleepWindow,
     restart_waits: u32,
     restart_run: Option<(&'static str, i64)>,
+    /// The last Unix second a restart run of this loop was minted at or restored to
+    /// ([`Self::restart_run`]), seeded from the newest run's second the journal beside the ledger
+    /// shows asked, which its note names by the run's ask
+    /// ([`turn_end_loop::journaled_restart_floor`]): a new run is minted past it, so no two runs
+    /// of this loop, or of this loop and one its journal shows, share an ask
+    /// (`policy::turn_end::RestartAsk::of`).
+    restart_floor: i64,
     look_at: Option<Instant>,
     /// When the last switch of the session's word a wait at rest woke on has stood
     /// [`Self::word_settle`] (v6 §14.10): the loop reads the word then and decides on it.
@@ -2323,10 +2330,10 @@ pub struct Session<'a, C: Ctl> {
     /// THE COMPOSER'S TEXT, THE CURSOR'S ROW AND COLUMN, AND WHETHER A DRAFT STOOD, as the host's guards
     /// last had a word of its cell for them ([`Self::composer_for_guards`]).
     guards_told: Option<(String, usize, usize, bool)>,
-    /// THE DRAFT the loop's reads found in the composer, and when it first stood so
-    /// ([`Self::see_draft`], [`Self::cell_saw`]). Whether it is a person's is [`Self::person_at`]'s
-    /// to say: the loop's own words are none.
-    draft_seen: Option<(String, Instant)>,
+    /// THE DRAFT the loop's reads found in the composer, when it first stood so, and what its glyph's
+    /// cell has told of it ([`Self::see_draft`], [`Self::cell_saw`]). Whether it is a person's is
+    /// [`Self::person_at`]'s to say: the loop's own words are none.
+    draft_seen: Option<(String, Instant, turn_end_loop::DraftCell)>,
     held: bool,
     rejudge: bool,
     host_held: bool,
@@ -2372,6 +2379,14 @@ pub struct Session<'a, C: Ctl> {
     /// it. One whose read could not say ([`Composer::Unknown`]) is looked at again at each wait step
     /// too ([`Self::wait_for_next`]): a cell unread moves no content seq when it comes back.
     draft_held: Option<Composer>,
+    /// THE TEXT A DECISION HELD THE POINT ON ([`Self::hold_on`]): that hold's, as its last look read
+    /// it, or a draft a person's grace waits on, and what its glyph's cell had told of it. None where
+    /// it is the loop's own line ([`Self::own_line_shown`]), which no person's grace waits on.
+    held_text: Option<(String, turn_end_loop::DraftCell)>,
+    /// WHEN A READ FOUND THAT TEXT GONE ([`Self::see_draft`]), which no read tells from a redraw
+    /// stalled before its text: a person's mark until the next turn ([`Self::person_at`]), so nothing
+    /// is typed there for a whole grace from it.
+    draft_left: Option<Instant>,
     unauthoritative_held: bool,
     /// A line this loop wrote and did not submit ([`Self::left_line_look`]). Gone at the loop's next
     /// write, at another point, or once the worker works.
@@ -2603,6 +2618,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             sleep_window: turn_end_loop::SleepWindow::default(),
             restart_waits: 0,
             restart_run: None,
+            restart_floor: 0,
             look_at: None,
             word_at: None,
             word_settle: WORD_SETTLE,
@@ -2696,6 +2712,8 @@ impl<'a, C: Ctl> Session<'a, C> {
             host_follows: None,
             agent_woke: None,
             draft_held: None,
+            held_text: None,
+            draft_left: None,
             unauthoritative_held: false,
             left_line: None,
             own_line: None,
@@ -3559,20 +3577,40 @@ impl<'a, C: Ctl> Session<'a, C> {
 
     /// THE DRAFT `screen`'S ROWS SHOW ([`Self::draft_seen`]), by its rows and the cursor alone
     /// ([`draft_read`]), no cell read: what every read keeps until a read that matters asks the
-    /// glyph's cell, a decision's or a step of the host's ([`Self::composer_typed`]). Rows that cannot
-    /// say leave the draft seen as it was. The same text keeps its first sight whichever way it is
-    /// read: a caret that went home is told from a suggestion first read with the cursor past it
-    /// only by that cell. Other text is another draft, as a person's edit of its whitespace is, and
-    /// a window's reflow, which no read tells from one: that only stretches the hold.
+    /// glyph's cell, a decision's or a step of the host's ([`Self::composer_typed`]). The same text
+    /// keeps its first sight whichever way it is read: a caret that went home is told from a
+    /// suggestion first read with the cursor past it only by that cell. Other text never does. It is
+    /// another draft, as a person's edit of its whitespace is, and a window's reflow, which no read
+    /// tells from one; a draft that comes back after it has a grace of its own, which only stretches
+    /// the hold.
+    ///
+    /// Text a decision held the point on ([`Self::held_text`]), at this point or the last, read gone
+    /// (the composer empty, or other text the rows do not call typed), leaves a person's mark
+    /// ([`Self::draft_left`]): that may be a frame read before the text was drawn again, and nothing
+    /// is typed there for a whole grace. Words that begin with text no read has said typed say it was
+    /// a suggestion all along, drawn in part or read before its cursor went home, so they leave none;
+    /// text a read has said typed was no suggestion, whatever words follow it. Nor does the loop's own
+    /// line going, which no decision holds the point on. A frame with no composer drawn neither
+    /// marks nor forgets: the read after it says.
     fn see_draft(&mut self, reader: &dyn ScreenReader, screen: &Screen) {
         let composer = reader.composer(&screen.rows);
         let typed = draft_read(composer.as_ref(), reader.placeholder(), screen);
         let draft = composer.as_ref().map(|(_, lines)| lines.join("\n"));
-        self.draft_seen = match (typed, draft, self.draft_seen.take()) {
-            (None, _, kept) => kept,
-            (Some(_), Some(d), Some((seen, at))) if d == seen => Some((seen, at)),
-            (Some(true), Some(d), _) => Some((d, self.fx.mono())),
-            (Some(_), _, _) => None,
+        let seen = self.draft_seen.take();
+        self.draft_seen = match (typed, draft) {
+            (_, Some(shown)) if seen.as_ref().is_some_and(|(text, ..)| *text == shown) => seen,
+            (Some(true), Some(shown)) => {
+                Some((shown, self.fx.mono(), turn_end_loop::DraftCell::Unasked))
+            }
+            (_, Some(shown)) => {
+                if self.held_text.take().is_some_and(|(text, cell)| {
+                    cell == turn_end_loop::DraftCell::Typed || !shown.starts_with(&text)
+                }) {
+                    self.draft_left = Some(self.fx.mono());
+                }
+                None
+            }
+            (_, None) => None,
         };
     }
 
@@ -5043,6 +5081,12 @@ impl<'a, C: Ctl> Session<'a, C> {
         }
         let open_wall = approvals::open_wall_in(body, self.setup.sid.as_deref());
         self.tap_said = approvals::tap_said_in(body, self.setup.sid.as_deref());
+        if let Some(newest) = journal
+            .as_deref()
+            .and_then(|j| turn_end_loop::journaled_restart_floor(j, self.setup.sid.as_deref()))
+        {
+            self.restart_floor = self.restart_floor.max(newest);
+        }
         self.seed_model_switch_in(body, older);
         let moves = approvals::account_moves_in(body, self.setup.sid.as_deref());
         let ago = |ts: i64| {
@@ -6030,7 +6074,13 @@ impl<'a, C: Ctl> Session<'a, C> {
         match self.park(&["seq", &seq.to_string()], step, latch)? {
             Wait::Latched => Ok(Past::Moved),
             Wait::Word(word) => Ok(Past::Word(word)),
-            Wait::TimedOut if self.fx.mono() >= deadline => Ok(Past::Still(None)),
+            // With a composer that could not say held, the wait's own step reads it next
+            // (`Self::wait_for_next`), so this read would be its twin.
+            Wait::TimedOut
+                if self.fx.mono() >= deadline || self.draft_held == Some(Composer::Unknown) =>
+            {
+                Ok(Past::Still(None))
+            }
             Wait::TimedOut => {
                 let now = self.screen()?;
                 Ok(if now.seq < seq {
@@ -6607,14 +6657,6 @@ impl<C: Ctl> Session<'_, C> {
                             self.word_moved(seen.screen.seq, word, review);
                             continue;
                         }
-                        // A composer whose read could not say (its glyph's cell refused, read
-                        // inside a frame, or grey with the cursor off it) is looked at again at the
-                        // wait's pace: a cell coming back or a cursor going home moves no content
-                        // seq, and nothing else would ever decide the point. The look's own read
-                        // does it (`Self::draft_look`), as a moved screen's would.
-                        Past::Still(Some(_)) if self.draft_held == Some(Composer::Unknown) => {
-                            return Ok(None);
-                        }
                         Past::Still(_) => {}
                     }
                 }
@@ -6629,6 +6671,14 @@ impl<C: Ctl> Session<'_, C> {
                     return Ok(None);
                 }
                 if self.stall_step(&seen, review)? {
+                    return Ok(None);
+                }
+                // A composer whose read could not say (its glyph's cell refused, read inside a frame,
+                // or grey with the cursor off it) is looked at again at the wait's pace: a cell coming
+                // back or a cursor going home moves no content seq, and nothing else would ever
+                // decide the point. The look's own read does it (`Self::draft_look`), as a moved
+                // screen's would.
+                if self.draft_held == Some(Composer::Unknown) {
                     return Ok(None);
                 }
                 if (self.fx.mono() < until && !self.due_at().is_some_and(|at| self.fx.mono() >= at))
@@ -6782,8 +6832,9 @@ impl<C: Ctl> Session<'_, C> {
 
     /// THE LOOP'S OWN STAMPS OF THE PERSON COUNT THE SLEEP (2026-10-30 review 9, second pass):
     /// their last gesture and key as the last `status` timed them (`Session::person`,
-    /// `Session::key`), the last hand a read saw (`Session::hand_key`) and the draft the loop saw
-    /// are `Instant`s, which stood still while the Mac slept `by`. Each moves back by it, as the
+    /// `Session::key`), the last hand a read saw (`Session::hand_key`), the draft the loop saw and
+    /// the read that found one gone (`Session::draft_left`) are `Instant`s, which stood still while
+    /// the Mac slept `by`. Each moves back by it, as the
     /// window's ages count it and [`TurnEndState::slept`] moves the policy's, so none reads as
     /// minutes old at the wake: [`Self::key_ago`] takes the youngest, and one left on the awake
     /// clock read as a new key past the moved-back one, which started the hour again. A stamp the
@@ -6793,10 +6844,11 @@ impl<C: Ctl> Session<'_, C> {
         self.person = back(self.person);
         self.key = back(self.key);
         self.hand_key = back(self.hand_key);
+        self.draft_left = back(self.draft_left);
         self.draft_seen = self
             .draft_seen
             .take()
-            .and_then(|(draft, at)| Some((draft, at.checked_sub(by)?)));
+            .and_then(|(draft, at, cell)| Some((draft, at.checked_sub(by)?, cell)));
     }
 
     fn recount_sleep(&mut self) -> Option<Duration> {
@@ -7647,7 +7699,10 @@ impl<C: Ctl> Session<'_, C> {
             }
             // No decision need read this composer at a point with nothing due, and its rows alone
             // tell neither a suggestion its cursor has since gone home on nor a draft whose caret is.
-            self.composer_for_guards(&reading, &point.screen);
+            // A hold's look has read it (`Self::draft_look`).
+            if self.draft_held.is_none() {
+                self.composer_for_guards(&reading, &point.screen);
+            }
             // The status this step read first ([`Self::foreground_program`]) is the person's and
             // the driver's word, as at a break's own write.
             let guards = self.occupancy_guards(self.fx.mono(), &opts.policy, &point.screen.rows);
@@ -7969,17 +8024,20 @@ fn typed_draft_in(
 }
 
 /// WHAT THE COMPOSER'S ROWS AND THE CURSOR ALONE SAY OF ITS TEXT: typed (`Some(true)`), none
-/// (`Some(false)`), or nothing (`None`). A second row of text is typed, as is any text where the
-/// program draws no grey suggestion. Where it does (`placeholder`), a lone first line is told by
-/// the cursor: past column 2 on the caret's row it stands after typed text, on a later row of the
-/// composer in a draft of more than one row (a Shift+Enter), and at column 2 on the caret's row on
-/// a suggestion's first glyph. Off the composer's rows it says nothing: a program that places its
-/// cursor last after drawing its rows (Muse Code's ~2 KB bottom pane ending `ESC[48;3H`,
-/// `docs/measured/half-drawn-frame-2026-10-22.md`, and Claude Code's unbracketed launch frame) is
-/// read there between the two, which is no person's typing (`fabric_world`'s `174640090a`). None of
-/// this is a decision's read or a host's step, which ask the glyph's cell wherever the cursor stands
-/// (`Session::composer_typed`): a frame read before its program placed the cursor can leave it past
-/// a suggestion or under one too.
+/// (`Some(false)`), or nothing (`None`). Any text where the program draws no grey suggestion is typed.
+/// Where it does (`placeholder`), the cursor tells, on the composer's rows. Past column 2 on the
+/// caret's row it stands after typed text, and on a later row in a draft of more than one row (a
+/// Shift+Enter). At column 2 of the caret's row, on a lone first line, it stands on a suggestion's
+/// first glyph; on text of more than one row it says nothing, which keeps grey text on more rows than
+/// one, never measured (Claude Code 2.1.318 cuts a suggestion to one row and Muse Code 1.4.14 clips
+/// its tip to one, `docs/measured/composer-cells-2026-11-03.md`), from being called either. Off the
+/// composer's rows, or off the rows read, it says nothing: a program that places
+/// its cursor last after drawing its rows (Muse Code's ~2 KB bottom pane ending `ESC[48;3H`,
+/// `docs/measured/half-drawn-frame-2026-10-22.md`, and Claude Code's unbracketed launch frame) is read
+/// there between the two, which is no person's typing (`fabric_world`'s `174640090a`). None of this is
+/// a decision's read or a host's step, which ask the glyph's cell wherever the cursor stands
+/// (`Session::composer_typed`): a frame read before its program placed the cursor can leave it past a
+/// suggestion or under one too.
 fn draft_read(
     composer: Option<&(usize, Vec<String>)>,
     placeholder: bool,
@@ -7988,32 +8046,26 @@ fn draft_read(
     let Some((caret, lines)) = composer else {
         return Some(false);
     };
-    if lines.iter().skip(1).any(|l| !l.is_empty()) {
-        return Some(true);
-    }
+    let later = lines.iter().skip(1).any(|l| !l.is_empty());
     if lines.first().is_none_or(|l| l.is_empty()) {
-        return Some(false);
+        return Some(later);
     }
     if !placeholder {
         return Some(true);
     }
-    match screen.cursor_index() {
-        Some(row) if row < *caret || row >= caret + lines.len() => None,
-        Some(row) if row != *caret => Some(true),
-        _ => Some(screen.cursor_col != 2),
+    let row = screen
+        .cursor_index()
+        .filter(|row| (*caret..caret + lines.len()).contains(row))?;
+    if row != *caret || screen.cursor_col != COMPOSER_COL {
+        return Some(true);
     }
+    (!later).then_some(false)
 }
 
-/// Whether `screen`'s cursor stands home on a composer of `lines` from row `caret`: at the column
-/// its first glyph is drawn at, where a program that draws grey text leaves its cursor over it, and
-/// on no later row of the composer, where only text of more than one row, or a redraw not yet done,
-/// leaves it. The caret's row itself need not be the cursor's: a grid a resize left drawn one row
-/// high has it a row under (`docs/DESIGN-wall-resume-2026-09-28.md`).
-fn cursor_home(caret: usize, lines: &[String], screen: &Screen) -> bool {
-    screen.cursor_col == crate::supervise::screen::COMPOSER_COL
-        && !screen
-            .cursor_index()
-            .is_some_and(|row| row > caret && row < caret + lines.len())
+/// [`cursor_home`] of `screen`'s cursor.
+fn screen_cursor_home(caret: usize, lines: &[String], screen: &Screen) -> bool {
+    let cursor = screen.cursor_index().map(|row| (row, screen.cursor_col));
+    cursor_home(cursor, caret, lines)
 }
 
 fn heads_with_zero(composer: Option<&(usize, Vec<String>)>) -> bool {
@@ -8608,6 +8660,8 @@ pub use answer::{
 mod approval_loop;
 #[path = "beside.rs"]
 mod beside;
+#[cfg(test)]
+pub(crate) use approval_loop::reask_pause;
 /// Re-exports whole-box approval decision evaluation for tape explanation.
 pub(crate) use approval_loop::whole_box_decision;
 #[path = "box_head.rs"]

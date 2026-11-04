@@ -21,24 +21,28 @@ pub struct LocalStageOptions {
     pub stage: bool,
 }
 
-fn regular(path: &Path) -> Result<std::fs::File, String> {
+fn regular(path: &Path) -> Result<(std::fs::File, std::fs::Metadata), String> {
     use std::os::unix::fs::OpenOptionsExt;
     let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)
         .map_err(|e| format!("open {}: {e}", path.display()))?;
-    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+    let meta = file.metadata().map_err(|e| e.to_string())?;
+    if !meta.is_file() {
         return Err(format!("{} is not a regular file", path.display()));
     }
-    Ok(file)
+    Ok((file, meta))
 }
 
 fn read_asset(dir: &Path, name: &str, cap: u64) -> Result<Vec<u8>, String> {
     leaf(name)?;
-    let mut bytes = Vec::new();
-    regular(&dir.join(name))?
-        .take(cap.saturating_add(1))
+    let (file, meta) = regular(&dir.join(name))?;
+    if meta.len() > cap {
+        return Err(format!("{name} exceeds its {cap}-byte bound"));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0).saturating_add(1));
+    file.take(cap.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(|e| e.to_string())?;
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > cap {
@@ -186,7 +190,7 @@ pub fn stage_local(options: &LocalStageOptions) -> Result<String, String> {
         return Err("candidate is quarantined by the installed updater".into());
     }
     let copied = scratch.path().join(&artifact.name);
-    let mut input = regular(&options.assets.join(&artifact.name))?;
+    let (mut input, _) = regular(&options.assets.join(&artifact.name))?;
     let mut output = std::fs::File::create(&copied).map_err(|e| e.to_string())?;
     let cap = aterm_update_core::RELEASE_ASSET_DOWNLOAD_BOUND;
     let size = std::io::copy(

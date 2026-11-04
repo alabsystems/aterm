@@ -113,10 +113,14 @@ fn read(path: &Path, max: u64) -> Result<Option<String>, String> {
         }
         Err(why) => return Err(format!("{}: {why}", path.display())),
     };
-    if !file.metadata().map_err(|why| why.to_string())?.is_file() {
+    let meta = file.metadata().map_err(|why| why.to_string())?;
+    if !meta.is_file() {
         return Err(format!("{}: sync file is not regular", path.display()));
     }
-    let mut bytes = Vec::new();
+    if meta.len() > max {
+        return Err(format!("{}: sync file exceeds its limit", path.display()));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0).saturating_add(1));
     file.take(max + 1)
         .read_to_end(&mut bytes)
         .map_err(|why| why.to_string())?;
@@ -429,6 +433,26 @@ impl Store {
         self.transact_pool_logins_held(&held, roster, now, note, edit)
     }
 
+    /// Exercise an admitted observation through the real roster-bound writer transaction.
+    ///
+    /// # Errors
+    /// Returns an error when the roster, admission or durable transaction refuses.
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
+    pub fn observe_admitted_workflow_for_test(
+        &self,
+        roster: &Path,
+        label: &str,
+        now: i64,
+        observe: impl FnOnce(&Roster, &mut State, &mut Logins) -> Vec<Event>,
+    ) -> Result<(), String> {
+        self.transact_pool_logins_within(&[], roster, now, &mut None, |raw, state, logins| {
+            workflow_scope::admit(logins, label)?;
+            Ok(observe(raw, state, logins))
+        })
+        .map(|_| ())
+    }
+
     /// The pool transaction under its caller's existing account writer lock.
     pub(in crate::harness) fn transact_pool_logins_held(
         &self,
@@ -618,7 +642,10 @@ impl Store {
     pub(in crate::harness) fn sync_read_receipt(&self) -> Result<Option<String>, String> {
         let receipt = self.receipt()?;
         if receipt.as_ref().is_some_and(|r| r.plan.is_some()) {
-            return Err("interrupted account sync; run `aterm harness accounts sync` to resume before using accounts".into());
+            return Err(format!(
+                "interrupted account sync; run `{}` to resume before using accounts",
+                crate::harness::accounts_step::Step::Sync(self.cli)
+            ));
         }
         Ok(receipt.map(|r| r.id))
     }
@@ -840,8 +867,8 @@ impl Store {
             state.machine = id;
         }
         let before = (state.clone(), logins.clone());
-        let managed_target = target.as_ref().filter(|_| !state.contextual_auth);
-        let raw_before = managed_target
+        let raw_before = target
+            .as_ref()
             .map(|target| {
                 target.before.map_or_else(
                     || Ok(Roster::default()),
@@ -849,7 +876,8 @@ impl Store {
                 )
             })
             .transpose()?;
-        let raw_after = managed_target
+        let raw_after = target
+            .as_ref()
             .map(|target| {
                 target.after.map_or_else(
                     || Ok(Roster::default()),
@@ -857,7 +885,9 @@ impl Store {
                 )
             })
             .transpose()?;
-        auth_scope::begin(&mut state, raw_before.as_ref(), &mut logins);
+        workflow_scope::begin(raw_before.as_ref(), &mut logins);
+        let managed_before = raw_before.as_ref().filter(|_| !state.contextual_auth);
+        auth_scope::begin(&mut state, managed_before, &mut logins);
         let mut events = edit(&mut state, &mut logins)?;
         let final_raw = if state.pending_auth.is_empty() {
             None
@@ -873,13 +903,12 @@ impl Store {
         };
         events.extend(self.finalize_auth(&mut state, &mut logins, final_raw.as_ref())?);
         advance_renewal_generations(&before.1, &mut logins, &events)?;
-        let auth_changed = auth_scope::finish(
-            &mut state,
-            &before.1,
-            raw_after.as_ref(),
-            &mut logins,
-            &events,
-        )?;
+        let managed_after = raw_after.as_ref().filter(|_| !state.contextual_auth);
+        let auth_changed =
+            auth_scope::finish(&mut state, &before.1, managed_after, &mut logins, &events)?;
+        let workflow_changed =
+            workflow_scope::finish(&before.1, raw_after.as_ref(), &mut logins, &mut events)?;
+        let auth_changed = auth_changed || workflow_changed;
         advance_sign_in_receipts(&before.1, &mut logins, &state, &events)?;
         let old_state = read(&self.state_file(), MAX_STATE_BYTES)?;
         let old_logins = read(&self.logins_file(), MAX_LOGINS_BYTES)?;

@@ -26,7 +26,7 @@ pub const USAGE: &str = "aterm db — encrypted embedded application databases (
   table <verb> ...                     typed ATT/1 tables: ls, schema, get, scan, history,\n\
                                        check, revert, export, apply, edit (table --help)\n\
   alab <verb> ...                      the ALab lab model: import, check, adopt (alab --help)\n\
-  commons-status                       local membership, history capacity, control and sharing\n\
+  commons-status                       local membership, history capacity and fingerprint, control and sharing\n\
   commons-lineage                      verified predecessor-to-current public writer identities\n\
   network-state                        local place, observer and retained history; never grants access\n\
   commons-authority                    inspect cached admin control metadata; changes nothing\n\

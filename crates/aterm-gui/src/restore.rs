@@ -2740,9 +2740,34 @@ fn quit_wire(
     Ok(toml)
 }
 
+fn read_restore_text(path: &Path, max_bytes: u64) -> std::io::Result<(String, Option<u64>)> {
+    use std::io::Read as _;
+    let (file, meta) = aterm_uds::regular_file::open(path)?;
+    if meta.len() > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "restore file exceeds size limit",
+        ));
+    }
+    let written_unix_ms = modified_unix_ms(&meta);
+    let cap = usize::try_from(meta.len().min(max_bytes))
+        .unwrap_or(0)
+        .saturating_add(1);
+    let mut text = String::with_capacity(cap);
+    file.take(max_bytes + 1).read_to_string(&mut text)?;
+    if text.len() as u64 > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "restore file exceeds size limit",
+        ));
+    }
+    Ok((text, written_unix_ms))
+}
+
 fn other_desks(path: &Path, run: &str) -> Vec<Desk> {
-    fs::read_to_string(path)
+    read_restore_text(path, 64 << 20)
         .ok()
+        .map(|(text, _)| text)
         .as_deref()
         .and_then(desks_of)
         .unwrap_or_default()
@@ -2840,7 +2865,12 @@ fn unwrite_quit_to_waiting(
         return Ok(());
     }
     with_restore_lock_waiting(path, wait, || {
-        let Some(desks) = fs::read_to_string(path).ok().as_deref().and_then(desks_of) else {
+        let Some(desks) = read_restore_text(path, 64 << 20)
+            .ok()
+            .map(|(text, _)| text)
+            .as_deref()
+            .and_then(desks_of)
+        else {
             return Ok(());
         };
         if !desks.iter().any(|desk| desk.run == run) {
@@ -2998,12 +3028,7 @@ fn take_from_result(path: &Path, wait: LockWait) -> Result<Option<TakenQuit>, St
             )
         })?;
 
-        let read = File::open(&claim).and_then(|mut file| {
-            let written_unix_ms = file.metadata().ok().as_ref().and_then(modified_unix_ms);
-            let mut text = String::new();
-            std::io::Read::read_to_string(&mut file, &mut text)?;
-            Ok((text, written_unix_ms))
-        });
+        let read = read_restore_text(&claim, 64 << 20);
         let parsed = match read {
             Ok((text, written_unix_ms)) => {
                 RestoreManifest::from_toml(&text).map(|manifest| TakenQuit {
@@ -3729,8 +3754,13 @@ fn hold_take(path: &Path) -> Option<crate::native_document_host::HeldAdvisoryLoc
 
 #[cfg(unix)]
 fn read_take(file: &File, path: &Path) -> Option<(String, Option<u64>)> {
-    let written_unix_ms = file.metadata().ok().as_ref().and_then(modified_unix_ms);
-    let mut text = String::new();
+    let meta = file.metadata().ok();
+    let written_unix_ms = meta.as_ref().and_then(modified_unix_ms);
+    let cap = meta
+        .as_ref()
+        .and_then(|m| usize::try_from(m.len().min(64 << 20).saturating_add(1)).ok())
+        .unwrap_or(0);
+    let mut text = String::with_capacity(cap);
     let mut reader = file;
     match std::io::Read::read_to_string(&mut reader, &mut text) {
         Ok(_) => Some((text, written_unix_ms)),
@@ -3826,7 +3856,7 @@ fn cell_metrics_scale_milli(scale: f64) -> u32 {
 }
 
 fn read_cell_metrics(path: &Path) -> Option<CellMetricsCache> {
-    let text = fs::read_to_string(path).ok()?;
+    let (text, _) = read_restore_text(path, 1 << 20).ok()?;
     let cache: CellMetricsCache = aterm_toml::from_str(&text).ok()?;
     (cache.schema == CELL_METRICS_SCHEMA).then_some(cache)
 }

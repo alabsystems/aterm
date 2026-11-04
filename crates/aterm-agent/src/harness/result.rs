@@ -1316,11 +1316,12 @@ fn tail_lines(text: &str, max: usize, file: &Path, noun: &str, whole: bool) -> V
 }
 
 fn tail_of(path: &Path, bytes: u64) -> Option<(String, bool)> {
-    let mut f = super::footer::open_regular(path)?;
-    let len = f.metadata().ok()?.len();
+    let (mut f, meta) = super::footer::open_regular_with_meta(path)?;
+    let len = meta.len();
     let start = len.saturating_sub(bytes);
     f.seek(SeekFrom::Start(start)).ok()?;
-    let mut buf = Vec::new();
+    let cap = usize::try_from(len.saturating_sub(start).min(bytes).saturating_add(1)).unwrap_or(0);
+    let mut buf = Vec::with_capacity(cap);
     f.take(bytes).read_to_end(&mut buf).ok()?;
     Some((String::from_utf8_lossy(&buf).into_owned(), start == 0))
 }

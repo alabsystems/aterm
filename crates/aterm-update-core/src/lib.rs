@@ -83,3 +83,14 @@ pub(crate) fn warn(msg: &str) {
 pub fn log_pkg_note(msg: &str) {
     aterm_log::warn!("atpkg: {msg}");
 }
+
+/// Create a private `.noindex` test scratch directory with a UTF-8-safe bounded prefix.
+#[cfg(test)]
+pub(crate) fn test_scratch_dir(tag: &str) -> aterm_tempfile::TempDir {
+    let end = tag.floor_char_boundary(tag.len().min(20));
+    aterm_tempfile::Builder::new()
+        .prefix(&format!("atuc-{}-", &tag[..end]))
+        .suffix(".noindex")
+        .tempdir()
+        .expect("aterm-update-core test scratch dir")
+}

@@ -234,6 +234,7 @@ fn facts(c: &'static Connector) -> Facts {
 
 fn accounts(state: Option<&'static str>) -> ClaudeAccounts {
     ClaudeAccounts {
+        pool_picks: false,
         store: None,
         roster: None,
         label: "main".into(),
@@ -484,6 +485,7 @@ fn the_health_line_names_aterms_fixes_and_only_a_persons_sign_in_needs_you() {
     agy.managed = None;
     let mut claude = facts(&CLAUDE);
     claude.accounts = Some(ClaudeAccounts {
+        pool_picks: false,
         state: Some("expired"),
         ..accounts(Some("expired"))
     });
@@ -569,6 +571,7 @@ fn a_row_aterm_cannot_sign_in_unattended_is_a_persons_with_the_step_only_a_perso
     use crate::harness::accounts::SignInAction;
     let mut claude = facts(&CLAUDE);
     claude.accounts = Some(ClaudeAccounts {
+        pool_picks: false,
         label: "m2-2".into(),
         unattended: false,
         tried: Some(crate::ai::facts::Tried {
@@ -595,6 +598,7 @@ fn a_row_aterm_cannot_sign_in_unattended_is_a_persons_with_the_step_only_a_perso
 
     let mut off = claude.clone();
     off.accounts = Some(ClaudeAccounts {
+        pool_picks: false,
         unattended: true,
         off: Some("`[harness] logins = \"off\"`"),
         ..accounts(Some("expired"))
@@ -621,6 +625,7 @@ fn a_row_aterm_cannot_sign_in_unattended_is_a_persons_with_the_step_only_a_perso
 
     let mut control = claude.clone();
     control.accounts = Some(ClaudeAccounts {
+        pool_picks: false,
         unattended: true,
         ..accounts(Some("expired"))
     });
@@ -651,6 +656,7 @@ fn a_row_whose_sign_in_starts_nothing_names_what_a_person_does_instead() {
     let mut claude = facts(&CLAUDE);
     claude.home_exists = false;
     claude.accounts = Some(ClaudeAccounts {
+        pool_picks: false,
         refused: Some("row 1: no label".into()),
         ..accounts(None)
     });
@@ -699,6 +705,7 @@ fn a_failed_sign_in_or_a_bot_check_on_record_holds_the_row_for_the_upkeep() {
     };
     let mut claude = facts(&CLAUDE);
     claude.accounts = Some(ClaudeAccounts {
+        pool_picks: false,
         tried: Some(tried("failed")),
         ..accounts(Some("expired"))
     });
@@ -733,6 +740,7 @@ fn a_failed_sign_in_or_a_bot_check_on_record_holds_the_row_for_the_upkeep() {
 fn a_signed_out_row_says_what_aterms_sign_in_tried() {
     let mut claude = facts(&CLAUDE);
     claude.accounts = Some(ClaudeAccounts {
+        pool_picks: false,
         tried: Some(crate::ai::facts::Tried {
             outcome: "no-route",
             routes: "profile(none) mailbox(none configured) vault(sync failed: exit 1)".into(),

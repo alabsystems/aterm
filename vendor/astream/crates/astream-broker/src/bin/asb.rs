@@ -4495,21 +4495,30 @@ mod tests {
 
     /// `--seq-file`'s directory flush after the rename goes on exactly where
     /// `astream_sys::dir_flush_unavailable` says the entry cannot be flushed: the volume's
-    /// `ENOTSUP` (Darwin's 45, which std leaves uncategorized, so a list of kinds alone
-    /// refused the publish there; Linux's 95) is tolerated, and `EIO` refuses the publish,
-    /// its kind kept. Either way the flush is asked of the directory that names the file,
-    /// `.` for a bare name. Unix errno numbers (Windows's 5 is `ERROR_ACCESS_DENIED`).
+    /// `ENOTSUP` (Darwin's 45, Linux's 95) and on Apple `ENODEV` (19, what a full flush of
+    /// `/dev/null` answers) are tolerated, and `EIO` refuses the publish, its kind kept.
+    /// Either way the flush is asked of the directory that names the file, `.` for a bare
+    /// name. `ENODEV` keeps the errno half under test: the Trust std reads Darwin's 45 as
+    /// `Unsupported` (a stock std leaves it uncategorized), but no std names 19 by a kind the
+    /// rule reads, so a list of kinds alone refuses the publish there. CONTROL: 19's kind
+    /// alone is not unavailable. Unix errno numbers (Windows's 5 is `ERROR_ACCESS_DENIED`).
     #[test]
     #[cfg(unix)]
     fn the_seq_files_directory_flush_tolerates_enotsup_and_refuses_on_eio() {
-        let enotsup = if cfg!(target_vendor = "apple") {
-            45
+        let refused: &[i32] = if cfg!(target_vendor = "apple") {
+            let enodev = std::io::Error::from_raw_os_error(19);
+            assert!(
+                !astream_sys::dir_flush_unavailable(&std::io::Error::from(enodev.kind())),
+                "CONTROL: std names ENODEV by kind ({enodev:?}); the errno half is untested"
+            );
+            &[45, 19]
         } else {
-            95
+            &[95]
         };
         let eio = 5;
         for (path, dir) in [("/seqs/p.seq", "/seqs"), ("p.seq", ".")] {
-            for (errno, tolerated) in [(enotsup, true), (eio, false)] {
+            let errnos = refused.iter().map(|&errno| (errno, true));
+            for (errno, tolerated) in errnos.chain([(eio, false)]) {
                 let mut asked = None;
                 let flushed = sync_parent_dir_by(path, |d| {
                     asked = Some(d.to_path_buf());

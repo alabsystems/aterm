@@ -287,6 +287,13 @@ pub enum StepEvent {
         /// The vendor turn's id.
         vref: StepId,
     },
+    /// The vendor turn `vref` (after its `Prompt`) was begun by the agent's own harness, as
+    /// its row says (codex's `task_started` `turn_attribution.turn_trigger` = `alab_autopilot`);
+    /// only the codex fold builds it, on a build that showed the word (`codex_steps::Gate`).
+    HarnessTurn {
+        /// The vendor turn's id.
+        vref: StepId,
+    },
     /// Esc's row: the open turn was interrupted.
     Interrupt,
     /// A `tool_use` part of an assistant row.

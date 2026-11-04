@@ -2621,6 +2621,8 @@ fn a_carry_on_left_unanswered_is_read_for_what_it_did() {
     let muted = |rig: &mut Rig| {
         rig.opts.timings.drive_reply = Duration::from_millis(200);
     };
+    // Only the carry-on's own line is waited out; every answered exchange waits the hang detector.
+    let _answered = crate::AnsweredBut::set(|l| l.contains(upgrade::HARNESS_MARK));
     let mut reached = adopted("unanswered-reached");
     muted(&mut reached);
     reached.on_harness_line(Some(crate::harness::UNANSWERED), true);

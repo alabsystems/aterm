@@ -2,6 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! Actual popup input and painting on a roster larger than the frame.
+//! Account completions recheck process-environment paths, so these fixtures run apart from
+//! other tests' scoped environment changes. The production stale-completion fence stays active.
 
 use super::*;
 use crate::claude_footer::probe;
@@ -185,6 +187,9 @@ fn capture(app: &mut App, wid: WindowId, path: &std::path::Path) {
 
 #[test]
 fn large_account_popup_viewport_gallery() {
+    if !crate::test_alone::alone() {
+        return;
+    }
     let (gallery, _permit) =
         crate::scripted_redraw_fixture::gallery_directory("ATERM_POPUP_VIEWPORT_GALLERY");
     let mut manifest = String::from(
@@ -249,6 +254,9 @@ fn large_account_popup_viewport_gallery() {
 
 #[test]
 fn an_unpainted_or_previously_hidden_action_cannot_be_chosen() {
+    if !crate::test_alone::alone() {
+        return;
+    }
     let (mut app, wid, session) = fixture(60, 56);
     let before = pair(&app, session);
     key(&mut app, wid, NamedKey::Enter);
@@ -309,6 +317,9 @@ fn an_unpainted_or_previously_hidden_action_cannot_be_chosen() {
 
 #[test]
 fn page_keys_start_at_the_visible_page_after_pointer_scrolling() {
+    if !crate::test_alone::alone() {
+        return;
+    }
     let (mut app, wid, session) = fixture(60, 0);
     frame(&mut app, wid);
     app.close_autopilot_menu();
@@ -344,6 +355,9 @@ fn page_keys_start_at_the_visible_page_after_pointer_scrolling() {
 
 #[test]
 fn popup_wheel_residuals_and_end_phases_do_not_change_the_covered_pane() {
+    if !crate::test_alone::alone() {
+        return;
+    }
     let (mut app, wid, session) = fixture(60, 0);
     frame(&mut app, wid);
     // A partial gesture already owned by the pane cannot advance the new popup.
@@ -409,6 +423,9 @@ fn popup_wheel_residuals_and_end_phases_do_not_change_the_covered_pane() {
 
 #[test]
 fn native_wheel_stays_with_the_popup_and_moved_rows_require_a_fresh_pointer() {
+    if !crate::test_alone::alone() {
+        return;
+    }
     let (mut app, wid, session) = fixture(60, 0);
     frame(&mut app, wid);
     let menu = app.autopilot_menu.as_ref().unwrap();

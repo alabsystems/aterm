@@ -172,10 +172,11 @@ fn reports_refuse_a_known_default_identity_mismatch_without_changing_records() {
         assert!(
             json["next"]["none"]
                 .as_str()
-                .is_some_and(|why| { why.contains("expected account") })
+                .is_some_and(|why| why.contains("other@example.test")),
+            "{json}"
         );
         assert!(text.contains("next: none"));
-        assert!(text.contains("expected account"));
+        assert!(text.contains("other@example.test"), "{text}");
         assert_eq!(json["active"].as_str(), Some("main"));
         assert_eq!(json["sessions"], Value::from(0));
         assert_eq!(fixture.use_takes(), UseTakes::Refused);
@@ -192,7 +193,8 @@ fn reports_refuse_a_known_default_identity_mismatch_without_changing_records() {
             assert!(
                 !json["next"]["none"]
                     .as_str()
-                    .is_some_and(|why| { why.contains("expected account") })
+                    .is_some_and(|why| why.contains("other@example.test")),
+                "{json}"
             );
         }
     }
@@ -358,13 +360,21 @@ fn a_wall_reset_does_not_hide_a_terminal_identity_refusal() {
         let (text, json) = fixture.reports();
         assert_eq!(json["next"]["to"], Value::Null);
         assert_eq!(json["next"]["wait_until"], Value::Null);
+        // The default login's row says what that login names; a pinned row of its own says only
+        // that its login is not that row's.
+        let refusal = if wrong_default {
+            "other@example.test"
+        } else {
+            "expected account"
+        };
         assert!(
             json["next"]["none"]
                 .as_str()
-                .is_some_and(|why| { why.contains("expected account") })
+                .is_some_and(|why| why.contains(refusal)),
+            "{json}"
         );
         assert!(text.contains("next: none"));
-        assert!(text.contains("expected account"));
+        assert!(text.contains(refusal), "{text}");
         assert!(!text.contains("next: wait until"));
         assert_eq!(fixture.use_takes(), UseTakes::Refused);
         assert_eq!(fixture.images(), before);
@@ -414,6 +424,8 @@ fn non_file_backend_reports_ignore_a_contradictory_stale_default_auth_file() {
                 &records.roster,
                 Some(row),
                 fixture.env.home.as_deref().unwrap(),
+                None,
+                None,
             )
             .is_ok()
         );

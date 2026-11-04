@@ -39,10 +39,7 @@ const APP: &str = "fixture-dev/app";
 const ATERM: &str = "alabsystems/aterm";
 
 fn scratch() -> aterm_tempfile::TempDir {
-    aterm_tempfile::Builder::new()
-        .prefix("agh-write-")
-        .tempdir()
-        .expect("a scratch directory")
+    crate::test_fixtures::scratch_dir("write")
 }
 
 fn slug(text: &str) -> Slug {

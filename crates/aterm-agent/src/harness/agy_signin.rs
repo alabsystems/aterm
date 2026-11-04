@@ -12,8 +12,13 @@ use std::time::{Duration, Instant};
 
 use aterm_secrets::SecretBytes;
 
+#[path = "agy_signin_observe.rs"]
+mod observe;
 #[path = "agy_signin_recovery.rs"]
 mod recovery;
+pub(super) use observe::NativeProfile;
+#[cfg(not(test))]
+pub(super) use observe::read_native_profile;
 
 pub use super::login_drive::RecoveryKey;
 

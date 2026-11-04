@@ -66,7 +66,7 @@ fn sync_source(cli: Cli, env: &Env, source: Option<&str>) -> (ExitCode, String) 
     let code = if cli == Cli::Claude {
         run_accounts_sync(env, source, None, false, &mut out, &mut err)
     } else {
-        run_cli_accounts_sync(cli, env, (source, None, false), &mut out, &mut err)
+        run_cli_accounts_sync(cli, (env, None), (source, None, false), &mut out, &mut err)
     };
     (code, String::from_utf8(err).unwrap())
 }

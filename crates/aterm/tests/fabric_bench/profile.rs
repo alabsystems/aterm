@@ -146,20 +146,43 @@ impl Profile {
     }
 }
 
-/// Returns the built file's length and nanosecond modification time.
+/// Returns the opened regular file's SHA-256, length and nanosecond modification time.
+/// This fingerprints file bytes; it does not identify a process's mapped executable.
 /// # Errors
-/// A file whose metadata or time cannot be read.
+/// A file that cannot be opened or read as regular, whose time cannot be read, or whose
+/// length or modification time changes while hashing.
 pub fn identity(path: &Path) -> Result<String, String> {
-    let meta = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let modified = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .ok_or_else(|| format!("{}: no modification time", path.display()))?;
+    use std::io::Read as _;
+    let fail = |error: std::io::Error| format!("{}: {error}", path.display());
+    let (file, meta) = aterm_uds::regular_file::open(path).map_err(fail)?;
+    let modified = meta.modified().map_err(fail)?;
+    let timestamp = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| format!("{}: no modification time", path.display()))?;
+    let mut reader = file.take(meta.len());
+    let mut digest = aterm_digest::Sha256::new();
+    let mut buffer = [0u8; 65536];
+    let mut read = 0u64;
+    loop {
+        let n = reader.read(&mut buffer).map_err(fail)?;
+        if n == 0 {
+            break;
+        }
+        read += n as u64;
+        digest.update(&buffer[..n]);
+    }
+    let after = reader.get_ref().metadata().map_err(fail)?;
+    if read != meta.len()
+        || after.len() != meta.len()
+        || after.modified().map_err(fail)? != modified
+    {
+        return Err(format!("{}: file changed while hashing", path.display()));
+    }
     Ok(format!(
-        "{} bytes, modified {}.{:09}",
+        "sha256 {}, {} bytes, modified {}.{:09}",
+        aterm_codec::hex::encode_lower(&digest.finalize()),
         meta.len(),
-        modified.as_secs(),
-        modified.subsec_nanos()
+        timestamp.as_secs(),
+        timestamp.subsec_nanos()
     ))
 }

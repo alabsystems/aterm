@@ -49,10 +49,10 @@ aterm-lexicon = { workspace = true }
 aterm-ctl = { path = "../aterm-ctl" }
 # Offline `messages.log` reader for `aterm exceptions` and `aterm doctor`.
 aterm-messages = { workspace = true }
-# `aterm doctor`'s `awake:` row: whether aCaffiene's mug holds macOS's idle-sleep assertion
+# `aterm doctor`'s `awake:` row: whether aCaffeine's mug holds macOS's idle-sleep assertion
 # (`held::held`, which reads the power manager's assertions in-process on macOS, the rows
 # `pmset -g assertions` prints, and nothing elsewhere).
-aterm-acaffiene = { workspace = true }
+aterm-acaffeine = { workspace = true }
 # `aterm_uds::spawnfd::command` child-process builder, and the unprivileged read of macOS's
 # own services' footprints (`services`) that `aterm doctor`'s `services:` row reports.
 aterm-uds = { workspace = true }

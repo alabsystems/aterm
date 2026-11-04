@@ -642,11 +642,20 @@ const LAST_WORD_TAIL: u64 = 4096;
 /// Last non-empty stderr line from `<root>/broker.err` as `written <age> ago: <line>`.
 pub(crate) fn supervisor_last_word(root: &Path) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
-    let mut f = std::fs::File::open(root.join("broker.err")).ok()?;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(LOCK_OPEN_FLAGS)
+        .open(root.join("broker.err"))
+        .ok()?;
     let meta = f.metadata().ok()?;
+    if !meta.is_file() {
+        return None;
+    }
     let from = meta.len().saturating_sub(LAST_WORD_TAIL);
     f.seek(SeekFrom::Start(from)).ok()?;
-    let mut tail = Vec::new();
+    let want = (meta.len() - from).min(LAST_WORD_TAIL);
+    let mut tail = Vec::with_capacity(usize::try_from(want.saturating_add(1)).unwrap_or(0));
     f.take(LAST_WORD_TAIL).read_to_end(&mut tail).ok()?;
     let text = String::from_utf8_lossy(&tail);
     let line: String = text
@@ -838,8 +847,54 @@ fn fleet_flag(fleet: Option<&str>) -> String {
         .map_or_else(String::new, |f| format!(" --fleet {f}"))
 }
 
+pub(crate) fn read_bounded_bytes(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let (file, meta) = aterm_uds::regular_file::open(path)?;
+    if meta.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file exceeds size limit",
+        ));
+    }
+    let cap = usize::try_from(meta.len().min(max_bytes))
+        .unwrap_or(0)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(cap);
+    file.take(max_bytes + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file exceeds size limit",
+        ));
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn read_bounded_string(path: &Path, max_bytes: u64) -> io::Result<String> {
+    use std::io::Read as _;
+    let (file, meta) = aterm_uds::regular_file::open(path)?;
+    if meta.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file exceeds size limit",
+        ));
+    }
+    let cap = usize::try_from(meta.len().min(max_bytes))
+        .unwrap_or(0)
+        .saturating_add(1);
+    let mut text = String::with_capacity(cap);
+    file.take(max_bytes + 1).read_to_string(&mut text)?;
+    if text.len() as u64 > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file exceeds size limit",
+        ));
+    }
+    Ok(text)
+}
+
 fn role_text(path: &Path) -> Result<Option<String>, String> {
-    match std::fs::read_to_string(path) {
+    match read_bounded_string(path, 1024 * 1024) {
         Ok(text) => Ok(Some(text)),
         Err(e)
             if e.kind() == io::ErrorKind::NotFound
@@ -1152,7 +1207,7 @@ impl Rendezvous {
         let Some(path) = rendezvous_path() else {
             return Ok(None);
         };
-        match std::fs::read_to_string(&path) {
+        match read_bounded_string(&path, 1024 * 1024) {
             Ok(text) => Self::parse(&text)
                 .map(Some)
                 .map_err(|e| format!("{}: {e}", path.display())),
@@ -1524,7 +1579,7 @@ pub(crate) fn random_bytes(n: usize) -> io::Result<Vec<u8>> {
 
 /// The node id a bridge with this state dir answers as, if one is provisioned.
 pub(crate) fn read_node(state: &Path) -> Option<String> {
-    let raw = std::fs::read_to_string(state.join("node")).ok()?;
+    let raw = read_bounded_string(&state.join("node"), 4096).ok()?;
     let node = raw.trim();
     is_node_id(node).then(|| node.to_string())
 }
@@ -3390,7 +3445,7 @@ fn broker_step(p: &Paths, node: &str, service: Service, named: bool, out: &mut O
         }
         Service::Launchd => {
             let plist = p.plist();
-            let old = std::fs::read_to_string(&plist).ok();
+            let old = read_bounded_string(&plist, 1024 * 1024).ok();
             let same = old.as_deref().is_some_and(|old| p.plist_is_current(old));
             // The plist is written inside the step, once launchd let go of the job it replaces.
             let (loaded, running, rewrite) = match launchd_read(&LiveLaunchd, p, &label, old) {
@@ -3540,7 +3595,7 @@ fn broker_step(p: &Paths, node: &str, service: Service, named: bool, out: &mut O
         Service::Systemd => {
             let unit = p.unit();
             let text = p.unit_text();
-            let old = std::fs::read(&unit).ok();
+            let old = read_bounded_bytes(&unit, 1024 * 1024).ok();
             let same = old.as_deref() == Some(text.as_bytes());
             let running = systemd_main_pid(&label);
             let view = probe(p, node);
@@ -4686,7 +4741,7 @@ fn on_steps(
             let would = if !holds {
                 format!("provision a node id into {}", file.display())
             } else {
-                let held = std::fs::read(&file)
+                let held = read_bounded_bytes(&file, 4096)
                     .map(|b| safe(String::from_utf8_lossy(&b).trim(), 64))
                     .unwrap_or_default();
                 format!(
@@ -4895,7 +4950,9 @@ fn finish(
                 use std::os::unix::fs::PermissionsExt;
                 std::fs::metadata(&path).is_ok_and(|m| m.permissions().mode() & 0o077 == 0)
             };
-            if private && std::fs::read(&path).is_ok_and(|old| old == want.as_bytes()) {
+            if private
+                && read_bounded_bytes(&path, 1024 * 1024).is_ok_and(|old| old == want.as_bytes())
+            {
                 out.already("rendezvous", &format!("{} (0600)", path.display()));
             } else {
                 out.done(

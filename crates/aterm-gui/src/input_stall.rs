@@ -407,13 +407,15 @@ fn linux_proc_stat_after_comm(pid: libc::pid_t) -> Option<String> {
         return None;
     }
     let path = format!("/proc/{pid}/stat");
-    let meta = std::fs::metadata(&path).ok()?;
+    let file = std::fs::File::open(&path).ok()?;
+    let meta = file.metadata().ok()?;
     // SAFETY: `geteuid` is a side-effect-free libc getter.
     let ours = unsafe { libc::geteuid() };
     if meta.uid() != ours {
         return None;
     }
-    let stat = std::fs::read_to_string(path).ok()?;
+    let mut stat = String::with_capacity(512);
+    std::io::Read::read_to_string(&mut std::io::Read::take(file, 64 * 1024), &mut stat).ok()?;
     let close_paren = stat.rfind(')')?;
     Some(stat.get(close_paren + 1..)?.trim_start().to_string())
 }

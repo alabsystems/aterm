@@ -263,6 +263,8 @@ pub struct ReleaseOptions {
     pub verbose: bool,
     /// `--prepare`: run the heavy half and stop after READY, PREPARED, nothing public; a bare run then finishes it ([`Prepared`]).
     pub prepare: bool,
+    /// `--qualify`: check and build a private candidate without pushing staging or publishing.
+    pub qualify: bool,
     /// `--forget`: drop this clone's release journal (nothing public changes).
     pub forget: bool,
     /// `--abandon vX.Y.Z`: withdraw this clone's claimed, unpublished cut of it.
@@ -843,6 +845,13 @@ pub struct Built {
     pub fixtures: Option<Result<String, Refusal>>,
 }
 
+/// Whether the export check may publish its snapshot to the staging repository.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StageTarget {
+    Remote,
+    Local,
+}
+
 /// Everything the release asks of the world — git, the engine, the records, the children, the clock, the owner's aterm.
 pub trait Backend {
     fn now(&mut self) -> u64;
@@ -894,7 +903,12 @@ pub trait Backend {
     fn facts(&mut self, c: &Candidate, prover: &Prover, artifact: Option<&Artifact>) -> Facts;
     fn disk(&mut self) -> (Option<u64>, bool);
     fn commit_gates(&mut self, c: &Candidate, dry: bool) -> Vec<Refusal>;
-    fn cut_gates(&mut self, c: &Candidate, creds: &Path) -> Vec<Refusal>;
+    fn cut_gates(
+        &mut self,
+        c: &Candidate,
+        creds: &Path,
+        kind: crate::publish::CutKind,
+    ) -> Vec<Refusal>;
     fn stage_fixtures(
         &mut self,
         c: &Candidate,
@@ -930,7 +944,12 @@ pub trait Backend {
         prover: &Prover,
         artifact: &Artifact,
     ) -> Result<Ran, Refusal>;
-    fn stage(&mut self, c: &Candidate, prover: &Prover) -> Result<Ran, Refusal>;
+    fn stage(
+        &mut self,
+        c: &Candidate,
+        prover: &Prover,
+        target: StageTarget,
+    ) -> Result<Ran, Refusal>;
     fn publish(&mut self, prover: &Prover) -> Result<Ran, Refusal>;
     fn source_publication(&mut self, c: &Candidate) -> Result<(), Refusal>;
     fn cut(&mut self, args: &[String], prover: &Prover) -> Ran;
@@ -1146,6 +1165,12 @@ impl Run<'_> {
         }
 
         self.refresh();
+        if self.opts.qualify && self.facts.cut.is_some() {
+            return self.refuse(Refusal::new(
+                "a cut is already journaled; private qualification cannot reuse an active cut",
+                "use a separate clean clone for the private candidate",
+            ));
+        }
         self.plan_print();
 
         self.begin(Step::Stage)?;
@@ -1181,6 +1206,23 @@ impl Run<'_> {
             self.ready()?;
         }
 
+        if self.opts.qualify {
+            if self.dry {
+                return self.dry_final();
+            }
+            self.let_go();
+            self.last = format!(
+                "QUALIFIED aterm {} from {} — its export checked locally and its bundle built \
+                 and verified; no staging snapshot pushed, nothing published. \
+                 {} cut --dry-run signs these verified bytes privately",
+                self.version(),
+                short(&self.commit_r()),
+                crate::publish::SHIP_COMMAND
+            );
+            let last = self.last.clone();
+            self.say(&last);
+            return Err(Halt::Said(0));
+        }
         if self.opts.prepare {
             self.prepare_stop()?;
         }
@@ -1452,7 +1494,13 @@ impl Run<'_> {
             )
         };
         if self.would.is_empty() {
-            self.last = if self.opts.prepare {
+            self.last = if self.opts.qualify {
+                format!(
+                    "DRY RUN aterm {v} from {}: --qualify would check the full export locally, build and verify, about {} of work{waits}; no staging snapshot pushed or publication — nothing was changed",
+                    short(&r),
+                    fmt_dur(self.plan_secs)
+                )
+            } else if self.opts.prepare {
                 format!(
                     "DRY RUN aterm {v} from {}: a real --prepare would go ahead and stop PREPARED \
                      after {}, about {} of work{waits}; then {RELEASE_COMMAND} would finish it, \
@@ -1589,7 +1637,7 @@ impl Run<'_> {
     }
 
     fn pending_reask(&mut self) -> Option<Prepared> {
-        if self.opts.prepare || self.claimed() {
+        if self.opts.prepare || self.opts.qualify || self.claimed() {
             return None;
         }
         self.prepared()
@@ -2762,6 +2810,9 @@ impl Run<'_> {
     }
 
     fn stage_done(&self) -> Option<String> {
+        if self.opts.qualify {
+            return None;
+        }
         if let Some(why) = self.claimed_words() {
             return Some(why);
         }
@@ -2818,7 +2869,9 @@ impl Run<'_> {
                 run.push(*step);
             }
         }
-        if self.opts.prepare {
+        if self.opts.qualify {
+            run.retain(|s| *s <= Step::Ready);
+        } else if self.opts.prepare {
             self.later = run.iter().copied().filter(|s| *s >= Step::Ready).collect();
             run.retain(|s| *s <= Step::Ready);
         }
@@ -2860,7 +2913,9 @@ impl Run<'_> {
                 done.join(" ")
             }
         ));
-        if self.opts.prepare {
+        if self.opts.qualify {
+            self.say("release: --qualify stops after ready; the export is checked with pub stage --dry-run, without pushing its snapshot");
+        } else if self.opts.prepare {
             let later: Vec<&str> = self.later.iter().map(|s| s.name()).collect();
             self.say(&format!(
                 "release: --prepare stops after {}, PREPARED with nothing public; then \
@@ -2923,6 +2978,31 @@ impl Run<'_> {
             return Ok(());
         }
         let mut words = vec![self.commit_gates(&c)?];
+        if self.opts.qualify {
+            if self.dry {
+                words.push("would check the compat slice and full export with pub stage --dry-run, without a staging push".into());
+            } else {
+                let log = self.b.log_path(Step::Stage);
+                self.say(&format!("        log: {}", log.display()));
+                let ran = match self.b.stage(&c, &p, StageTarget::Local) {
+                    Ok(ran) => ran,
+                    Err(refusal) => return self.refuse(refusal),
+                };
+                self.refresh();
+                if ran.code != 0 {
+                    return self.refuse(
+                        Refusal::new(
+                            format!("private export qualification failed (exit {})", ran.code),
+                            "read its log and fix the candidate before qualifying it again",
+                        )
+                        .detail(ran.detail),
+                    );
+                }
+                words.push("the full export qualified locally; no staging snapshot pushed".into());
+            }
+            self.finish(&words.join("; "));
+            return Ok(());
+        }
         match self.skip_stage() {
             Some(why) => words.push(why),
             None if self.dry => words.push(format!(
@@ -2937,7 +3017,7 @@ impl Run<'_> {
             None => {
                 let log = self.b.log_path(Step::Stage);
                 self.say(&format!("        log: {}", log.display()));
-                let ran = self.b.stage(&c, &p);
+                let ran = self.b.stage(&c, &p, StageTarget::Remote);
                 self.refresh();
                 match self.stage_verdict(&c, ran) {
                     Ok(note) => words.push(note),
@@ -3083,7 +3163,12 @@ impl Run<'_> {
         }
         if gates {
             let creds = self.creds.clone();
-            out.extend(self.b.cut_gates(c, &creds));
+            let kind = if self.opts.qualify {
+                crate::publish::CutKind::DryRun
+            } else {
+                crate::publish::CutKind::Real
+            };
+            out.extend(self.b.cut_gates(c, &creds, kind));
         }
         out
     }
@@ -3167,7 +3252,7 @@ impl Run<'_> {
             "        {why}: {r} is staged again by the engine as it is now, before the publish"
         ));
         self.restage = Some((old, why));
-        let ran = self.b.stage(c, p);
+        let ran = self.b.stage(c, p, StageTarget::Remote);
         self.refresh();
         let note = match self.stage_verdict(c, ran) {
             Ok(note) => note,
@@ -3262,6 +3347,29 @@ impl Run<'_> {
                         unknown_keys.insert(crate::provision::ask_words(f.label, what).key);
                     }
                 }
+            }
+            if self.opts.qualify {
+                if !owner.is_empty() || !unknown.is_empty() {
+                    let missing = owner
+                        .iter()
+                        .map(|(gap, _)| gap.as_str())
+                        .chain(unknown.iter().map(String::as_str))
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    let refusal = Refusal::new(
+                        format!("private qualification prerequisites are unavailable: {missing}"),
+                        "retry qualification when the recorded prerequisites are available",
+                    );
+                    self.refuse(if unknown.is_empty() {
+                        refusal
+                    } else {
+                        refusal.could_not_run()
+                    })?;
+                    return Ok("private qualification prerequisites are unavailable; no owner request created".into());
+                }
+                return Ok(format!(
+                    "this machine's qualification prerequisites pass ({id}); no owner request created"
+                ));
             }
             self.settle_asks(&owner, &unknown_keys)?;
             if owner.is_empty() && (unknown.is_empty() || !wait) {

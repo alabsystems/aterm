@@ -4306,13 +4306,13 @@ pub(crate) fn cmd_meta_harness_held(
     Some(("OK\n".to_string(), moved))
 }
 
-/// A WRITE ONLY THE SESSION'S STANDING PROVEN SELF-CLAIM MAKES (`meta set harness_held`, `meta set harness_land`, `meta set harness_needs`): admitted by the proof `meta set harness_act` takes — the line came on that claim's connection, or `prove` names the very proof of the claim's process — and `write` runs under the meta lock with the claim's proof only where neither [`crate::session_timeline::SessionMeta::supervisor_revision`] nor the live claim's proof moved since the look (a claim that moved between the look and the write admits nothing). The holder and whether `write` moved what it keeps; `None` for anything else, which the verb answers `ERR denied`.
-fn self_claim_write(
+/// A WRITE ONLY THE SESSION'S STANDING PROVEN SELF-CLAIM MAKES (`meta set harness_held`, `meta set harness_land`, `meta set harness_needs`, `harness fact`): admitted by the proof `meta set harness_act` takes — the line came on that claim's connection, or `prove` names the very proof of the claim's process — and `write` runs under the meta lock with the claim's proof only where neither [`crate::session_timeline::SessionMeta::supervisor_revision`] nor the live claim's proof moved since the look (a claim that moved between the look and the write admits nothing). The holder and what `write` returned (for a `meta set`, whether it moved what it keeps); `None` for anything else, which the verb answers `ERR denied`.
+pub(crate) fn self_claim_write<T>(
     ctx: &SessionCtx,
     conn: Option<u64>,
     prove: &dyn Fn(&str) -> Option<crate::self_claim::Proven>,
-    write: impl FnOnce(&mut crate::session_timeline::SessionMeta, &crate::self_claim::Proven) -> bool,
-) -> Option<(String, bool)> {
+    write: impl FnOnce(&mut crate::session_timeline::SessionMeta, &crate::self_claim::Proven) -> T,
+) -> Option<(String, T)> {
     let standing = {
         let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
         meta.live_claim(crate::metrics::now_us()).and_then(|claim| {

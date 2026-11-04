@@ -386,7 +386,7 @@ mod tests {
     fn image_digest_refuses_multi_hop_root_escape_and_trailing_slash_on_file() {
         use std::os::unix::fs::symlink;
 
-        let tmp = aterm_tempfile::TempDir::new().unwrap();
+        let tmp = crate::test_scratch_dir("svc-img");
         let reenter = tmp.path().join("reenter");
         std::fs::create_dir_all(reenter.join("sub")).unwrap();
         std::fs::write(reenter.join("aterm"), b"exe").unwrap();

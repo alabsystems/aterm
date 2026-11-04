@@ -155,9 +155,13 @@ pub fn ran(exit: i32, stdout: &str, stderr: &str) -> Ran {
     }
 }
 
+/// `p`'s file name, a twin's as its tool's logical name (`codex.cmd` is `codex` on Windows:
+/// `atpkg::store::ToolName::from_shim_file`).
 fn name(p: &Path) -> String {
-    p.file_name()
-        .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+    let file = p
+        .file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    atpkg::store::ToolName::from_shim_file(&file).map_or(file, |tool| tool.as_str().to_owned())
 }
 
 impl Runner for FakeRunner {
@@ -208,7 +212,20 @@ pub struct Box3 {
     pub state: PathBuf,
 }
 
-/// Lays out a machine with shims for `installed`.
+impl Box3 {
+    /// `id`'s managed twin, where atpkg lays it (`atpkg::store::Layout::agent_shim`:
+    /// `agents/<id>`, `agents\<id>.cmd` on Windows).
+    ///
+    /// # Panics
+    /// `id` is no tool name atpkg admits.
+    #[must_use]
+    pub fn twin(&self, id: &str) -> PathBuf {
+        self.pkg
+            .agent_shim(&atpkg::store::ToolName::new(id).expect("a tool name"))
+    }
+}
+
+/// Lays out a machine with shims for `installed`, each at its twin ([`Box3::twin`]).
 pub fn machine(installed: &[&str]) -> Box3 {
     let dir = aterm_tempfile::tempdir().expect("tempdir");
     let home = dir.path().join("home");
@@ -217,15 +234,16 @@ pub fn machine(installed: &[&str]) -> Box3 {
     std::fs::create_dir_all(&home).expect("home");
     std::fs::create_dir_all(prefix.join("agents")).expect("agents");
     std::fs::create_dir_all(&state).expect("state");
-    for id in installed {
-        std::fs::write(prefix.join("agents").join(id), "#!/bin/sh\n").expect("shim");
-    }
-    Box3 {
+    let b = Box3 {
         dir,
         home,
         pkg: atpkg::store::Layout { prefix },
         state,
+    };
+    for id in installed {
+        std::fs::write(b.twin(id), "#!/bin/sh\n").expect("shim");
     }
+    b
 }
 
 /// A [`super::fleet::Fetcher`] that serves fixed bodies by URL and records requests.

@@ -913,7 +913,7 @@ fn over_ssh_the_doctor_and_login_run_the_cli_under_the_no_desk_sandbox() {
             .collect()
     };
     let b = machine(&["codex"]);
-    let shim = b.pkg.agents_dir().join("codex").display().to_string();
+    let shim = b.twin("codex").display().to_string();
     let runner = FakeRunner::quiet();
     let _ = run_cli(&env_of(&b, ONLY_CODEX, &ssh, true), &runner, &["doctor"]);
     assert_eq!(
@@ -939,7 +939,7 @@ fn over_ssh_the_doctor_and_login_run_the_cli_under_the_no_desk_sandbox() {
         return;
     }
     let b = machine(&["grok"]);
-    let shim = b.pkg.agents_dir().join("grok").display().to_string();
+    let shim = b.twin("grok").display().to_string();
     let runner = FakeRunner::quiet();
     let (_, out, err) = run_cli(
         &env_of(&b, CODEX_AND_GROK, &ssh, true),
@@ -1350,7 +1350,7 @@ fn with_no_terminal_a_login_under_a_refusing_pin_names_the_mend() {
 /// that step with no "alone".
 #[test]
 fn under_a_pin_on_a_row_of_its_own_a_signed_out_default_row_signs_codex_out() {
-    use crate::harness::codex_alab::{DEFAULT_SIGN_IN, unread_fix};
+    use crate::harness::codex_alab::{default_sign_in, unread_fix};
     let now = 1_800_000_000;
     let b = codex_default_only("");
     pin_codex(&b, "work", now);
@@ -1362,7 +1362,7 @@ fn under_a_pin_on_a_row_of_its_own_a_signed_out_default_row_signs_codex_out() {
     assert_eq!(state::sign_in_then_pin(&f), Some(("main", true)));
     let mend = row.mend.clone().expect("a person's step");
     let sign_in = mend
-        .find(&format!("`{DEFAULT_SIGN_IN}`"))
+        .find(&format!("`{}`", default_sign_in()))
         .unwrap_or_else(|| panic!("the sign-in: {mend}"));
     let pin = mend
         .find(&format!("`{}`", unread_fix(Some("main"))))
@@ -1383,7 +1383,7 @@ fn under_a_pin_on_a_row_of_its_own_a_signed_out_default_row_signs_codex_out() {
     assert_ne!(row.state, State::SignedOut, "CONTROL: {}", row.fact);
     assert_eq!(state::sign_in_then_pin(&f), None, "CONTROL");
     let mend = row.mend.clone().expect("CONTROL: the re-pin");
-    assert!(!mend.contains(DEFAULT_SIGN_IN), "CONTROL: {mend}");
+    assert!(!mend.contains(&default_sign_in()), "CONTROL: {mend}");
     let (code, out, err) = run_cli(&env, &FakeRunner::quiet(), &["login", "codex"]);
     assert_eq!(code, 2, "CONTROL: {out}{err}");
     assert!(

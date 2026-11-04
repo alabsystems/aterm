@@ -1840,6 +1840,150 @@ fn a_cold_relaunch_leaves_a_row_that_no_longer_serves_and_keeps_one_that_does() 
     );
 }
 
+/// A COLD RELAUNCH READS THE ROW IT RAN ON BEFORE IT JUDGES IT: a conversation on `work`, whose
+/// records say it serves, relaunches on `main` once `work`'s own home reads full, and that wall
+/// is recorded. CONTROL: with nothing read it stays on `work`; once the records hold `work`
+/// walled, or hold a reading of it younger than five minutes, `work` is not read again (the
+/// owner's no-polling rule: only the row a relaunch is about to start on is read, and only when
+/// due); a conversation on a home of its own reads no row's usage at all; on a Codex program that
+/// keeps no row's login its own, a conversation on `work` reads nothing, and one on this machine's
+/// own login reads that row alone.
+#[test]
+fn a_cold_relaunch_reads_the_row_it_ran_on_before_it_judges_it() {
+    let world = World::new("cold-read");
+    let work = world.two(Cli::Codex);
+    world.on_main(Cli::Codex, &[]);
+    let work_auth = work.join("auth.json").display().to_string();
+    let on_work = [("CODEX_AUTH_PATH", work_auth.as_str())];
+    assert_eq!(
+        cold_launch_env(&world.seat(), Cli::Codex, &on_work, &no_usage, None),
+        None,
+        "CONTROL: with nothing read, `work` serves by its records"
+    );
+    let full = |cli: Cli, home: &Path, _: Option<&str>, _: i64| {
+        assert_eq!(cli, Cli::Codex);
+        (home == work).then(|| Usage {
+            sample: Sample {
+                session_pct: Some(100),
+                session_reset: Some(NOW + 2 * HOUR),
+                at: NOW,
+                ..Sample::default()
+            },
+            walls: vec![(accounts::SESSION_LIMIT, Some(NOW + 2 * HOUR))],
+        })
+    };
+    let moved = cold_launch_env(&world.seat(), Cli::Codex, &on_work, &full, None)
+        .map(|pick| (pick.label, pick.value));
+    assert_eq!(moved, Some(("main".to_string(), None)));
+    assert!(
+        matches!(
+            condition_of(&world, Cli::Codex, "work"),
+            Condition::Limited { .. }
+        ),
+        "the wall the read found is recorded"
+    );
+    let not_work = |_: Cli, home: &Path, _: Option<&str>, _: i64| -> Option<Usage> {
+        assert_ne!(
+            home, work,
+            "a row the records hold walled is not read again"
+        );
+        None
+    };
+    assert_eq!(
+        cold_launch_env(&world.seat(), Cli::Codex, &on_work, &not_work, None)
+            .map(|pick| pick.label),
+        Some("main".to_string())
+    );
+
+    let fresh = World::new("cold-read-fresh");
+    let fresh_work = fresh.two(Cli::Codex);
+    fresh.on_main(Cli::Codex, &[]);
+    let fresh_auth = fresh_work.join("auth.json").display().to_string();
+    let on_fresh = [("CODEX_AUTH_PATH", fresh_auth.as_str())];
+    let light = |_: Cli, home: &Path, _: Option<&str>, _: i64| {
+        (home == fresh_work).then(|| Usage {
+            sample: Sample {
+                session_pct: Some(10),
+                session_reset: Some(NOW + 2 * HOUR),
+                at: NOW,
+                ..Sample::default()
+            },
+            walls: Vec::new(),
+        })
+    };
+    assert_eq!(
+        cold_launch_env(&fresh.seat(), Cli::Codex, &on_fresh, &light, None),
+        None,
+        "a row that reads light serves"
+    );
+    let unread = |_: Cli, home: &Path, _: Option<&str>, _: i64| -> Option<Usage> {
+        assert_ne!(
+            home, fresh_work,
+            "a reading younger than five minutes is not taken again"
+        );
+        None
+    };
+    assert_eq!(
+        cold_launch_env(&fresh.seat(), Cli::Codex, &on_fresh, &unread, None),
+        None
+    );
+
+    let other = World::new("cold-read-home");
+    other.two(Cli::Codex);
+    other.on_main(Cli::Codex, &[]);
+    let never = |_: Cli, home: &Path, _: Option<&str>, _: i64| -> Option<Usage> {
+        panic!(
+            "a conversation on a home of its own reads no row: {}",
+            home.display()
+        )
+    };
+    assert_eq!(
+        cold_launch_env(
+            &other.seat(),
+            Cli::Codex,
+            &[("CODEX_HOME", "/scratch/codex")],
+            &never,
+            None
+        ),
+        None
+    );
+
+    let unkept = World::new("cold-read-unkept");
+    let unkept_work = unkept.two(Cli::Codex);
+    unkept.on_main(Cli::Codex, &[]);
+    let old = crate::harness::codex_alab::lay_package(&unkept.root.join("store/old"), false);
+    let unkept_auth = unkept_work.join("auth.json").display().to_string();
+    let homes = std::sync::Mutex::new(Vec::new());
+    let default_alone = |_: Cli, home: &Path, _: Option<&str>, _: i64| -> Option<Usage> {
+        assert_ne!(
+            home, unkept_work,
+            "that build runs no row of its own, so its usage is not read"
+        );
+        homes.lock().unwrap().push(home.to_path_buf());
+        None
+    };
+    assert_eq!(
+        cold_launch_env(
+            &unkept.seat(),
+            Cli::Codex,
+            &[("CODEX_AUTH_PATH", unkept_auth.as_str())],
+            &default_alone,
+            Some(&old)
+        ),
+        None
+    );
+    assert!(homes.lock().unwrap().is_empty(), "{homes:?}");
+    assert_eq!(
+        cold_launch_env(&unkept.seat(), Cli::Codex, &[], &default_alone, Some(&old)),
+        None
+    );
+    assert_eq!(
+        *homes.lock().unwrap(),
+        [unkept.home.join(Cli::Codex.accounts().default_home)],
+        "CONTROL: this machine's own login, due, is read"
+    );
+}
+
 /// ON A CODEX PROGRAM THAT KEEPS NO ROW'S LOGIN ITS OWN, A REFUSED LAUNCH WAITS FOR THE DEFAULT
 /// ROW'S WALL, NOT FOR ANOTHER ROW'S: with `work` usable, and with `work` walled to an earlier
 /// reset, the opening is the instant the refusal names, `main`'s. Under the owner's pin on

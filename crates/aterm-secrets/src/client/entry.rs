@@ -612,18 +612,20 @@ fn read_entry_with_version(
             return Ok(None);
         };
         let envelope = envelope::parse(&cached)?;
-        let (entries, _) = if materialized {
-            super::log_entries::open_entries_preferring_log(paths, &config, &envelope, &identity)?
-        } else {
-            super::log_entries::open_named_entries_preferring_log(
-                paths, &config, &envelope, &identity, &requested,
-            )?
-        };
+        let seeded = super::log_entries::trusted_seeded_log(paths, &config, &envelope)?;
+        if !super::log_entries::applied_log_available(&state, seeded.as_ref()) {
+            return Ok(None);
+        }
+        let (entries, _) = super::log_entries::open_entries_with_log(
+            seeded.as_ref().map(|(log, digest)| (log, *digest)),
+            &envelope,
+            &identity,
+            if materialized { None } else { Some(&requested) },
+        )?;
         let Some(entries) = entries else {
             return Ok(None);
         };
-        let trusted_log =
-            super::log_entries::trusted_seeded_log(paths, &config, &envelope)?.map(|(log, _)| log);
+        let trusted_log = seeded.map(|(log, _)| log);
         // Admin standing reads the base roster. A reserved read of that roster must not ask
         // for standing again; only the caller returning admin status needs that proof.
         let admin = matches!(reading, Reading::ReservedAndAdmin)

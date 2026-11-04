@@ -85,6 +85,22 @@ pub(super) struct ConfiguredLog {
     pub(super) log: Log,
 }
 
+/// Open a configured log with the same removal and audience checks for recovery and apply.
+pub(super) fn configured_entries(
+    log: &Log,
+    identity: &Identity,
+) -> crate::Result<Option<Vec<Entry>>> {
+    if log.removes(&identity.recipient())
+        || recipient_denied_by_roster_or_log(None, log, &identity.recipient())
+        || log.audience_left_out_recipient(&EpochAudience::Everyone, &identity.recipient())
+        || !log_alone_admits(log, identity)?
+    {
+        Ok(None)
+    } else {
+        log.open_entries(identity)
+    }
+}
+
 pub(super) fn trusted_configured_log(
     paths: &Paths,
     config: &Config,
@@ -106,6 +122,53 @@ pub(super) fn trusted_configured_log(
         return Ok(None);
     }
     Ok(Some(ConfiguredLog { log: log.clone() }))
+}
+
+/// Authenticated records remain evidence while a reader is revoked or partly applied.
+/// This establishes custody only; it grants no read, signing or publication authority.
+pub(super) fn authenticated_custody(
+    paths: &Paths,
+    config: &Config,
+    state: &State,
+) -> crate::Result<Option<(Log, [u8; 32])>> {
+    if let Some(bytes) = super::read_verified_cached_envelope(paths, config, state)?
+        && let Some(seeded) = trusted_seeded_log(paths, config, &envelope::parse(&bytes)?)?
+    {
+        return Ok(Some(seeded));
+    }
+    Ok(trusted_configured_log(paths, config)?.map(|c| {
+        let digest = records_heads_digest(&c.log);
+        (c.log, digest)
+    }))
+}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "VaultCallerCustody",
+        action = "Advance",
+        reason = "An authenticated later log is retained on disk"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "VaultCallerCustody",
+        action = "Noncurrent",
+        reason = "Membership or materialization becomes noncurrent independently of custody"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "VaultCallerCustody",
+        action = "Read",
+        project = "aterm_secrets::client::cold_read_tests::caller_custody_transition"
+    )
+)]
+pub(super) fn caller_covers_custody(log: &Log, custody: Option<&(Log, [u8; 32])>) -> bool {
+    // A retained head has all its parents, so covering every head covers its causal past.
+    custody.is_none_or(|(held, _)| held.heads().iter().all(|head| log.get(head).is_some()))
 }
 
 pub(super) fn trusted_local_log(paths: &Paths, config: &Config) -> crate::Result<Option<Log>> {
@@ -227,6 +290,7 @@ pub(super) fn reads_log(log: &Log, identity: &Identity) -> bool {
 /// [`reads_log`] it. A log behind the envelope, or an envelope a writer with no seat in the log
 /// published, is read from its lockers instead, so an older log never stands in for a newer
 /// version.
+#[cfg(test)]
 pub(super) fn readable_log(
     paths: &Paths,
     config: &Config,
@@ -414,42 +478,60 @@ pub(super) fn log_base(
 
 pub(super) type OpenedWithDigest = (Option<Vec<Entry>>, Option<[u8; 32]>);
 
+/// Positive observations cannot fall back to an envelope after applying a log.
+/// This does not filter authenticated evidence used only to establish denial.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "VaultColdRead",
+        action = "Apply",
+        reason = "A completed vault application establishes the persistent log floor before this read"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "VaultColdRead",
+        action = "LoseLog",
+        reason = "The environment removes local records while retaining applied state"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "VaultColdRead",
+        action = "RestoreLog",
+        reason = "Authenticated records become available again before this read"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "VaultColdRead",
+        action = "Read",
+        project = "aterm_secrets::client::cold_read_tests::cold_read_transition"
+    )
+)]
+pub(super) fn applied_log_available(state: &State, seeded: Option<&(Log, [u8; 32])>) -> bool {
+    !super::peer_selection::awaiting_applied_log(state, seeded.map(|(_, digest)| *digest))
+}
+
 pub(super) fn open_entries_preferring_log(
     paths: &Paths,
     config: &Config,
     envelope: &Envelope,
     identity: &Identity,
 ) -> crate::Result<OpenedWithDigest> {
-    open_entries_preferring_log_selected(paths, config, envelope, identity, None)
-}
-
-pub(super) fn open_named_entries_preferring_log(
-    paths: &Paths,
-    config: &Config,
-    envelope: &Envelope,
-    identity: &Identity,
-    names: &[&str],
-) -> crate::Result<OpenedWithDigest> {
-    open_entries_preferring_log_selected(paths, config, envelope, identity, Some(names))
-}
-
-fn open_entries_preferring_log_selected(
-    paths: &Paths,
-    config: &Config,
-    envelope: &Envelope,
-    identity: &Identity,
-    names: Option<&[&str]>,
-) -> crate::Result<OpenedWithDigest> {
     let seeded = trusted_seeded_log(paths, config, envelope)?;
     open_entries_with_log(
         seeded.as_ref().map(|(log, digest)| (log, *digest)),
         envelope,
         identity,
-        names,
+        None,
     )
 }
 
-fn open_entries_with_log(
+pub(super) fn open_entries_with_log(
     seeded: Option<(&Log, [u8; 32])>,
     envelope: &Envelope,
     identity: &Identity,
@@ -541,9 +623,16 @@ enum RosterSource {
         network: RecordId,
         heads: [u8; 32],
     },
+    Everyone {
+        network: RecordId,
+        heads: [u8; 32],
+    },
     Envelope {
         envelope: [u8; 32],
         log: Option<(RecordId, [u8; 32])>,
+    },
+    EnvelopeDenial {
+        envelope: [u8; 32],
     },
 }
 
@@ -575,21 +664,7 @@ fn observed_roster(
     Ok(result)
 }
 
-pub(super) fn roster_preferring_log(
-    paths: &Paths,
-    config: &Config,
-    envelope: &Envelope,
-    identity: &Identity,
-) -> crate::Result<(RosterRead, Option<[u8; 32]>)> {
-    let seeded = trusted_seeded_log(paths, config, envelope)?;
-    roster_with_log(
-        seeded.as_ref().map(|(log, digest)| (log, *digest)),
-        envelope,
-        identity,
-    )
-}
-
-fn roster_with_log(
+pub(super) fn roster_with_log(
     seeded: Option<(&Log, [u8; 32])>,
     envelope: &Envelope,
     identity: &Identity,
@@ -630,6 +705,146 @@ pub(super) fn roster_from_log(log: &Log, identity: &Identity) -> crate::Result<R
             )?))
         },
     )
+}
+
+/// Denial evidence has a causal order only where the envelope carries a stamp.
+/// With no stamp, retain both authenticated sets of denials until they can be ordered.
+pub(super) fn denial_roster(
+    log: Option<&Log>,
+    envelope: Option<&Envelope>,
+    identity: &Identity,
+) -> crate::Result<Option<crate::swarm_roster::SwarmRoster>> {
+    let Some(envelope) = envelope else {
+        return log
+            .map(|log| log_denial_roster(log, identity))
+            .transpose()
+            .map(Option::flatten);
+    };
+    let base = log_base(log, envelope, identity)?;
+    if let Some(log) = log
+        && base == LogBase::Unstamped
+    {
+        let mut combined = envelope_denial_roster(envelope, identity)?;
+        merge_optional_roster(&mut combined, log_denial_roster(log, identity)?);
+        return Ok(combined);
+    }
+    let (read, digest) = roster_with_log(
+        log.map(|log| (log, records_heads_digest(log))),
+        envelope,
+        identity,
+    )?;
+    if read.visible {
+        let mut combined = if digest.is_some() {
+            read.into_roster()?
+        } else {
+            envelope_denial_roster(envelope, identity)?
+        };
+        if let Some(log) = log
+            && base == LogBase::Covers
+        {
+            merge_optional_roster(&mut combined, everyone_roster(log, identity)?);
+        }
+        return Ok(combined);
+    }
+    // Removal may hide current ciphertext while cached negative evidence remains useful.
+    envelope_denial_roster(envelope, identity)
+}
+
+/// A host override changes the positive view, but cannot erase same-envelope denials.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "VaultEnvelopeDenials",
+        action = "Everyone",
+        reason = "Environment supplies an authenticated envelope's readable Everyone roster"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "VaultEnvelopeDenials",
+        action = "Host",
+        reason = "Environment supplies an authenticated envelope's readable host roster"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "VaultEnvelopeDenials",
+        action = "Read",
+        project = "aterm_secrets::client::envelope_denial_tests::envelope_denials_transition"
+    )
+)]
+fn envelope_denial_roster(
+    envelope: &Envelope,
+    identity: &Identity,
+) -> crate::Result<Option<crate::swarm_roster::SwarmRoster>> {
+    observed_roster(
+        RosterSource::EnvelopeDenial {
+            envelope: envelope.digest(),
+        },
+        identity,
+        || {
+            let Some(entries) = super::open_locker_audiences(envelope, identity)? else {
+                return Ok(RosterRead::default());
+            };
+            let mut roster = RosterRead::from_entries(Some(entries.hosts.into_values().collect()))
+                .into_roster()?;
+            merge_optional_roster(
+                &mut roster,
+                RosterRead::from_entries(Some(entries.everyone.into_values().collect()))
+                    .into_roster()?,
+            );
+            Ok(RosterRead {
+                visible: true,
+                roster,
+                ..RosterRead::default()
+            })
+        },
+    )?
+    .into_roster()
+}
+
+fn everyone_roster(
+    log: &Log,
+    identity: &Identity,
+) -> crate::Result<Option<crate::swarm_roster::SwarmRoster>> {
+    observed_roster(
+        RosterSource::Everyone {
+            network: *log.network(),
+            heads: records_heads_digest(log),
+        },
+        identity,
+        || {
+            Ok(RosterRead::from_entries(log.open_audience_entries_named(
+                identity,
+                &Audience::Everyone,
+                &[crate::swarm_roster::ROSTER_ENTRY],
+            )?))
+        },
+    )?
+    .into_roster()
+}
+
+fn log_denial_roster(
+    log: &Log,
+    identity: &Identity,
+) -> crate::Result<Option<crate::swarm_roster::SwarmRoster>> {
+    let mut combined = roster_from_log(log, identity)?.into_roster()?;
+    merge_optional_roster(&mut combined, everyone_roster(log, identity)?);
+    Ok(combined)
+}
+
+fn merge_optional_roster(
+    into: &mut Option<crate::swarm_roster::SwarmRoster>,
+    other: Option<crate::swarm_roster::SwarmRoster>,
+) {
+    if let Some(roster) = other {
+        match into {
+            Some(base) => merge_swarm_roster(base, roster),
+            None => *into = Some(roster),
+        }
+    }
 }
 
 fn same_entry(a: &Entry, b: &Entry) -> bool {
@@ -1312,38 +1527,44 @@ pub fn local_swarm_roster_for_log(
 pub(crate) fn local_swarm_roster_for_log_held(
     paths: &Paths,
     log: &Log,
-    lock: &StateLock,
+    _lock: &StateLock,
 ) -> crate::Result<Option<crate::swarm_roster::SwarmRoster>> {
     if !commons_log_matches_local_lineage(paths, log)? {
         return Err(Error::new(
             "the roster log belongs to another configured vault authority",
         ));
     }
-    // A held head has all its parents, so retaining every current head retains the
-    // current log's whole causal past. A caller's uncommitted draft may extend it.
-    if let Some(expected) = super::config(paths)?
-        && let Some(current) = trusted_local_log(paths, &expected)?
-        && current.heads().iter().any(|head| log.get(head).is_none())
-    {
-        return Err(Error::new(
-            "the caller's membership log is behind the current vault snapshot",
-        ));
-    }
-    let mut combined = super::roster::base_swarm_roster_held(paths, lock)?;
-    let identity = super::read_identity(paths)?;
-    if let Some(identity) = &identity
-        && let Some(entries) = log.open_audience_entries_named(
-            identity,
-            &Audience::Everyone,
-            &[crate::swarm_roster::ROSTER_ENTRY],
-        )?
-        && let Some(r) = roster_from_doc_or_entry(None, entries.first(), Some(log))
-    {
-        match &mut combined {
-            None => combined = Some(r),
-            Some(acc) => merge_swarm_roster(acc, r),
+    // A caller's uncommitted draft may extend custody, but cannot omit its heads.
+    if let Some(expected) = super::config(paths)? {
+        let state = super::load_state(paths)?;
+        let custody = authenticated_custody(paths, &expected, &state)?;
+        if super::peer_selection::awaiting_applied_log(
+            &state,
+            custody.as_ref().map(|(_, digest)| *digest),
+        ) {
+            return Err(Error::new(
+                "the applied membership log is unavailable while reading its roster",
+            ));
+        }
+        if !caller_covers_custody(log, custody.as_ref()) {
+            return Err(Error::new(
+                "the caller's membership log is behind the current vault snapshot",
+            ));
         }
     }
+    let identity = super::read_identity(paths)?;
+    let combined = if let Some(identity) = &identity {
+        let cached = match super::config(paths)? {
+            Some(config) => {
+                super::read_verified_cached_envelope(paths, &config, &super::load_state(paths)?)?
+            }
+            None => None,
+        };
+        let envelope = cached.as_deref().map(envelope::parse).transpose()?;
+        denial_roster(Some(log), envelope.as_ref(), identity)?
+    } else {
+        None
+    };
     let mut roster = combined.unwrap_or_default();
     let reader = identity.as_ref().map(Identity::recipient);
     super::roster::overlay_log_membership(log, reader.as_ref(), &mut roster);

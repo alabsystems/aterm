@@ -567,7 +567,8 @@ fn read_open_text(file: &std::fs::File, limit: u64) -> std::io::Result<String> {
     }
     let mut input = file;
     input.seek(std::io::SeekFrom::Start(0))?;
-    let mut bytes = Vec::new();
+    let cap = usize::try_from(metadata.len().min(limit).saturating_add(1)).unwrap_or(0);
+    let mut bytes = Vec::with_capacity(cap);
     input
         .take(limit.saturating_add(1))
         .read_to_end(&mut bytes)?;

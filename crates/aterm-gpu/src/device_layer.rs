@@ -1133,6 +1133,16 @@ pub(crate) fn metal_try_read_back(
     Ok(crate::frame_from_padded_rgba(&bytes, w, h, stride))
 }
 
+/// How long [`metal_stage_readback`] waits for its committed command buffer to reach a terminal
+/// status: a shipped build gives up after five seconds; a build with debug assertions (the tests,
+/// whose `tests/*.rs` binaries link this library without `cfg(test)`, and the dev builds) waits
+/// the one-minute hang detector (`aterm_spec::wait::MUST_HAPPEN`), since a committed command
+/// buffer always ends and a GPU other work loads only slows it.
+#[cfg(all(target_os = "macos", not(any(test, debug_assertions))))]
+const READBACK_HANG: std::time::Duration = std::time::Duration::from_secs(5);
+#[cfg(all(target_os = "macos", any(test, debug_assertions)))]
+const READBACK_HANG: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// The staging step of [`metal_try_read_back`].
 #[cfg(target_os = "macos")]
 pub(crate) fn metal_stage_readback(
@@ -1150,15 +1160,15 @@ pub(crate) fn metal_stage_readback(
     let mut cb = session.begin()?;
     cb.copy_texture_to_buffer(texture, w, h, &readback, padded)?;
     let submitted = cb.commit();
-    let deadline = aterm_time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = aterm_time::Instant::now() + READBACK_HANG;
     let outcome = loop {
         if let Some(outcome) = submitted.try_outcome() {
             break outcome;
         }
         if aterm_time::Instant::now() >= deadline {
-            return Err(
-                "metal readback: command buffer not terminal within 5s (status polling)".to_owned(),
-            );
+            return Err(format!(
+                "metal readback: command buffer not terminal within {READBACK_HANG:?} (status polling)"
+            ));
         }
         std::thread::sleep(std::time::Duration::from_micros(50));
     };

@@ -535,45 +535,99 @@ fn a_bound_paste_chord_pastes_into_the_query_never_the_pty() {
     crate::control::PBPASTE_STUB.with(|s| *s.borrow_mut() = None);
 }
 
-#[cfg(not(target_os = "macos"))]
+/// NEGATIVE CONTROL: exercises macOS (`⌘V`, plain `Ctrl+V` ignored), Linux (`Ctrl+Shift+V`,
+/// `Shift+Insert`, `Ctrl+Shift+Insert`, plain `Ctrl+V` ignored), and Windows (`Ctrl+V`,
+/// `Ctrl+Shift+V`, `Shift+Insert`) seeded paste tables on every host.
 #[test]
 fn every_seeded_paste_spelling_pastes_into_the_query() {
-    let mut app = App::headless_for_test();
-    let wid = WindowId(0);
-    app.keybindings = crate::keybinding::Keybindings::platform_defaults();
     crate::control::PBPASTE_STUB.with(|s| *s.borrow_mut() = Some("x".to_string()));
+    let wid = WindowId(0);
 
+    // macOS seeds: plain Ctrl+V is ignored; Cmd+V pastes.
+    let mut app = App::headless_for_test();
+    app.keybindings = crate::keybinding::Keybindings::macos_defaults_for_test();
     app.search_enter();
     set_mods(&mut app, wid, ModifiersState::CONTROL);
     app.on_key(wid, character("v"));
-    let mut q = String::new();
-    if cfg!(windows) {
-        q.push('x');
-        assert_eq!(
-            query(&app, wid),
-            Some((q.clone(), 1)),
-            "ctrl+v (Windows seed)"
-        );
-    } else {
-        assert_eq!(
-            query(&app, wid),
-            Some((String::new(), 0)),
-            "plain ctrl+v is NOT seeded on Linux — the field ignores it"
-        );
-    }
+    assert_eq!(
+        query(&app, wid),
+        Some((String::new(), 0)),
+        "plain ctrl+v is NOT seeded on macOS — the field ignores it"
+    );
+    set_mods(&mut app, wid, ModifiersState::SUPER);
+    app.on_key(wid, character("v"));
+    assert_eq!(query(&app, wid), Some(("x".to_string(), 1)), "cmd+v");
+    assert!(app.windows[&wid].search.is_some(), "find stays open");
+
+    // Linux seeds: plain Ctrl+V is ignored; Ctrl+Shift+V, Shift+Insert, and Ctrl+Shift+Insert paste.
+    let mut app = App::headless_for_test();
+    app.keybindings = crate::keybinding::Keybindings::linux_defaults_for_test();
+    app.search_enter();
+    set_mods(&mut app, wid, ModifiersState::CONTROL);
+    app.on_key(wid, character("v"));
+    assert_eq!(
+        query(&app, wid),
+        Some((String::new(), 0)),
+        "plain ctrl+v is NOT seeded on Linux — the field ignores it"
+    );
     set_mods(
         &mut app,
         wid,
         ModifiersState::CONTROL | ModifiersState::SHIFT,
     );
     app.on_key(wid, character("v"));
-    q.push('x');
-    assert_eq!(query(&app, wid), Some((q.clone(), q.len())), "ctrl+shift+v");
+    assert_eq!(query(&app, wid), Some(("x".to_string(), 1)), "ctrl+shift+v");
     set_mods(&mut app, wid, ModifiersState::SHIFT);
     app.on_key(wid, named(NamedKey::Insert));
-    q.push('x');
-    assert_eq!(query(&app, wid), Some((q.clone(), q.len())), "shift+insert");
+    assert_eq!(
+        query(&app, wid),
+        Some(("xx".to_string(), 2)),
+        "shift+insert"
+    );
+    set_mods(
+        &mut app,
+        wid,
+        ModifiersState::CONTROL | ModifiersState::SHIFT,
+    );
+    app.on_key(wid, named(NamedKey::Insert));
+    assert_eq!(
+        query(&app, wid),
+        Some(("xxx".to_string(), 3)),
+        "ctrl+shift+insert"
+    );
     assert!(app.windows[&wid].search.is_some(), "find stays open");
+
+    // Windows seeds: plain Ctrl+V, Ctrl+Shift+V, and Shift+Insert all paste.
+    let mut app = App::headless_for_test();
+    app.keybindings = crate::keybinding::Keybindings::windows_defaults_for_test();
+    app.search_enter();
+    set_mods(&mut app, wid, ModifiersState::CONTROL);
+    app.on_key(wid, character("v"));
+    assert_eq!(
+        query(&app, wid),
+        Some(("x".to_string(), 1)),
+        "ctrl+v (Windows seed)"
+    );
+    set_mods(
+        &mut app,
+        wid,
+        ModifiersState::CONTROL | ModifiersState::SHIFT,
+    );
+    app.on_key(wid, character("v"));
+    assert_eq!(
+        query(&app, wid),
+        Some(("xx".to_string(), 2)),
+        "ctrl+shift+v"
+    );
+    set_mods(&mut app, wid, ModifiersState::SHIFT);
+    app.on_key(wid, named(NamedKey::Insert));
+    assert_eq!(
+        query(&app, wid),
+        Some(("xxx".to_string(), 3)),
+        "shift+insert"
+    );
+    assert!(app.windows[&wid].search.is_some(), "find stays open");
+
     crate::control::PBPASTE_STUB.with(|s| *s.borrow_mut() = None);
 }
 

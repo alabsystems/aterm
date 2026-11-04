@@ -8,7 +8,7 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use super::{
-    past_the_budget, refused_for_good, Bridge, Opens, ReadAt, Then, DEADLINE_RETRY,
+    past_the_budget, refused_for_good, Bridge, Opens, ReadAt, Then, DEADLINE_RETRY, IDLE_ACK_GRACE,
     LINK_MIRROR_WAIT_LANE, PIPELINE_WINDOW,
 };
 use crate::ctl::Reply;
@@ -100,6 +100,10 @@ pub(super) struct MirrorRun {
     /// A snapshot the endpoint held back to its rate (`due=`, a moved mail count) is due then:
     /// a take is owed at that instant though nothing appends to wake one.
     held_back: Option<Instant>,
+    /// When the loop first found a take due that nothing would carry: the pass waits from then
+    /// for the loop's next write, at most [`IDLE_ACK_GRACE`] ([`Bridge::mirror_rides_nothing`],
+    /// critic item E04).
+    uncarried: Option<Instant>,
     /// The batch in flight and the node's total.
     pin: Pin,
     /// Per slot: whether THIS process may have sent it (a never-sent slot's
@@ -182,6 +186,7 @@ impl MirrorRun {
                 owed: false,
                 retry_at: None,
                 held_back: None,
+                uncarried: None,
                 pin: Pin {
                     key,
                     ..Pin::default()
@@ -231,6 +236,21 @@ impl MirrorRun {
     pub(super) fn hold_first_pass_for_tests(&mut self, hold: Duration) {
         self.hold = hold;
     }
+
+    /// When the hold of a take nothing would carry began ([`Bridge::mirror_rides_nothing`]),
+    /// while it holds.
+    #[cfg(test)]
+    pub(super) fn uncarried(&self) -> Option<Instant> {
+        self.uncarried
+    }
+
+    /// Date the hold of a take nothing would carry from `at` (a grace ago, so a test reaches
+    /// its end without waiting it out).
+    #[cfg(test)]
+    pub(super) fn date_uncarried_for_tests(&mut self, at: Instant) {
+        self.uncarried = Some(at);
+    }
+
     /// The batch in flight and what came of each slot.
     #[cfg(test)]
     pub(super) fn batch(&self) -> (&[PinSlot], &[Outcome]) {
@@ -749,7 +769,7 @@ impl Bridge {
         }
     }
 
-    /// When the loop owes the mirror a pass: `Some(now)` for work it can do now (the loop's wait is then zero), the retry's instant while a busy answer waits, a held-back snapshot's when only it is owed, `None` for nothing; no earlier than a held first pass's instant ([`FirstPass::Held`]).
+    /// When the loop owes the mirror a pass: `Some(now)` for work it can do now (the loop's wait is then zero), the retry's instant while a busy answer waits, a held-back snapshot's when only it is owed, `None` for nothing; no earlier than a held first pass's instant ([`FirstPass::Held`]), nor, for a take nothing would carry once its hold began, than [`IDLE_ACK_GRACE`] past that ([`Bridge::mirror_rides_nothing`]).
     pub(super) fn mirror_due(&self, now: Instant) -> Option<Instant> {
         if !self.mirror_engaged() || self.conn.is_none() {
             return None;
@@ -762,10 +782,48 @@ impl Bridge {
         } else {
             Some(m.retry_at.map_or(now, |t| t.max(now)))
         };
+        let due = match (due, m.uncarried) {
+            (Some(at), Some(from)) if self.mirror_rides_nothing() => {
+                Some(at.max(from + IDLE_ACK_GRACE))
+            }
+            _ => due,
+        };
         match m.first_pass {
             FirstPass::Held { until, .. } => due.map(|at| at.max(until)),
             FirstPass::Free | FirstPass::Attached { .. } => due,
         }
+    }
+
+    /// A PASS THAT OWES NOTHING WAITS FOR THE LOOP'S NEXT WRITE (critic item E04): whether a
+    /// pass due now would take a fresh batch with no inbox commit for its burst to carry
+    /// ([`Bridge::mirror_has_a_commit_to_carry`]), in an open that holds the pin's fence
+    /// ([`StateDir::logpin_fence_held`]). Such a pass is held from when the loop first finds it
+    /// due ([`Bridge::mirror_step`]) for at most [`IDLE_ACK_GRACE`], and goes as soon as its
+    /// burst would carry a commit. A sender's snapshot of the mail count its own post moved
+    /// falls due before the delivery owes a commit; on one node the delivery comes well inside
+    /// the grace, so the pass behind it takes the sender's snapshot and the recipient's in one
+    /// take, and its burst carries the commit ahead of both: one write and one writer batch where
+    /// they were two. With no commit coming (a post to another node's session, or to a person)
+    /// the take goes alone at the grace's end, so the hold puts no take off by more than that.
+    /// Not held: a pass with a pinned batch (a resend, a re-pin, a recovered batch), and an
+    /// open's first pass, which makes the fence and sends the commit its deliveries owe alone
+    /// ahead of it ([`Bridge::commit_ahead_of_the_fence`], critic item D06), so nothing would
+    /// ride it. A post does not end the hold: a take pins its batch before any slot goes, so a
+    /// post that carried one would wait behind the take, and the post's own delivery on this node
+    /// owes the commit the pass then rides.
+    pub(super) fn mirror_rides_nothing(&self) -> bool {
+        #[cfg(test)]
+        if self
+            .fx
+            .mutant(crate::sim::world::Mutant::MirrorSendsAnUnowedSlotAtOnce)
+        {
+            return false;
+        }
+        self.mirror
+            .as_deref()
+            .is_some_and(|m| m.pin.slots.is_empty() && !m.repin)
+            && !self.mirror_has_a_commit_to_carry()
+            && self.state.logpin_fence_held()
     }
 
     /// WHETHER THE LOOP HOLDS THE MIRROR'S PASS BACK FOR A ROUND (critic item D06): the first
@@ -871,16 +929,24 @@ impl Bridge {
         let _ = self.ctl_request(&reason.request());
     }
 
-    /// THE PASS: re-pin after a collision, take when nothing is pinned, send what is owed, and settle a batch whose every slot concluded.
+    /// THE PASS: re-pin after a collision, take when nothing is pinned, send what is owed, and settle a batch whose every slot concluded. A take nothing would carry is held first, from the round that finds it due ([`Bridge::mirror_rides_nothing`]).
     pub(super) fn mirror_step(&mut self) {
         let now = self.fx.now();
         if self.mirror_due(now).is_none_or(|at| at > now) {
             return;
         }
+        let rides_nothing = self.mirror_rides_nothing();
+        if let Some(m) = self.mirror.as_deref_mut() {
+            if rides_nothing && m.uncarried.is_none() {
+                m.uncarried = Some(now);
+                return;
+            }
+        }
         let inc = self.inc;
         if let Some(m) = self.mirror.as_deref_mut() {
             m.retry_at = None;
             m.held_back = None;
+            m.uncarried = None;
             if m.sent_inc != inc {
                 for o in &mut m.outcome {
                     if *o == Outcome::Sending {
@@ -1295,6 +1361,21 @@ impl Bridge {
                 .is_some_and(|link| link.unacked() + BURST_ROOM > PIPELINE_WINDOW)
                 && self.settle_one(waiting)
             {}
+            if self.conn.is_none() || self.mirror.as_deref().is_some_and(|m| m.repin) {
+                return;
+            }
+            // A slot's pinned sequence can lie below a publish still in flight: on a broker
+            // that gap-fences, those answers are read first, and a fence a refusal set is
+            // lifted (`Bridge::settle_above`, `Bridge::lift_gap_fences`), so no slot lands
+            // under a fence that holds back a write sent before it.
+            if let Some(lowest) = self.mirror.as_deref().and_then(|m| {
+                rest.iter()
+                    .filter_map(|(i, _)| m.pin.slots.get(*i).map(|slot| slot.pseq))
+                    .min()
+            }) {
+                self.settle_above(lowest);
+            }
+            self.lift_gap_fences();
             if self.conn.is_none() || self.mirror.as_deref().is_some_and(|m| m.repin) {
                 return;
             }

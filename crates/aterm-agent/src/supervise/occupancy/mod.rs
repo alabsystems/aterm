@@ -258,6 +258,15 @@ pub mod fault {
         /// that stood asked when the line settled unspent: one the host made and answered as a
         /// deferral is asked again for the next loss, a second restart for the line.
         CustodySettleKeepsAsked,
+        /// [`SelfClaimFacts::offer`](crate::supervise::facts_offer::SelfClaimFacts::offer) keeps one
+        /// offer for the whole account (the first draft's): a second reader's offer replaces the
+        /// first's, whose ack is then refused and whose episode is offered again.
+        OneOfferSlot,
+        /// [`SelfClaimFacts::offer`](crate::supervise::facts_offer::SelfClaimFacts::offer) ages a
+        /// lease its reader takes again before it lapses from that reader's first offer, not its
+        /// last: an episode taken again after the other's offer lapses with that older offer, and is
+        /// offered to the other reader while its act may still be deciding.
+        LeaseFromFirstOffer,
     }
 
     thread_local! {
@@ -357,6 +366,8 @@ pub(crate) mod fault {
         CustodyRestartOnWord,
         CustodyRestartBySnapshot,
         CustodySettleKeepsAsked,
+        OneOfferSlot,
+        LeaseFromFirstOffer,
     }
 
     /// The shipped build: never armed.

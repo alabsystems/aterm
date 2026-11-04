@@ -92,6 +92,8 @@ fn a_higher_sequence_does_not_license_a_stale_conditional_parent() {
 
 #[test]
 fn http_store_rejects_a_sibling_and_a_parentless_downgrade() {
+    // Every server it reads is its own on loopback, which answers.
+    let _answering = ServersAnswering::set();
     let dir = aterm_tempfile::tempdir().unwrap();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let server = crate::server::start(

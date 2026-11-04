@@ -73,10 +73,14 @@ fn is_cache_dir(dir: &Path) -> bool {
     let Ok(file) = options.open(&tag) else {
         return false;
     };
-    if !file.metadata().is_ok_and(|meta| meta.is_file()) {
+    let Ok(meta) = file.metadata() else {
+        return false;
+    };
+    if !meta.is_file() {
         return false;
     }
-    let mut head = Vec::with_capacity(CACHEDIR_TAG_SIGNATURE.len());
+    let cap = usize::try_from(meta.len().min(4096).saturating_add(1)).unwrap_or(0);
+    let mut head = Vec::with_capacity(cap);
     file.take(4096).read_to_end(&mut head).is_ok()
         && head.starts_with(CACHEDIR_TAG_SIGNATURE.as_bytes())
 }

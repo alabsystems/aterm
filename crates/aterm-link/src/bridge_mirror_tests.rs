@@ -2369,7 +2369,9 @@ fn the_alias_key_survives_a_bridge_restart_and_a_cap_change() {
     assert_ne!(elsewhere.key(), key, "another node's is its own");
 }
 
-/// The round that reads a batch's acks parks for zero duration while the landing is owed.
+/// The round that reads a batch's acks parks for zero duration while the landing is owed; the
+/// take owed after the landing, which nothing would carry, is held for at most the grace
+/// (critic item E04).
 #[test]
 fn the_round_that_reads_a_batchs_acks_parks_for_nothing_before_its_landing() {
     let mut w = World::new();
@@ -2411,6 +2413,29 @@ fn the_round_that_reads_a_batchs_acks_parks_for_nothing_before_its_landing() {
         Some(Duration::ZERO),
         "the next take is owed now"
     );
+    // Nothing would carry that take, so the round that finds it due holds it for the loop's
+    // next write, parking no longer than the grace (critic item E04); the hold is dated a grace
+    // ago here, so the round after it takes without waiting it out.
+    let takes = w.lane.mirror.lock().unwrap().takes;
+    assert!(w.bridge.mirror_then_round());
+    assert_eq!(
+        w.lane.mirror.lock().unwrap().takes,
+        takes,
+        "the round held the take"
+    );
+    assert!(
+        w.bridge.parked.is_some_and(|p| p <= IDLE_ACK_GRACE),
+        "and parked no longer than the grace: {:?}",
+        w.bridge.parked
+    );
+    let a_grace_ago = Instant::now()
+        .checked_sub(IDLE_ACK_GRACE)
+        .expect("a clock past its first grace");
+    w.bridge
+        .mirror
+        .as_deref_mut()
+        .unwrap()
+        .date_uncarried_for_tests(a_grace_ago);
     assert!(w.bridge.mirror_then_round());
     let (slots, outcomes) = w.bridge.mirror.as_deref().unwrap().batch();
     assert!(
@@ -2431,6 +2456,16 @@ fn the_round_that_reads_a_batchs_acks_parks_for_nothing_before_its_landing() {
     );
     assert!(w.bridge.mirror.as_deref().unwrap().batch().0.is_empty());
     let takes = w.lane.mirror.lock().unwrap().takes;
+    w.bridge.mirror_step();
+    assert!(
+        w.bridge.mirror.as_deref().unwrap().uncarried().is_some(),
+        "PRECONDITION: the next take is held"
+    );
+    w.bridge
+        .mirror
+        .as_deref_mut()
+        .unwrap()
+        .date_uncarried_for_tests(a_grace_ago);
     w.bridge.mirror_step();
     assert_eq!(
         w.lane.mirror.lock().unwrap().takes,
@@ -2493,8 +2528,9 @@ fn an_empty_take_that_says_more_waits_its_retry_and_never_spins() {
 
 /// An empty take whose endpoint held a moved mail count's snapshot back to its rate (`due=`, LOOP-2)
 /// owes a take at that instant, not at the roster's next wake; a record appended meanwhile is
-/// still taken at once, and once the instant passes the pass takes again. The owed instant and
-/// the loop's wait are read as of the moment before the take, so a slow take changes neither.
+/// due at once, and once the instant passes the pass takes again (each take, which nothing would
+/// carry, held for the grace first: critic item E04). The owed instant and the loop's wait are
+/// read as of the moment before the take, so a slow take changes neither.
 #[test]
 fn an_empty_take_that_holds_a_snapshot_back_takes_again_when_it_is_due() {
     let mut w = World::new();
@@ -2534,13 +2570,13 @@ fn an_empty_take_that_holds_a_snapshot_back_takes_again_when_it_is_due() {
     assert_eq!(
         w.bridge.mirror_due(after),
         Some(after),
-        "an append meanwhile is taken at once"
+        "an append meanwhile is due at once"
     );
     w.lane.mirror.lock().unwrap().refuse_take = Some("OK 0 slots=0 due=0\n".to_string());
-    w.bridge.mirror_step();
+    pass_past_its_hold(&mut w.bridge);
     assert_eq!(w.lane.mirror.lock().unwrap().takes, 2, "PRECONDITION");
     w.lane.mirror.lock().unwrap().refuse_take = None;
-    w.bridge.mirror_step();
+    pass_past_its_hold(&mut w.bridge);
     assert_eq!(
         w.lane.mirror.lock().unwrap().takes,
         3,

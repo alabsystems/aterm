@@ -1131,10 +1131,7 @@ mod tests {
     #[test]
     fn fresh_log_replaces_only_our_regular_files_and_resets_mode() {
         use std::os::unix::fs::PermissionsExt as _;
-        let scratch = aterm_tempfile::Builder::new()
-            .prefix("akk-fresh-log-")
-            .tempdir()
-            .expect("exclusive fixture");
+        let scratch = crate::test_scratch_dir("fresh-log");
         std::fs::set_permissions(scratch.path(), std::fs::Permissions::from_mode(0o700))
             .expect("0700");
 

@@ -223,6 +223,7 @@ const BOOT_7: [u8; 16] = [
 struct FakeProbe {
     host: Option<String>,
     boot: Option<[u8; 16]>,
+    exe: Option<String>,
     pids: HashMap<u32, PidState>,
     /// Process groups this fake can answer for; anything else is `Unknown`, as from a real
     /// probe that could not read the table, and `Unknown` never licenses a reclaim.
@@ -239,6 +240,7 @@ impl FakeProbe {
         FakeProbe {
             host: Some("publisher-host".to_string()),
             boot: Some(BOOT_7),
+            exe: Some("/opt/aterm/aterm-release".to_string()),
             pids: HashMap::new(),
             groups: HashMap::new(),
             own_pgid: Some(PROBE_GROUP),
@@ -276,7 +278,7 @@ impl PublisherProbe for FakeProbe {
     }
 
     fn exe(&self) -> Option<String> {
-        Some("/opt/aterm/aterm-release".to_string())
+        self.exe.clone()
     }
 
     fn pid_state(&self, pid: u32) -> PidState {
@@ -708,11 +710,36 @@ fn a_fence_this_binary_writes_is_readable_from_another_clone() {
     assert_eq!(identity.version.as_deref(), Some("0.87.0"));
     assert!(identity.started_unix.is_some(), "{identity:?}");
 
-    assert!(matches!(
-        publish::fence_liveness(&identity, &LocalProbe),
-        FenceLiveness::Alive(_)
-    ));
+    let liveness = publish::fence_liveness(&identity, &LocalProbe);
+    assert!(
+        matches!(liveness, FenceLiveness::Alive(_)),
+        "{liveness:?}; recorded identity: {identity:?}"
+    );
     publish::release_publisher_fence(&git_a, &guard).unwrap();
+}
+
+/// A long build directory must not make the fence describe a different executable.
+/// NEGATIVE CONTROL: truncating the recorded field at 200 characters loses its basename
+/// and makes the reader mistake this live publisher for a reused pid.
+#[test]
+fn a_long_executable_path_keeps_a_live_publisher_alive() {
+    for directory in ["directory/", "directory-🦀/"] {
+        let executable = format!("/build/{}aterm-release", directory.repeat(40));
+        let mut probe = FakeProbe::here().with_pid(
+            std::process::id(),
+            PidState::Running {
+                exe: Some(executable.clone()),
+            },
+        );
+        probe.exe = Some(executable.clone());
+        let identity = FenceIdentity::parse(&publish::fence_identity_block(&probe));
+        let liveness = publish::fence_liveness(&identity, &probe);
+        assert!(
+            matches!(liveness, FenceLiveness::Alive(_)),
+            "{liveness:?}; recorded identity: {identity:?}"
+        );
+        assert_eq!(identity.exe.as_deref(), Some(executable.as_str()));
+    }
 }
 
 #[test]

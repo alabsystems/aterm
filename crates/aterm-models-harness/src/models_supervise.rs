@@ -134,9 +134,17 @@ pub fn supervisor_focus_choice_model() -> Model {
 /// first try, as a flapping outage's does; a wall's words met again keep the tries they had, which
 /// this model leaves to a wall that clears at once; at Budget = 0 alone, as the scenario Budget = 2
 /// with it is past the interpreter's state budget), still climbs the ladder.
-/// Real work still ends the streak. `Buggy = 10` counts every cut act and `Buggy = 11` the
-/// person's turn, the rules before it (`NoPassedCutOrPersonsTurnCounts`); `Buggy = 12` leaves
-/// every cut act uncounted (`AWallPassesOncePerRung`).
+/// Real work still ends the streak. A turn the harness's own stop ended adds nothing either
+/// (`HarnessStopsTurn`: the restart whose cut call a resume restores, or the Esc it pressed on a
+/// turn the Mac slept through, ended the act's turn, not the agent): the streak's back-off stands
+/// again from that point, as at a person's turn, and real work in it still ends the streak
+/// (`HarnessStopsTurnLong`). `Buggy = 10` counts every cut act, `Buggy = 11` the person's turn and
+/// `Buggy = 13` the turn the harness's stop ended, the rules before them
+/// (`NoPassedCutPersonsTurnOrHarnessStopCounts`); `Buggy = 12` leaves every cut act uncounted
+/// (`AWallPassesOncePerRung`); `Buggy = 14` leaves real work in a stopped turn uncounted, so the
+/// streak's back-off outlives it (`NeverBackOffAfterRealWork`). The stops add no state at
+/// Budget = 0 (52 270 with and without them) and take the scenario Budget = 2 from 85 774 states
+/// to 90 694.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn supervisor_turn_end_model() -> Model {
@@ -433,6 +441,30 @@ pub fn supervisor_turn_end_model() -> Model {
                 run = if run <= NoWork + Futile - 1 { run + 1 } else { run };
                 quiet = if quiet <= NoWork + Futile - 1 { quiet + 1 } else { quiet };
             }
+            action HarnessStopsTurn when (pending == 1) {
+                pending = 0;
+                short = if Buggy == 13 && short <= Streak - 1 { short + 1 } else { short };
+                backoff = if short > 0 || Buggy == 13 { 1 } else { 0 };
+                earned = if short > 0 || Buggy == 13 { 1 } else { 0 };
+                long = 0;
+                claim = 0;
+                same = 1;
+                run = if run <= NoWork + Futile - 1 { run + 1 } else { run };
+                quiet = if quiet <= NoWork + Futile - 1 { quiet + 1 } else { quiet };
+            }
+            action HarnessStopsTurnLong when (pending == 1) {
+                pending = 0;
+                short = if Buggy == 14 { short } else { 0 };
+                own = if Buggy == 14 { own } else { 0 };
+                free = if Buggy == 14 { free } else { 0 };
+                backoff = if Buggy == 14 && short > 0 { 1 } else { 0 };
+                earned = if Buggy == 14 && short > 0 { 1 } else { 0 };
+                long = 1;
+                claim = 0;
+                same = 0;
+                run = 0;
+                quiet = 0;
+            }
             action WorkedClaimsDone when (pending == 1) {
                 pending = 0;
                 short = if short <= Streak - 1 { short + 1 } else { short };
@@ -569,7 +601,7 @@ pub fn supervisor_turn_end_model() -> Model {
             invariant AWallGetsItsTriesAndNoMore: typed_futile == 0;
             invariant AWallsTriesAreItsOwnRetries: tries <= retried;
             invariant RoutineContinuationRespectsNoWorkBudget: typed_run == 0;
-            invariant NoPassedCutOrPersonsTurnCounts: short == own;
+            invariant NoPassedCutPersonsTurnOrHarnessStopCounts: short == own;
             invariant AWallPassesOncePerRung: free <= 1;
         }
     }

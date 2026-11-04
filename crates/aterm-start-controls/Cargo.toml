@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-start-controls"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Dev-only controls for `verify perf cli-start`: empty programs that link nothing, all the dylibs aterm links, or all but the window-only ones"
+
+# Every program is an empty `main`. What `start-control-all` and `start-control-cli` link comes
+# from the lane at build time (build.rs), read from aterm's own load commands, so nothing here
+# lists a framework.
+
+[lints]
+workspace = true

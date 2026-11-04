@@ -58,11 +58,17 @@ pub(crate) fn canonical_u(point: &[u8; 32]) -> bool {
     point.iter().rev().cmp(MODULUS.iter().rev()).is_lt()
 }
 
+/// One carry pass. This and [`mul`] wrap because a release build does: the Coq proof of the C this
+/// transcribes (ePrint 2021/428) bounds every limb, so a wrap is never reached, and a checked dev
+/// build spent 78% of a ladder's instructions and half its CPU on these two functions' checks.
+/// What [`elligator2`] feeds them (unpacked bytes, `mul` outputs and at most two `add`s or `sub`s
+/// from those) stays within the same limb bound by inspection and not by the proof.
 #[inline]
 fn car25519(o: &mut Gf) {
     for i in 0..16 {
         let fold: i64 = if i < 15 { 1 } else { 38 };
-        o[(i + 1) % 16] += fold * (o[i] >> 16);
+        let next = (i + 1) % 16;
+        o[next] = o[next].wrapping_add(fold.wrapping_mul(o[i] >> 16));
         o[i] &= 0xffff;
     }
 }
@@ -136,11 +142,13 @@ fn mul(a: &Gf, b: &Gf) -> Gf {
     let mut t = [0i64; 31];
     for i in 0..16 {
         for j in 0..16 {
-            t[i + j] += a[i] * b[j];
+            let product = a[i].wrapping_mul(b[j]);
+            t[i + j] = t[i + j].wrapping_add(product);
         }
     }
     for i in 0..15 {
-        t[i] += 38 * t[i + 16];
+        let fold = 38i64.wrapping_mul(t[i + 16]);
+        t[i] = t[i].wrapping_add(fold);
     }
     let mut o: Gf = [0; 16];
     o.copy_from_slice(&t[..16]);
@@ -414,7 +422,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "RFC 7748's million-iteration vector takes minutes even optimized (203 s under --profile opt-test) and hours unoptimized; run with --ignored"]
+    #[ignore = "RFC 7748's million-iteration vector takes about four minutes even optimized (237 s in the test profile); run with --ignored"]
     fn rfc7748_5_2_iterated_a_million_times() {
         assert_eq!(
             iterate(1_000_000),

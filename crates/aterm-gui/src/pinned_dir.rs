@@ -1099,7 +1099,7 @@ mod imp {
             }
             let mut file = std::fs::File::from(fd);
             let cap = u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1);
-            let mut bytes = Vec::with_capacity(limit.min(4096));
+            let mut bytes = Vec::with_capacity(limit.min(64 << 10).saturating_add(1));
             (&mut file).take(cap).read_to_end(&mut bytes)?;
             if bytes.len() > limit {
                 return Err(io::Error::new(
@@ -1478,19 +1478,23 @@ mod imp {
             Ok(file)
         }
 
-        /// An existing entry opened read-only with no follow and no wait.
-        pub(crate) fn open_regular_at_retained(&self, name: &OsStr) -> io::Result<std::fs::File> {
+        /// An existing entry opened read-only with no follow and no wait, with its descriptor metadata.
+        pub(crate) fn open_regular_at_retained(
+            &self,
+            name: &OsStr,
+        ) -> io::Result<(std::fs::File, std::fs::Metadata)> {
             validate_component(name)?;
             let fd = openat(self.leaf(), name, file_read_flags(), Mode::empty())
                 .map_err(io::Error::from)?;
             let file = std::fs::File::from(fd);
-            if !is_regular_file(&file)? {
+            let meta = file.metadata()?;
+            if !meta.is_file() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "not a regular file",
                 ));
             }
-            Ok(file)
+            Ok((file, meta))
         }
 
         /// Rename `from` to `to` within this directory, never over an existing `to`.

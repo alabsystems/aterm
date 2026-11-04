@@ -258,6 +258,7 @@ pub fn measure(spec: &Spec) -> Report {
             .collect();
         sizes.push((n, rounds));
     }
+    let elapsed_s = started.elapsed().as_secs_f64();
     let at_end = profile::identity(&exe).unwrap_or_else(|why| why);
     let arm = Profile::of_binary(&exe);
     let json = json!({
@@ -272,7 +273,7 @@ pub fn measure(spec: &Spec) -> Report {
                    admission, placement and import readings less the seam's own work, \
                    seam_ms) and the bench's monotonic clock from just before B's spawn (which \
                    holds the seam's work)",
-        "elapsed_s": stats::round3(started.elapsed().as_secs_f64()),
+        "elapsed_s": stats::round3(elapsed_s),
         "sizes": sizes.iter().map(|(n, rounds)| size_json(*n, rounds)).collect::<Vec<_>>(),
     });
     Report {

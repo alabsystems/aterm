@@ -1652,7 +1652,7 @@ fn readings_of(rows: &[&str], program: Program) -> Readings {
                 .collect();
         }
         Program::Codex => {
-            let mut f = CodexStepFold::new(0);
+            let mut f = CodexStepFold::ungated(0);
             f.bind(READ_FP, READ_ID, 0);
             let mut spend = TurnReader::default();
             for line in rows {
@@ -1708,6 +1708,7 @@ const fn kind(e: &StepEvent) -> &'static str {
     match e {
         StepEvent::Bind { .. } => "bind",
         StepEvent::Prompt { .. } => "prompt",
+        StepEvent::HarnessTurn { .. } => "harness",
         StepEvent::Interrupt => "interrupt",
         StepEvent::ToolUse { .. } => "tool",
         StepEvent::ToolResult { .. } => "result",
@@ -1723,7 +1724,8 @@ fn same_event(a: &StepEvent, b: &StepEvent, ids: &mut OneToOne) -> Result<(), St
     use StepEvent as E;
     match (a, b) {
         (E::Bind { len: x }, E::Bind { len: y }) if x == y => Ok(()),
-        (E::Prompt { vref: x }, E::Prompt { vref: y }) => ids.same(x, y),
+        (E::Prompt { vref: x }, E::Prompt { vref: y })
+        | (E::HarnessTurn { vref: x }, E::HarnessTurn { vref: y }) => ids.same(x, y),
         (E::Interrupt, E::Interrupt) | (E::Compact, E::Compact) => Ok(()),
         (
             E::ToolUse {

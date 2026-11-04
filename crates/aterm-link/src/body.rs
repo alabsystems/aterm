@@ -16,7 +16,7 @@ pub(crate) fn decode_calls() -> usize {
 }
 
 pub use aterm_types::fabric_grammar::{
-    is_kind, is_verdict, via_ok, KINDS, VERDICTS, VIA_MAX_BYTES, VIA_MAX_HOPS,
+    is_verdict, via_ok, KINDS, VERDICTS, VIA_MAX_BYTES, VIA_MAX_HOPS,
 };
 
 /// One decoded fabric body.

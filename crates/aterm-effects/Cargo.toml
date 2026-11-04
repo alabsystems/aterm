@@ -86,6 +86,8 @@ aterm-models-effects = { workspace = true }
 aterm-models-misc = { workspace = true }
 aterm-models-render = { workspace = true }
 aterm-png = { workspace = true }
+# `.ubd`-quiet `.noindex` scratch directories for `file_feed` and `spec` reader tests.
+aterm-tempfile = { workspace = true }
 # The pack themes' grounds the harness card's floor tests hold every dark theme's stars on.
 aterm-theme-pack = { workspace = true }
 

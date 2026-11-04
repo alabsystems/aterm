@@ -7,8 +7,8 @@
 //! `aterm-agent` does not link `aterm-db` (it would bring Commons and the broker into every
 //! harness build), so the journal reaches it through a [`Sink`] the `aterm` executable installs
 //! at start, as the account claims do (`super::claims`, `crates/aterm/src/alab_journal.rs`).
-//! With no sink installed nothing is keyed and nothing is noted, which is what every
-//! `aterm-agent` test sees.
+//! With no sink installed nothing is keyed and nothing is noted, unless a test supplies a
+//! scoped keyer for its current-thread identity lookups.
 //!
 //! - [`learn`]: a roster-bound transaction keys each account it read by its lab key
 //!   ([`super::accounts::Account::pk`]), the account key of the claims email (design §5).
@@ -221,6 +221,38 @@ pub trait Sink: Send + Sync {
 
 static SINK: OnceLock<&'static dyn Sink> = OnceLock::new();
 
+#[cfg(any(test, debug_assertions))]
+type Keyer = fn(&str, &str) -> Option<String>;
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    static KEYER: std::cell::Cell<Option<Keyer>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+/// Run `body` with this thread's keyer, restoring the previous one even on unwind.
+/// This changes key lookup only; notes still go exclusively to the installed sink.
+#[cfg(any(test, debug_assertions))]
+pub fn with_keyer<T>(keyer: Keyer, body: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Keyer>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            KEYER.with(|held| held.set(self.0));
+        }
+    }
+    let _restore = Restore(KEYER.with(|held| held.replace(Some(keyer))));
+    body()
+}
+
+fn account_pk(realm: &str, email: &str) -> Option<String> {
+    #[cfg(any(test, debug_assertions))]
+    if let Some(keyer) = KEYER.with(std::cell::Cell::get) {
+        return keyer(realm, email);
+    }
+    SINK.get()?.account_pk(realm, email)
+}
+
 /// Install the process's journal sink; the first install wins.
 pub fn install(sink: &'static dyn Sink) {
     let _ = SINK.set(sink);
@@ -235,10 +267,27 @@ pub fn note(note: &Note) {
 
 /// The account key of an unpooled CLI's login, by its realm (`google` for agy, `meta` for Muse)
 /// and the login its own files name, through the installed sink: what a provider read of agy or
-/// Muse is attributed to ([`ProbeEvent::login`]). None without a sink, which is every test.
+/// Muse is attributed to ([`ProbeEvent::login`]). None without a sink or scoped test keyer.
 #[must_use]
 pub fn realm_key(realm: &str, login: &str) -> Option<Key> {
-    Key::new(&SINK.get()?.account_pk(realm, login)?)
+    Key::new(&account_pk(realm, login)?)
+}
+
+/// The current row's canonical claims key, independently of a previously learned label key.
+#[must_use]
+pub fn account_key(cli: Cli, row: &super::accounts::Row) -> Option<Key> {
+    account_key_with(cli, row, &account_pk)
+}
+
+/// [`account_key`] through an explicit canonical realm-and-email keyer.
+#[must_use]
+pub fn account_key_with(
+    cli: Cli,
+    row: &super::accounts::Row,
+    keyer: &dyn Fn(&str, &str) -> Option<String>,
+) -> Option<Key> {
+    let lease = LeaseKey::for_cli(cli, row.vendor.region, row.expected_identity_email()?).ok()?;
+    Key::new(&keyer(&lease.pool, &lease.email)?)
 }
 
 /// Send each note to the installed sink, once its transaction is durable.
@@ -256,8 +305,7 @@ fn row_key(
     keyer: &dyn Fn(&str, &str) -> Option<String>,
 ) -> Option<String> {
     let row = roster.row(label)?;
-    let lease = LeaseKey::for_cli(cli, row.vendor.region, row.expected_identity_email()?).ok()?;
-    keyer(&lease.pool, &lease.email).filter(|pk| Key::new(pk).is_some())
+    account_key_with(cli, row, keyer).map(|key| key.as_str().to_owned())
 }
 
 /// Key every account of `state` that a row of `roster` names by the installed sink's account
@@ -265,11 +313,7 @@ fn row_key(
 /// key does, so a relabelled login is keyed as the account it holds; what was observed under the
 /// key it had stays under that key, in [`State::forgotten`](super::accounts::State::forgotten).
 pub fn learn(cli: Cli, roster: &Roster, state: &mut State) {
-    if let Some(sink) = SINK.get() {
-        learn_with(cli, roster, state, &|realm, email| {
-            sink.account_pk(realm, email)
-        });
-    }
+    learn_with(cli, roster, state, &account_pk);
 }
 
 /// [`learn`] with an explicit keyer.

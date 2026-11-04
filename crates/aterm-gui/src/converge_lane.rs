@@ -15,11 +15,11 @@
 /// Whether this process runs the converge pass's window lane, or the Secrets stage's pass: a
 /// windowed instance (not `headless`) on a Unix desktop whose first-run setup is not running now
 /// (`unified_setup`: the setup's own startup then starts the lane, `crate::start_converge_lane`,
-/// and its Secrets stage a pass as it ends), outside a private state root and CI
-/// (`ATERM_STATE_HOME`, `CI`, as the Commons runtime), `set` saying which of those variables are
-/// set.
+/// and its Secrets stage a pass as it ends), outside a scratch world and CI
+/// ([`aterm_types::world::MARKER`], `CI`, as the Commons runtime), `set` saying which of those
+/// variables are set.
 pub(crate) fn runs(headless: bool, unified_setup: bool, set: &dyn Fn(&str) -> bool) -> bool {
-    cfg!(unix) && !headless && !unified_setup && !set("ATERM_STATE_HOME") && !set("CI")
+    cfg!(unix) && !headless && !unified_setup && !set(aterm_types::world::MARKER) && !set("CI")
 }
 
 /// Whether the environment variable `name` is set.

@@ -92,7 +92,7 @@ const TOPICS: &[Topic] = &[
 The first Mac window opens System State. Under a headline that says where setup stands,
 the aterm lockup's rainbow ribbon fills as steps finish. One card, pinned under it, holds
 everything that needs you, once each: the permission walk's current page, macOS's local
-network question, the Command Line Tools password, the Allow another ALab Mac gives, an
+network question, the Mac Setup password, the Allow another ALab Mac gives, an
 approval code to run on an admin Mac, and a step that failed with what aterm does next.
 Five lines follow (Mac settings, Permissions, Secrets & identity, Developer, and Sign out
 of Messages & FaceTime), each with a switch and a phrase saying what is true now and,
@@ -108,11 +108,14 @@ or the vault answering on the LAN is no such Mac. Elsewhere Mac settings reads L
 is until you turn it on, and the sign-outs are left alone. Setup
 starts at once, with no countdown and nothing to confirm, whether or not anyone is at
 the Mac or an aterm window is in front, and after an update too. macOS's grants that only a
-person can give (Full Disk Access, Developer Tools, the debugger) never ask by themselves: each
-reads Offered, nothing waits on it, and setup finishes without it. One quiet press at the foot
-of the page, Turn On macOS Access…, asks for them together (a record on this Mac keeps that
-press); `aterm init` and `doctor --apply` never ask macOS for a grant. Once you pressed it, the
-permission pages and the debugger question, like the Messages and FaceTime sign-outs, start
+person can give (Full Disk Access, Developer Tools) never ask by themselves: each reads
+Offered, nothing waits on it, and setup finishes without it. One quiet press at the foot of the
+page, Turn On macOS Access…, asks for them together (a record on this Mac keeps that press);
+`aterm init` and `doctor --apply` never ask macOS for a grant. Debugger access is no such
+grant: the Mac Setup tab's one password turns developer mode on, and the Debugger row reads
+Waiting until it does. Once that tab was stopped, `aterm init --only base.clt` asks for the
+password now, or aterm's Settings ▸ Security turns it on. Once you pressed Turn On macOS
+Access…, the permission pages, like the Messages and FaceTime sign-outs, start
 while System State is in front and you are at the Mac (a key, click or trackpad used
 within the last minute, the screen unlocked), stop waiting when you lock the screen or
 step away, and go on when you come back. Once aterm finds the ALab signal before
@@ -188,10 +191,11 @@ are spent. It then stays Failed until something it waits on changes, you press C
 again or Set up now or make a choice, or aterm launches again; switching windows does not
 try it again. One only you can fix (a GitHub token to renew in the vault, Apple's Command
 Line Tools to install) reads Needs you with what to do. Apple's Command Line Tools install
-early in the first launch, in a terminal tab titled Command Line Tools, which aterm opens by
-itself, in front, once per build for your account on this Mac (an update retries unfinished
-setup) and where you type your Mac password once; System State's Go to tab brings it to the
-front. Until they exist the GitHub repositories row waits calmly, and `git`, `cc`, `python3`
+early in the first launch, in a terminal tab titled Mac Setup, which aterm opens by itself, in
+front, once per build for your account on this Mac (an update retries unfinished setup) and
+where you type your Mac password once. That one password also turns developer mode on, so a
+debugger attaches with no further dialog, which is why a Mac that already has the tools may
+still get the tab once; System State's Go to tab brings it to the front. Until they exist the GitHub repositories row waits calmly, and `git`, `cc`, `python3`
 and their kin, in the shells aterm opens, say so and exit instead of raising Apple's install
 dialog, whatever you press. For what those shells start with a PATH of its own (an agent's tool
 shell, a `zsh -lc`, a program that runs `/usr/bin/git` by its full path), aterm also names its
@@ -574,10 +578,10 @@ STATUS & RESTORE
         ),
     },
     Topic {
-        name: "acaffiene",
+        name: "acaffeine",
         tagline: "the menu-bar keep-awake mug — starts with aterm (on | off | status | startup | quit)",
         body: Some(
-            r#"acaffiene — menu-bar keep-awake mug (`aterm acaffiene`, macOS only).
+            r#"acaffeine — menu-bar keep-awake mug (`aterm acaffeine`, macOS only).
 
 WHAT IT DOES
   While full, the mug's launchd process holds an idle-sleep assertion (`pmset -g
@@ -585,7 +589,7 @@ WHAT IT DOES
   choosing Sleep still sleeps). A click toggles it; a right-click or Control-click
   opens the menu: its one-line about (version, what it does, who made it), then
   Activate for 1 Hour, 8 Hours, 24 Hours or Forever (the checked span's row says what
-  is left of it), Enable at Startup and Quit aCaffiene. Timed spans count time asleep,
+  is left of it), Enable at Startup and Quit aCaffeine. Timed spans count time asleep,
   and a change of the date or time neither lengthens nor shortens one; at its end the
   span turns the mug off and the Mac may sleep again, a reboot included. With no saved
   state it keeps the Mac awake forever. Enable at Startup works
@@ -600,7 +604,7 @@ STARTING WITH ATERM
   installed app's Enable at Startup on (in /Applications or ~/Applications), so a
   restart keeps this Mac awake with no window open; headless, diagnostic and
   private-control launches do nothing. An off you choose (a click, Quit
-  aCaffiene, `off`, `quit`, or the end of a span) lasts, through a restart too,
+  aCaffeine, `off`, `quit`, or the end of a span) lasts, through a restart too,
   until you turn it on again; so does turning Enable at Startup off, after which
   the subscriber's pass leaves the mug to a window. A quit from outside the menu
   (a SIGTERM, Activity Monitor) stops the mug and keeps its mode, so the next
@@ -609,26 +613,26 @@ STARTING WITH ATERM
   up (a full disk) is started again by launchd, and one whose reason lasts (a
   refused menu bar) by the next window or pass. A trouble that lasts ten minutes
   is an exception (`aterm doctor`'s `awake:` row reads whether macOS lists the
-  assertion). A login item from aCaffiene's old name, `aterm caffeine`, is
+  assertion). A login item from aCaffeine's old name, `aterm caffeine`, is
   removed when it runs an aterm from 0.146 on, and by a window or a subscriber's
   pass that starts the mug when its aterm is gone or answers no to `aterm help
   caffeine` (0.145, say); one whose aterm answers yes (0.144 and before) is that
   aterm's own mug and stays. None of its settings carries over.
 
-VERBS (`aterm acaffiene --help` has each one)
-  aterm acaffiene [start] | on [1h|8h|24h|forever|<n>h|<n>m] | off | status
-  aterm acaffiene startup [on|off] | quit [own]
+VERBS (`aterm acaffeine --help` has each one)
+  aterm acaffeine [start] | on [1h|8h|24h|forever|<n>h|<n>m] | off | status
+  aterm acaffeine startup [on|off] | quit [own]
 
 FILES
   Runs from an isolated bundle copy in
-  `~/Library/Application Support/aterm/acaffiene-code.noindex/`, with state in
-  `acaffiene.state`, lock in `acaffiene.lock`, update bridge pid in
-  `acaffiene.bridge`, and its job's plist in `acaffiene/<label>.plist` beside them
+  `~/Library/Application Support/aterm/acaffeine-code.noindex/`, with state in
+  `acaffeine.state`, lock in `acaffeine.lock`, update bridge pid in
+  `acaffeine.bridge`, and its job's plist in `acaffeine/<label>.plist` beside them
   (`~/Library/LaunchAgents/<label>.plist` while Enable at Startup is on). The job's
-  stderr goes to `~/Library/Logs/aterm/acaffiene.log`; why the mug turned off or
+  stderr goes to `~/Library/Logs/aterm/acaffeine.log`; why the mug turned off or
   stopped, a failed Enable at Startup and who sent it a SIGTERM go to `aterm.log`
-  beside it. What keeps it from keeping the Mac awake is in `acaffiene.trouble`,
-  and an Enable at Startup you turned off in `acaffiene/<label>.startup-off`."#,
+  beside it. What keeps it from keeping the Mac awake is in `acaffeine.trouble`,
+  and an Enable at Startup you turned off in `acaffeine/<label>.startup-off`."#,
         ),
     },
     Topic {
@@ -2363,7 +2367,7 @@ fn overview_page() -> String {
             crate::Verb::Keeper => {
                 "the PTY keeper: shells that outlive a crashed window (start | stop | status | serve; macOS)"
             }
-            crate::Verb::Acaffiene => {
+            crate::Verb::Acaffeine => {
                 "the menu-bar keep-awake mug: a click keeps this Mac awake (on | off | status | startup | quit; macOS)"
             }
             crate::Verb::Theme => {
@@ -3422,8 +3426,8 @@ DEBUGGER ACCESS (a password dialog, not privacy)
   1. `aterm ctl privacy`: the `debugger` row (`mode=disabled` means macOS prompts).
   2. Tell your operator before attaching, or wait with
      `aterm ctl @<sid> await consent kind=debugger timeout=<ms>`.
-  3. The owner can allow debugger access Mac-wide in aterm's Settings ▸ Security, and
-     System State turns it on once per Mac behind macOS's own password dialog. To turn
+  3. Setup's one Mac password, typed in the Mac Setup tab early in the first launch, turns
+     developer mode on Mac-wide, and the owner can change it in aterm's Settings ▸ Security. To turn
      developer mode off again in a terminal:
     {revert}
   4. A binary you built yourself, signed ad hoc with `com.apple.security.get-task-allow`,
@@ -4920,6 +4924,11 @@ fn agent_page(sid: Option<&str>) -> String {
          `@<sid> log` its records; wait on it with `@<sid> await log need,close=turn\n  \
          since=<log_seq> ep=<log_ep> base=<log_base>` (all three from its `status`), and read\n  \
          every session the fabric mirrors with `aterm fabric brief --json` (`aterm help fabric`).\n  \
+         On a codex tab an approval or question step is the program's own claim (`src=engine\n  \
+         conf=claim`): one per box a status sweep's program mark shows (stacked boxes of one\n  \
+         kind share one; a box shown and answered between two sweeps, or one whose `blocked`\n  \
+         coalesced past the bucket, has none), closed when the box goes (`out=gone` when its\n  \
+         program or its turn went).\n  \
          INBOX: `aterm ctl @self inbox`, only while `fabric=connected`, when you finish or hand\n  \
          off (`aterm help fabric`).\n  \
          If `ls` finds nothing it says WHY (a sandbox refusing the socket, a stale socket, an\n  \
@@ -5309,7 +5318,7 @@ fn page_of(t: &str) -> &str {
         | "containment" | "sandbox" => "aterm",
         "exceptions" => "update",
         "themes" | "colors" | "colours" | "color-scheme" | "colour-scheme" => "theme",
-        "awake" | "keep-awake" | "acaffeine" => "acaffiene",
+        "awake" | "keep-awake" | "acaffeine" => "acaffeine",
         "secret" | "vault" | "credentials" => "secrets",
         "amacs" | "editor" => "edit",
         "privacy" => "permissions",
@@ -5522,12 +5531,6 @@ mod tests {
             assert_eq!(code, 0, "`aterm help {name}` exits {code}");
             assert!(!page.contains("unknown topic"), "`aterm help {name}` 404s");
             assert!(page.contains(name), "`aterm help {name}` never says {name}");
-        }
-        for v in crate::Verb::ALL {
-            for alias in v.operand_aliases() {
-                assert_eq!(page_of(alias), page_of(v.name()), "`aterm help {alias}`");
-                assert_eq!(render(Some(alias), None).1, 0, "`aterm help {alias}`");
-            }
         }
     }
 

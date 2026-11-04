@@ -344,7 +344,7 @@ fn memory(pid: i32) -> Option<Usage> {
     if !file.metadata().ok()?.is_file() {
         return None;
     }
-    let mut text = String::new();
+    let mut text = String::with_capacity(4096);
     file.take(64 << 10).read_to_string(&mut text).ok()?;
     let field = |name: &str| {
         text.lines()

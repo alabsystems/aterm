@@ -2515,7 +2515,9 @@ pub fn command_read_only_at(
 }
 
 /// The home the advisory word and `aterm drive classify` resolve `~` and the secret list
-/// against: `HOME`, or on Windows `USERPROFILE` when `HOME` is unset or empty.
+/// against: `HOME`, or on Windows `USERPROFILE` when `HOME` is unset or empty. With none, a read
+/// that names the home is refused ([`operand_reach`]), as the home's own secret rules cannot be
+/// listed.
 pub(crate) fn advisory_home() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .filter(|h| !h.is_empty())
@@ -3614,13 +3616,23 @@ impl Reach {
 /// name, and a relative `op` (and `~+/…`) joined to each of `bases`' directories and read below
 /// each it floats (and from the root, where an alias of the root leads what it names below one,
 /// [`below_aliases`]); and why it may name another file this check cannot see (a path the line
-/// builds at run time, `~-`, or a relative one after `bases`' lost move).
+/// builds at run time, `~-`, a home with none known to resolve it, or a relative one after
+/// `bases`' lost move).
 fn operand_reach(op: &str, home: Option<&Path>, bases: &Bases, literal: bool) -> Reach {
     let only = |comps: Vec<Vec<String>>, unsure: Option<String>| Reach {
         comps,
         tails: Vec::new(),
         unsure,
     };
+    // A `~` (a user's home) or an expansion leading the word names the home or a place the
+    // environment sets; with no home known, the home's own rules are not in the list to hold it
+    // to, so the read is unproven rather than approved.
+    if home.is_none() && (op.starts_with('$') || (op.starts_with('~') && !op.starts_with("~+"))) {
+        return only(
+            operand_comps(op, home),
+            Some("a read under a home this check knows none of, which may name a secret".into()),
+        );
+    }
     let as_written = literal || rooted(op) || op.starts_with(['~', '$']);
     let mut comps = if as_written {
         operand_comps(op, home)

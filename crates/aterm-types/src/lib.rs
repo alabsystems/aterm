@@ -37,6 +37,7 @@ pub mod index;
 mod bitflags;
 
 pub mod dirs;
+pub mod world;
 
 mod time;
 pub use time::duration_to_nanos;
@@ -45,6 +46,7 @@ pub mod rfc3339;
 pub mod rust_lane;
 pub mod update_boundary;
 
+pub mod allocation_monitor;
 pub mod app_inspection;
 mod color_palette;
 pub mod control_request;
@@ -82,7 +84,7 @@ mod kitty_keyboard;
 pub mod mouse;
 pub mod native_window;
 pub mod pipeline_timestamps;
-pub use pipeline_timestamps::PipelineTimestamps;
+pub use pipeline_timestamps::{BatchStages, PipelineTimestamps};
 mod callback_types;
 pub mod charset;
 pub mod macos_setup;

@@ -114,7 +114,6 @@ fn point(said: &str, at: Seen, worked: Option<Duration>, reach: Reach) -> TurnEn
         worked,
         rules: None,
         pending_input: false,
-        background: false,
         interrupted: false,
         restartable: true,
         relaunch_off: false,

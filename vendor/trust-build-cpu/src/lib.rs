@@ -10,10 +10,15 @@
 //! after an abnormal process exit. Local jobserver and memory policy remain
 //! the caller's responsibilities.
 //!
-//! Slot records are diagnostics, not authority. Only the kernel lock makes a
+//! Ordinary `Pool` slot records are diagnostics, not authority. Only the kernel lock makes a
 //! slot busy; a stale record in an unlocked file never consumes capacity.
 //! An owner read while a lock is held is a reported identity, not independent
 //! proof that the process currently holds that descriptor.
+//!
+//! `RetainedPool` is a separate, explicitly created private domain. It records
+//! debt before exposing a release capability, so controller death cannot release
+//! capacity still used by descendants. It does not select or migrate the global
+//! pool. Its caller must establish actual work completion before settlement.
 
 #![warn(missing_docs)]
 
@@ -127,5 +132,13 @@ mod unix;
 #[cfg(unix)]
 pub use unix::{Lease, Pool, capacity_dir};
 
+#[cfg(unix)]
+mod retained;
+#[cfg(unix)]
+pub use retained::{RETAINED_DIRECTORY_NAME, RetainedLease, RetainedPool, RetainedSlotState};
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, unix))]
+mod retained_tests;

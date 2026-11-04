@@ -127,6 +127,16 @@ fn a_legacy_reserved_host_gets_an_admitted_discovery_name_without_reconfiguratio
         };
         assert_eq!(decide(&mut role).as_deref(), Some(expected.as_str()));
         assert_eq!(decide(&mut role).as_deref(), Some(expected.as_str()));
+        assert!(
+            matches!(
+                observe_alab_member_with(&lab.m1, false, || {}),
+                AlabRoleObservation::Allowed {
+                    own_label: None,
+                    ..
+                }
+            ),
+            "automatic installation does not invent the explicit server's discovery name"
+        );
         let start = Instant::now();
         let mut watcher = crate::server::AlabNameWatcher::new();
         for (seconds, takes) in [(0, false), (90, true)] {
@@ -267,6 +277,14 @@ fn server_role_survives_only_same_context_transient_reads() {
         changed.host = "m27".to_owned();
         assert!(matches!(
             observe_alab_role_with(&m2, || {
+                save_config(&m2, &changed).unwrap();
+            }),
+            AlabRoleObservation::Unavailable(None)
+        ));
+        save_config(&m2, &original).unwrap();
+
+        assert!(matches!(
+            observe_alab_member_with(&m2, false, || {
                 save_config(&m2, &changed).unwrap();
             }),
             AlabRoleObservation::Unavailable(None)

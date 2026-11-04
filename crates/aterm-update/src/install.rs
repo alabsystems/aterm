@@ -5383,10 +5383,12 @@ pub(crate) fn read_trial_launch_stamp(stamp: &Path) -> Option<LaunchName> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(stamp)
         .ok()?;
-    if !file.metadata().ok()?.is_file() {
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.len() > TRIAL_LAUNCH_STAMP_MAX_BYTES {
         return None;
     }
-    let mut text = String::new();
+    let mut text =
+        String::with_capacity(usize::try_from(meta.len()).unwrap_or(0).saturating_add(1));
     file.take(TRIAL_LAUNCH_STAMP_MAX_BYTES + 1)
         .read_to_string(&mut text)
         .ok()?;

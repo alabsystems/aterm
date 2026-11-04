@@ -119,7 +119,7 @@ const fn key_block(key: &[u8]) -> [u8; BLOCK_LEN] {
     }
 }
 
-const fn hmac_ipad(k: &[u8; BLOCK_LEN]) -> [u8; BLOCK_LEN] {
+const fn hmac_ipad_q0(k: &[u8; BLOCK_LEN]) -> [u8; 16] {
     [
         k[0] ^ 0x36,
         k[1] ^ 0x36,
@@ -137,6 +137,11 @@ const fn hmac_ipad(k: &[u8; BLOCK_LEN]) -> [u8; BLOCK_LEN] {
         k[13] ^ 0x36,
         k[14] ^ 0x36,
         k[15] ^ 0x36,
+    ]
+}
+
+const fn hmac_ipad_q1(k: &[u8; BLOCK_LEN]) -> [u8; 16] {
+    [
         k[16] ^ 0x36,
         k[17] ^ 0x36,
         k[18] ^ 0x36,
@@ -153,6 +158,11 @@ const fn hmac_ipad(k: &[u8; BLOCK_LEN]) -> [u8; BLOCK_LEN] {
         k[29] ^ 0x36,
         k[30] ^ 0x36,
         k[31] ^ 0x36,
+    ]
+}
+
+const fn hmac_ipad_q2(k: &[u8; BLOCK_LEN]) -> [u8; 16] {
+    [
         k[32] ^ 0x36,
         k[33] ^ 0x36,
         k[34] ^ 0x36,
@@ -169,6 +179,11 @@ const fn hmac_ipad(k: &[u8; BLOCK_LEN]) -> [u8; BLOCK_LEN] {
         k[45] ^ 0x36,
         k[46] ^ 0x36,
         k[47] ^ 0x36,
+    ]
+}
+
+const fn hmac_ipad_q3(k: &[u8; BLOCK_LEN]) -> [u8; 16] {
+    [
         k[48] ^ 0x36,
         k[49] ^ 0x36,
         k[50] ^ 0x36,
@@ -188,7 +203,23 @@ const fn hmac_ipad(k: &[u8; BLOCK_LEN]) -> [u8; BLOCK_LEN] {
     ]
 }
 
-const fn hmac_opad(k: &[u8; BLOCK_LEN]) -> [u8; BLOCK_LEN] {
+const fn hmac_ipad(k: &[u8; BLOCK_LEN]) -> [u8; BLOCK_LEN] {
+    let [b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15] = hmac_ipad_q0(k);
+    let [b16, b17, b18, b19, b20, b21, b22, b23, b24, b25, b26, b27, b28, b29, b30, b31] =
+        hmac_ipad_q1(k);
+    let [b32, b33, b34, b35, b36, b37, b38, b39, b40, b41, b42, b43, b44, b45, b46, b47] =
+        hmac_ipad_q2(k);
+    let [b48, b49, b50, b51, b52, b53, b54, b55, b56, b57, b58, b59, b60, b61, b62, b63] =
+        hmac_ipad_q3(k);
+    [
+        b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15, b16, b17, b18, b19,
+        b20, b21, b22, b23, b24, b25, b26, b27, b28, b29, b30, b31, b32, b33, b34, b35, b36, b37,
+        b38, b39, b40, b41, b42, b43, b44, b45, b46, b47, b48, b49, b50, b51, b52, b53, b54, b55,
+        b56, b57, b58, b59, b60, b61, b62, b63,
+    ]
+}
+
+const fn hmac_opad_q0(k: &[u8; BLOCK_LEN]) -> [u8; 16] {
     [
         k[0] ^ 0x5c,
         k[1] ^ 0x5c,
@@ -206,6 +237,11 @@ const fn hmac_opad(k: &[u8; BLOCK_LEN]) -> [u8; BLOCK_LEN] {
         k[13] ^ 0x5c,
         k[14] ^ 0x5c,
         k[15] ^ 0x5c,
+    ]
+}
+
+const fn hmac_opad_q1(k: &[u8; BLOCK_LEN]) -> [u8; 16] {
+    [
         k[16] ^ 0x5c,
         k[17] ^ 0x5c,
         k[18] ^ 0x5c,
@@ -222,6 +258,11 @@ const fn hmac_opad(k: &[u8; BLOCK_LEN]) -> [u8; BLOCK_LEN] {
         k[29] ^ 0x5c,
         k[30] ^ 0x5c,
         k[31] ^ 0x5c,
+    ]
+}
+
+const fn hmac_opad_q2(k: &[u8; BLOCK_LEN]) -> [u8; 16] {
+    [
         k[32] ^ 0x5c,
         k[33] ^ 0x5c,
         k[34] ^ 0x5c,
@@ -238,6 +279,11 @@ const fn hmac_opad(k: &[u8; BLOCK_LEN]) -> [u8; BLOCK_LEN] {
         k[45] ^ 0x5c,
         k[46] ^ 0x5c,
         k[47] ^ 0x5c,
+    ]
+}
+
+const fn hmac_opad_q3(k: &[u8; BLOCK_LEN]) -> [u8; 16] {
+    [
         k[48] ^ 0x5c,
         k[49] ^ 0x5c,
         k[50] ^ 0x5c,
@@ -254,6 +300,22 @@ const fn hmac_opad(k: &[u8; BLOCK_LEN]) -> [u8; BLOCK_LEN] {
         k[61] ^ 0x5c,
         k[62] ^ 0x5c,
         k[63] ^ 0x5c,
+    ]
+}
+
+const fn hmac_opad(k: &[u8; BLOCK_LEN]) -> [u8; BLOCK_LEN] {
+    let [b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15] = hmac_opad_q0(k);
+    let [b16, b17, b18, b19, b20, b21, b22, b23, b24, b25, b26, b27, b28, b29, b30, b31] =
+        hmac_opad_q1(k);
+    let [b32, b33, b34, b35, b36, b37, b38, b39, b40, b41, b42, b43, b44, b45, b46, b47] =
+        hmac_opad_q2(k);
+    let [b48, b49, b50, b51, b52, b53, b54, b55, b56, b57, b58, b59, b60, b61, b62, b63] =
+        hmac_opad_q3(k);
+    [
+        b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15, b16, b17, b18, b19,
+        b20, b21, b22, b23, b24, b25, b26, b27, b28, b29, b30, b31, b32, b33, b34, b35, b36, b37,
+        b38, b39, b40, b41, b42, b43, b44, b45, b46, b47, b48, b49, b50, b51, b52, b53, b54, b55,
+        b56, b57, b58, b59, b60, b61, b62, b63,
     ]
 }
 

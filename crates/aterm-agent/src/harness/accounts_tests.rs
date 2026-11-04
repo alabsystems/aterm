@@ -5078,6 +5078,22 @@ fn a_ledger_row_round_trips_as_one_bounded_line() {
     );
     assert_eq!(Event::of_json_line(&bare.to_json_line()), Some(bare));
 
+    let mut scoped = aterm_json::json!({
+        "t": NOW, "kind": "sign-in", "account": "work-2", "workflow": 7
+    });
+    let event = Event::of_json_line(&scoped.to_string()).expect("scoped ledger record");
+    assert_eq!(Event::of_json_line(&event.to_json_line()), Some(event));
+    for invalid in [Value::Null, Value::from(-1), Value::from("0")] {
+        scoped
+            .as_object_mut()
+            .unwrap()
+            .insert("workflow".into(), invalid);
+        assert!(
+            Event::of_json_line(&scoped.to_string()).is_none(),
+            "malformed present workflow custody must not become legacy evidence"
+        );
+    }
+
     let long = "é".repeat(4000);
     let hostile = Event {
         t: NOW,
@@ -5087,6 +5103,7 @@ fn a_ledger_row_round_trips_as_one_bounded_line() {
         sid: Some(format!("s-1\u{2028}{long}")),
         why: format!("failed:\r\n\t{long}"),
         pk: None,
+        workflow: None,
     };
     let line = hostile.to_json_line();
     assert!(!line.contains(['\n', '\r', '\u{2028}']));

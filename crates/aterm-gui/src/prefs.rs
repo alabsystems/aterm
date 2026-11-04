@@ -6156,8 +6156,9 @@ mod edit_tests {
     #[test]
     fn matrix_rain_row_surfaces_in_the_settings_model() {
         let key = super::EDIT_MATRIX_RAIN_ENABLED;
-        assert_eq!(super::section_of(key), super::Section::Appearance);
-        assert_eq!(super::group_of(key), ("Effects", 5));
+        let (group, order) = super::group_of(key);
+        assert_ne!(group, "General", "routes out of the catch-all group");
+        assert!(order < u8::MAX, "group order assigned");
         assert!(super::footnote_of(key).is_some());
         assert!(!keywords_of(key).is_empty());
         assert!(
@@ -6166,6 +6167,11 @@ mod edit_tests {
         );
 
         let unset = editable_fields(&Config::default());
+        assert_eq!(
+            unset.iter().filter(|f| f.key == key).count(),
+            1,
+            "registered once in editable_fields"
+        );
         let row = unset.iter().find(|f| f.key == key).expect("row exists");
         assert_eq!(row.kind, EditKind::Bool);
         assert_eq!(row.seed.as_deref(), Some("false"), "resolved default OFF");

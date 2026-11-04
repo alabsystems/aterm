@@ -234,7 +234,14 @@ fn an_active_replacement_cannot_clear_or_complete_another_rows_owner() {
     let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
     let clock = Instant::now();
     let permit = AutoRenewPermit::claim(&guard, &original.label, clock, true).unwrap();
-    permit.attribute_row(&bed.store, Cli::Claude, original, NOW, &records.logins);
+    permit.attribute_row(
+        &bed.store,
+        Cli::Claude,
+        original,
+        records.raw_roster.row(&original.label).unwrap(),
+        NOW,
+        &records.logins,
+    );
     let diagnostic = LoginDiagnostic::from_exit_for_test(original, NOW, 1, None);
     guard
         .lock()

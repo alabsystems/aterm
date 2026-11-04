@@ -1083,7 +1083,7 @@ fn the_console_owner_is_dev_consoles_uid() {
 }
 
 /// A running aterm, for the app half, is a window of this account's: a bundle's executable
-/// alone or with `--window`. The helpers that run from the same executable (`acaffiene serve`,
+/// alone or with `--window`. The helpers that run from the same executable (`acaffeine serve`,
 /// the login item that stays when every window is closed; a tether; `aterm ctl`) are none
 /// (round 12: pgrep -f matched them, and another account's aterm, so a run said aterm was
 /// running and left the app it installed closed). An editor open on the executable is none
@@ -1099,7 +1099,7 @@ fn only_a_window_of_this_account_is_a_running_aterm() {
     let dev = s(&scratch.exe(&format!("Applications/aterm (dev).app/{exe}"), "")).to_owned();
     let gone = scratch.join(&format!("gone/aterm.app/{exe}"));
     let helpers =
-        format!("{app} acaffiene serve\n{app} __tether 88279 /usr/bin/log stream\n{app} ctl ls");
+        format!("{app} acaffeine serve\n{app} __tether 88279 /usr/bin/log stream\n{app} ctl ls");
     let rows: Vec<(String, String)> = vec![
         (helpers.clone(), String::new()),
         (format!("{helpers}\n  {app} --window"), s(&bundle).into()),

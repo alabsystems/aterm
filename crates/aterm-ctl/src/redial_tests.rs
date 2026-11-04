@@ -23,10 +23,7 @@ fn gone_pid() -> u32 {
 /// bytes, and the platform temp dir can be longer), removed on drop.
 #[cfg(unix)]
 fn scratch_sock(tag: &str) -> (aterm_tempfile::TempDir, PathBuf) {
-    let dir = aterm_tempfile::Builder::new()
-        .prefix(&format!("{tag}-"))
-        .tempdir_in("/tmp")
-        .expect("scratch dir");
+    let dir = crate::test_scratch_dir(tag);
     let sock = dir.path().join("s.sock");
     (dir, sock)
 }

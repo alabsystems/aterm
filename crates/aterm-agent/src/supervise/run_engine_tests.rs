@@ -5664,9 +5664,9 @@ fn a_memory_banner_is_the_hosts_restart_and_escalated_only_when_it_cannot_be() {
         "asked again after its deferral as the same ask of its run: {asks:?}"
     );
     assert!(
-        lines
-            .iter()
-            .any(|l| l.starts_with("HOST seq=") && l.ends_with("restart:memory step=wait:held")),
+        lines.iter().any(|l| l.starts_with("HOST seq=")
+            && l.contains(" restart:memory ask=memory@")
+            && l.ends_with(" step=wait:held")),
         "{lines:#?}"
     );
     assert!(
@@ -5676,9 +5676,9 @@ fn a_memory_banner_is_the_hosts_restart_and_escalated_only_when_it_cannot_be() {
         "{lines:#?}"
     );
     assert!(
-        lines
-            .iter()
-            .any(|l| l.starts_with("HOST seq=") && l.ends_with("restart:memory step=adopted")),
+        lines.iter().any(|l| l.starts_with("HOST seq=")
+            && l.contains(" restart:memory ask=memory@")
+            && l.ends_with(" step=adopted")),
         "{lines:#?}"
     );
     assert!(escalated(&m).is_empty(), "{:#?}", m.requests);
@@ -5794,9 +5794,9 @@ fn a_measure_past_the_ceiling_warns_and_restarts_only_when_the_mac_is_in_trouble
     let r = run(MemoryCeiling::Auto, true, adopted());
     assert_eq!(r.restarted, ["memory"], "{:#?}", r.lines);
     assert!(
-        r.lines
-            .iter()
-            .any(|l| l.starts_with("HOST seq=") && l.ends_with("restart:memory step=adopted")),
+        r.lines.iter().any(|l| l.starts_with("HOST seq=")
+            && l.contains(" restart:memory ask=memory@")
+            && l.ends_with(" step=adopted")),
         "{:#?}",
         r.lines
     );
@@ -5912,7 +5912,7 @@ fn trouble_that_comes_while_idle_decides_the_standing_point_again() {
         assert!(warned[1].ends_with(aterms), "{trouble:?}: {warned:#?}");
         let asked = journal
             .iter()
-            .position(|l| l.starts_with("HOST seq=") && l.contains(" restart:memory step="))
+            .position(|l| l.starts_with("HOST seq=") && l.contains(" restart:memory ask="))
             .unwrap_or_else(|| panic!("{trouble:?}: the host asked: {journal:#?}"));
         let row = journal[..asked]
             .iter()
@@ -6374,7 +6374,7 @@ fn a_refused_memory_restart_keeps_the_persons_row_until_the_host_is_asked_again(
     let asked_at = |lines: &[String]| -> Vec<String> {
         lines
             .iter()
-            .filter(|l| l.starts_with("HOST seq=") && l.contains(" restart:memory step="))
+            .filter(|l| l.starts_with("HOST seq=") && l.contains(" restart:memory ask="))
             .map(|l| l.split_whitespace().nth(1).unwrap_or_default().to_string())
             .collect()
     };
@@ -6570,7 +6570,7 @@ fn a_restart_that_typed_its_carry_on_typed_a_harness_turn() {
     assert!(
         lines
             .iter()
-            .any(|l| l.ends_with("restart:memory step=continued")),
+            .any(|l| l.contains(" restart:memory ask=memory@") && l.ends_with(" step=continued")),
         "{lines:#?}"
     );
     assert!(continued(&lines), "the carry-on's answer: {lines:#?}");
@@ -9019,7 +9019,7 @@ fn a_question_asked_a_third_time_is_answered_again_after_a_pause() {
         one,
         idle_screen(),
     ]);
-    let mut s = session(&mut m, None);
+    let mut s = virtual_session(&mut m, None);
     s.set_approval_env(owner_env());
     book.keep(&mut s);
     let opts = SuperviseOpts {
@@ -11511,6 +11511,7 @@ fn tier1_the_cards_0_tells_a_homed_draft_from_the_dim_suggestion() {
     draft[c] = "❯ hello".to_string();
     let homed = |attrs: &'static str| {
         survey_sitting(draft.clone(), &move |m, _| {
+            m.cursor_on_caret = true;
             m.cursor_col = Some(2);
             m.cell_attrs = attrs;
         })
@@ -12253,7 +12254,7 @@ fn a_fallback_the_host_keeps_deferring_gives_way_to_the_continuation_at_the_rese
     assert!(
         lines[..first_turn]
             .iter()
-            .any(|l| l.contains("restart:model step=wait:changed")),
+            .any(|l| l.contains(" restart:model ask=model@") && l.contains(" step=wait:changed")),
         "{lines:#?}"
     );
 }

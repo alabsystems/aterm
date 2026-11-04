@@ -1849,6 +1849,9 @@ struct Round {
     /// When the kill window's posts were all answered: a backlog run posts one per session
     /// there, and they can outlast the relaunch, so [`Round::t_pid`] is watched across them.
     t_posted: u64,
+    /// The records the broker read back cold from just before the kill to the attach's last row
+    /// and every live mail (`Broker::cold_reads`, read outside the timed window, D10d).
+    cold_reads: u64,
 }
 
 /// The bridge's pid from its state dir, if it has written one.
@@ -1981,6 +1984,8 @@ struct Backlog {
     steady: (Vec<f64>, Vec<f64>),
     /// What the broker held in memory once this population's restarts were done (D10).
     held: backlog::Held,
+    /// The records the broker read back cold in each restart ([`Round::cold_reads`], D10d).
+    cold_per_restart: Vec<u64>,
 }
 
 /// One `| … | n | mean | p50 | p95 | p99 | max |` cell run of `values`.
@@ -2055,6 +2060,7 @@ fn backlog_report(
             "steady_inside_ms": stats::to_json(inside),
             "steady_outside_ms": stats::to_json(outside),
             "held": held_json(&b.held),
+            "cold_reads_per_restart": b.cold_per_restart,
         }));
     }
     md.push(String::new());
@@ -2085,10 +2091,10 @@ fn backlog_report(
     ));
     md.push(
         "| read | resident records | resident (MiB) | retained records | footprint (MiB) | peak \
-         (MiB) |"
+         (MiB) | cold reads since the open |"
             .to_string(),
     );
-    md.push("|---|---:|---:|---:|---:|---:|".to_string());
+    md.push("|---|---:|---:|---:|---:|---:|---:|".to_string());
     for b in backlogs {
         md.push(held_row(
             &format!("after {} session(s)' restarts", b.sessions),
@@ -2097,6 +2103,26 @@ fn backlog_report(
     }
     if let Some(held) = &reopened.held {
         md.push(held_row("the last open of the stopped log", held));
+    }
+    md.push(String::new());
+    md.push(
+        "**What the budget made the broker read back** (D10d): the records it read from its log \
+         file because the budget left them cold (`Broker::cold_reads`), from just before each \
+         kill to the attach's last row and every live mail, read outside the timed window. With \
+         no budget every retained record is resident and each count is 0.\n"
+            .to_string(),
+    );
+    md.push("| sessions | restarts | cold reads per restart | max |".to_string());
+    md.push("|---:|---:|---|---:|".to_string());
+    for b in backlogs {
+        let each: Vec<String> = b.cold_per_restart.iter().map(u64::to_string).collect();
+        md.push(format!(
+            "| {} | {} | {} | {} |",
+            b.sessions,
+            b.cold_per_restart.len(),
+            each.join(", "),
+            b.cold_per_restart.iter().max().copied().unwrap_or(0)
+        ));
     }
     md.push(String::new());
     json!({
@@ -2123,15 +2149,17 @@ fn mib(bytes: Option<u64>) -> String {
     )
 }
 
-/// One `| read | resident records | resident | retained | footprint | peak |` row of `held`.
+/// One `| read | resident records | resident | retained | footprint | peak | cold reads |` row
+/// of `held`.
 fn held_row(read: &str, held: &backlog::Held) -> String {
     format!(
-        "| {read} | {} | {} | {} | {} | {} |",
+        "| {read} | {} | {} | {} | {} | {} | {} |",
         held.resident_records,
         mib(u64::try_from(held.resident_bytes).ok()),
         held.retained,
         mib(held.footprint),
-        mib(held.peak_footprint)
+        mib(held.peak_footprint),
+        held.cold_reads
     )
 }
 
@@ -2141,6 +2169,7 @@ fn held_json(held: &backlog::Held) -> Value {
         "resident_records": held.resident_records,
         "resident_bytes": held.resident_bytes,
         "retained_records": held.retained,
+        "cold_reads": held.cold_reads,
         "footprint_bytes": held.footprint,
         "peak_footprint_bytes": held.peak_footprint,
     })
@@ -2254,6 +2283,7 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
                         t.rebase(now);
                         t.free_wait();
                     }
+                    let cold_before = broker.cold_reads();
                     let mark = broker.visible_head();
                     let mut watch = w
                         .god()
@@ -2322,6 +2352,7 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
                     });
                     await_attach(&mut watch, &node_subject, &session_subjects, new_pid);
                     drop(watch);
+                    let cold_reads = broker.cold_reads().saturating_sub(cold_before);
                     if let Some(t) = counted.as_mut() {
                         let at = tallies::At {
                             bridge: new_pid,
@@ -2344,6 +2375,7 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
                         t_mail_seen,
                         t_every_mail_seen,
                         t_posted,
+                        cold_reads,
                     });
                 }
                 stop_steady.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -2364,6 +2396,7 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
                     fill_ms,
                     steady: backlog::split(&beats, &windows),
                     held: backlog::held(broker),
+                    cold_per_restart: size_rounds.iter().map(|r| r.cold_reads).collect(),
                 });
             }
             rounds.extend(size_rounds);
@@ -2466,6 +2499,7 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
             "pid_to_all_ms": ms_opt(Some(r.t_pid), t_all).map(stats::round3),
             "kill_to_live_mail_ms": stats::round3(ms(r.t_kill, r.t_mail_seen)),
             "kill_to_every_live_mail_ms": ms_opt(Some(r.t_kill), r.t_every_mail_seen).map(stats::round3),
+            "cold_reads": r.cold_reads,
         }));
         let rec = records.entry(r.sessions).or_default();
         rec.censuses.push(c);
@@ -2725,6 +2759,7 @@ pub fn measure(spec: &Spec) -> Report {
     md.extend(handoff_md);
     md.extend(asks_md);
     md.extend(cross_md);
+    let elapsed_s = started.elapsed().as_secs_f64();
     let binary_at_end = binary_identity();
     let arm = Profile::of_binary(Path::new(harness::aterm()));
     let json = json!({
@@ -2738,7 +2773,7 @@ pub fn measure(spec: &Spec) -> Report {
         "broker": broker_note(spec),
         "retention": retention_note(spec),
         "clock": "one monotonic origin in the bench process; microsecond stamps",
-        "elapsed_s": stats::round3(started.elapsed().as_secs_f64()),
+        "elapsed_s": stats::round3(elapsed_s),
         "messaging": messaging,
         "pingpong": pingpong,
         "attach": attach,

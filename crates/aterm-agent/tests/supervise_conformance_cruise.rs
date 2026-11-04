@@ -114,7 +114,6 @@ fn point(
         worked,
         rules: None,
         pending_input: false,
-        background: over_shell,
         interrupted: false,
         restartable: true,
         relaunch_off: false,

@@ -268,6 +268,8 @@ fn busy_or_unsafe_optional_state_cannot_change_sync_result_or_follow_a_link() {
 
 #[test]
 fn failed_transport_followed_by_real_local_cache_apply_remains_a_failed_refresh() {
+    // Every server it reads is its own on loopback, which answers.
+    let _answering = ServersAnswering::set();
     let root = aterm_tempfile::tempdir().unwrap();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let held_listener = listener.try_clone().unwrap();

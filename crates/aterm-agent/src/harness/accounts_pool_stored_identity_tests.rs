@@ -158,7 +158,7 @@ fn an_observed_launch_preserves_the_last_identity_failure_when_alternatives_end(
         &enrolled,
         Some(&world.exe),
         NOW,
-        &world.home,
+        (&world.home, None),
     )
     .unwrap_err();
     assert!(refused.contains("different users"));
@@ -540,10 +540,11 @@ fn cached_usage_identity_case(named: bool) {
             let result = super::super::launch_env(&seat, Cli::Codex, &no_poll);
             if pinned || blocked {
                 assert!(
-                    result.is_err_and(|why| why.contains(if named {
-                        "expected account"
-                    } else {
-                        "different users"
+                    result.is_err_and(|why| why.contains(match (named, default) {
+                        // A refusal of the default login names what it holds.
+                        (true, true) => "other@example.test",
+                        (true, false) => "expected account",
+                        (false, _) => "different users",
                     })),
                     "default={default}, pinned={pinned}, off={off}, blocked={blocked}"
                 );

@@ -1,21 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Reader bound and recovery tests on hand-crafted supervisor tapes.
+//! Reader bound tests on hand-crafted supervisor tapes.
 
 use astream_effects::EffectRecord;
 
 use super::super::codec::{Encoder, Item};
 use super::super::doors;
-use super::super::frame::{HEAD, Kind, MAGIC, frame_bytes};
+use super::super::frame::{Kind, MAGIC, frame_bytes};
 use super::super::frame_tests::{HEADER, mono};
 use super::*;
 
-/// Bounds small enough that a test reaches them with small bytes.
-const SMALL: Limits = Limits {
-    held: 1 << 20,
-    search_floor: 0,
-};
+/// A hold small enough that a test reaches it with small bytes.
+const SMALL: usize = 1 << 20;
 
 /// The header frame and one records frame of `items`, encoded in order by one encoder.
 fn one_frame(items: &[Item]) -> (Vec<u8>, usize) {
@@ -24,20 +21,15 @@ fn one_frame(items: &[Item]) -> (Vec<u8>, usize) {
     for item in items {
         enc.item(item, &mut raw);
     }
-    let header = frame_bytes(Kind::Header, 0, HEADER.as_bytes());
+    let header = frame_bytes(Kind::Header, 0, HEADER.as_bytes()).expect("a frame");
     let at = MAGIC.len() + header.len();
-    let bytes = [
-        MAGIC.as_slice(),
-        &header,
-        &frame_bytes(Kind::Records, 1, &raw),
-    ]
-    .concat();
-    (bytes, at)
+    let records = frame_bytes(Kind::Records, 1, &raw).expect("a frame");
+    ([MAGIC.as_slice(), &header, &records].concat(), at)
 }
 
-/// A read of `bytes`, refusing a fault or keeping the prefix before it.
-fn read_with(bytes: &[u8], keep: Keep, limits: Limits) -> Recovered {
-    read(bytes, keep, Check::Xxh64, limits)
+/// A read of `bytes` holding at most [`SMALL`], refusing a fault or keeping the prefix before it.
+fn read_small(bytes: &[u8], keep: Keep) -> Recovered {
+    read(bytes, keep, SMALL, steps)
 }
 
 #[test]
@@ -57,12 +49,12 @@ fn a_body_repeated_past_what_a_read_holds_is_refused() {
         "{} bytes stand for 4 MiB of replies",
         bytes.len()
     );
-    let refused = read_with(&bytes, Keep::Refuse, SMALL);
+    let refused = read_small(&bytes, Keep::Refuse);
     assert_eq!(
         refused.tail,
         Tail::Fault {
             at,
-            why: Why::TooLarge { limit: SMALL.held }
+            why: Why::TooLarge { limit: SMALL }
         }
     );
     assert_eq!(
@@ -70,7 +62,7 @@ fn a_body_repeated_past_what_a_read_holds_is_refused() {
         (None, 0, 0),
         "a refused tape serves nothing"
     );
-    let kept = read_with(&bytes, Keep::Prefix, SMALL);
+    let kept = read_small(&bytes, Keep::Prefix);
     assert_eq!(kept.tail, refused.tail);
     assert_eq!(kept.header.as_deref(), Some(HEADER));
     assert_eq!(
@@ -94,93 +86,23 @@ fn a_name_and_items_that_own_nothing_count_too() {
     ];
     let (bytes, at) = one_frame(&named);
     assert_eq!(
-        read_with(&bytes, Keep::Refuse, SMALL).tail,
+        read_small(&bytes, Keep::Refuse).tail,
         Tail::Fault {
             at,
-            why: Why::TooLarge { limit: SMALL.held }
+            why: Why::TooLarge { limit: SMALL }
         }
     );
     assert_eq!(recover(&bytes).items, named);
-    let bare: Vec<Item> = (0..(SMALL.held / std::mem::size_of::<Item>()) as u64 + 1)
+    let bare: Vec<Item> = (0..(SMALL / std::mem::size_of::<Item>()) as u64 + 1)
         .map(mono)
         .collect();
     let (bytes, at) = one_frame(&bare);
     assert_eq!(
-        read_with(&bytes, Keep::Refuse, SMALL).tail,
+        read_small(&bytes, Keep::Refuse).tail,
         Tail::Fault {
             at,
-            why: Why::TooLarge { limit: SMALL.held }
+            why: Why::TooLarge { limit: SMALL }
         }
     );
     assert_eq!(recover(&bytes).items.len(), bare.len());
-}
-
-/// Header plus a damaged records frame followed by frame-like heads every 17 bytes to `len`.
-fn crowded(len: usize, last: &[u8]) -> (Vec<u8>, usize) {
-    let header = frame_bytes(Kind::Header, 0, HEADER.as_bytes());
-    let at = MAGIC.len() + header.len();
-    let mut bad = frame_bytes(Kind::Records, 1, &{
-        let mut raw = Vec::new();
-        Encoder::default().item(&mono(5), &mut raw);
-        raw
-    });
-    *bad.last_mut().expect("a payload") ^= 0x01;
-    let mut bytes = [MAGIC.as_slice(), &header, &bad].concat();
-    let total = len + last.len();
-    while bytes.len() + HEAD <= len {
-        let q = bytes.len();
-        let raw_len = u32::try_from(total - q - HEAD).expect("a short test file");
-        bytes.push(Kind::Records as u8);
-        bytes.extend_from_slice(&raw_len.to_le_bytes());
-        bytes.extend_from_slice(&0u32.to_le_bytes());
-        bytes.extend_from_slice(&0u64.to_le_bytes());
-    }
-    bytes.resize(len, 0);
-    bytes.extend_from_slice(last);
-    assert_eq!(bytes.len(), total);
-    (bytes, at)
-}
-
-#[test]
-fn bytes_crowded_with_frame_heads_are_refused_unsearched() {
-    let (bytes, at) = crowded(256 * 1024, &[]);
-    let kept = salvage(&bytes);
-    assert_eq!(
-        kept.tail,
-        Tail::Fault {
-            at,
-            why: Why::Unsearched
-        }
-    );
-    assert_eq!(
-        (kept.header.as_deref(), kept.frames),
-        (Some(HEADER), 1),
-        "salvage keeps the whole frames before the damage"
-    );
-}
-
-#[test]
-fn within_its_bound_the_search_still_finds_a_whole_frame() {
-    let whole = frame_bytes(Kind::Records, 2, &{
-        let mut raw = Vec::new();
-        Encoder::default().item(&mono(9), &mut raw);
-        raw
-    });
-    let (bytes, at) = crowded(8 * 1024, &whole);
-    assert_eq!(
-        recover(&bytes).tail,
-        Tail::Fault {
-            at,
-            why: Why::Damaged
-        }
-    );
-    assert_eq!(
-        read_with(&bytes, Keep::Refuse, SMALL).tail,
-        Tail::Fault {
-            at,
-            why: Why::Unsearched
-        }
-    );
-    let (bytes, at) = crowded(8 * 1024, &[]);
-    assert_eq!(recover(&bytes).tail, Tail::Torn { at });
 }

@@ -385,7 +385,8 @@ mod unix {
                     "nested locks exceed the 32 MiB/file or 64 MiB/batch read limit".into(),
                 );
             }
-            let mut bytes = Vec::new();
+            let mut bytes =
+                Vec::with_capacity(usize::try_from(before.len).unwrap_or(0).saturating_add(1));
             (&file)
                 .take(LOCK_BYTES.min(remaining) + 1)
                 .read_to_end(&mut bytes)

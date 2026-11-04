@@ -305,21 +305,47 @@ fn kimi_env(tag: &str) -> (Tmp, Env) {
 /// `a_sign_in_that_needs_an_overlay_runs_nothing_where_aterm_makes_no_links` holds the refusal.
 #[cfg(unix)]
 #[test]
-fn a_kimi_row_renews_through_its_own_sign_in_and_a_failed_one_changes_nothing() {
+fn a_kimi_row_renews_through_its_own_sign_in_and_a_failed_one_preserves_its_binding() {
     let (tmp, env) = kimi_env("signin-kimi");
     let home = tmp.path().join("home");
     let store = env.accounts_store_for(Cli::Kimi).expect("kimi's store");
     let logins_root = home.join(".aterm/logins/kimi");
 
     let failing = SignInHost::new(Script::Kimi("kimi 1"), &home);
-    let before = read(&store.logins_file());
     let (code, out, err) = renew("accounts renew kimi-one --cli kimi", &env, &failing);
     assert_eq!(code, exit(1), "{out}{err}");
+    let prepared = store.load_logins(env.now).unwrap().0;
+    let binding = prepared.get("kimi-one").unwrap();
+    assert!(binding.renewal_generation > 0);
     assert_eq!(
-        read(&store.logins_file()),
-        before,
-        "the binding is unchanged"
+        binding,
+        &accounts::Binding {
+            renewal_generation: binding.renewal_generation,
+            ..Default::default()
+        },
+        "failed authentication leaves only its generation fence"
     );
+    let (code, _, _) = renew("accounts renew kimi-one --cli kimi", &env, &failing);
+    assert_eq!(code, exit(1));
+    let after = store.load_logins(env.now).unwrap().0;
+    let mut retained = after.clone();
+    retained.workflows = prepared.workflows.clone();
+    retained.workflow_clock = prepared.workflow_clock;
+    assert_eq!(retained, prepared, "only workflow custody changes on retry");
+    let raw = accounts::Roster::load_for(Cli::Kimi, &env.accounts_roster_for(Cli::Kimi).unwrap())
+        .unwrap();
+    let event = store
+        .tail(20)
+        .unwrap()
+        .into_iter()
+        .find(|event| event.kind == accounts::Kind::SignIn)
+        .unwrap();
+    assert!(event.workflow.is_some());
+    assert!(accounts::workflow_event_matches(
+        raw.row("kimi-one").unwrap(),
+        &after,
+        &event
+    ));
     assert!(
         stagings(&logins_root, "kimi-one").is_empty(),
         "staging removed"
@@ -2252,15 +2278,22 @@ fn codex_signin_binds_auth_path_overlay_suffixes_reconcile_and_due_renewals_orde
     let kimi_store = kimi_env.accounts_store_for(Cli::Kimi).expect("kimi store");
     let mut note = None;
     kimi_store
-        .transact_logins(kimi_env.now, &mut note, |_, logins| {
-            accounts::note_sign_in_task(
-                logins,
-                "kimi-one",
-                accounts::SignInAction::Browser,
-                kimi_env.now - 60,
-            );
-            Ok(Vec::new())
-        })
+        .transact_pool_logins_within(
+            &accounts::LOCK_LADDER,
+            &kimi_env.accounts_roster_for(Cli::Kimi).unwrap(),
+            kimi_env.now,
+            &mut note,
+            |_, _, logins| {
+                accounts::admit_workflow(logins, "kimi-one")?;
+                accounts::note_sign_in_task(
+                    logins,
+                    "kimi-one",
+                    accounts::SignInAction::Browser,
+                    kimi_env.now - 60,
+                );
+                Ok(Vec::new())
+            },
+        )
         .expect("record sign_in_task on kimi-one");
     let due_host = OrderHost {
         order: std::cell::RefCell::new(Vec::new()),

@@ -16,6 +16,8 @@ default = []
 toml = ["dep:aterm-toml", "dep:serde", "serde/derive"]
 
 [dependencies]
+# `aterm_alloc::heap::table_bytes`: the decision buckets' and limiters' tables in `PolicyEngine::heap_bytes`.
+aterm-alloc = { workspace = true }
 serde = { workspace = true, optional = true }
 aterm-toml = { workspace = true, optional = true }
 # std's Instant on native; the JS clock on wasm32, where std's panics.

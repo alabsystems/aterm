@@ -3,7 +3,20 @@
 
 //! Panic sweep: every [`Program::ALL`] reader, phase/prompt/launch-card entry
 //! point, and [`PromptV2`](aterm_phase::PromptV2) accessor never panics on any
-//! tail, head, middle window, or width truncation of any fixture screen.
+//! tail, head or middle window of any fixture screen as captured, nor on a fifth of those
+//! windows with the screen cut to a width ([`sweep`]). A file taller than [`SCREEN_ROWS`] is
+//! swept as captured and cut to no width: ten today, seven tables and corpora
+//! (`land-defense-table`, `needs-table`, `go-ahead-guard-base`, `open-work-corpus`,
+//! `owner-bash-command`, `go-ahead-table`, `land-holdout`) and three reflow captures, real
+//! frames stacked under `## W columns` lines (`claude-2.1.302-question-multi-reflow-long-26-160col`,
+//! `-short-26-160col` and `-long-270-300col`).
+//!
+//! Why the windows left out are implied: a width cut changes what each row's text and width
+//! arithmetic sees, and every width still reaches every other screen whole and at one row in
+//! five, on a residue its place in [`WIDTHS`] sets, so that the widths cover all five, while every
+//! whole-width window stays. What is not implied, and would be missed: a panic only a width-cut
+//! head or tail off its width's residue reaches, or only a width cut of a file taller than
+//! [`SCREEN_ROWS`] reaches.
 
 use std::collections::BTreeSet;
 use std::hash::{Hash, Hasher};
@@ -91,6 +104,10 @@ fn truncated(rows: &[String], width: usize) -> Vec<String> {
         .collect()
 }
 
+/// Every entry point on one window. Each function the sweep answers for runs here once:
+/// `aterm_phase::transcript_end` and `busy_zone_start` under the Claude reader, which delegates
+/// to them; `prompt_box_first_row` under `busy_zone_start`; and `parse_prompt` under the Claude
+/// reader's `read`, its first question, over the `parse` `parse_prompt_v2` also runs.
 fn read_all(w: &[String]) {
     for col in [0, 1, 2, 200] {
         let _ = aterm_phase::continuation_suggestion(w, col);
@@ -101,18 +118,15 @@ fn read_all(w: &[String]) {
             read_box(&p);
         }
         let _ = reader.transcript_end(w);
-        let _ = reader.busy_zone_start(w);
+        let zone = reader.busy_zone_start(w);
+        if program == Program::Claude {
+            let _ = w.get(zone..).expect("the live zone starts on the screen");
+        }
     }
-    let _ = aterm_phase::parse_prompt(w);
     if let Some(p) = aterm_phase::parse_prompt_v2(w) {
         read_box(&p);
     }
     let _ = aterm_phase::prompt_box_span(w);
-    let _ = aterm_phase::prompt_box_first_row(w);
-    let _ = w
-        .get(aterm_phase::busy_zone_start(w)..)
-        .expect("the live zone starts on the screen");
-    let _ = aterm_phase::transcript_end(w);
     for row in w {
         let _ = aterm_phase::agents_panel::parse_row(row, aterm_phase::agents_panel::one_cell);
     }
@@ -220,17 +234,22 @@ fn check(name: &str, what: &str, w: &[String], failures: &Mutex<Vec<String>>) {
 
 /// The most rows a head or tail window holds: more than any terminal screen a reader is
 /// handed (the tallest capture here is 81 rows), so every screen's heads and tails are whole.
-/// A taller file (a policy table, a corpus, frames stacked under `## W columns` lines) gives a
-/// screen's worth of rows to each side of every cut, which keeps its sweep linear in its height.
+/// A taller file gives a screen's worth of rows to each side of every cut, which keeps its sweep
+/// linear in its height, and is cut to no width. Ten files are taller today: seven tables and
+/// corpora, and three reflow captures whose frames are stacked under `## W columns` lines
+/// (this module's doc names them).
 const SCREEN_ROWS: usize = 128;
 
 /// Sweep shard `part` of `parts`: whole screen (part 0), tail/head cuts at
 /// `k ≡ part (mod parts)` (at most [`SCREEN_ROWS`] rows each), and middle windows of
-/// heights 1..=12.
+/// heights 1..=12. A screen as captured (`width_at` is `None`) gets every one. Cut to the width
+/// at index `i` of [`WIDTHS`] it gets the fifth of them with `(k + i) % 5 == 0` and
+/// `(s + h) % 5 == 0`: the index moves the cuts' residue, so that every `k` is cut at some width
+/// and the widths' heads and tails do not all end on the rows the middles do.
 fn sweep(
     name: &str,
     rows: &[String],
-    every_middle: bool,
+    width_at: Option<usize>,
     (part, parts): (usize, usize),
     failures: &Mutex<Vec<String>>,
 ) {
@@ -239,6 +258,9 @@ fn sweep(
         check(name, "whole", rows, failures);
     }
     for k in (part..=n).step_by(parts) {
+        if width_at.is_some_and(|i| (k + i) % 5 != 0) {
+            continue;
+        }
         let (top, end) = (k.saturating_sub(SCREEN_ROWS), (k + SCREEN_ROWS).min(n));
         check(
             name,
@@ -255,7 +277,7 @@ fn sweep(
     }
     for h in 1..=12.min(n) {
         for s in (part..=n - h).step_by(parts) {
-            if every_middle || (s + h) % 5 == 0 {
+            if width_at.is_none() || (s + h) % 5 == 0 {
                 check(
                     name,
                     &format!("middle rows[{s}..{}]", s + h),
@@ -271,11 +293,11 @@ fn parts_for(n: usize) -> usize {
     n.div_ceil(32).max(1)
 }
 
-/// One job of the sweep: a screen as captured, or cut to a width.
+/// One job of the sweep: a screen as captured, or cut to the width at an index of [`WIDTHS`].
 #[derive(Clone, Copy)]
 enum Cut {
     Whole,
-    Width(usize),
+    WidthAt(usize),
 }
 
 const WIDTHS: &[usize] = &[1, 2, 3, 6, 12, 40];
@@ -299,10 +321,23 @@ fn the_reader_never_panics_on_any_window_of_any_fixture() {
     let mut jobs: Vec<(&Screen, Cut, (usize, usize))> = Vec::new();
     for s in &all {
         let parts = parts_for(s.rows.len());
-        for cut in std::iter::once(Cut::Whole).chain(WIDTHS.iter().map(|&w| Cut::Width(w))) {
+        let widths = if s.rows.len() > SCREEN_ROWS {
+            0
+        } else {
+            WIDTHS.len()
+        };
+        for cut in std::iter::once(Cut::Whole).chain((0..widths).map(Cut::WidthAt)) {
             jobs.extend((0..parts).map(|p| (s, cut, (p, parts))));
         }
     }
+    // The size rule is for the few files no terminal shows; it must not take the width cuts
+    // from the captures the sweep is for.
+    let uncut = all.iter().filter(|s| s.rows.len() > SCREEN_ROWS).count();
+    assert!(
+        uncut * 50 < all.len(),
+        "{uncut} of {} files are taller than {SCREEN_ROWS} rows and cut to no width",
+        all.len()
+    );
     jobs.sort_by_key(|(s, _, _)| std::cmp::Reverse(s.rows.len()));
     let next = std::sync::atomic::AtomicUsize::new(0);
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
@@ -316,11 +351,11 @@ fn the_reader_never_panics_on_any_window_of_any_fixture() {
                         break;
                     };
                     match cut {
-                        Cut::Whole => sweep(&s.name, &s.rows, true, part, &failures),
-                        Cut::Width(w) => sweep(
-                            &format!("{} @width {w}", s.name),
-                            &truncated(&s.rows, w),
-                            false,
+                        Cut::Whole => sweep(&s.name, &s.rows, None, part, &failures),
+                        Cut::WidthAt(i) => sweep(
+                            &format!("{} @width {}", s.name, WIDTHS[i]),
+                            &truncated(&s.rows, WIDTHS[i]),
+                            Some(i),
                             part,
                             &failures,
                         ),

@@ -114,7 +114,22 @@ pub fn target_name(link: &Path) -> Option<OsString> {
     }
     #[cfg(windows)]
     {
-        let body = std::fs::read_to_string(link).ok()?;
+        use std::io::Read as _;
+        const MAX_ALIAS_BYTES: u64 = 256;
+        let (file, meta) = crate::regular_file::open(link).ok()?;
+        if meta.len() > MAX_ALIAS_BYTES {
+            return None;
+        }
+        let cap = usize::try_from(meta.len().min(MAX_ALIAS_BYTES))
+            .unwrap_or(0)
+            .saturating_add(1);
+        let mut body = String::with_capacity(cap);
+        file.take(MAX_ALIAS_BYTES + 1)
+            .read_to_string(&mut body)
+            .ok()?;
+        if body.len() as u64 > MAX_ALIAS_BYTES {
+            return None;
+        }
         let name = body.trim();
         if is_instance_sock_name(name) {
             Some(OsString::from(name))

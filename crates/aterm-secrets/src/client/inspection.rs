@@ -20,6 +20,10 @@ use std::collections::BTreeMap;
 pub struct MembershipHistoryInspection {
     pub network: [u8; 16],
     pub complete: crate::membership_log::RecordCounts,
+    /// SHA-256 of `aterm/commons/membership-record-inventory/1\0`, the little-endian
+    /// u64 count, and the sorted complete record IDs. Waiting records are excluded.
+    /// Equal fingerprints identify the same observed set, not current access or connectivity.
+    pub complete_inventory_sha256: [u8; 32],
     pub waiting: usize,
     pub bytes: usize,
     pub budgets: crate::membership_log::RecordBudgets,
@@ -39,7 +43,7 @@ impl MembershipHistoryInspection {
     }
 }
 
-/// Read public counts from the locally authenticated membership log, including
+/// Read public counts and a record-set fingerprint from the authenticated local log, including
 /// when Commons control is excluded. Requires no admin key and writes nothing.
 /// A missing or unauthenticated history returns `None`, never an empty count.
 ///
@@ -73,10 +77,23 @@ pub fn inspect_membership_history_until(
     Ok(Some(MembershipHistoryInspection {
         network: root.network,
         complete: log.counts(),
+        complete_inventory_sha256: membership_inventory(&log),
         waiting: log.waiting(),
         bytes: log.total_bytes(),
         budgets: log.budgets(),
     }))
+}
+
+fn membership_inventory(log: &crate::membership_log::Log) -> [u8; 32] {
+    let mut ids: Vec<_> = log.records().map(|record| record.id()).collect();
+    ids.sort_unstable();
+    let mut hash = aterm_digest::Sha256::new();
+    hash.update(b"aterm/commons/membership-record-inventory/1\0");
+    hash.update((ids.len() as u64).to_le_bytes());
+    for id in ids {
+        hash.update(id);
+    }
+    hash.finalize()
 }
 
 pub(super) struct PublishedControl {
@@ -254,9 +271,69 @@ mod tests {
         client::save_records(&macs.m7, &encode_records(&[child])).unwrap();
         let after = history(&macs.m7).unwrap().unwrap();
         assert_eq!(after.complete, before.complete);
+        assert_eq!(
+            after.complete_inventory_sha256,
+            before.complete_inventory_sha256
+        );
         assert_eq!(after.waiting, 1);
         assert_eq!(after.retained_records(), before.retained_records() + 1);
         assert_eq!(after.remaining_records() + 1, before.remaining_records());
+        macs.server.stop();
+    }
+
+    #[test]
+    fn membership_inventory_compares_sets_not_counts_or_arrival_order() {
+        use crate::client::log_entries_tests::{member_key, two_macs};
+        use crate::membership_log::Body;
+        let macs = two_macs(&[]);
+        let (first, first_actor, first_incarnation) = member_key(&macs.m22);
+        let (second, second_actor, second_incarnation) = member_key(&macs.m7);
+        let baseline = client::load_records(&macs.m22)
+            .unwrap()
+            .log()
+            .unwrap()
+            .clone();
+        let a = first.device().with_seed(|seed| {
+            baseline
+                .draft(
+                    &first_actor,
+                    1000,
+                    Body::Name {
+                        name: "left".into(),
+                    },
+                )
+                .sign(seed, first_incarnation)
+                .unwrap()
+        });
+        let second_record = |name: &str| {
+            second.device().with_seed(|seed| {
+                baseline
+                    .draft(&second_actor, 1000, Body::Name { name: name.into() })
+                    .sign(seed, second_incarnation)
+                    .unwrap()
+            })
+        };
+        let b = second_record("right");
+        let replacement = second_record("different-right");
+        let mut left = baseline.clone();
+        left.insert(a.clone()).unwrap();
+        left.insert(b.clone()).unwrap();
+        let mut reordered = baseline.clone();
+        reordered.insert(b.clone()).unwrap();
+        reordered.insert(a.clone()).unwrap();
+        assert_ne!(left.record_index(a.id()), reordered.record_index(a.id()));
+        assert_eq!(
+            super::membership_inventory(&left),
+            super::membership_inventory(&reordered)
+        );
+        let mut different = baseline;
+        different.insert(a).unwrap();
+        different.insert(replacement).unwrap();
+        assert_eq!(left.counts(), different.counts());
+        assert_ne!(
+            super::membership_inventory(&left),
+            super::membership_inventory(&different)
+        );
         macs.server.stop();
     }
 

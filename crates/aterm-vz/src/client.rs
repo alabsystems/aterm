@@ -1018,7 +1018,8 @@ fn log_tail(path: &Path) -> String {
         }
         let sought =
             meta.len() > TAIL_BYTES && file.seek(SeekFrom::End(-(TAIL_BYTES as i64))).is_ok();
-        let mut buf = Vec::new();
+        let cap = usize::try_from(meta.len().min(TAIL_BYTES).saturating_add(1)).unwrap_or(0);
+        let mut buf = Vec::with_capacity(cap);
         file.take(TAIL_BYTES).read_to_end(&mut buf).ok()?;
         Some((String::from_utf8_lossy(&buf).into_owned(), sought))
     })()

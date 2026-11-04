@@ -24,6 +24,61 @@ use crate::{channel, gates, machines, publish, sign};
 #[path = "provision/layer.rs"]
 mod layer;
 
+/// Check or restore only the authenticated shared notary credential, without provisioning
+/// release identities or credential files, packages, site keys, or credential requests.
+pub fn run_notary_only(check_only: bool) -> crate::ledger::Result<()> {
+    #[cfg(unix)]
+    {
+        let check = notary_only_with(check_only, notary_probe, || {
+            aterm_secrets::client::Paths::live()
+                .and_then(|paths| aterm_secrets::client::release::sync_notary(&paths))
+                .map_err(|error| error.to_string())
+        });
+        print_check("notary", &check);
+        if matches!(check, Check::Pass(_)) {
+            println!(
+                "NOTARY READY{}",
+                if check_only {
+                    " (--check: nothing written)"
+                } else {
+                    ""
+                }
+            );
+            Ok(())
+        } else {
+            Err(Error::new("notary-only: credential is not ready"))
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = check_only;
+        Err(crate::ledger::Error::new("notary-only requires macOS"))
+    }
+}
+
+#[cfg(unix)]
+fn notary_only_with(
+    check_only: bool,
+    mut probe: impl FnMut() -> NotaryProbe,
+    sync: impl FnOnce() -> std::result::Result<Option<String>, String>,
+) -> Check {
+    let initial = probe();
+    if check_only || matches!(initial.check, Check::Pass(_) | Check::Skip(_)) {
+        return initial.check;
+    }
+    match sync() {
+        Ok(Some(_)) => probe().check,
+        Ok(None) => Check::Todo {
+            what: "no authenticated shared notary credential is available".into(),
+            next: "inspect the vault membership and registered release-notary entry".into(),
+        },
+        Err(why) => Check::Fail {
+            what: why,
+            fix: "retry after the shared credential or notary service recovers".into(),
+        },
+    }
+}
+
 /// Restore only an already-authorized signer's public roster pair.
 pub fn run_roster_only(
     repo: &std::path::Path,
@@ -2914,6 +2969,59 @@ mod tests {
         assert_eq!(ready.need, NotaryNeed::Satisfied);
         settle_notary_need(&paths, ready.need).unwrap();
         assert!(need::peek(&paths).unwrap()[0].state.ended());
+    }
+
+    #[test]
+    fn notary_only_check_and_existing_success_never_materialize_credentials() {
+        let checked = notary_only_with(
+            true,
+            || notary_probe_verdict("notary", false, "", "No Keychain password item found"),
+            || panic!("a check must not materialize credentials"),
+        );
+        assert!(!matches!(checked, Check::Pass(_)));
+        let ready = notary_only_with(
+            false,
+            || notary_probe_verdict("notary", true, "No submission history.", ""),
+            || panic!("an authenticating profile must remain unchanged"),
+        );
+        assert!(matches!(ready, Check::Pass(_)));
+    }
+
+    #[test]
+    fn notary_only_repair_requires_an_available_credential_and_a_fresh_provider_check() {
+        let mut probes = 0;
+        let mut materialized = 0;
+        let ready = notary_only_with(
+            false,
+            || {
+                probes += 1;
+                if probes == 1 {
+                    notary_probe_verdict("notary", false, "", "No Keychain password item found")
+                } else {
+                    notary_probe_verdict("notary", true, "No submission history.", "")
+                }
+            },
+            || {
+                materialized += 1;
+                Ok(Some("authenticated shared credential".into()))
+            },
+        );
+        assert!(matches!(ready, Check::Pass(_)));
+        assert_eq!((probes, materialized), (2, 1));
+        for available in [false, true] {
+            let not_ready = notary_only_with(
+                false,
+                || notary_probe_verdict("notary", false, "", "No Keychain password item found"),
+                || Ok(available.then(|| "materialized".into())),
+            );
+            assert!(!matches!(not_ready, Check::Pass(_)));
+        }
+        let failed = notary_only_with(
+            false,
+            || notary_probe_verdict("notary", false, "", "No Keychain password item found"),
+            || Err("credential unavailable".into()),
+        );
+        assert!(matches!(failed, Check::Fail { .. }));
     }
 
     #[test]

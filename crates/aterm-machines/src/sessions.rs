@@ -160,7 +160,11 @@ pub(crate) fn read_owned_text(path: &Path, max_bytes: usize) -> Option<String> {
     {
         return None;
     }
-    let mut bytes = Vec::new();
+    let cap = usize::try_from(meta.len())
+        .unwrap_or(0)
+        .min(max_bytes)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(cap);
     f.take(bound as u64).read_to_end(&mut bytes).ok()?;
     if bytes.len() > max_bytes {
         return None;
@@ -188,10 +192,13 @@ fn same_hosted_session(
         || (a.instance_pid != 0 && a.instance_pid == b.instance_pid && a.local_id == b.local_id)
 }
 
+/// Each read and write of the batch waits at most `wait`: the roster's 80 ms, or a test's
+/// one-minute hang detector where the test's own server always answers.
 fn enrich_sessions_dims_and_cwd(
     sock_path: &Path,
     token: &str,
     sessions: &mut [crate::protocol::HostedSession],
+    wait: Duration,
 ) {
     if sessions.is_empty()
         || sessions
@@ -206,7 +213,7 @@ fn enrich_sessions_dims_and_cwd(
     if !same_user_peer(&stream) {
         return;
     }
-    let timeout = Some(Duration::from_millis(80));
+    let timeout = Some(wait);
     let _ = stream.set_read_timeout(timeout);
     let _ = stream.set_write_timeout(timeout);
     let mut batch = format!("AUTH {token}\n");
@@ -314,7 +321,7 @@ fn query_instance_sessions(
         }
     }
     if wait <= Duration::from_secs(1) {
-        enrich_sessions_dims_and_cwd(sock_path, &token, &mut out);
+        enrich_sessions_dims_and_cwd(sock_path, &token, &mut out, Duration::from_millis(80));
     }
     out
 }
@@ -509,7 +516,8 @@ mod tests {
             parse_aterm_roster_line(77, "0 s-first - alive zsh meta=0").unwrap(),
             parse_aterm_roster_line(77, "1 s-second - alive zsh meta=0").unwrap(),
         ];
-        enrich_sessions_dims_and_cwd(&sock, "abcd", &mut sessions);
+        // The server above always answers: a hang detector, never the roster's 80 ms.
+        enrich_sessions_dims_and_cwd(&sock, "abcd", &mut sessions, Duration::from_secs(60));
         let _held = server.join().unwrap();
         assert_eq!(sessions[0].rows, Some(24));
         assert_eq!(sessions[0].cols, Some(80));

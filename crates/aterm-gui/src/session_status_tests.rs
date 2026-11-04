@@ -185,6 +185,7 @@ fn the_sweep_asks_for_a_released_codex_tabs_rollout_while_its_process_fronts_it(
             draft_empty: Some(true),
             frame: None,
             goal: None,
+            background_terminals: None,
             initializing: false,
         }),
         resume: Err("no-resume-line"),
@@ -225,8 +226,17 @@ fn the_sweep_asks_for_a_released_codex_tabs_rollout_while_its_process_fronts_it(
     let mut observer = StatusObserver::new(policy(), Duration::from_millis(50));
     let wake = crate::claude_footer::LogWake::default();
     let now = Instant::now();
+    let screen = crate::control::ScreenGen { epoch: 1, seq: 1 };
     let mut sweep = |program, pgid, at| {
-        observer.request_rollout_if_due(SESSION, ctx, Some(program), pgid, (at, None), &wake);
+        observer.request_rollout_if_due(
+            SESSION,
+            ctx,
+            Some(program),
+            pgid,
+            screen,
+            (at, None),
+            &wake,
+        );
         observer.rollout_asked.contains_key(&SESSION)
     };
     assert!(!sweep("codex", group + 1, now), "another group in front");
@@ -246,6 +256,131 @@ fn the_sweep_asks_for_a_released_codex_tabs_rollout_while_its_process_fronts_it(
             now + crate::codex_rollout_tap::RECHECK * 2
         ),
         "the process left the front: the tap is stopped"
+    );
+    crate::self_claim::forget(sid);
+}
+
+/// THE SWEEP OWES A SETTLE READ AFTER A COUNTED CODEX TAB'S SCREEN MOVES
+/// ([`StatusObserver::request_rollout_if_due`], [`StatusObserver::next_wake`]): while the timeline
+/// holds a count codex-alab's record named, a sweep that sees the tab's screen generation move
+/// owes one more rollout ask [`crate::codex_rollout_tap::SETTLE`] later, and `next_wake` names it
+/// (clamped to the slot's `next_due`); the read at it discharges it, and an older build's record
+/// (no count) arms nothing. The tab sits at a settled prompt, so its slot's own FSM owes no wake
+/// and every wake below is the rollout ask's. The copy's home holds no record and the tab arms no
+/// rollout transcript, so no ask reaches the tap thread and nothing clears the slot under the test.
+#[test]
+fn the_sweep_owes_a_settle_read_after_a_counted_codex_tabs_screen_moves() {
+    use aterm_agent::harness::self_claimed::{Copy, Record, Seen};
+
+    use crate::codex_rollout_tap::{RECHECK, SETTLE};
+    use crate::session_timeline::{claim_supervisor_as, release_supervisor};
+    const SESSION: u64 = 7597;
+    let handle = crate::session_store::test_handle_on(SESSION, -1);
+    let ctx = &handle.ctx;
+    let sid = ctx.self_id.as_str();
+    let proven = crate::self_claim::stand_in::running();
+    let group = i32::try_from(proven.pid).expect("a pid");
+    let copy = Copy {
+        pid: proven.pid,
+        start: proven.start.clone(),
+        home: "/private/tmp/x/codex-home".into(),
+        seen: Seen::Present(Record {
+            pid: proven.pid,
+            session_id: Some("019a0000-0000-7000-8000-00000000000d".to_string()),
+            resume_argv: None,
+            env: Vec::new(),
+            status: Some("idle".to_string()),
+            exit: None,
+            cwd: None,
+            draft_empty: Some(true),
+            frame: None,
+            goal: None,
+            background_terminals: Some(2),
+            initializing: false,
+        }),
+        resume: Err("no-resume-line"),
+    };
+    let now_us = crate::metrics::now_us();
+    crate::self_claim::forget(sid);
+    claim_supervisor_as(
+        ctx,
+        &format!("codex-alab@{}", proven.pid),
+        Some(1),
+        None,
+        Some(proven.clone()),
+        now_us,
+        aterm_slog::Actor::Ctl,
+    )
+    .expect("the proven claim");
+    crate::self_claim::set_copy_for_test(sid, Some(copy.clone()));
+    assert!(release_supervisor(
+        ctx,
+        None,
+        now_us,
+        aterm_slog::Actor::Ctl
+    ));
+    let revision = ctx.meta.lock().unwrap().supervisor_revision;
+    assert!(crate::self_claim::released_for_test(
+        ctx,
+        &proven,
+        revision,
+        true,
+        Some(copy)
+    ));
+    ctx.timeline.lock().unwrap().note_foreground_group(group);
+    let count = |n: Option<u32>| {
+        assert!(
+            ctx.timeline.lock().unwrap().set_codex_terminals(group, n),
+            "the group is in front"
+        );
+    };
+
+    let mut observer = StatusObserver::new(policy(), Duration::from_millis(0));
+    let mut at_prompt = evidence(blank(1));
+    at_prompt.shell = Some(ShellEvidence::Prompt);
+    let start = Instant::now();
+    observer.observe(SESSION, &at_prompt, start);
+    let t0 = start + DWELL + Duration::from_millis(10);
+    observer.observe(SESSION, &at_prompt, t0);
+    let next_due = observer.sessions.get(&SESSION).expect("a slot").next_due;
+    let wake = crate::claude_footer::LogWake::default();
+    let g = |seq: u64| crate::control::ScreenGen { epoch: 1, seq };
+    let mut sweep = |seq: u64, at: Instant| {
+        observer.request_rollout_if_due(
+            SESSION,
+            ctx,
+            Some("codex"),
+            group,
+            g(seq),
+            (at, None),
+            &wake,
+        );
+        assert!(
+            observer.rollout_asked.contains_key(&SESSION),
+            "the released claim's process fronts its tab"
+        );
+        observer.next_wake()
+    };
+
+    assert_eq!(sweep(1, t0), None, "premise: no count, no wake");
+    count(Some(2));
+    assert_eq!(
+        sweep(1, t0 + RECHECK),
+        None,
+        "a count with a still screen owes nothing"
+    );
+    let settle = (t0 + RECHECK * 2 + SETTLE).max(next_due);
+    assert_eq!(
+        sweep(2, t0 + RECHECK * 2),
+        Some(settle),
+        "the screen moved while counted: a settle read is owed"
+    );
+    assert_eq!(sweep(2, settle), None, "the settle read discharges it");
+    count(None);
+    assert_eq!(
+        sweep(3, settle + RECHECK),
+        None,
+        "an older build's record names no count: a move owes nothing"
     );
     crate::self_claim::forget(sid);
 }
@@ -2178,6 +2313,88 @@ fn output_without_movement_arms_the_retire_wake_off_the_freshest_clock() {
     observer.observe(1, &ev, owed);
     observer.observe(1, &ev, owed + DWELL);
     assert_eq!(observer.status(1).map(|s| s.phase), Some(Phase::Quiet));
+}
+
+/// THE PAIR READ OUTLASTS THE SWEEPS THAT MISS IT (gap 25, [`StatusObserver::note_pair_wait`],
+/// [`StatusObserver::next_wake`]): a harness read wait handed to a codex tab's rollout ask makes
+/// `next_wake` name the read it owes, clamped to the slot's gate. A sweep that sees the session
+/// inside the recheck, one that reads it before the wait's time and one that skips it
+/// (`note_skipped`, lock contention) leave it owed, so the loop wakes for it again; the read at or
+/// after it discharges it, and the same wait handed again (that read failed) arms no wake. The tab sits at
+/// a settled prompt, so its slot's own FSM owes no wake and every wake below is the ask's.
+#[test]
+fn a_pair_read_stays_owed_through_sweeps_that_miss_it() {
+    use crate::codex_rollout_tap::{Ask, RECHECK, due};
+    use crate::session_log::transcript::ReadWait;
+    const SESSION: u64 = 7598;
+    let interval = Duration::from_millis(250);
+    let mut observer = StatusObserver::new(policy(), interval);
+    let mut at_prompt = evidence(blank(1));
+    at_prompt.shell = Some(ShellEvidence::Prompt);
+    let start = Instant::now();
+    observer.observe(SESSION, &at_prompt, start);
+    let t0 = start + DWELL + Duration::from_millis(10);
+    observer.observe(SESSION, &at_prompt, t0);
+    let target: crate::self_claim::TapTarget = crate::self_claim::RolloutTarget {
+        revision: 1,
+        pid: 4242,
+        start: "Mon Oct 20 16:37:58 2026".to_string(),
+        thread: "019a0000-0000-7000-8000-00000000000f".to_string(),
+        home: std::path::PathBuf::from("/private/tmp/x/codex-home"),
+    }
+    .into();
+    let sweep = |observer: &mut StatusObserver, at: Instant| {
+        observer.observe(SESSION, &at_prompt, at);
+        due(
+            &mut observer.rollout_asked,
+            SESSION,
+            Some(target.clone()),
+            None,
+            (at, None),
+        )
+    };
+    let wait = ReadWait {
+        since: 9_000,
+        read_ms: 0,
+    };
+
+    assert_eq!(sweep(&mut observer, t0), Ask::Read(target.clone()));
+    assert_eq!(observer.next_wake(), None, "premise: nothing owed at rest");
+    let owed = t0 + RECHECK * 3;
+    observer.note_pair_wait(SESSION, Some((wait, owed)));
+    assert_eq!(observer.next_wake(), Some(owed), "the pair read is owed");
+    assert_eq!(
+        sweep(&mut observer, t0 + RECHECK / 2),
+        Ask::Nothing,
+        "premise: a sweep inside the recheck reads nothing"
+    );
+    assert_eq!(observer.next_wake(), Some(owed), "and leaves it owed");
+    assert_eq!(
+        sweep(&mut observer, t0 + RECHECK * 2),
+        Ask::Read(target.clone())
+    );
+    assert_eq!(
+        observer.next_wake(),
+        Some(owed),
+        "a read before its time leaves it owed"
+    );
+    observer.note_skipped(SESSION, owed);
+    assert_eq!(
+        observer.next_wake(),
+        Some(owed + interval),
+        "a sweep that skips it leaves it owed, at the slot's next gate"
+    );
+    assert_eq!(
+        sweep(&mut observer, owed + interval),
+        Ask::Read(target.clone())
+    );
+    assert_eq!(observer.next_wake(), None, "the read at it discharges it");
+    observer.note_pair_wait(SESSION, Some((wait, owed)));
+    assert_eq!(
+        observer.next_wake(),
+        None,
+        "that read failed: the same wait arms no wake"
+    );
 }
 
 #[test]

@@ -76,6 +76,133 @@ fn learn_keys_accounts_by_the_claims_email() {
     assert!(none.accounts.is_empty());
 }
 
+#[test]
+fn current_account_keys_follow_provider_identity_and_survive_a_relabel() {
+    let mut rows = roster();
+    rows.rows[1].identity_email = Some(" BoB@Example.INVALID \t".into());
+    let mut state = State::default();
+    for row in &rows.rows {
+        state.accounts.insert(row.label.clone(), Account::default());
+    }
+    learn_with(Cli::Claude, &rows, &mut state, &keyer);
+    for (row, expected) in rows.rows.iter().zip([ANN, BOB]) {
+        assert_eq!(
+            account_key_with(Cli::Claude, row, &keyer),
+            Key::new(expected)
+        );
+        assert_eq!(state.accounts[&row.label].pk.as_deref(), Some(expected));
+        let mut renamed = row.clone();
+        renamed.label = "renamed".into();
+        renamed.dir = Some("/synthetic/another-login-route".into());
+        assert_eq!(
+            account_key_with(Cli::Claude, &renamed, &keyer),
+            Key::new(expected),
+            "a local label and login path do not change the provider account"
+        );
+    }
+}
+
+#[test]
+fn current_account_keys_separate_kimi_regions_and_default_to_global() {
+    use crate::ai::connector::Region;
+
+    let mut row = Row {
+        label: "kimi".into(),
+        email: Some(" Ann@Example.INVALID \t".into()),
+        ..Row::default()
+    };
+    let observed = std::cell::RefCell::new(Vec::new());
+    let region_keyer = |realm: &str, email: &str| {
+        observed
+            .borrow_mut()
+            .push((realm.to_owned(), email.to_owned()));
+        match (realm, email) {
+            ("kimi:global", "ann@example.invalid") => Some(ANN.to_owned()),
+            ("kimi:mainland-cn", "ann@example.invalid") => Some(BOB.to_owned()),
+            _ => None,
+        }
+    };
+    for (region, expected) in [
+        (None, ANN),
+        (Some(Region::Global), ANN),
+        (Some(Region::MainlandCn), BOB),
+    ] {
+        row.vendor.region = region;
+        assert_eq!(
+            account_key_with(Cli::Kimi, &row, &region_keyer),
+            Key::new(expected)
+        );
+    }
+    assert_eq!(
+        observed.into_inner(),
+        ["kimi:global", "kimi:global", "kimi:mainland-cn"]
+            .map(|realm| (realm.to_owned(), "ann@example.invalid".to_owned()))
+    );
+}
+
+#[test]
+fn current_account_keys_require_identity_and_a_valid_keyer_result() {
+    let mut row = Row::default();
+    let must_not_key = |_: &str, _: &str| -> Option<String> {
+        panic!("an absent or invalid provider identity must not reach the keyer")
+    };
+    assert_eq!(account_key_with(Cli::Claude, &row, &must_not_key), None);
+    row.email = Some("ann@example.invalid".into());
+    for invalid in ["", " ", "not-an-address"] {
+        row.identity_email = Some(invalid.into());
+        assert_eq!(account_key_with(Cli::Claude, &row, &must_not_key), None);
+    }
+    row.identity_email = None;
+    assert_eq!(account_key_with(Cli::Claude, &row, &|_, _| None), None);
+    for invalid in [
+        "",
+        "not-a-key",
+        "ac-0123",
+        "ac-0123456789abcdeg",
+        "ac-0123456789ABCDEf",
+    ] {
+        assert_eq!(
+            account_key_with(Cli::Claude, &row, &|_, _| Some(invalid.to_owned())),
+            None,
+            "a keyer response is validated: {invalid:?}"
+        );
+    }
+}
+
+#[test]
+fn scoped_keyers_restore_the_previous_lookup_after_nesting_and_unwind() {
+    fn bob_keyer(_: &str, _: &str) -> Option<String> {
+        Some(BOB.to_owned())
+    }
+    fn no_keyer(_: &str, _: &str) -> Option<String> {
+        None
+    }
+
+    let row = roster().rows.remove(0);
+    let before = account_key(Cli::Claude, &row);
+    with_keyer(keyer, || {
+        assert_eq!(account_key(Cli::Claude, &row), Key::new(ANN));
+        with_keyer(bob_keyer, || {
+            assert_eq!(account_key(Cli::Claude, &row), Key::new(BOB));
+        });
+        assert_eq!(account_key(Cli::Claude, &row), Key::new(ANN));
+        let failed = std::panic::catch_unwind(|| {
+            with_keyer(no_keyer, || {
+                assert_eq!(account_key(Cli::Claude, &row), None);
+                panic!("unwind the inner keyer scope");
+            });
+        });
+        assert!(failed.is_err());
+        assert_eq!(account_key(Cli::Claude, &row), Key::new(ANN));
+    });
+    assert_eq!(account_key(Cli::Claude, &row), before);
+    let failed = std::panic::catch_unwind(|| {
+        with_keyer(bob_keyer, || panic!("unwind the outer keyer scope"));
+    });
+    assert!(failed.is_err());
+    assert_eq!(account_key(Cli::Claude, &row), before);
+}
+
 /// `observe` keys each ledger row by its account's learned key and maps its kind (design §8):
 /// a rotation is a switch naming the account rotated to, a sign-in row is `sign-in-failed`
 /// whatever its reason line says, an auth word is `signed-out` or `auth`, a sample is nothing;

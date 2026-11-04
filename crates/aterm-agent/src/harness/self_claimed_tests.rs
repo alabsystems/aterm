@@ -20,6 +20,7 @@ fn record(argv: &[&str], env: &[(&str, &str)]) -> Record {
         draft_empty: None,
         frame: None,
         goal: None,
+        background_terminals: None,
         initializing: false,
     }
 }
@@ -1128,6 +1129,87 @@ fn codex_auth_path_and_record_goal_round_trip_and_validate() {
         Some("Ship native protocol second line")
     );
     assert_eq!(read_record_goal(dir.path(), 4242, "other-thread"), None);
+}
+
+/// A record names its background terminals (`backgroundTerminals`, CONTRACT §4) as a JSON
+/// integer that fits a `u32`, or reads `None`; no form of that key ever makes [`parse`] refuse a
+/// record it would take without it, because a refusal turns a crash witness `Unreadable`.
+#[test]
+fn a_record_names_its_background_terminals_or_none_and_never_refuses_for_them() {
+    let counted = parse(r#"{"v":1,"pid":4242,"backgroundTerminals":2}"#).expect("a v1 record");
+    assert_eq!(counted.background_terminals, Some(2));
+    assert_eq!(
+        parse(r#"{"v":1,"pid":4242,"backgroundTerminals":0}"#).map(|r| r.background_terminals),
+        Ok(Some(0)),
+    );
+    assert_eq!(
+        parse(r#"{"v":1,"pid":4242,"backgroundTerminals":4294967295}"#)
+            .map(|r| r.background_terminals),
+        Ok(Some(u32::MAX)),
+    );
+    for text in [
+        r#"{"v":1,"pid":4242}"#,
+        r#"{"v":1,"pid":4242,"backgroundTerminals":null}"#,
+        r#"{"v":1,"pid":4242,"backgroundTerminals":"2"}"#,
+        r#"{"v":1,"pid":4242,"backgroundTerminals":-1}"#,
+        r#"{"v":1,"pid":4242,"backgroundTerminals":1.5}"#,
+        r#"{"v":1,"pid":4242,"backgroundTerminals":4294967296}"#,
+    ] {
+        let record = parse(text).unwrap_or_else(|why| panic!("{text} refused: {why}"));
+        assert_eq!(record.background_terminals, None, "{text}");
+        assert_eq!(record.pid, 4242, "{text}");
+    }
+}
+
+/// [`read_record_facts`] reads a live record's goal and background terminals together, and
+/// neither once the record names another thread, shows an exit, or is another pid's.
+#[test]
+fn read_record_facts_names_only_the_live_threads_goal_and_terminals() {
+    let dir = aterm_tempfile::TempDir::new().expect("dir");
+    let path = record_path(dir.path(), 4242);
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("sessions");
+    let write = |text: String| std::fs::write(&path, text).expect("write record");
+    let facts = || read_record_facts(dir.path(), 4242, UUID);
+
+    write(format!(
+        r#"{{"v":1,"pid":4242,"sessionId":"{UUID}","status":"idle","goal":"Ship it","backgroundTerminals":2}}"#
+    ));
+    assert_eq!(
+        facts(),
+        RecordFacts {
+            goal: Some("Ship it".to_string()),
+            background_terminals: Some(2),
+        }
+    );
+    assert_eq!(read_record_goal(dir.path(), 4242, UUID), facts().goal);
+    assert_eq!(
+        read_record_facts(dir.path(), 4242, "other-thread"),
+        RecordFacts::default(),
+        "another thread"
+    );
+
+    write(format!(
+        r#"{{"v":1,"pid":4242,"sessionId":"{UUID}","status":"exited","exit":"signal:15","goal":"Ship it","backgroundTerminals":2}}"#
+    ));
+    assert_eq!(facts(), RecordFacts::default(), "an exited record");
+
+    write(format!(
+        r#"{{"v":1,"pid":4243,"sessionId":"{UUID}","status":"idle","goal":"Ship it","backgroundTerminals":2}}"#
+    ));
+    assert_eq!(facts(), RecordFacts::default(), "another pid's record");
+
+    write(format!(
+        r#"{{"v":1,"pid":4242,"sessionId":"{UUID}","status":"idle","goal":"Ship it"}}"#
+    ));
+    assert_eq!(
+        facts(),
+        RecordFacts {
+            goal: Some("Ship it".to_string()),
+            background_terminals: None,
+        },
+        "an older build's record names no count"
+    );
+    assert_eq!(read_record_goal(dir.path(), 4242, UUID), facts().goal);
 }
 
 #[test]

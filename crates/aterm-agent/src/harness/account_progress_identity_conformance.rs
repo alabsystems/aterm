@@ -149,6 +149,7 @@ fn project(case: i64, fault: Fault) -> [(&'static str, i64); 9] {
         Fault::IgnoreIdentity => enrich_inventory(
             &mut progress,
             &roster,
+            &roster,
             &state,
             &logins,
             &enrolled,
@@ -157,6 +158,7 @@ fn project(case: i64, fault: Fault) -> [(&'static str, i64); 9] {
         ),
         Fault::None | Fault::UnknownBecomesZero => enrich_inventory_with_identity(
             &mut progress,
+            &roster,
             &roster,
             &state,
             &logins,

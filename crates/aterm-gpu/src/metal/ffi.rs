@@ -1097,9 +1097,8 @@ pub(crate) fn commit(cb: &Obj) {
 }
 
 /// `GPUStartTime` and `GPUEndTime` of `cb`, a live `MTLCommandBuffer`, in seconds on `mach_absolute_time`'s base (0 until it ran).
-#[cfg(any(test, feature = "compute"))]
 pub(crate) fn gpu_times(cb: Id) -> (f64, f64) {
-    // SAFETY: `GPUStartTime` and `GPUEndTime` are `CFTimeInterval` (double) getters on a live command buffer, which every caller holds (Metal passes it to the handler).
+    // SAFETY: `GPUStartTime` and `GPUEndTime` are `CFTimeInterval` (double) getters on a live command buffer, which every caller holds (Metal passes it to the compute job's handler; `Submitted::gpu_span` reads it through its own +1 reference).
     unsafe {
         let get: unsafe extern "C-unwind" fn(Id, Sel) -> f64 = checked_msg();
         (get(cb, sel(c"GPUStartTime")), get(cb, sel(c"GPUEndTime")))

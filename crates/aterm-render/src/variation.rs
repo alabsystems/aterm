@@ -464,7 +464,7 @@ impl<'a> VariedFace<'a> {
 #[inline]
 fn px_scale(face: &aterm_font::Face, px: f32) -> Option<f32> {
     let upem = f32::from(face.units_per_em());
-    (upem > 0.0 && px.is_finite() && px > 0.0).then(|| px / upem)
+    (upem > 0.0 && px.is_finite() && px > 0.0).then_some(px / upem)
 }
 
 /// Glyph `g`'s linear advance at `scale`: its `hmtx` advance (`HVAR` applied at the

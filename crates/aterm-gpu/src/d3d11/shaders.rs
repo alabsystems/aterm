@@ -5,13 +5,17 @@
 //! the compiler that turns one entry point of one twin into bytecode.
 //!
 //! The compiler is `D3DCompile` from `d3dcompiler_47.dll`, the FXC that
-//! wgpu's DX12 backend compiles naga's HLSL with when no DXC is installed
-//! (its default), loaded from System32 only, with the flags wgpu passes it:
-//! `ENABLE_STRICTNESS` always, and `DEBUG | SKIP_OPTIMIZATION` in a build
-//! with debug assertions (wgpu's `InstanceFlags::DEBUG`). The arm is held
-//! byte-identical to wgpu-dx12's recorded frames, and an optimizer that
-//! reorders a float expression on one side only breaks that, so the flags are
-//! the ones wgpu passed. Shader model 5.0: feature level 11_0's (wgpu asks FXC for 5.1,
+//! wgpu's DX12 backend compiled naga's HLSL with when no DXC was installed
+//! (its default), loaded from System32 only, with the flags wgpu passed it:
+//! `ENABLE_STRICTNESS` always ([`RELEASE_FLAGS`]), and `DEBUG |
+//! SKIP_OPTIMIZATION` in a build with debug assertions (wgpu's
+//! `InstanceFlags::DEBUG`). The arm is held to wgpu-dx12's recorded frames,
+//! and an optimizer that reorders a float expression on one side only breaks
+//! that, so the flags are the ones wgpu passed. A test build compiles with the
+//! debug pair, so a test also compiles every row with [`RELEASE_FLAGS`] and
+//! builds it (`every_table_row_compiles_and_builds_with_the_release_flags`):
+//! FXC's optimizer refusing a twin fails there, not in a shipped build's first
+//! window. Shader model 5.0: feature level 11_0's (wgpu asked FXC for 5.1,
 //! which D3D11 cannot load; the two compile the same arithmetic).
 //!
 //! Bytecode is cached per process by (library, entry point, stage): a second
@@ -60,11 +64,15 @@ impl Stage {
     }
 }
 
-/// The flags every compile passes (see the module header).
+/// The flags a shipped build compiles with (see the module header).
+pub(crate) const RELEASE_FLAGS: u32 = d3d::D3DCOMPILE_ENABLE_STRICTNESS;
+
+/// The flags every compile in this build passes: [`RELEASE_FLAGS`], and with debug assertions
+/// `DEBUG | SKIP_OPTIMIZATION` too (see the module header).
 pub(crate) const FLAGS: u32 = if cfg!(debug_assertions) {
-    d3d::D3DCOMPILE_ENABLE_STRICTNESS | d3d::D3DCOMPILE_DEBUG | d3d::D3DCOMPILE_SKIP_OPTIMIZATION
+    RELEASE_FLAGS | d3d::D3DCOMPILE_DEBUG | d3d::D3DCOMPILE_SKIP_OPTIMIZATION
 } else {
-    d3d::D3DCOMPILE_ENABLE_STRICTNESS
+    RELEASE_FLAGS
 };
 
 /// `D3DCompile`'s signature (aterm-win32's `pD3DCompile`, unwrapped).
@@ -128,12 +136,14 @@ fn blob_bytes(blob: &Com) -> &[u8] {
     }
 }
 
-/// Compile `src`'s `entry` for `stage`; `Err` carries the compiler's log.
+/// Compile `src`'s `entry` for `stage` with `flags` ([`FLAGS`] in this build's own compiles);
+/// `Err` carries the compiler's log.
 pub(crate) fn compile_source(
     src: &str,
     file: &str,
     entry: &str,
     stage: Stage,
+    flags: u32,
 ) -> Result<Vec<u8>, String> {
     let compile = compiler()?;
     let file_c = CString::new(file).map_err(|_| format!("d3d11: a NUL in {file:?}"))?;
@@ -151,7 +161,7 @@ pub(crate) fn compile_source(
             std::ptr::null_mut(),
             entry_c.as_ptr().cast(),
             stage.target().as_ptr(),
-            FLAGS,
+            flags,
             0,
             &mut code,
             &mut errors,
@@ -179,7 +189,7 @@ pub(crate) fn compile_source(
 
 /// The library's file name in a compiler message.
 #[inline]
-const fn file_name(library: ShaderLibrary) -> &'static str {
+pub(crate) const fn file_name(library: ShaderLibrary) -> &'static str {
     match library {
         ShaderLibrary::Cell => "cell.hlsl",
         ShaderLibrary::Blit => "blit.hlsl",
@@ -211,7 +221,8 @@ pub(crate) fn bytecode(
     }
     // Compiled outside the lock: two threads may compile one entry point
     // once each, and the second insert keeps the first's bytes.
-    let code: Arc<[u8]> = compile_source(source(library), file_name(library), entry, stage)?.into();
+    let code: Arc<[u8]> =
+        compile_source(source(library), file_name(library), entry, stage, FLAGS)?.into();
     let mut cache = CACHE
         .lock()
         .map_err(|_| "d3d11: the shader cache is poisoned".to_owned())?;

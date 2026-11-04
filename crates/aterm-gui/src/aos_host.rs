@@ -53,18 +53,19 @@ pub(crate) const REPAIR_THREAD: &str = "aterm-aos-repair";
 /// The watcher's host worker thread's name.
 pub(crate) const WATCH_THREAD: &str = "aterm-aos-watch";
 
-/// Why a typed key may expose a secret if recorded, or `None` when aterm sees it go where it is echoed (the tty echoes it, or it is typed at an open prompt of aterm's own shell); `echo` reads the tty only when that decides. A [`RAW_KEY`] is held for the proof of its own echo ([`echo::admit_key`]).
+/// Why a typed key may expose a secret if recorded, or `None` when it cannot expose a secret's character: aterm sees it go where it is echoed (the tty echoes it, or it is typed at an open prompt of aterm's own shell), or it carries no text (`bare`: the press sends no character). A tty that swallows input and Secure Keyboard Entry name it private all the same; `echo` reads the tty only when that decides. A [`RAW_KEY`] is held for the proof of its own echo ([`echo::admit_key`]).
 pub(crate) fn key_privacy(
     swallows: bool,
     secure: bool,
     at_prompt: bool,
+    bare: bool,
     echo: impl FnOnce() -> Option<aterm_pty::TtyEcho>,
 ) -> Option<&'static str> {
     if swallows {
         Some(NO_ECHO_KEY)
     } else if secure {
         Some(SECURE_ENTRY)
-    } else if at_prompt || echo().is_some_and(|e| e.echo) {
+    } else if at_prompt || bare || echo().is_some_and(|e| e.echo) {
         None
     } else {
         Some(RAW_KEY)

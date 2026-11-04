@@ -751,9 +751,8 @@ mod tests {
         let id = Identity::for_self(IdentityPolicy::Designated).expect("own requirement");
         let exe = std::env::current_exe().expect("test binary");
         answered(id.admits_code_at(&exe)).expect("this binary meets its own requirement");
-        let dir = std::env::temp_dir().join(format!("akcode-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("dir");
-        let copy = dir.join("copy");
+        let scratch = crate::test_scratch_dir("code");
+        let copy = scratch.path().join("copy");
         std::fs::copy(&exe, &copy).expect("copy");
         answered(id.admits_code_at(&copy)).expect("a byte-for-byte copy is the same code");
         let other = answered(id.admits_code_at(Path::new("/usr/bin/true")));
@@ -767,7 +766,6 @@ mod tests {
         Identity::same_uid()
             .admits_code_at(Path::new("/usr/bin/true"))
             .expect("the floor checks no code");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -813,24 +811,20 @@ mod tests {
             matches!(refused, Err(CheckError::Refused(_))),
             "this test binary met /usr/bin/true's requirement: {refused:?}"
         );
-        let dir = std::env::temp_dir().join(format!("akunsigned-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("dir");
-        let unsigned = dir.join("script");
+        let scratch = crate::test_scratch_dir("unsigned");
+        let unsigned = scratch.path().join("script");
         std::fs::write(&unsigned, "#!/bin/sh\nexit 0\n").expect("write");
         assert!(
             Identity::for_code_at(&unsigned).is_err(),
             "an unsigned file has no designated requirement"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn another_program_fails_the_designated_check() {
         aterm_uds::deadline::require_trust_service();
-        let dir = std::env::temp_dir().join(format!("akid-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("dir");
-        let path = dir.join("s");
-        let _ = std::fs::remove_file(&path);
+        let scratch = crate::test_scratch_dir("id");
+        let path = scratch.path().join("s");
         let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
         let mut nc = aterm_uds::spawnfd::command("/usr/bin/nc")
             .arg("-U")
@@ -852,6 +846,5 @@ mod tests {
             .expect("nc is our uid");
         let _ = nc.kill();
         let _ = nc.wait();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

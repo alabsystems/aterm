@@ -40,7 +40,11 @@ pub(super) fn read(path: &Path, uid: u32, max: usize, private: bool) -> io::Resu
         if metadata.len() > max as u64 {
             return Err(io::ErrorKind::InvalidData.into());
         }
-        let mut bytes = Vec::new();
+        let cap = usize::try_from(metadata.len())
+            .unwrap_or(0)
+            .min(max)
+            .saturating_add(1);
+        let mut bytes = Vec::with_capacity(cap);
         file.take(bound as u64).read_to_end(&mut bytes)?;
         if bytes.len() > max {
             return Err(io::ErrorKind::InvalidData.into());

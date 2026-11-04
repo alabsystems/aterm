@@ -324,7 +324,7 @@ impl Loop<'_> {
         if let Some(p) = self.s.person.as_mut() {
             back(p);
         }
-        if let Some((_, p)) = self.s.draft_seen.as_mut() {
+        if let Some((_, p, _)) = self.s.draft_seen.as_mut() {
             back(p);
         }
         self.s.clock_marks = Some((self.s.fx.mono(), self.s.now_unix_ms()));
@@ -668,8 +668,6 @@ fn run_first(sc: &Scenario, dir: &Path) -> First {
     );
     let opts = opts_for(sc, host.as_ref());
     let mut m = Mock::new(vec![Vec::new()]);
-    // The only text a composer here holds is a line typed.
-    m.cell_attrs = "none";
     let mut l = Loop {
         s: session(&mut m, Some(SID.to_string())),
         opts,
@@ -1028,8 +1026,6 @@ fn run_follower_cut(
     let host = host_for(sc, &["relaunched"], tail);
     let opts = opts_for(sc, host.as_ref());
     let mut m = Mock::new(vec![Vec::new()]);
-    // The only text a composer here holds is a line typed.
-    m.cell_attrs = "none";
     let mut l = Loop {
         s: session(&mut m, Some(SID.to_string())),
         opts,
@@ -7677,6 +7673,37 @@ fn restored_cells(sc: &Scenario, i: usize, noted: bool, owed: bool) -> (usize, V
     (cells, broken)
 }
 
+/// The scenarios [`a_loop_in_a_tab_a_cold_restore_reopened_types_as_the_first_loop_at_every_handoff`]
+/// restores. What a restore adds is the seed's head: the earlier tab's books re-signed under the
+/// new sid ([`approvals::books_through`], which reads a row only for its sid and its lead time)
+/// and the note beside the new ledger. Past that head the loop is the one every other seed runs,
+/// and the first matrix ([`a_loop_that_follows_types_as_the_first_loop_at_every_handoff`]) holds
+/// post-seed behaviour over all the scenarios, so this list is enough only while that matrix keeps
+/// them all: it may not shrink if that one does. These hold every ledger row's shape and every
+/// journal kind any scenario writes, `/clear`'s rows among them, and each control's scenario.
+/// What it gives up: a restore-only seed defect that depends on a sequence of rows or on how many
+/// there are, not a row's shape, and shows only in a scenario outside this list (the longest books,
+/// `API 5xx met again at every rung`, are outside it). Open in both forms: nothing fails with
+/// `lefts_of` given no earlier ledgers, so that branch of the restored seed is held by no test.
+const RESTORED_SCENARIOS: [&str; 16] = [
+    "RS8-F3 short turns in a row to the ladder's top",
+    "D spend (met again, the ladder)",
+    "D spend (met again, a /clear, a new task meets it)",
+    "R2 Land, the landing spent",
+    "R4 Off lifts after the landing (Land, in words)",
+    "J bucket, the fallback (wait:resume thrice, the redraw)",
+    "the done check's turn meets a full context",
+    "R2 in the limit's place: the reversible answer",
+    "J bucket, the fallback (relaunched, a person's prompt met by the bucket)",
+    "KI1016-P6 the act's answer Esc'd, then a person's exchange (the Esc no key)",
+    "O Opus bucket, no reset (take window: the try taken, its own 3h turn ends on it)",
+    "M mixed (the spend try met by the five-hour window)",
+    "R2 in the limit's place: Land: the land answer",
+    "RS9-F4 Land, the land act answered not done, then a done report (a person's hand)",
+    "Land's instruction meets a full context, defended, take window",
+    "API 529 met again twice, a retry's short work meets it",
+];
+
 #[test]
 fn a_loop_in_a_tab_a_cold_restore_reopened_types_as_the_first_loop_at_every_handoff() {
     let run = |scenarios: &[Scenario], noted: bool, owed: bool| {
@@ -7690,9 +7717,25 @@ fn a_loop_in_a_tab_a_cold_restore_reopened_types_as_the_first_loop_at_every_hand
             (c + c1, b)
         })
     };
-    let all = scenarios();
+    // A renamed scenario drops out of the list loudly; these two hold the journal's catch and
+    // the SOONER control.
+    let all: Vec<Scenario> = scenarios()
+        .into_iter()
+        .filter(|sc| RESTORED_SCENARIOS.contains(&sc.name.as_str()))
+        .collect();
+    assert_eq!(
+        all.len(),
+        RESTORED_SCENARIOS.len(),
+        "the restored matrix's scenarios"
+    );
+    for held in [
+        "R4 Off lifts after the landing (Land, in words)",
+        "D spend (met again, the ladder)",
+    ] {
+        assert!(RESTORED_SCENARIOS.contains(&held), "{held} is restored");
+    }
     let (cells, broken) = run(&all, true, false);
-    assert!(cells > 500, "{cells} cells");
+    assert!(cells > 300, "{cells} cells");
     assert!(
         broken.is_empty(),
         "{} of {cells} cells break the rule:\n{}",

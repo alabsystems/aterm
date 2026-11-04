@@ -1479,6 +1479,78 @@ fn a_ctl_turn_never_leaves_a_settle_for_the_loop() {
     assert_eq!(g.slog_wake(), None, "…and the resting turn closed");
 }
 
+/// THE LOOP HANDS A HARNESS READ WAIT TO THE ROLLOUT ASK (gap 25, [`crate::App::on_session_log_moved`],
+/// [`crate::App::tick_session_logs`]): a log move and a settle tick each hand the codex run's read
+/// wait to the session's rollout ask, which then owes a read at the wait's time; a move that finds
+/// no wait clears it.
+#[test]
+fn the_loop_hands_a_harness_read_wait_to_the_rollout_ask() {
+    let mut app = crate::App::headless_for_test();
+    let timeline = app.pool.get(0).expect("session").ctx.timeline.clone();
+    timeline.lock().unwrap().note_root_group(100);
+    with_agent(&timeline, "codex");
+    let target: crate::self_claim::TapTarget = crate::self_claim::RolloutTarget {
+        revision: 1,
+        pid: 4242,
+        start: "Mon Oct 20 16:37:58 2026".to_string(),
+        thread: "019a0000-0000-7000-8000-000000000010".to_string(),
+        home: std::path::PathBuf::from("/private/tmp/x/codex-home"),
+    }
+    .into();
+    let t0 = std::time::Instant::now();
+    let _ = crate::codex_rollout_tap::due(
+        &mut app.session_status.rollout_asked,
+        0,
+        Some(target),
+        None,
+        (t0, None),
+    );
+    let wait = |read_ms: u64| {
+        let mut g = timeline.lock().unwrap();
+        let since = g.slog().now().wall_ms + 3_000;
+        g.slog_mut()
+            .agent
+            .as_mut()
+            .expect("the codex run")
+            .pairs
+            .wait = Some(transcript::ReadWait { since, read_ms });
+    };
+    let pair = |app: &crate::App| {
+        app.session_status
+            .rollout_asked
+            .get(&0)
+            .and_then(|a| a.pair)
+    };
+    let owed = |app: &crate::App| {
+        pair(app).is_some_and(|at| {
+            at >= t0 + std::time::Duration::from_millis(2_900)
+                && at <= std::time::Instant::now() + std::time::Duration::from_secs(3)
+        })
+    };
+    wait(0);
+    app.on_session_log_moved(0);
+    assert!(
+        owed(&app),
+        "a log move hands the wait over: {:?}",
+        pair(&app)
+    );
+    timeline
+        .lock()
+        .unwrap()
+        .slog_mut()
+        .agent
+        .as_mut()
+        .expect("the codex run")
+        .pairs
+        .wait = None;
+    app.on_session_log_moved(0);
+    assert_eq!(pair(&app), None, "a move with no wait clears it");
+    wait(1);
+    app.session_status.slog_wakes.note(0, Some(0));
+    app.tick_session_logs();
+    assert!(owed(&app), "a tick hands the wait over: {:?}", pair(&app));
+}
+
 #[test]
 fn an_idle_session_arms_nothing_and_a_pending_settle_is_ticked() {
     let mut app = crate::App::headless_for_test();
@@ -4970,6 +5042,84 @@ fn an_agent_mid_turn_stays_in_its_turn_across_an_update() {
     }
 }
 
+/// A STANDING CODEX BOX RIDES AN UPDATE (GAP 26, `program-claimed-boxes`): a codex run's claimed
+/// box step standing when the handoff worker takes the log is still open in the successor once
+/// it adopted the carry (its reconcile holds the claim step as it holds the turn), and the
+/// successor's next `blocked` on a permission, under another began, adopts it: no second open,
+/// and the next `working` is its leave, `out=passed`. A reconcile that holds no claim step
+/// closes it `out=gone` at the adoption, and the next box opens `p2`.
+#[test]
+fn a_standing_codex_box_rides_an_update() {
+    use aterm_core::terminal::program_state::{
+        ProgramApp, ProgramBlockedKind, ProgramState, ProgramStateWord as W,
+    };
+    let shown = |state, kind| {
+        Some(ProgramState {
+            state,
+            kind,
+            app: ProgramApp::Codex,
+        })
+    };
+    let permission = Some(ProgramBlockedKind::Permission);
+    let (p, store, hand) = producer();
+    {
+        let mut g = p.ctx.timeline.lock().unwrap();
+        hand.set(10);
+        assert!(g.note_foreground_group(300));
+        assert!(g.set_program(300, Some("codex".into())));
+        swept(&mut g);
+        hand.set(1_000);
+        g.note_program_state(shown(W::Working, None), 10);
+        hand.set(1_100);
+        g.note_program_state(shown(W::Blocked, permission), 11);
+    }
+    let p1 = p
+        .ctx
+        .timeline
+        .lock()
+        .unwrap()
+        .slog()
+        .codex_claim_step()
+        .expect("PRECONDITION: the box's claimed step stands");
+    let steps = |tl: &Mutex<SessionTimeline>| -> Vec<String> {
+        lines_of(tl)
+            .into_iter()
+            .filter(|l| l.contains(" approval "))
+            .collect()
+    };
+    let (s, _store2, hand2) = hand_over(&p, &store, 2_000, true);
+    let adopted = steps(&s.ctx.timeline);
+    assert!(
+        adopted.len() == 1 && adopted[0].contains(&format!(" open {p1} approval ")),
+        "the carried step, still open: {adopted:#?}"
+    );
+    assert_eq!(
+        s.ctx.timeline.lock().unwrap().slog().codex_claim_step(),
+        Some(p1),
+        "the successor's tracker holds it"
+    );
+    {
+        let mut g = s.ctx.timeline.lock().unwrap();
+        successors_first_sweep(&mut g, "codex");
+        hand2.set(100);
+        g.note_program_state(shown(W::Blocked, permission), 99);
+        assert_eq!(
+            g.slog().codex_claim_step(),
+            Some(p1),
+            "a box of its kind adopts it"
+        );
+        hand2.set(200);
+        g.note_program_state(shown(W::Working, None), 100);
+    }
+    let got = steps(&s.ctx.timeline);
+    assert!(
+        got.len() == 2
+            && got[1].contains(&format!(" close {p1} approval out=passed "))
+            && got[1].contains(" src=engine conf=claim "),
+        "no second open, and the leave closes it: {got:#?}"
+    );
+}
+
 /// A MAIL ITS BRIDGE OFFERS AGAIN AFTER A SEAMLESS UPDATE IS MARKED ONCE
 /// (6G-4's latch finding, found live by `lab seamless`). The predecessor
 /// marks a task mail's delivery. The update carries the log but not the
@@ -6422,6 +6572,7 @@ fn the_always_present_host_lines_fit_the_carry_at_their_worst() {
         who,
         by_screen: true,
         tracker: TurnTracker::from_carry_line(&worst, now).expect("the worst line reads"),
+        pairs: transcript::HarnessPairs::default(),
     });
     s.typed = Typed {
         input: Some((max, Actor::sid(sid), Some(sid), now)),

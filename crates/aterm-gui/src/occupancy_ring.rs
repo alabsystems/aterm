@@ -35,7 +35,7 @@ pub(crate) fn read_ring_text(path: &Path) -> std::io::Result<String> {
             "occupancy ring is not a bounded regular file",
         ));
     }
-    let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
     file.take(MAX_RING_BYTES + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_RING_BYTES {
         return Err(std::io::Error::new(

@@ -119,13 +119,14 @@ fn regular_len(path: &Path) -> Option<u64> {
 /// The last `tail` bytes of the regular file `path` as text, the partial first
 /// line of a cut dropped; `None` when it is not a regular file or unreadable.
 fn read_tail(path: &Path, tail: u64) -> Option<String> {
-    let mut file = crate::logging::open_regular_nonblock(path).ok()?;
-    let bytes = file.metadata().ok()?.len();
+    let (mut file, meta) = crate::logging::open_regular_nonblock_with_meta(path).ok()?;
+    let bytes = meta.len();
     let partial = bytes > tail;
     if partial {
         file.seek(SeekFrom::Start(bytes - tail)).ok()?;
     }
-    let mut buf = Vec::with_capacity(usize::try_from(tail.min(bytes)).unwrap_or(0));
+    let cap = usize::try_from(tail.min(bytes).saturating_add(1)).unwrap_or(0);
+    let mut buf = Vec::with_capacity(cap);
     (&mut file).take(tail).read_to_end(&mut buf).ok()?;
     let text = String::from_utf8_lossy(&buf).into_owned();
     Some(if partial {

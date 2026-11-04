@@ -35,11 +35,35 @@ pub struct Inventory(pub Digest);
 /// What [`Registry::lab`] read.
 #[derive(Clone, Debug)]
 pub enum LabRead {
+    /// This Mac's history of the registry still waits on a record (an operation whose
+    /// predecessor or parent has not arrived, or a sealed table's new generation before its cover
+    /// row): its rows are not all here yet, so this says nothing of the lab and the caller keeps
+    /// what it holds.
+    Partial,
     /// The registry's operations are the ones the caller's view was projected from: nothing is
     /// projected again.
     Unchanged,
     /// The view of the registry as it is now, and the inventory it was projected from.
     Projected(Box<LabView>, Inventory),
+}
+
+/// What one read of the registry gives the harness ([`Registry::lab`]): a partial history where
+/// it is not `complete`, nothing new where its operations' `inventory` is the caller's `held`,
+/// else the view `project` makes of it. Each is read only where it decides.
+pub(super) fn lab_read(
+    complete: bool,
+    inventory: impl FnOnce() -> Inventory,
+    held: Option<Inventory>,
+    project: impl FnOnce() -> LabView,
+) -> LabRead {
+    if !complete {
+        return LabRead::Partial;
+    }
+    let inventory = inventory();
+    if held == Some(inventory) {
+        return LabRead::Unchanged;
+    }
+    LabRead::Projected(Box::new(project()), inventory)
 }
 
 /// The declaration of the registry generation `compiled`.
@@ -520,11 +544,11 @@ impl Registry {
 
     /// The registry as the harness reads it ([`LabView`]), with the inventory it was projected
     /// from, as an observer that writes nothing: `None` where there is no Commons, `[commons]`
-    /// excludes the registry or the catalog, the registry is not declared here, or this Mac's
-    /// history of it still waits on a record (a partial history reads as rows that are not there
-    /// yet). Where the registry's inventory is still `held`, the one the caller's view was
-    /// projected from, it reads the log and its view to learn so and projects nothing
-    /// ([`LabRead::Unchanged`]).
+    /// excludes the registry or the catalog, or the registry is not declared here, and
+    /// [`LabRead::Partial`] where this Mac's history of it still waits on a record (a partial
+    /// history reads as rows that are not there yet). Where the registry's inventory is still
+    /// `held`, the one the caller's view was projected from, it reads the log and its view to
+    /// learn so and projects nothing ([`LabRead::Unchanged`]).
     ///
     /// # Errors
     /// This Mac's custody, its `[commons]` policy or the registry's storage cannot be read.
@@ -539,31 +563,29 @@ impl Registry {
             |session, store, scope| {
                 let log = Log::read_with(session, store, scope, decode)?;
                 let view = View::read(compiled.table, session, &log);
-                if !view.complete {
-                    return Ok(None);
-                }
-                let ids: BTreeSet<Digest> = view.ops.iter().map(|op| op.id).collect();
-                let inventory = Inventory(crate::replica::InventorySummary::of(&ids).fingerprint);
-                if held == Some(inventory) {
-                    return Ok(Some(LabRead::Unchanged));
-                }
-                let actor = session.actor();
-                let uuid = session
-                    .members()
-                    .iter()
-                    .find(|binding| binding.actor() == actor)
-                    .map(|binding| keys::uuid32(binding.machine()));
-                let owned = |name: &str| view.owned.get(name).cloned().unwrap_or_default();
-                let lab = LabView::read(
-                    &view.cells,
-                    &owned(MACHINE_FACTS.name),
-                    &owned(MAILBOX_OBS.name),
-                    uuid.as_deref(),
-                );
-                Ok(Some(LabRead::Projected(Box::new(lab), inventory)))
+                let inventory = || {
+                    let ids: BTreeSet<Digest> = view.ops.iter().map(|op| op.id).collect();
+                    Inventory(crate::replica::InventorySummary::of(&ids).fingerprint)
+                };
+                let project = || {
+                    let actor = session.actor();
+                    let uuid = session
+                        .members()
+                        .iter()
+                        .find(|binding| binding.actor() == actor)
+                        .map(|binding| keys::uuid32(binding.machine()));
+                    let owned = |name: &str| view.owned.get(name).cloned().unwrap_or_default();
+                    LabView::read(
+                        &view.cells,
+                        &owned(MACHINE_FACTS.name),
+                        &owned(MAILBOX_OBS.name),
+                        uuid.as_deref(),
+                    )
+                };
+                Ok(lab_read(view.complete, inventory, held, project))
             },
         )?;
-        Ok(seen.flatten())
+        Ok(seen)
     }
 
     /// What every pass reads first: this Mac's trust, or the outcome that ends the pass, when

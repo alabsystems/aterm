@@ -49,7 +49,16 @@ pub fn decode_records(bytes: &[u8]) -> Result<Vec<Record>> {
     decode_records_bounded(bytes, MAX_HELD_RECORDS)
 }
 
-pub(crate) fn decode_records_bounded(bytes: &[u8], record_limit: usize) -> Result<Vec<Record>> {
+/// [`decode_records`] of a stream that holds at most `record_limit` records, refused whole past
+/// them before the record past them is verified: a records file under the held budget of the
+/// store that reads it ([`Store::recovering`]), a member's join bundle within what both sides
+/// hold (`client::admit`), or a witness only a build before the fence could have sent, which
+/// holds at most [`super::LEGACY_RECORDS`] whatever this build holds.
+///
+/// # Errors
+/// `bytes` exceeds [`MAX_RECORDS_STREAM`], holds more than `record_limit` records, or contains a
+/// malformed or invalidly signed record.
+pub fn decode_records_bounded(bytes: &[u8], record_limit: usize) -> Result<Vec<Record>> {
     if bytes.len() > MAX_RECORDS_STREAM {
         return Err(Error::new("membership record stream is too large"));
     }
@@ -1084,6 +1093,14 @@ mod tests {
     /// `make_room` leaves the counter high) fails "waiting bytes after make_room".
     #[test]
     fn log_byte_counters_match_their_sums() {
+        RecordBudgets {
+            held: MAX_WAITING,
+            ..RecordBudgets::PRODUCTION
+        }
+        .within(byte_counters_at_a_full_held_store);
+    }
+
+    fn byte_counters_at_a_full_held_store() {
         let (w1, inc1, m1, e1) = entrant(1, "m1");
         let (_, _, _, e2) = entrant(2, "m2");
         // A founder's key: only a seated signer's record waits for its parents.
@@ -1150,7 +1167,7 @@ mod tests {
 
         let mut store = Store::with_compiled(Some(*genesis.id()));
         store.insert(genesis.clone()).expect("genesis");
-        for i in 0..MAX_HELD_RECORDS - 1 {
+        for i in 0..MAX_WAITING - 1 {
             store.insert(waiting(i)).expect("room to wait");
         }
         assert_counters(store.log().expect("log"), "filling the store");
@@ -1175,7 +1192,7 @@ mod tests {
         let log = store.log().expect("log");
         assert_eq!(
             log.order.len() + log.waiting.len(),
-            MAX_HELD_RECORDS,
+            MAX_WAITING,
             "make_room let one go"
         );
         assert_counters(log, "make_room");
@@ -1307,6 +1324,23 @@ mod tests {
         }
         .sign(&[tag; 32], [tag; 16])
         .expect("signed")
+    }
+
+    /// A stream read with a bound of its own is refused whole past that bound, wherever the held
+    /// bound stands.
+    ///
+    /// NEGATIVE CONTROL (in the test): the same stream within the bound, and with the held bound,
+    /// decodes.
+    #[test]
+    fn a_stream_bound_of_its_own_refuses_past_it() {
+        let records: Vec<Record> = (0..5).map(|i| unseated([0x55; 32], 0xEE, i)).collect();
+        let stream = encode_records(&records);
+        assert_eq!(decode_records(&stream).expect("held bound").len(), 5);
+        assert_eq!(
+            decode_records_bounded(&stream, 5).expect("its bound").len(),
+            5
+        );
+        assert!(decode_records_bounded(&stream, 4).is_err());
     }
 
     #[test]
@@ -1627,6 +1661,14 @@ mod tests {
 
     #[test]
     fn records_missing_a_parent_never_shut_out_the_genesis_or_a_record_whose_parents_are_held() {
+        RecordBudgets {
+            held: MAX_WAITING,
+            ..RecordBudgets::PRODUCTION
+        }
+        .within(missing_parents_at_a_full_held_store);
+    }
+
+    fn missing_parents_at_a_full_held_store() {
         let (w1, inc1, m1, e1) = entrant(1, "m1");
         let (_, _, _, e2) = entrant(2, "m2");
         // A founder's key, so its records wait in a store's log: a Mac removed later keeps its
@@ -1686,7 +1728,7 @@ mod tests {
                     .expect("a record whose parents are held finds room")
             );
             assert!(store.log().expect("rooted").get(admit_two.id()).is_some());
-            assert_eq!(store.len(), MAX_HELD_RECORDS);
+            assert_eq!(store.len(), MAX_WAITING);
             assert!(
                 store.insert(extra.clone()).is_err(),
                 "a record missing a parent finds no room in a full store"

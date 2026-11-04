@@ -232,8 +232,7 @@ impl FabricRunner for ChildRunner {
 /// `aterm fabric on`'s attach) or configured (`[fabric] command`).
 #[cfg(all(not(test), unix))]
 fn bridge_named() -> bool {
-    let s = crate::fabric_launch::status();
-    s.armed.is_some() || s.configured.is_some()
+    crate::fabric_launch::status().names_a_command()
 }
 
 /// Off unix there is no bridge.

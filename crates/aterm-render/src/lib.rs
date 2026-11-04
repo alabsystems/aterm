@@ -87,6 +87,9 @@ mod hinted;
 #[cfg(any(test, debug_assertions))]
 #[doc(hidden)]
 pub mod legacy_sprite_oracle;
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub mod letter_judge;
 pub mod ligature_shaping;
 pub mod procedural;
 /// The scanline signed-area coverage rasterizer every outline fill in this crate uses.
@@ -24861,13 +24864,8 @@ mod tests {
             1u64 << i.expect("a supplement probe")
         };
         let (armenian, georgian) = ('\u{0531}', '\u{10D0}');
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-script-census-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("DejaVuSansMono.ttf");
+        let scratch = crate::test_scratch_dir("script-census");
+        let path = scratch.path().join("DejaVuSansMono.ttf");
         std::fs::write(&path, embedded_font()).unwrap();
         take_script_censuses();
 
@@ -24953,7 +24951,6 @@ mod tests {
             ),
             "a counted face's facts must not depend on which other probes are missing"
         );
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -25004,27 +25001,21 @@ mod tests {
             vec![None, None],
             "both entries are user-supplied"
         );
-        let present = std::env::temp_dir().join(format!(
-            "aterm-relocation-present-probe-{}.ttf",
-            std::process::id()
-        ));
+        let scratch = crate::test_scratch_dir("relocation-present");
+        let present = scratch.path().join("probe.ttf");
         std::fs::write(&present, b"present").unwrap();
         let paths = vec![present.to_str().unwrap().to_string()];
         assert_eq!(relocate_missing_builtin_fonts(&paths, 0), vec![None]);
-        let _ = std::fs::remove_file(present);
     }
 
     #[cfg(feature = "embedded-font")]
     #[test]
     fn a_relocated_text_only_backstop_keeps_its_gate() {
         let backstop = SYMBOL_TIER_TEXT_ONLY_BACKSTOPS[0];
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-relocated-backstop-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let elsewhere = dir.join(std::path::Path::new(backstop).file_name().unwrap());
+        let scratch = crate::test_scratch_dir("relocated-backstop");
+        let elsewhere = scratch
+            .path()
+            .join(std::path::Path::new(backstop).file_name().unwrap());
         std::fs::write(&elsewhere, embedded_font()).unwrap();
         let elsewhere = elsewhere.to_str().unwrap().to_string();
 
@@ -25039,7 +25030,6 @@ mod tests {
         let plain = admit_chain_face(&elsewhere, None).expect("admissible");
         assert_eq!(plain.relocated_from, None);
         assert!(!symbol_face_is_text_only_backstop(&plain));
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -26744,10 +26734,8 @@ mod tests {
             None,
             "precondition: the primary face must not cover the noncharacter"
         );
-        let path = std::env::temp_dir().join(format!(
-            "aterm-test-lazy-fallback-{}.ttf",
-            std::process::id()
-        ));
+        let scratch = crate::test_scratch_dir("lazy-fallback");
+        let path = scratch.path().join("lazy-fallback.ttf");
         std::fs::write(&path, embedded_font()).expect("temp font written");
         r.fallback_paths = vec![path.to_string_lossy().into_owned()];
         let epoch0 = r.font_epoch;
@@ -26786,7 +26774,6 @@ mod tests {
                 .contains_key(&(UNCOVERED, ScalarPresentation::Default)),
             "the post-landing resolution is final and memoized"
         );
-        let _ = std::fs::remove_file(&path);
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -31202,14 +31189,8 @@ mod tests {
     #[cfg(feature = "embedded-font")]
     #[test]
     fn sealed_generation_rebuilds_after_all_source_paths_disappear() {
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-admitted-font-rebuild-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create font fixture directory");
-        let path = dir.join("PreparedMono-Regular.ttf");
+        let scratch = crate::test_scratch_dir("admitted-font-rebuild");
+        let path = scratch.path().join("PreparedMono-Regular.ttf");
         std::fs::write(&path, embedded_font()).expect("write admitted primary fixture");
 
         let theme = Theme::default();
@@ -31259,7 +31240,8 @@ mod tests {
                 .is_some_and(|head| head.bytes.bytes() == embedded_font())
         );
 
-        std::fs::remove_dir_all(&dir).expect("remove every source pathname");
+        std::fs::remove_dir_all(scratch.path()).expect("remove every source pathname");
+        drop(scratch);
         let rebuilt = renderer
             .rebuild_from_admitted(24.0, theme)
             .expect("sealed rebuild uses retained bytes only");
@@ -33725,5 +33707,34 @@ mod emoji_oracle {
                 && has_gold,
             "all four family members ink inside the shared cell box"
         );
+    }
+}
+
+/// Creates a `.noindex` scratch directory for tests with a short UTF-8-safe prefix.
+#[cfg(test)]
+pub(crate) fn test_scratch_dir(tag: &str) -> aterm_tempfile::TempDir {
+    let end = tag.floor_char_boundary(24);
+    let prefix = format!("aterm-render-{}-", &tag[..end]);
+    aterm_tempfile::Builder::new()
+        .prefix(&prefix)
+        .suffix(".noindex")
+        .tempdir()
+        .expect("create .noindex scratch dir")
+}
+
+#[cfg(test)]
+mod test_scratch_tests {
+    /// NEGATIVE CONTROL: multi-byte UTF-8 tags straddling byte 24 must truncate at a valid char
+    /// boundary without panicking and preserve the `.noindex` Spotlight-exclusion suffix.
+    #[test]
+    fn test_scratch_dir_truncates_utf8_tags_and_preserves_noindex_suffix() {
+        let dir = crate::test_scratch_dir("aaaaaaaaaaaaaaaaaaaaaaaé-extra-tail");
+        let name = dir
+            .path()
+            .file_name()
+            .and_then(|os| os.to_str())
+            .expect("scratch dir name is UTF-8");
+        assert!(name.starts_with("aterm-render-aaaaaaaaaaaaaaaaaaaaaaa-"));
+        assert!(name.ends_with(".noindex"));
     }
 }

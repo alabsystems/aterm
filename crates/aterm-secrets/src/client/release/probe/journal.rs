@@ -252,7 +252,12 @@ fn read(dir: &Path, name: &str) -> Result<Option<Vec<u8>>> {
     if metadata.nlink() != 1 || metadata.len() > CAP as u64 {
         return Err(Error::new("release probe journal has unsafe links or size"));
     }
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.len())
+            .unwrap_or(0)
+            .min(CAP)
+            .saturating_add(1),
+    );
     file.take(CAP as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| Error::new("release probe journal read failed"))?;

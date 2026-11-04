@@ -846,6 +846,7 @@ fn lab_own_claim_gallery() {
         enrich_inventory(
             &mut progress,
             &roster,
+            &roster,
             &state,
             &Logins::default(),
             &enrolled,
@@ -942,6 +943,14 @@ fn network_history_gallery() {
     let _stats = crate::stats_deck::tests::attach_stats();
     for (name, mut cols, limited, details) in [
         ("baseline", 120, false, false),
+        ("away-reader-busy", 120, false, false),
+        ("away-reader-busy-narrow", 60, false, false),
+        ("away-expired", 120, false, false),
+        ("away-expired-narrow", 60, false, false),
+        ("away-history-unavailable", 120, false, false),
+        ("away-history-unavailable-narrow", 60, false, false),
+        ("away-history-restoring", 120, false, false),
+        ("away-history-restoring-narrow", 60, false, false),
         ("reader-busy", 120, false, false),
         ("reader-busy-narrow", 60, false, false),
         ("reader-busy-details", 120, false, true),
@@ -1005,6 +1014,10 @@ fn network_history_gallery() {
         ("services-short", 60, false, true),
         ("services-short-wide", 120, false, true),
     ] {
+        let _place = crate::net_place::hold_scoped(
+            name.starts_with("away-")
+                .then(|| aterm_netplace::sample::hotspot(1_793_040_000_000, 1_793_040_000_000)),
+        );
         let (mut app, wid, session) = probe::probe_glass();
         app.config
             .sys
@@ -1115,8 +1128,8 @@ fn network_history_gallery() {
             }
         }
         let recorded_repair = repair_scene.then(|| snapshot.network.peers[0].last_repair.clone());
-        if name.starts_with("history-") {
-            snapshot.network.history = if name.starts_with("history-unavailable") {
+        if name.starts_with("history-") || name.starts_with("away-history-") {
+            snapshot.network.history = if name.contains("history-unavailable") {
                 HistoryState::Unavailable
             } else {
                 HistoryState::Restoring
@@ -1232,8 +1245,28 @@ fn network_history_gallery() {
                 "Account proposals not retained locally; harness rosters are separate".into();
             snapshot.services.secrets.last_success_ms = Some(snapshot.network.observed_at_ms);
         }
+        if name.starts_with("away-") {
+            // With no peer box to warn, the words must still expose a blocked observer.
+            snapshot.network.peers.clear();
+            for service in [
+                &mut snapshot.services.accounts,
+                &mut snapshot.services.secrets,
+            ] {
+                *service = ServiceState {
+                    availability: ServiceAvailability::Cached,
+                    observed_at_ms: snapshot.network.observed_at_ms,
+                    detail: "Synthetic independently cached shared metadata".into(),
+                    ..ServiceState::default()
+                };
+            }
+        }
         app.network_source = None;
         app.network_snapshot = Arc::new(snapshot);
+        if name.starts_with("away-expired") {
+            let expired_at = app.network_snapshot.network.observed_at_ms + 15_001;
+            app.network_snapshot =
+                crate::network_deck::fresh_snapshot(app.network_snapshot.clone(), Some(expired_at));
+        }
         if name.contains("reader-busy") {
             app.network_snapshot = crate::network_deck::snapshot_after_read(
                 None,

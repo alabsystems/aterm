@@ -444,17 +444,40 @@ impl Fx {
         }
     }
 
-    /// A file's bytes, `std::fs::read`.
+    /// A file's bytes, bounded regular-file read.
     pub(crate) fn read_file(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+        fn read_bounded(path: &Path) -> std::io::Result<Vec<u8>> {
+            use std::io::Read as _;
+            const MAX_FX_FILE_BYTES: u64 = 16 * 1024 * 1024;
+            let (file, meta) = aterm_uds::regular_file::open(path)?;
+            if meta.len() > MAX_FX_FILE_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "file exceeds size limit",
+                ));
+            }
+            let cap = usize::try_from(meta.len().min(MAX_FX_FILE_BYTES))
+                .unwrap_or(0)
+                .saturating_add(1);
+            let mut bytes = Vec::with_capacity(cap);
+            file.take(MAX_FX_FILE_BYTES + 1).read_to_end(&mut bytes)?;
+            if bytes.len() as u64 > MAX_FX_FILE_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "file exceeds size limit",
+                ));
+            }
+            Ok(bytes)
+        }
         let core = match &self.mode {
-            Mode::Live => return std::fs::read(path),
+            Mode::Live => return read_bounded(path),
             Mode::Replay(core) => return core.file(path),
             Mode::Record(core) => core,
         };
         let Some(entered) = core.enter("file") else {
-            return std::fs::read(path);
+            return read_bounded(path);
         };
-        let read = std::fs::read(path);
+        let read = read_bounded(path);
         drop(entered);
         core.file(path, read)
     }

@@ -13,6 +13,8 @@ use super::facts::{Facts, Job, Ran, RunFailed, Runner};
 use super::run::RunDir;
 use super::state::{Row, State};
 use super::store::{Ended, How, Outcome, Store};
+use crate::harness::accounts::Cli;
+use crate::harness::accounts_step::Step;
 
 /// The status read's time limit.
 pub const STATUS_BUDGET: Duration = Duration::from_secs(20);
@@ -186,10 +188,13 @@ pub fn claude_mend(f: &Facts) -> Option<Mend> {
                 crate::harness::one_line(why, 160)
             ),
             then: format!(
-                "fix it (`aterm harness accounts` says how), then run `aterm ai login {id}`"
+                "fix it (`{}` says how), then run `{}`",
+                Step::Report(Cli::Claude),
+                Step::AiLogin(id.to_owned())
             ),
             step: format!(
-                "mend accounts.toml (`aterm harness accounts` says how), then sign {id} in"
+                "mend accounts.toml (`{}` says how), then sign {id} in",
+                Step::Report(Cli::Claude)
             ),
         });
     }
@@ -197,12 +202,14 @@ pub fn claude_mend(f: &Facts) -> Option<Mend> {
         return Some(Mend {
             why: format!("accounts v2's records cannot be read ({why})"),
             then: format!(
-                "make them readable again (`aterm harness accounts` says why), then run `aterm ai \
-                 login {id}`"
+                "make them readable again (`{}` says why), then run `{}`",
+                Step::Report(Cli::Claude),
+                Step::AiLogin(id.to_owned())
             ),
             step: format!(
-                "make accounts v2's records readable again ({why}; `aterm harness accounts` says \
-                 why), then sign {id} in"
+                "make accounts v2's records readable again ({why}; `{}` says why), then sign {id} \
+                 in",
+                Step::Report(Cli::Claude)
             ),
         });
     }
@@ -211,7 +218,10 @@ pub fn claude_mend(f: &Facts) -> Option<Mend> {
             "accounts.toml lists this machine's own login as `{}` with no email",
             a.label
         ),
-        then: format!("add `email = \"…\"` to that row, then `aterm ai login {id}` renews it"),
+        then: format!(
+            "add `email = \"…\"` to that row, then `{}` renews it",
+            Step::AiLogin(id.to_owned())
+        ),
         step: format!(
             "add `email = \"…\"` to `{}`'s row in accounts.toml, then sign {id} in",
             a.label
@@ -236,7 +246,8 @@ fn claude(h: &Host<'_>, f: &Facts, out: &mut dyn Write) -> Done {
     if !renews && let Some(marker) = agent_marker(h.var) {
         return Done::Refused(format!(
             "{marker} is set: accounts v2 renews this login once it knows the Claude account's \
-             email, which a person gives (`aterm ai login claude` at a terminal)"
+             email, which a person gives (`{}` at a terminal)",
+            Step::ai_login(Cli::Claude)
         ));
     }
     if !renews {
@@ -279,7 +290,8 @@ fn claude(h: &Host<'_>, f: &Facts, out: &mut dyn Write) -> Done {
     match renew_run(h, &args, &env, out) {
         Ok(0) => Done::SignedIn(None),
         Ok(code) => Done::Failed(format!(
-            "`aterm harness accounts renew {label}` exited {code}"
+            "`{}` exited {code}",
+            Step::Renew(Cli::Claude, label.clone())
         )),
         Err(why) => Done::Failed(why),
     }
@@ -382,9 +394,10 @@ pub fn pool_target(
     let roster = pool.roster.display();
     if let Some(why) = &pool.refused {
         return Err(format!(
-            "{roster} is refused ({}): fix it (`aterm harness accounts --cli {id}` says how), then \
-             run `aterm ai login {id}`",
+            "{roster} is refused ({}): fix it (`{}` says how), then run `{}`",
             crate::harness::one_line(why, 160),
+            Step::Report(cli),
+            Step::ai_login(cli)
         ));
     }
     if let Some(why) = &pool.sign_in_refused {
@@ -396,8 +409,19 @@ pub fn pool_target(
         return Err(format!(
             "`{label}`, the row on this machine's own login, signs in by Codex's own sign-in in \
              its default home on this Codex build, which `{}` runs",
-            crate::harness::codex_alab::DEFAULT_SIGN_IN
+            crate::harness::codex_alab::default_sign_in()
         ));
+    }
+    // A launch refused for what this machine's own login names is ended by the one step its
+    // refusal names: this sign-in where that is the row's, and otherwise that step.
+    if let Some((label, step)) = &pool.default_moved {
+        return match step {
+            Step::Login(_, row) => Ok((row.as_str(), cli.sign_in_verb(false))),
+            step => Err(format!(
+                "this machine's own login names another account than `{label}`'s, and no sign-in \
+                 here makes it `{label}`'s: `{step}`"
+            )),
+        };
     }
     if let Some(target) = pool.sign_in_target(cli) {
         return Ok(target);
@@ -418,7 +442,7 @@ pub fn pool_target(
                  build serves, and its login still works: only Codex's own sign-in in its \
                  default home renews it here, and that signs the login out (revokes it) \
                  before it starts, so `{}` runs it once that login has ended",
-                crate::harness::codex_alab::DEFAULT_SIGN_IN
+                crate::harness::codex_alab::default_sign_in()
             ));
         }
         if pool.default_only {
@@ -435,29 +459,36 @@ pub fn pool_target(
             .strip_suffix(crate::harness::accounts_pool::NO_WORKER)
             .unwrap_or(why);
         return Err(format!(
-            "{roster} names no row `aterm ai login {id}` signs in, and a launch of {id} now is \
-             refused: {why}"
+            "{roster} names no row a sign-in here signs in, and a launch of {id} now is refused: \
+             {why}"
         ));
     }
     if let Some(label) = &pool.unaddressed {
         return Err(format!(
-            "`{label}` is the row with no current login, and it has no email, so `aterm ai login \
-             {id}` does not sign it in: `aterm harness accounts login {label} --cli {id}` does, at \
-             a terminal; no other row of this pool needs a sign-in"
+            "`{label}` is the row with no current login, and it has no email, so aterm does not \
+             sign it in: `{}` does, at a terminal; no other row of this pool needs a sign-in",
+            Step::Login(cli, label.clone())
         ));
     }
     Err(if pool.emails > 0 {
         format!(
             "this pool needs no sign-in: every row of {roster} that this Mac signs in has a \
-             current login (`aterm harness accounts --cli {id}` says each row's state)"
+             current login (`{}` says each row's state)",
+            Step::Report(cli)
         )
     } else if cli.renews_headlessly() {
         format!(
-            "{roster} lists no email: run `aterm harness accounts add <label> --cli {id} \
-             --email <e>` (kimi also `--region <r>`)"
+            "{roster} lists no email: run `{}` (kimi also `--region <r>`)",
+            Step::Add {
+                cli,
+                email: Some("<e>".to_owned()),
+            }
         )
     } else {
-        format!("{roster} lists no row: run `aterm harness accounts add <label> --cli {id}`")
+        format!(
+            "{roster} lists no row: run `{}`",
+            Step::Add { cli, email: None }
+        )
     })
 }
 
@@ -489,8 +520,8 @@ pub fn pool_sign_in(
         && let Some(marker) = agent_marker(h.var)
     {
         return Done::Refused(format!(
-            "{marker} is set: `aterm harness accounts {verb} {label} --cli {id}` is a person's \
-             approval at this Mac, not an agent's"
+            "{marker} is set: `{}` is a person's approval at this Mac, not an agent's",
+            Step::sign_in(cli, label, verb == "renew")
         ));
     }
     if verb == "renew"
@@ -508,7 +539,8 @@ pub fn pool_sign_in(
     match ran {
         Ok(0) => Done::SignedIn(None),
         Ok(code) => Done::Failed(format!(
-            "`aterm harness accounts {verb} {label} --cli {id}` exited {code}"
+            "`{}` exited {code}",
+            Step::sign_in(cli, label, verb == "renew")
         )),
         Err(why) => Done::Failed(why),
     }
@@ -535,8 +567,9 @@ pub fn refusal(f: &Facts, row: &Row) -> Option<String> {
     }
     if matches!(row.state, State::NotInstalled) {
         return Some(format!(
-            "not installed (`aterm ai login {}` and `aterm ai doctor` install it first)",
-            c.id
+            "not installed (`{}` and `{}` install it first)",
+            Step::AiLogin(c.id.to_owned()),
+            Step::Doctor
         ));
     }
     if f.home_var.is_none()
@@ -657,8 +690,9 @@ pub fn sign_in(h: &Host<'_>, f: &Facts, row: &Row, out: &mut dyn Write) -> Done 
     }
     let Some(managed) = &f.managed else {
         return Done::Refused(format!(
-            "not installed (`aterm ai login {}` and `aterm ai doctor` install it first)",
-            c.id
+            "not installed (`{}` and `{}` install it first)",
+            Step::AiLogin(c.id.to_owned()),
+            Step::Doctor
         ));
     };
     let run = match RunDir::make(h.store.dir()) {

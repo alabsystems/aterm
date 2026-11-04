@@ -265,6 +265,48 @@ fn exchange_wait(line: &str, bound: std::time::Duration) -> std::time::Duration 
     bound.saturating_add(named_timeout(&words).unwrap_or_default())
 }
 
+/// Which requests a test's stand-in leaves unanswered ([`AnsweredBut`]).
+#[cfg(all(test, unix))]
+type Unanswered = fn(&str) -> bool;
+
+#[cfg(all(test, unix))]
+thread_local! {
+    static LEFT_UNANSWERED: std::cell::Cell<Option<Unanswered>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// While held, every exchange on this thread but the requests `unanswered` names waits at least
+/// the one-minute hang detector for its reply ([`answered_within`]): the test's stand-in answers
+/// it, so a reply a loaded machine slows is waited for rather than read as unanswered. A request
+/// `unanswered` names keeps its connection's bound ([`RelayClient::bounded`]), the one its test
+/// waits out. Its drop, a panic's unwind included, puts back the predicate it replaced.
+#[cfg(all(test, unix))]
+pub(crate) struct AnsweredBut(Option<Unanswered>);
+
+#[cfg(all(test, unix))]
+impl AnsweredBut {
+    pub(crate) fn set(unanswered: Unanswered) -> Self {
+        Self(LEFT_UNANSWERED.replace(Some(unanswered)))
+    }
+}
+
+#[cfg(all(test, unix))]
+impl Drop for AnsweredBut {
+    fn drop(&mut self) {
+        LEFT_UNANSWERED.set(self.0);
+    }
+}
+
+/// `bound`, or at least the hang detector for a request `line` a test's stand-in answers
+/// ([`AnsweredBut`]).
+#[cfg(all(test, unix))]
+fn answered_within(line: &str, bound: std::time::Duration) -> std::time::Duration {
+    match LEFT_UNANSWERED.get() {
+        Some(unanswered) if !unanswered(line) => bound.max(aterm_spec::wait::MUST_HAPPEN),
+        _ => bound,
+    }
+}
+
 /// Whether `e` ended an exchange whose reply did not come within its wait
 /// ([`RelayClient::bounded`]): the request may have reached the server, which may still act on it,
 /// so its outcome is unknown, never the server's refusal.
@@ -552,6 +594,8 @@ impl<S: Read + Write> RelayClient<S> {
         }
         self.reply_started = !self.buf.is_empty();
         if let Some((arm, bound)) = self.bound {
+            #[cfg(all(test, unix))]
+            let bound = answered_within(line, bound);
             let wait = exchange_wait(line, bound).max(std::time::Duration::from_millis(1));
             let started = (self.clock)(&self.io);
             arm(&self.io, wait)?;
@@ -1954,8 +1998,7 @@ mod tests {
     fn the_own_client_runs_the_ctl_verb_first() {
         use std::os::unix::fs::PermissionsExt as _;
         assert!(own_exe().expect("this binary").is_file());
-        let dir = std::env::temp_dir().join(format!("aterm-own-ctl-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("scratch");
+        let dir = crate::supervise::ScratchDir::new("own-ctl", "exe");
         let exe = dir.join("aterm");
         std::fs::write(&exe, "#!/bin/sh\necho \"$*\"\n").expect("write the stand-in");
         std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).expect("chmod");
@@ -1969,7 +2012,6 @@ mod tests {
             plain.run(&["cursor"]).expect("it runs"),
             "--sock /s.sock cursor\n"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

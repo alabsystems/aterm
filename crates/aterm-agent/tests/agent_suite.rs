@@ -35,6 +35,7 @@ mod conformance_footer_model;
 mod conformance_left;
 mod conformance_login_wall;
 mod conformance_occupancy;
+mod conformance_self_claim_facts;
 mod conformance_upgrade_models;
 mod conformance_usage_tap;
 mod conformance_wakes;

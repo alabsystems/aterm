@@ -3686,12 +3686,13 @@ fn convert_cpu_report_value(
 }
 
 fn read_bounded(path: &Path, max_bytes: u64) -> Option<String> {
-    let mut text = String::new();
-    std::fs::File::open(path)
-        .ok()?
-        .take(max_bytes + 1)
-        .read_to_string(&mut text)
-        .ok()?;
+    let (file, meta) = crate::logging::open_regular_nonblock_with_meta(path).ok()?;
+    if meta.len() > max_bytes {
+        return None;
+    }
+    let mut text =
+        String::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
+    file.take(max_bytes + 1).read_to_string(&mut text).ok()?;
     (text.len() as u64 <= max_bytes).then_some(text)
 }
 

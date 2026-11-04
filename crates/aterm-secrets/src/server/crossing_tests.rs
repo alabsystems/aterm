@@ -7,17 +7,20 @@
 //!
 //! The vault is [`fixture::Batch`]: a base log three records short of
 //! [`crate::membership_log::LEGACY_RECORDS`] and a removal batch past it. A server's connection
-//! threads and peer pulls hold the production bound, the legacy one. Mark-order tests use a
+//! threads and peer pulls hold the production bound. Mark-order tests use a
 //! matching-capacity source and a retained prefix ending at F's wrap, the dangerous history a
 //! legacy build reads as its own revocation. A larger crossed source is refused whole in the
-//! numeric-compatibility tests. The test that holds the whole log raises the held
-//! bound through the budgets seam ([`fixture::RAISED`], `RecordBudgets::within`) and posts
-//! through the test adapter ([`post_records_stating`]), on the test thread that holds it.
+//! numeric-compatibility tests. Explicit budget fixtures use the budgets seam
+//! ([`fixture::RAISED`], `RecordBudgets::within`) and the test adapter
+//! ([`post_records_stating`]); a refusal fixture preloads a smaller-budget store before
+//! starting the production-capacity connection threads.
 
 use super::*;
 use crate::crossing::fixture::{self, Batch, Legacy, VAULT};
 use crate::crossing::{Faults, Mark, RecordsBound};
-use crate::membership_log::{RecordId, decode_records, encode_records};
+use crate::membership_log::{
+    LEGACY_RECORDS, RecordBudgets, RecordId, decode_records, encode_records,
+};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
@@ -156,7 +159,10 @@ fn numeric_incompatible_get_and_post_leave_the_server_unchanged() {
     let batch = Batch::get();
     let root = aterm_tempfile::tempdir().unwrap();
     let running = holding_base(root.path());
-    let incompatible = RecordsBound::of(fixture::RAISED.held, true);
+    let incompatible = RecordsBound::of(
+        2 * crate::membership_log::RecordBudgets::PRODUCTION.held,
+        true,
+    );
     let get = stated_get(&running, incompatible);
     assert_eq!(get.status, 409);
     assert_eq!(get.records(), 0);
@@ -189,7 +195,11 @@ fn numeric_incompatible_post_is_refused_before_reading_its_body() {
         "POST /v1/{VAULT}/records?{} HTTP/1.1\r\nHost: 127.0.0.1\r\n{}: {}\r\nContent-Length: 1024\r\nConnection: close\r\n\r\n",
         crate::transport::CROSSED_POST_QUERY,
         crate::transport::RECORDS_BOUND_HEADER,
-        RecordsBound::of(fixture::RAISED.held, true).value(),
+        RecordsBound::of(
+            2 * crate::membership_log::RecordBudgets::PRODUCTION.held,
+            true
+        )
+        .value(),
     );
     let response = exchange(&running, request.as_bytes());
     assert_eq!(response.status, 409);
@@ -848,10 +858,16 @@ fn a_crossed_posters_batch_a_store_takes_none_of_stores_no_mark() {
         let unrooted = (unrooted.status, Mark::at(mark).stored().expect("look"));
         running.stop();
 
-        // A store at its bound: the base, and the batch up to F's wrap from a build before the
-        // fence.
+        // A store at its explicit smaller bound: load the base under that budget, then fill
+        // it through the real HTTP path up to F's wrap from a build before the fence.
         let root = aterm_tempfile::tempdir().expect("tempdir");
-        let running = holding_base(root.path());
+        fsx::write_atomic(
+            &root.path().join(format!("{VAULT}.records")),
+            &encode_records(&batch.base),
+            0o600,
+        )
+        .unwrap();
+        let running = fixture::LEGACY.within(|| serve(root.path()));
         let filled = legacy_post(&running, &encode_records(&batch.removal[..3]));
         assert_eq!(filled.status, 204, "{}", filled.head);
         assert_eq!(held(&running), crate::membership_log::LEGACY_RECORDS);
@@ -1184,4 +1200,365 @@ fn a_server_that_cannot_look_for_its_mark_states_no_bound_and_takes_nothing() {
         "control: with its mark"
     );
     running.stop();
+}
+
+/// A real server replaying `SwarmRecordsCapacity`'s `Crossing` actions on its own store folder,
+/// on the test thread within the configuration's budgets: `Crossing` is a server that holds the
+/// base log, each POST is the test adapter ([`post_records_stating`]) with the removal batch
+/// whole (a crossed poster's, `RecordsBound::here(true)`, one that states it has not crossed, or
+/// for `LegacyPost` one that states no bound: its `409` the fence's, its `204` a batch taken),
+/// each `…Dies` the same POST with the server dying between its mark and its records
+/// (`Faults::dies_between`) and a server started anew on the folder, and `LegacyGet` a records
+/// GET that states no bound, over HTTP: its `409` the fence's, its `200` a log served.
+struct CapacityRun {
+    root: aterm_tempfile::TempDir,
+    running: Option<Running>,
+    /// What the run does wrong: the faults beside `dies_between` each POST suffers, and those
+    /// each GET does.
+    mutant: Faults,
+    /// Whether the server took records a crossed poster sent (the model's `nx`).
+    taught: bool,
+    /// How many of the batch's records the last answer to a request that states no bound
+    /// carried (`gs`): none for a POST's.
+    served: usize,
+    /// Whether the last request that states no bound was answered the fence's `409` (`fenced`).
+    fenced: bool,
+}
+
+impl CapacityRun {
+    fn start(mutant: Faults) -> Self {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        crate::crossing::inject(&mark_in(root.path()), mutant);
+        let running = serve(root.path());
+        let base = post_records(
+            &running.shared,
+            VAULT,
+            &encode_records(&Batch::get().base),
+            true,
+        );
+        assert_eq!(base.status, 204);
+        let run = Self {
+            root,
+            running: Some(running),
+            mutant,
+            taught: false,
+            served: 0,
+            fenced: false,
+        };
+        assert_eq!(held(run.running()), fixture::BASE);
+        run
+    }
+
+    fn running(&self) -> &Running {
+        self.running.as_ref().expect("a running server")
+    }
+
+    fn mark(&self) -> PathBuf {
+        mark_in(self.root.path())
+    }
+
+    fn batch_held(&self) -> usize {
+        holds_of(self.running(), &ids(&Batch::get().removal))
+    }
+
+    /// The removal batch, POSTed by a poster that states `bound` (`None` for none), the server
+    /// dying between its mark and its records where `dies`.
+    fn post(&mut self, bound: Option<RecordsBound>, dies: bool) {
+        let before = self.batch_held();
+        crate::crossing::inject(
+            &self.mark(),
+            Faults {
+                dies_between: dies,
+                ..self.mutant
+            },
+        );
+        let reply = post_records_stating(
+            &self.running().shared,
+            VAULT,
+            &encode_records(&Batch::get().removal),
+            true,
+            bound,
+        );
+        crate::crossing::inject(&self.mark(), self.mutant);
+        if dies {
+            assert_eq!(reply.status, 500, "the server died");
+            self.running.take().expect("a running server").stop();
+            self.running = Some(serve(self.root.path()));
+        } else if bound.is_some() {
+            assert_eq!(reply.status, 204);
+        } else {
+            assert!(matches!(reply.status, 204 | 409), "{}", reply.status);
+            self.fenced = reply.status == 409;
+            self.served = 0;
+        }
+        if bound.is_some_and(|bound| bound.crossed) && self.batch_held() > before {
+            self.taught = true;
+        }
+    }
+
+    fn apply(&mut self, action: &str) {
+        match action {
+            "CrossedPost" => self.post(Some(RecordsBound::here(true)), false),
+            "CrossedPostDies" => self.post(Some(RecordsBound::here(true)), true),
+            "Grow" => self.post(Some(RecordsBound::uncrossed()), false),
+            "GrowDies" => self.post(Some(RecordsBound::uncrossed()), true),
+            "LegacyPost" => self.post(None, false),
+            "LegacyGet" => {
+                // The slot first, on this thread within its budgets: a GET's connection thread
+                // would read a file past the legacy bound at the production one.
+                let _ = self.batch_held();
+                let get = legacy_get(self.running());
+                self.fenced = get.status == 409;
+                self.served = match get.status {
+                    200 => {
+                        let removal = ids(&Batch::get().removal);
+                        decode_records(&get.body)
+                            .expect("a records stream")
+                            .iter()
+                            .filter(|record| removal.contains(record.id()))
+                            .count()
+                    }
+                    409 => 0,
+                    other => panic!("LegacyGet answered {other}: {}", get.head),
+                };
+            }
+            other => panic!("not a Crossing action: {other}"),
+        }
+    }
+
+    fn stop(mut self) {
+        crate::crossing::inject(&self.mark(), Faults::default());
+        if let Some(running) = self.running.take() {
+            running.stop();
+        }
+    }
+}
+
+/// `SwarmRecordsCapacity`'s variables, read off a real server in its `Crossing`: `nr` how many
+/// of the batch's records it holds, `mark` whether its crossed mark is stored, `nx` whether
+/// records a crossed poster sent were taken, and of the last records request that stated no
+/// bound (a GET or a POST), `gs` how many of the batch's records its answer carried and `fenced`
+/// whether it was the `409`.
+fn records_capacity_crossing(run: &CapacityRun) -> aterm_spec::interp::State {
+    let count = |n: usize| i64::try_from(n).expect("a count");
+    aterm_spec::interp::State::from([
+        ("sc", 2),
+        ("w", 0),
+        ("k", 0),
+        ("last", 0),
+        ("lw", 0),
+        ("lk", 0),
+        ("nr", count(run.batch_held())),
+        ("nx", i64::from(run.taught)),
+        (
+            "mark",
+            i64::from(Mark::at(run.mark()).stored().expect("look")),
+        ),
+        ("gs", count(run.served)),
+        ("fenced", i64::from(run.fenced)),
+    ])
+}
+
+/// The budgets a server holds `model`'s `Crossing` within: the explicit legacy bound where
+/// `CX` past the base is `LX`, and production capacity where it takes the whole batch.
+fn crossing_budgets(model: &aterm_spec::derive::Model) -> RecordBudgets {
+    let constant = |name: &str| {
+        model
+            .consts
+            .iter()
+            .find(|(constant, _)| *constant == name)
+            .map(|&(_, value)| usize::try_from(value).expect("a count"))
+            .expect("the model's constant")
+    };
+    let batch = Batch::get();
+    assert_eq!(constant("R"), batch.removal.len());
+    assert_eq!(fixture::BASE + constant("LX"), LEGACY_RECORDS);
+    if constant("CX") == constant("LX") {
+        fixture::LEGACY
+    } else {
+        assert_eq!(constant("CX"), batch.removal.len());
+        RecordBudgets::PRODUCTION
+    }
+}
+
+/// S8: a vault server refines `SwarmRecordsCapacity`'s `Crossing` in each configuration the
+/// model declares (the legacy held total, where it takes the batch up to the bound; the
+/// activation's, where it takes it all, past the bound): from every state the model reaches,
+/// every action it enables, replayed on a real server (a fresh store folder each), gives the
+/// state the model's walk found by that path, or another successor the model allows there. At
+/// the legacy held total a POST from a source that has not crossed (`Grow`, or `LegacyPost`
+/// before any mark) leaves the server holding the batch cut mid-`Wrap`s with no mark, which a
+/// legacy GET is served whole: the residual the model names, which the activation's room ends.
+///
+/// NEGATIVE CONTROLS: with `Faults::capped_prefix` (a crossed log's first records, capped at the
+/// legacy bound, for a GET that states no bound) the legacy GET after a crossed POST at the
+/// activation's held total, past the bound, carries the batch cut mid-`Wrap`s, which is no
+/// successor of `LegacyGet` and breaks `LegacyNeverPartial`. With `Faults::mark_after_take`
+/// (the records before the mark) a server that dies between them holds the cut batch with no
+/// mark, which is no successor of `CrossedPostDies` and breaks `CrossedBeforeHeld`. A marked
+/// server that takes a POST stating no bound as it takes one stating it has not crossed (`Grow`'s,
+/// the POST without its fence) holds the batch's first records, which is no successor of
+/// `LegacyPost`.
+#[test]
+fn the_crossed_fence_conforms_to_the_capacity_model() {
+    let name = aterm_models_swarm::records_capacity_model().name;
+    let configurations = aterm_spec::xref::model_configurations()
+        .into_iter()
+        .find(|configurations| configurations[0].name == name)
+        .expect("SwarmRecordsCapacity is registered");
+    let crossing = [
+        "CrossedPost",
+        "CrossedPostDies",
+        "Grow",
+        "GrowDies",
+        "LegacyPost",
+        "LegacyGet",
+    ];
+    for model in &configurations {
+        let budgets = crossing_budgets(model);
+        let start = model.successors("Crossing", &model.init_state());
+        assert_eq!(start.len(), 1);
+        let mut paths: BTreeMap<aterm_spec::interp::State, Vec<&'static str>> =
+            BTreeMap::from([(start[0].clone(), Vec::new())]);
+        let mut queue = std::collections::VecDeque::from([start[0].clone()]);
+        while let Some(state) = queue.pop_front() {
+            for action in &model.actions {
+                if model.action_enabled(action.name, &state) {
+                    assert!(crossing.contains(&action.name), "{}", action.name);
+                }
+                for next in model.successors(action.name, &state) {
+                    if !paths.contains_key(&next) {
+                        let mut path = paths[&state].clone();
+                        path.push(action.name);
+                        paths.insert(next.clone(), path);
+                        queue.push_back(next);
+                    }
+                }
+            }
+        }
+        let found_by: BTreeMap<&[&str], &aterm_spec::interp::State> = paths
+            .iter()
+            .map(|(state, path)| (path.as_slice(), state))
+            .collect();
+        budgets.within(|| {
+            let run = CapacityRun::start(Faults::default());
+            assert_eq!(records_capacity_crossing(&run), start[0], "after Crossing");
+            run.stop();
+            let mut judged = BTreeSet::from([start[0].clone()]);
+            for (state, path) in &paths {
+                for action in &model.actions {
+                    if !model.action_enabled(action.name, state) {
+                        continue;
+                    }
+                    let mut run = CapacityRun::start(Faults::default());
+                    for step in path {
+                        run.apply(step);
+                    }
+                    run.apply(action.name);
+                    let observed = records_capacity_crossing(&run);
+                    run.stop();
+                    let next_path = [path.as_slice(), &[action.name]].concat();
+                    match found_by.get(next_path.as_slice()) {
+                        Some(&next) => {
+                            assert_eq!(&observed, next, "after {next_path:?}");
+                            judged.insert(next.clone());
+                        }
+                        None => assert!(
+                            model.successors(action.name, state).contains(&observed),
+                            "{} after {path:?} gave {observed:?}",
+                            action.name
+                        ),
+                    }
+                }
+            }
+            assert_eq!(
+                judged.len(),
+                paths.len(),
+                "every state was replayed and judged"
+            );
+            eprintln!(
+                "SwarmRecordsCapacity Crossing (held {}): {} states judged",
+                budgets.held,
+                judged.len()
+            );
+        });
+    }
+
+    let committed = &configurations[0];
+    let legacy_budgets = crossing_budgets(committed);
+    let start = committed.successors("Crossing", &committed.init_state())[0].clone();
+    // Negative control: the capped reply, after a crossed POST past the bound.
+    let activation = &configurations[1];
+    let posted = activation.successors(
+        "CrossedPost",
+        &activation.successors("Crossing", &activation.init_state())[0],
+    )[0]
+    .clone();
+    let capped = crossing_budgets(activation).within(|| {
+        let mut run = CapacityRun::start(Faults {
+            capped_prefix: true,
+            ..Faults::default()
+        });
+        run.apply("CrossedPost");
+        run.apply("LegacyGet");
+        let observed = records_capacity_crossing(&run);
+        run.stop();
+        observed
+    });
+    assert_eq!(
+        (capped["nr"], capped["gs"], capped["fenced"]),
+        (5, 3, 0),
+        "mutant: the batch cut mid-Wraps is served"
+    );
+    assert!(
+        !activation
+            .successors("LegacyGet", &posted)
+            .contains(&capped)
+    );
+    assert!(!activation.check_invariant("LegacyNeverPartial", &capped));
+    // Negative control: the records before the mark, the server dying between them.
+    let unmarked = legacy_budgets.within(|| {
+        let mut run = CapacityRun::start(Faults {
+            mark_after_take: true,
+            ..Faults::default()
+        });
+        run.apply("CrossedPostDies");
+        let observed = records_capacity_crossing(&run);
+        run.stop();
+        observed
+    });
+    assert_eq!(
+        (unmarked["nr"], unmarked["mark"]),
+        (3, 0),
+        "mutant: the cut batch is held with no mark"
+    );
+    assert!(
+        !committed
+            .successors("CrossedPostDies", &start)
+            .contains(&unmarked)
+    );
+    assert!(!committed.check_invariant("CrossedBeforeHeld", &unmarked));
+    // Negative control: the POST without its fence (one that states no bound, taken as one that
+    // states it has not crossed), after a crossed POST died past its mark. The walk above
+    // replayed the fenced `LegacyPost` from this state.
+    let died = committed.successors("CrossedPostDies", &start)[0].clone();
+    assert_eq!((died["nr"], died["mark"]), (0, 1));
+    let unfenced = legacy_budgets.within(|| {
+        let mut run = CapacityRun::start(Faults::default());
+        run.apply("CrossedPostDies");
+        run.post(Some(RecordsBound::uncrossed()), false);
+        let observed = records_capacity_crossing(&run);
+        run.stop();
+        observed
+    });
+    assert_eq!(
+        (unfenced["nr"], unfenced["mark"], unfenced["fenced"]),
+        (3, 1, 0),
+        "mutant: the batch's first records taken past the mark"
+    );
+    assert!(
+        !committed
+            .successors("LegacyPost", &died)
+            .contains(&unfenced)
+    );
 }

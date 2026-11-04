@@ -211,7 +211,8 @@ fn read_token(plan: &SocketPlan) -> Option<TokenIdentity> {
     {
         return None;
     }
-    let mut bytes = Vec::with_capacity(MAX_TOKEN_BYTES);
+    let mut bytes =
+        Vec::with_capacity(usize::try_from(opened.len().saturating_add(1)).unwrap_or(0));
     file.take(MAX_TOKEN_BYTES as u64)
         .read_to_end(&mut bytes)
         .ok()?;

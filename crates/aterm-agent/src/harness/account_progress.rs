@@ -100,6 +100,10 @@ pub struct AccountProgress {
     pub details: Vec<String>,
     /// Validated historical provider facts, separate from free-text route records.
     pub login_diagnostics: Vec<super::accounts_sync::LoginDiagnostic>,
+    /// Earliest observed reevaluation or retry event, not a promise of account readiness.
+    /// Independent holds on one unchanged account end at their latest deadline; alternatives
+    /// and normal decision rechecks contribute their earliest event. A live execution gate
+    /// keeps its own recheck deadline when login activity is added.
     pub next_at: Option<i64>,
     pub own_claim: Option<OwnClaimFinding>,
 }
@@ -135,18 +139,31 @@ impl AccountProgress {
         project = "aterm_agent::harness::account_progress::ranking_tests::ranking_transition"
     )
 )]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Current workflow policy and bound login decisions use separate captured rosters"
+)]
 pub fn enrich_inventory(
     progress: &mut AccountProgress,
     roster: &Roster,
+    raw_roster: &Roster,
     state: &State,
     logins: &Logins,
     enrolled: &BTreeSet<String>,
     me: &Me<'_>,
     point: Option<&Point>,
 ) {
-    enrich_inventory_with_identity(progress, roster, state, logins, enrolled, me, point, |_| {
-        true
-    });
+    enrich_inventory_with_identity(
+        progress,
+        roster,
+        raw_roster,
+        state,
+        logins,
+        enrolled,
+        me,
+        point,
+        |_| true,
+    );
 }
 
 /// Add inventory using the same captured identity admission as the caller's decision.
@@ -175,6 +192,7 @@ pub fn enrich_inventory(
 pub fn enrich_inventory_with_identity(
     progress: &mut AccountProgress,
     roster: &Roster,
+    raw_roster: &Roster,
     state: &State,
     logins: &Logins,
     enrolled: &BTreeSet<String>,
@@ -228,8 +246,8 @@ pub fn enrich_inventory_with_identity(
         if state.account(label).current_auth(row) == accounts::Auth::SignedOut {
             progress.details.push(format!("{label}: signed out"));
         }
-        let binding = logins.get(label);
-        if let Some(task) = binding.and_then(|binding| binding.sign_in_task) {
+        let raw = raw_roster.row(label);
+        if let Some(task) = raw.and_then(|raw| accounts::current_sign_in_task(raw, logins)) {
             let action = match task.action {
                 accounts::SignInAction::Browser => "browser sign-in needed",
                 accounts::SignInAction::Login => "CLI sign-in needed",
@@ -239,7 +257,7 @@ pub fn enrich_inventory_with_identity(
                 .details
                 .push(task.action.next_step(accounts::Cli::Claude, label));
         }
-        if let Some(attempt) = binding.and_then(|binding| binding.sign_in_attempt.as_ref()) {
+        if let Some(attempt) = raw.and_then(|raw| accounts::current_sign_in_attempt(raw, logins)) {
             let outcome = match attempt.outcome {
                 accounts::AttemptOutcome::NoRoute => Some("no usable sign-in route"),
                 accounts::AttemptOutcome::Failed => Some("sign-in route failed"),
@@ -364,6 +382,34 @@ fn own_claim_note(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::harness::host_path::abs;
+
+    fn admitted_guidance(
+        roster: &Roster,
+        logins: &mut Logins,
+        at: i64,
+        label: &str,
+        observe: impl FnOnce(&mut Logins) -> Vec<accounts::Event>,
+    ) {
+        let home = aterm_tempfile::tempdir().unwrap();
+        let store = accounts::Store::at(home.path());
+        let path = home.path().join("accounts.toml");
+        std::fs::write(
+            &path,
+            accounts::append_rows_for(accounts::Cli::Claude, "", &roster.rows).unwrap(),
+        )
+        .unwrap();
+        store.save_logins(logins).unwrap();
+        store
+            .transact_pool_logins_within(&[], &path, at, &mut None, |raw, _, logins| {
+                assert_eq!(raw, roster);
+                accounts::admit_workflow(logins, label)?;
+                Ok(observe(logins))
+            })
+            .unwrap();
+        *logins = store.load_logins(at).unwrap().0;
+        assert!(accounts::current_workflow(roster.row(label).unwrap(), logins).is_some());
+    }
 
     #[test]
     fn known_signed_out_account_is_explained_without_a_sign_in_attempt() {
@@ -382,6 +428,7 @@ mod tests {
             .push("No eligible alternate account".into());
         enrich_inventory(
             &mut progress,
+            &roster,
             &roster,
             &state,
             &Logins::default(),
@@ -422,6 +469,13 @@ mod tests {
         };
         let mut state = State::default();
         let mut logins = Logins::default();
+        logins.labels.insert(
+            "current".into(),
+            accounts::Binding {
+                dir: roster.row("current").unwrap().dir.clone(),
+                ..Default::default()
+            },
+        );
         accounts::note_login_end(&mut state, &mut logins, "current", 80);
         accounts::note_sign_in_task(&mut logins, "current", accounts::SignInAction::Login, 90);
         let point = Point::Wall {
@@ -483,6 +537,7 @@ mod tests {
             enrich_inventory(
                 &mut progress,
                 &roster,
+                &roster,
                 &state,
                 &logins,
                 &enrolled,
@@ -518,7 +573,7 @@ mod tests {
             rows: vec![
                 accounts::Row {
                     label: "current".into(),
-                    dir: Some("/synthetic/current".into()),
+                    dir: Some(abs("/synthetic/current")),
                     ..Default::default()
                 },
                 accounts::Row {
@@ -529,15 +584,24 @@ mod tests {
         };
         let mut state = State::default();
         let mut logins = Logins::default();
-        accounts::note_login_end(&mut state, &mut logins, "current", 80);
-        accounts::note_sign_in_task(&mut logins, "current", accounts::SignInAction::Login, 85);
-        accounts::note_sign_in_attempt(
-            &mut logins,
-            "current",
-            accounts::AttemptOutcome::NoRoute,
-            "profile(none)",
-            90,
+        logins.labels.insert(
+            "current".into(),
+            accounts::Binding {
+                dir: roster.row("current").unwrap().dir.clone(),
+                ..Default::default()
+            },
         );
+        accounts::note_login_end(&mut state, &mut logins, "current", 80);
+        admitted_guidance(&roster, &mut logins, 90, "current", |logins| {
+            accounts::note_sign_in_task(logins, "current", accounts::SignInAction::Login, 85);
+            accounts::note_sign_in_attempt(
+                logins,
+                "current",
+                accounts::AttemptOutcome::NoRoute,
+                "profile(none)",
+                90,
+            )
+        });
         // `alternate`, the default login, is signed in here as `accounts::enrolled_for` holds it.
         let enrolled = BTreeSet::from(["current".into(), "alternate".into()]);
         let project = |state: &State| {
@@ -545,6 +609,7 @@ mod tests {
             progress.phase = ProgressPhase::Waiting;
             enrich_inventory(
                 &mut progress,
+                &roster,
                 &roster,
                 state,
                 &logins,
@@ -586,7 +651,7 @@ mod tests {
         let roster = Roster {
             rows: vec![accounts::Row {
                 label: "alternate".into(),
-                dir: Some("/synthetic/alternate".into()),
+                dir: Some(abs("/synthetic/alternate")),
                 ..Default::default()
             }],
         };
@@ -606,6 +671,7 @@ mod tests {
             enrich_inventory(
                 &mut progress,
                 &roster,
+                &roster,
                 &state,
                 logins,
                 enrolled,
@@ -620,7 +686,23 @@ mod tests {
             accounts::SignInAction::Login,
         ] {
             let mut logins = Logins::default();
+            logins.labels.insert(
+                "alternate".into(),
+                accounts::Binding {
+                    dir: roster.row("alternate").unwrap().dir.clone(),
+                    ..Default::default()
+                },
+            );
             accounts::note_sign_in_task(&mut logins, "alternate", action, 90);
+            assert_eq!(
+                project(&logins, &BTreeSet::new()).details,
+                baseline.details,
+                "unadmitted task remains historical"
+            );
+            admitted_guidance(&roster, &mut logins, 90, "alternate", |logins| {
+                accounts::note_sign_in_task(logins, "alternate", action, 90);
+                Vec::new()
+            });
             let progress = project(&logins, &BTreeSet::new());
             assert_eq!(
                 (progress.known, progress.eligible),
@@ -646,34 +728,33 @@ mod tests {
                 },
                 accounts::Row {
                     label: "missing".into(),
-                    dir: Some("/synthetic/missing".into()),
+                    dir: Some(abs("/synthetic/missing")),
                     ..Default::default()
                 },
                 accounts::Row {
                     label: "unlogged".into(),
-                    dir: Some("/synthetic/login".into()),
+                    dir: Some(abs("/synthetic/login")),
                     ..Default::default()
                 },
             ],
         };
         let state = State::default();
         let mut logins = Logins::default();
-        logins.labels.insert(
-            "unlogged".into(),
-            accounts::Binding {
-                sign_in_attempt: Some(accounts::SignInAttempt {
-                    outcome: accounts::AttemptOutcome::NoRoute,
-                    routes: "profile(none)".into(),
-                    since: 80,
-                }),
-                ..Default::default()
-            },
-        );
+        admitted_guidance(&roster, &mut logins, 80, "unlogged", |logins| {
+            accounts::note_sign_in_attempt(
+                logins,
+                "unlogged",
+                accounts::AttemptOutcome::NoRoute,
+                "profile(none)",
+                80,
+            )
+        });
         let mut progress = AccountProgress::unknown(100);
         progress.account = Some("current".into());
         progress.phase = ProgressPhase::Limited;
         enrich_inventory(
             &mut progress,
+            &roster,
             &roster,
             &state,
             &logins,
@@ -705,6 +786,7 @@ mod tests {
         progress = AccountProgress::unknown(100);
         enrich_inventory(
             &mut progress,
+            &roster,
             &roster,
             &state,
             &logins,
@@ -783,6 +865,7 @@ mod tests {
             progress.phase = phase;
             enrich_inventory(
                 &mut progress,
+                &roster,
                 &roster,
                 state,
                 &Logins::default(),
@@ -890,6 +973,7 @@ mod tests {
             changed.account = account.map(str::to_owned);
             enrich_inventory(
                 &mut changed,
+                &roster,
                 &roster,
                 &senior,
                 &Logins::default(),

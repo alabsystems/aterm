@@ -154,12 +154,10 @@ fn now_secs() -> u64 {
 /// The holder `path`'s record names, if it names one.
 #[must_use]
 pub fn read(path: &Path) -> Option<Holder> {
-    let mut head = Vec::new();
-    open_regular_existing(path)
-        .ok()?
-        .take(RECORD)
-        .read_to_end(&mut head)
-        .ok()?;
+    let (file, meta) = open_regular_existing(path).ok()?;
+    let cap = usize::try_from(meta.len().min(RECORD).saturating_add(1)).unwrap_or(0);
+    let mut head = Vec::with_capacity(cap);
+    file.take(RECORD).read_to_end(&mut head).ok()?;
     Holder::parse(&String::from_utf8_lossy(&head))
 }
 
@@ -495,7 +493,7 @@ fn open(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
-fn open_regular_existing(path: &Path) -> io::Result<File> {
+fn open_regular_existing(path: &Path) -> io::Result<(File, std::fs::Metadata)> {
     #[cfg(not(unix))]
     if !std::fs::symlink_metadata(path)?.is_file() {
         return Err(io::Error::new(
@@ -511,13 +509,14 @@ fn open_regular_existing(path: &Path) -> io::Result<File> {
         options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     let file = options.open(path)?;
-    if !file.metadata()?.is_file() {
+    let meta = file.metadata()?;
+    if !meta.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("{} is not a regular file", path.display()),
         ));
     }
-    Ok(file)
+    Ok((file, meta))
 }
 
 #[cfg(test)]

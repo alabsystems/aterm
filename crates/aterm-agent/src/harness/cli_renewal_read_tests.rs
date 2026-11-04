@@ -227,8 +227,8 @@ fn manual_renewals_recover_or_refuse_before_dispatching_any_provider() {
                 );
                 if fault < 2 {
                     // The recovery runs everywhere; the sign-in after it only where it runs
-                    // (`signs_in_here`).
-                    let asked: &[&str] = if signs_in_here(cli) {
+                    // (`links_here`).
+                    let asked: &[&str] = if links_here(cli) {
                         &["main@example.test"]
                     } else {
                         &[]

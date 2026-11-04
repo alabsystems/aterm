@@ -126,13 +126,20 @@ pub(crate) fn read_regular_file(path: &Path) -> std::io::Result<Vec<u8>> {
         .read(true)
         .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)?;
-    if !file.metadata()?.is_file() {
+    let meta = file.metadata()?;
+    if !meta.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "not a regular file",
         ));
     }
-    let mut bytes = Vec::new();
+    if meta.len() > 16 * 1024 * 1024 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "file exceeds 16 MiB limit",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0).saturating_add(1));
     file.take(16 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
     if bytes.len() > 16 * 1024 * 1024 {
         return Err(std::io::Error::new(

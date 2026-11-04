@@ -12,67 +12,7 @@ use crate::ladder::{Finding, Outcome, Report, Severity};
 /// How many findings a failed check lists before pointing at the log.
 pub const FINDINGS_SHOWN: usize = 10;
 
-/// Inspect top-level wire fields before Value's general-purpose map can replace duplicates.
-/// Ambiguous records grant no authority; retain every valid identity they actually named so
-/// only those units lose their join, including both sides of a duplicated identity field.
-enum UnitMessage {
-    Other,
-    Unit(aterm_json::Value),
-    Ambiguous(Vec<String>),
-}
-
-impl<'de> serde::Deserialize<'de> for UnitMessage {
-    fn deserialize<D: serde::Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
-        struct Wire;
-        impl<'de> serde::de::Visitor<'de> for Wire {
-            type Value = UnitMessage;
-            fn expecting(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                out.write_str("a compiler message object")
-            }
-            fn visit_map<A: serde::de::MapAccess<'de>>(
-                self,
-                mut input: A,
-            ) -> Result<Self::Value, A::Error> {
-                use aterm_json::Value;
-                let mut fields = aterm_json::Map::new();
-                let mut identities = std::collections::BTreeSet::new();
-                let mut unit = false;
-                let mut duplicate = false;
-                while let Some((key, value)) = input.next_entry::<String, Value>()? {
-                    if key == "reason"
-                        && matches!(
-                            value.as_str(),
-                            Some("compiler-artifact" | "compilation-unit-dispatched")
-                        )
-                    {
-                        unit = true;
-                    }
-                    if key == "trust_unit_identity_sha256"
-                        && let Some(identity) = value
-                            .as_str()
-                            .filter(|id| aterm_codec::hex::is_lower(id, 64))
-                    {
-                        identities.insert(identity.to_owned());
-                    }
-                    match fields.entry(key) {
-                        std::collections::btree_map::Entry::Occupied(_) => duplicate = true,
-                        std::collections::btree_map::Entry::Vacant(slot) => {
-                            slot.insert(value);
-                        }
-                    }
-                }
-                Ok(if !unit {
-                    UnitMessage::Other
-                } else if duplicate {
-                    UnitMessage::Ambiguous(identities.into_iter().collect())
-                } else {
-                    UnitMessage::Unit(Value::Object(fields))
-                })
-            }
-        }
-        decoder.deserialize_map(Wire)
-    }
-}
+use crate::compiler_message::UnitMessage;
 
 /// The bounded v1 dispatch evidence emitted by Targo, not a process-start or success receipt.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -307,7 +247,7 @@ pub fn compile_unit_events(stage: &str, output: &str) -> Vec<String> {
         let UnitMessage::Unit(value) = message else {
             return format!("verify-event: {}", aterm_json::json!({
                 "schema": 1, "event": "compile-unit-message-unavailable", "stage": stage,
-                "detail": "duplicate top-level fields in a unit message",
+                "detail": "duplicate fields in a unit message",
             }));
         };
         let identity = unit_identity(value);
@@ -854,6 +794,37 @@ mod tests {
         assert_eq!(
             without["rebuild_reason_status"].as_str(),
             Some("not-reported-by-producer")
+        );
+    }
+
+    #[test]
+    fn nested_wire_ambiguity_taints_an_otherwise_matching_unit() {
+        let capture = include_str!("../tests/fixtures/targo-unit-dispatch-v1.jsonl");
+        let artifact = capture.lines().nth(1).unwrap();
+        let ambiguous = artifact.replacen('{', r#"{"extra":{"nested":[{"key":1,"key":2}]},"#, 1);
+        let events = compile_unit_events("nested ambiguity", &format!("{capture}\n{ambiguous}"));
+        let finished: Vec<aterm_json::Value> = events
+            .iter()
+            .map(|line| aterm_json::from_str(line.strip_prefix("verify-event: ").unwrap()).unwrap())
+            .collect();
+        assert_eq!(
+            finished
+                .iter()
+                .filter(|event| event["event"].as_str() == Some("compile-unit-finished"))
+                .count(),
+            1
+        );
+        assert!(
+            finished
+                .iter()
+                .any(|event| event["event"].as_str() == Some("compile-unit-message-unavailable"))
+        );
+        assert!(
+            finished
+                .iter()
+                .filter(|event| event["event"].as_str() == Some("compile-unit-finished"))
+                .all(|event| event["rebuild_reason"].is_null()
+                    && event["rebuild_reason_status"].as_str() == Some("ambiguous-message"))
         );
     }
 

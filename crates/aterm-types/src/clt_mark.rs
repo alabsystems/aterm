@@ -10,7 +10,7 @@
 //! terminal's `aterm init` always find one file.
 //!
 //! Two askers share it, reading and writing it through this one code: System State's automatic
-//! Command Line Tools tab, which claims its build's ask as the tab lands, and `aterm init` in a run
+//! Mac Setup tab, which claims its build's ask as the tab lands, and `aterm init` in a run
 //! aterm decided (the follow-up of a person's own `aterm pkg install` or `update`), which claims it
 //! right before `sudo` asks. A claim ([`claim`]) adds the build's line only where the record does
 //! not name it yet, under a lock beside the record ([`Files::lock`]) that every change of it
@@ -50,8 +50,14 @@ pub const BYTES: usize = BUILDS * ("opened ".len() + BUILD_BYTES + 1);
 /// How long a change of the record waits for another asker's change to end ([`Live`]'s lock): a
 /// change is a short read and one durable write, so a holder past this is stuck, and the change
 /// fails rather than hold the window's loop.
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), not(test)))]
 pub const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// [`LOCK_WAIT`] under this crate's tests, whose other asker always lets go once its durable write
+/// is done: the one-minute hang detector, so a write a loaded disk slows is not read as a stuck
+/// holder.
+#[cfg(all(not(target_family = "wasm"), test))]
+pub const LOCK_WAIT: std::time::Duration = aterm_spec::wait::MUST_HAPPEN;
 
 /// This account's record: [`FILE`] in its aterm state root ([`crate::dirs::account_state_dir`]:
 /// `~/Library/Application Support/aterm` on macOS, which `ATERM_STATE_HOME` isolates for a lab

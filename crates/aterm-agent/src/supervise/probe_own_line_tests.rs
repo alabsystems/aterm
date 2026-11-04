@@ -223,6 +223,7 @@ fn a_usage_draft_is_no_persons_only_while_the_probe_that_left_it_lasts() {
     let mut m = Mock::new(vec![with_draft(&ended(PROBE_SAID), USAGE_COMMAND)]);
     m.gen_fence = true;
     m.human_seq = Some(0);
+    m.cursor_on_caret = true;
     m.cursor_col = Some(2 + USAGE_COMMAND.len());
     let mut s = virtual_session(&mut m, None);
     let mut heard = Heard::default();
@@ -335,6 +336,11 @@ fn a_probe_the_ledger_seeds_presses_no_enter_on_a_usage_it_did_not_write() {
     m.screens.push(standing);
     m.served = m.screens.len() - 2;
     m.stalls = 0;
+    // The grace is what this run waits out, and nothing here reads a time finer than it: the nap
+    // caps how far the virtual clock moves, so it overshoots no wake the loop asked for. What it
+    // gives up: a transition between two of these steps, or a defect only the thousands of reads
+    // of a 5 ms nap reach.
+    m.stall_sleep = Some(Duration::from_secs(5));
     m.exit_when = Some(|m| probe_writes(m).contains(&"esc"));
     let next = ProbeHost::probing(true);
     let (lines, journal) = probe_run_over(

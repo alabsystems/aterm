@@ -562,286 +562,6 @@ fn withdrawn_system_state_offer_restores_policy_only_after_a_fresh_read() {
     assert_ne!(app.system_state_host.generation, before_withdrawal);
 }
 
-/// A launch that resumes a run an earlier process admitted offers that plan back
-/// ([`OfferKind::Resume`]): the offer holds none of aterm's own permissions and takes no tab, the
-/// page answers it by itself while the run keeps it busy, with the plan as offered and nothing
-/// chosen, and that answer, accepted, is the window's own admission of the revision the records
-/// name (design §3.3, §6). Nothing goes to the manual Apply. A Stop withdraws an offer still
-/// waiting, and a person's press answers for itself, leaving the offer withdrawn.
-#[test]
-fn a_resumed_runs_offer_is_answered_by_the_page_while_the_run_goes() {
-    let admitted = || SetupStatus {
-        permissions: Some(crate::InitialSetupPermissionPolicy {
-            revision: 5,
-            allowed: true,
-        }),
-        ..running()
-    };
-    let mut app = App::headless_for_test();
-    app.workstation_setup = crate::workstation_setup::Host::for_launch(
-        Some(|| true),
-        false,
-        crate::clt_shim::Shim::default(),
-    );
-    let (wid, instance, view) = page(&mut app);
-    app.windows.get_mut(&wid).unwrap().os_window_for_test = true;
-    app.set_system_state_handlers_for_test(InitialSetupHandlers {
-        apply: |_, _, _, _| panic!("the resumed run's answer is no manual Apply"),
-        ..InitialSetupHandlers::inert_for_test()
-    });
-    fresh(&mut app, admitted());
-    assert!(app.admitted_access().is_none(), "the records' yes is none");
-    let active = app.windows[&wid].tab_set.active_id();
-    let (send, receive) = mpsc::channel();
-    let request = Request::resume(Plan::default(), send);
-    app.attach_system_state_offer(request.clone());
-    assert!(
-        app.system_state_host.pending.is_some(),
-        "offered while busy"
-    );
-    assert!(
-        !app.workstation_setup.suppresses_permissions(),
-        "nothing held"
-    );
-    assert_eq!(app.windows[&wid].tab_set.active_id(), active);
-    assert!(indicators(&app, instance, view).busy, "the run reads on");
-    assert!(app.commit_glassless_native_frame(wid));
-    answer_offer(&mut app);
-    app.drain_system_state_actions();
-    let mut answer = receive.try_recv().expect("the page answered by itself");
-    assert_eq!(
-        answer.decision,
-        WorkstationSetupDecision::Begin(Plan::default())
-    );
-    assert!(!answer.chosen && !answer.vault_typed && answer.changed.is_none());
-    assert!(
-        !app.workstation_setup.suppresses_permissions() && app.access_revision() == Some(5),
-        "the answer holds nothing either: the run's access steps go on"
-    );
-    let receipt = answer.receipt.take().expect("its receipt");
-    assert_eq!(receipt.admission(), Admission::Automatic);
-    receipt.accept();
-    app.resolve_system_state_apply();
-    fresh(&mut app, admitted());
-    assert!(
-        app.admitted_access().is_none(),
-        "automatic resume grants no permission authority"
-    );
-    assert!(!request.pending());
-
-    // A Stop withdraws an offer still waiting.
-    let mut app = App::headless_for_test();
-    app.workstation_setup = crate::workstation_setup::Host::for_launch(
-        Some(|| true),
-        false,
-        crate::clt_shim::Shim::default(),
-    );
-    let (wid, _, _) = page(&mut app);
-    app.windows.get_mut(&wid).unwrap().os_window_for_test = true;
-    fresh(&mut app, admitted());
-    let (send, receive) = mpsc::channel();
-    app.attach_system_state_offer(Request::resume(Plan::default(), send));
-    assert!(app.system_state_host.pending.is_some());
-    app.run_system_state_action_with_handlers(SystemStateAction::Stop, None);
-    assert_eq!(
-        receive.try_recv().unwrap().decision,
-        WorkstationSetupDecision::Unavailable
-    );
-    assert!(app.system_state_host.pending.is_none());
-
-    // A press answers for itself: the offer goes, and the press is the manual choice it is.
-    let mut app = App::headless_for_test();
-    app.workstation_setup = crate::workstation_setup::Host::for_launch(
-        Some(|| true),
-        false,
-        crate::clt_shim::Shim::default(),
-    );
-    let (wid, _, _) = page(&mut app);
-    app.windows.get_mut(&wid).unwrap().os_window_for_test = true;
-    app.set_system_state_handlers_for_test(InitialSetupHandlers {
-        apply: |_, _, _, receipt| {
-            APPLY_RECEIPTS.with(|receipts| receipts.borrow_mut().push(receipt));
-            true
-        },
-        ..InitialSetupHandlers::inert_for_test()
-    });
-    fresh(&mut app, admitted());
-    let (send, receive) = mpsc::channel();
-    app.attach_system_state_offer(Request::resume(Plan::default(), send));
-    let mut pressed = crate::SetupAnswer::from(WorkstationSetupDecision::Begin(Plan::default()));
-    pressed.chosen = true;
-    app.run_system_state_action_with_handlers(
-        SystemStateAction::Apply(pressed, Admission::Person),
-        app.system_state_handlers(),
-    );
-    assert_eq!(
-        receive.try_recv().unwrap().decision,
-        WorkstationSetupDecision::Unavailable
-    );
-    let manual = APPLY_RECEIPTS.with(|receipts| receipts.borrow_mut().pop());
-    assert_eq!(
-        manual.map(|receipt| receipt.admission()),
-        Some(Admission::Person),
-        "the press went to the manual Apply"
-    );
-}
-
-thread_local! {
-    /// The resumed offer the Stop handler looks at, and whether it was still waiting then.
-    static STOPPED_OFFER: RefCell<(Option<Request>, Vec<bool>)> = const {
-        RefCell::new((None, Vec::new()))
-    };
-}
-
-/// A Stop raises the worker's Stop before it lets the resumed run's offer go, so the offer's
-/// thread, woken by that, finds the run stopped and never offers it again; and a window a Stop
-/// holds takes no offer of the run's plan, whose answer would hold the gate again and take back
-/// the row press a person may still make after the Stop.
-#[test]
-fn a_stop_ends_the_resumed_runs_offer_for_good() {
-    let admitted = || SetupStatus {
-        permissions: Some(crate::InitialSetupPermissionPolicy {
-            revision: 5,
-            allowed: true,
-        }),
-        ..running()
-    };
-    let setup = |app: &mut App| {
-        app.workstation_setup = crate::workstation_setup::Host::for_launch(
-            Some(|| true),
-            false,
-            crate::clt_shim::Shim::default(),
-        );
-        let (wid, _, view) = page(app);
-        app.windows.get_mut(&wid).unwrap().os_window_for_test = true;
-        fresh(app, admitted());
-        (wid, view)
-    };
-    let mut app = App::headless_for_test();
-    let (wid, _) = setup(&mut app);
-    app.set_system_state_handlers_for_test(InitialSetupHandlers {
-        stop: || {
-            STOPPED_OFFER.with(|seen| {
-                let mut seen = seen.borrow_mut();
-                let pending = seen.0.as_ref().is_some_and(Request::pending);
-                seen.1.push(pending);
-            });
-        },
-        ..InitialSetupHandlers::inert_for_test()
-    });
-    let (send, receive) = mpsc::channel();
-    let request = Request::resume(Plan::default(), send);
-    STOPPED_OFFER.with(|seen| seen.borrow_mut().0 = Some(request.clone()));
-    app.attach_system_state_offer(request);
-    assert!(app.system_state_host.pending.is_some());
-    app.run_system_state_action_with_handlers(SystemStateAction::Stop, app.system_state_handlers());
-    assert_eq!(
-        STOPPED_OFFER.with(|seen| seen.borrow().1.clone()),
-        [true],
-        "the worker's Stop came while the offer still waited"
-    );
-    assert_eq!(
-        receive.try_recv().unwrap().decision,
-        WorkstationSetupDecision::Unavailable
-    );
-    // The offer's thread offers again: a stopped window takes none.
-    let (send, receive) = mpsc::channel();
-    app.attach_system_state_offer(Request::resume(Plan::default(), send));
-    assert_eq!(
-        receive.try_recv().unwrap().decision,
-        WorkstationSetupDecision::Unavailable
-    );
-    assert!(app.system_state_host.pending.is_none());
-    assert!(app.commit_glassless_native_frame(wid));
-    answer_offer(&mut app);
-    app.drain_system_state_actions();
-    assert!(
-        app.system_state_host.pending_apply.is_none(),
-        "nothing answered"
-    );
-    assert!(
-        app.admitted_by_press(true).is_some(),
-        "a person's row press still goes past the Stop"
-    );
-}
-
-/// The offer of a resumed run's plan is moot while the window holds its own admission of the
-/// plan in force (a startup a press or a Restore began, a heal's, after the launch's answer): it
-/// is let go for this launch, at the offer or at its answer, and that admission stands.
-#[test]
-fn a_window_that_holds_its_own_admission_lets_the_resumed_offer_go() {
-    let admitted = || SetupStatus {
-        permissions: Some(crate::InitialSetupPermissionPolicy {
-            revision: 5,
-            allowed: true,
-        }),
-        ..running()
-    };
-    let own = |app: &mut App| {
-        app.hold_initial_setup_permissions();
-        app.note_system_state_touch();
-        app.note_system_state_apply(Admission::Person);
-        app.accepted_initial_setup_apply();
-        assert!(!app.own_admission_stands(), "held: none stands");
-        fresh(app, admitted());
-        assert!(app.admitted_access().is_some());
-        assert!(
-            app.own_admission_stands(),
-            "the same fact, with no yes made"
-        );
-    };
-    let mut app = App::headless_for_test();
-    app.workstation_setup = crate::workstation_setup::Host::for_launch(
-        Some(|| true),
-        false,
-        crate::clt_shim::Shim::default(),
-    );
-    let (wid, _, view) = page(&mut app);
-    app.windows.get_mut(&wid).unwrap().os_window_for_test = true;
-    fresh(&mut app, admitted());
-    own(&mut app);
-    let (send, receive) = mpsc::channel();
-    app.attach_system_state_offer(Request::resume(Plan::default(), send));
-    let moot = receive.try_recv().unwrap();
-    assert_eq!(
-        moot.decision,
-        WorkstationSetupDecision::Begin(Plan::default()),
-        "let go as offered: nothing offers it again in this launch"
-    );
-    assert!(moot.receipt.is_none(), "it admits nothing");
-    assert!(app.system_state_host.pending.is_none());
-
-    // The admission came while the offer was up: its answer is let go, and nothing is held.
-    let mut app = App::headless_for_test();
-    app.workstation_setup = crate::workstation_setup::Host::for_launch(
-        Some(|| true),
-        false,
-        crate::clt_shim::Shim::default(),
-    );
-    let (wid, _, _) = page(&mut app);
-    app.windows.get_mut(&wid).unwrap().os_window_for_test = true;
-    fresh(&mut app, admitted());
-    let (send, receive) = mpsc::channel();
-    app.attach_system_state_offer(Request::resume(Plan::default(), send));
-    assert!(app.system_state_host.pending.is_some());
-    own(&mut app);
-    assert!(app.commit_glassless_native_frame(wid));
-    answer_offer(&mut app);
-    app.drain_system_state_actions();
-    let moot = receive.try_recv().unwrap();
-    assert_eq!(
-        moot.decision,
-        WorkstationSetupDecision::Begin(Plan::default())
-    );
-    assert!(moot.receipt.is_none(), "it admits nothing");
-    assert!(
-        app.system_state_host.pending_apply.is_none(),
-        "nothing submitted"
-    );
-    assert!(app.admitted_access().is_some(), "the admission stands");
-    let _ = view;
-}
-
 #[test]
 fn an_automatic_offer_withdrawn_after_queueing_restores_only_fresh_policy() {
     let policy = || SetupStatus {
@@ -866,7 +586,7 @@ fn an_automatic_offer_withdrawn_after_queueing_restores_only_fresh_policy() {
     });
     fresh(&mut app, policy());
     assert!(!app.workstation_setup.suppresses_permissions());
-    assert!(app.admitted_access().is_none());
+    assert!(!app.person_permission_admission_stands());
     let (send, receive) = mpsc::channel();
     let request = Request::new(Plan::default(), send);
     app.attach_system_state_offer(request.clone());
@@ -897,13 +617,13 @@ fn an_automatic_offer_withdrawn_after_queueing_restores_only_fresh_policy() {
     app.publish_system_state(policy());
     app.receive_system_state_status(Some(before_apply), policy());
     assert!(app.workstation_setup.suppresses_permissions());
-    assert!(app.admitted_access().is_none());
+    assert!(!app.person_permission_admission_stands());
     fresh(&mut app, policy());
     assert!(
         !app.workstation_setup.suppresses_permissions(),
         "an abandoned automatic answer must converge on fresh durable policy"
     );
-    assert!(app.admitted_access().is_none());
+    assert!(!app.person_permission_admission_stands());
     assert!(
         receive.try_recv().is_err(),
         "the withdrawn offer stays answered once"
@@ -974,7 +694,7 @@ fn a_rejected_automatic_offer_restores_fresh_policy_unless_stopped() {
         assert!(app.workstation_setup.suppresses_permissions());
         fresh(&mut app, policy());
         assert_eq!(app.workstation_setup.suppresses_permissions(), stopped);
-        assert!(app.admitted_access().is_none());
+        assert!(!app.person_permission_admission_stands());
         assert!(app.native_runtime.take_system_state_action().is_none());
         assert!(receive.try_recv().is_err());
     }
@@ -1018,7 +738,7 @@ fn an_automatic_offer_with_a_closed_answer_receiver_restores_fresh_policy() {
     assert!(app.workstation_setup.suppresses_permissions());
     fresh(&mut app, policy());
     assert!(!app.workstation_setup.suppresses_permissions());
-    assert!(app.admitted_access().is_none());
+    assert!(!app.person_permission_admission_stands());
 }
 
 #[test]
@@ -1063,7 +783,7 @@ fn a_refused_local_decision_keeps_its_permission_hold() {
             intent != "restore",
             "{intent}"
         );
-        assert!(app.admitted_access().is_none(), "{intent}");
+        assert!(!app.person_permission_admission_stands(), "{intent}");
     }
 }
 
@@ -1423,7 +1143,7 @@ fn a_waiting_launch_offer_keeps_previous_permission_policy_held_and_allows_only_
     }
     assert!(calls().is_empty());
     assert!(app.workstation_setup.suppresses_permissions());
-    assert!(app.admitted_access().is_none());
+    assert!(!app.person_permission_admission_stands());
     assert!(request.pending() && receive.try_recv().is_err());
     press(&mut app, wid, view, "system-state/check");
     assert_eq!(
@@ -1549,8 +1269,7 @@ fn a_join_while_the_offer_waits_hands_the_vault_and_password_to_the_startup_once
 /// the page's first tick, as one a person just used does: the admission and the background stages
 /// it starts wait for nobody (init-on-by-default design §6.1, the owner's ruling of 2026-10-25).
 /// Its person stages wait: the page in front of nobody does not open the sign-outs' `on_screen`
-/// port, nor the debugger step's moment. A page not in front reads neither the input nor the
-/// screen.
+/// port. A page not in front reads neither the input nor the screen.
 #[test]
 fn a_mac_nobody_touches_admits_its_offer_at_once_and_holds_its_person_stages() {
     let admits = |input: fn(Duration) -> bool, away: fn() -> bool| {
@@ -1576,22 +1295,17 @@ fn a_mac_nobody_touches_admits_its_offer_at_once_and_holds_its_person_stages() {
             answer.decision,
             WorkstationSetupDecision::Begin(Plan::default())
         );
-        (
-            app.system_state_front_with_a_person(),
-            app.debugger_step_moment().page.is_some(),
-        )
+        app.system_state_front_with_a_person()
     };
-    assert_eq!(
+    assert!(
         admits(|within| within >= Duration::from_secs(5), || false),
-        (true, true),
         "a person who used the trackpad five seconds ago"
     );
-    assert_eq!(
-        admits(|within| within >= Duration::from_secs(10 * 60), || false),
-        (false, false),
+    assert!(
+        !admits(|within| within >= Duration::from_secs(10 * 60), || false),
         "idle ten minutes"
     );
-    assert_eq!(admits(|_| true, || true), (false, false), "screen locked");
+    assert!(!admits(|_| true, || true), "screen locked");
 
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
@@ -2727,7 +2441,7 @@ mod observation_start {
             },
         );
         assert_eq!(app.access_revision(), None);
-        assert!(app.admitted_access().is_none());
+        assert!(!app.person_permission_admission_stands());
         let next = app.system_state_host.next_tick.unwrap();
         tick(&mut app, next);
         assert_eq!(
@@ -2758,7 +2472,7 @@ mod observation_start {
         tick(&mut app, next);
         assert_eq!(reads().len(), 2, "the accepted refresh runs once");
         assert_eq!(app.access_revision(), None);
-        assert!(app.admitted_access().is_none());
+        assert!(!app.person_permission_admission_stands());
     }
 
     #[test]
@@ -2784,7 +2498,7 @@ mod observation_start {
         assert_eq!(state.headline(), before, "known On readings remain facts");
         assert!(!state.can_open_access(Access::DeveloperTools));
         assert_eq!(app.access_revision(), None);
-        assert!(app.admitted_access().is_none());
+        assert!(!app.person_permission_admission_stands());
     }
 
     /// While the GitHub repositories need a person, their remedy is the vault's (a token
@@ -4919,7 +4633,7 @@ fn the_vault_address_takes_the_text_keys_a_settings_field_takes() {
 
 /// A focused window macOS reports occluded (the screen locked, the display asleep, a
 /// screen saver up: the key window stays key) shows nothing, so System State is not in
-/// front there: the sign-outs, the access dialogs and the debugger step, which all read
+/// front there: the sign-outs and the access dialogs, which all read
 /// `system_state_frontmost`, wait for a page someone sees.
 #[test]
 fn an_occluded_focused_window_is_not_in_front_for_on_screen_steps() {
@@ -5272,13 +4986,13 @@ fn admitted_here(app: &mut App) -> SetupStatus {
     app.note_system_state_apply(Admission::Person);
     app.accepted_initial_setup_apply();
     fresh(app, admitted.clone());
-    assert!(app.admitted_access().is_some(), "the standing yes");
+    assert!(app.person_permission_admission_stands(), "the standing yes");
     admitted
 }
 
 /// A read that met a write (a pass saving its progress at a stage, a Stop saving its request)
 /// says nothing of the plan: the page and the window's own admission keep the last read that
-/// did, so the debugger's step still has its standing yes when the next read comes.
+/// did, so the window still holds its own admission when the next read comes.
 #[test]
 fn a_read_that_met_a_write_keeps_the_page_and_the_windows_own_admission() {
     let mut app = App::headless_for_test();
@@ -5299,10 +5013,11 @@ fn a_read_that_met_a_write_keeps_the_page_and_the_windows_own_admission() {
     assert!(asked + CHANGING_REREAD <= next && next <= replied + CHANGING_REREAD);
     assert!(app.system_state_host.deadline(replied, true) <= Some(next));
     fresh(&mut app, admitted);
-    let yes = app
-        .admitted_access()
-        .expect("still the window's own admission");
-    assert_eq!(yes.revision(), 5);
+    assert!(
+        app.person_permission_admission_stands(),
+        "still the window's own admission"
+    );
+    assert_eq!(app.access_revision(), Some(5));
 }
 
 /// Records that keep changing show as such: after a run of reads that each met a write, the page
@@ -5321,7 +5036,7 @@ fn records_that_keep_changing_show_on_the_page_alone() {
         fresh(&mut app, changing());
     }
     assert!(
-        app.admitted_access().is_some(),
+        app.person_permission_admission_stands(),
         "each read of a run says nothing"
     );
     assert_eq!(app.system_state_host.latest_status(), &admitted);
@@ -5329,11 +5044,11 @@ fn records_that_keep_changing_show_on_the_page_alone() {
     assert_eq!(app.system_state_host.latest_status(), &changing());
     assert!(!app.workstation_setup.suppresses_permissions());
     fresh(&mut app, admitted.clone());
-    assert_eq!(
-        app.admitted_access().map(|yes| yes.revision()),
-        Some(5),
+    assert!(
+        app.person_permission_admission_stands(),
         "the records settled: still the window's own admission"
     );
+    assert_eq!(app.access_revision(), Some(5));
     fresh(
         &mut app,
         SetupStatus {
@@ -5342,7 +5057,7 @@ fn records_that_keep_changing_show_on_the_page_alone() {
         },
     );
     assert!(app.workstation_setup.suppresses_permissions());
-    assert!(app.admitted_access().is_none());
+    assert!(!app.person_permission_admission_stands());
 }
 
 /// While the launch's offer waits for the page's first tick its headline is the one signal
@@ -5474,7 +5189,7 @@ fn a_plan_without_the_repositories_ends_the_shims_word_of_an_install() {
 }
 
 /// Install… on the GitHub repositories row is a person's press (design §3.3): a control
-/// client's press opens no Command Line Tools tab and spends its evidence, and the person's asks
+/// client's press opens no Mac Setup tab and spends its evidence, and the person's asks
 /// for the tab at once (here, with no event loop to spawn on, the ask is answered at once); on
 /// Windows, which types no install line, neither press opens it.
 #[test]

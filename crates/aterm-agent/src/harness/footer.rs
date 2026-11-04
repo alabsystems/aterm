@@ -451,24 +451,31 @@ fn open_nonblocking(path: &Path) -> std::io::Result<File> {
     options.open(path)
 }
 
-fn regular(file: File) -> Option<File> {
-    file.metadata().ok()?.is_file().then_some(file)
+fn regular(file: File) -> Option<(File, std::fs::Metadata)> {
+    let meta = file.metadata().ok()?;
+    meta.is_file().then_some((file, meta))
+}
+
+/// Open `path` for reading only if it is a regular file ([`regular`]), returning its metadata.
+pub(crate) fn open_regular_with_meta(path: &Path) -> Option<(File, std::fs::Metadata)> {
+    regular(open_nonblocking(path).ok()?)
 }
 
 /// Open `path` for reading only if it is a regular file ([`regular`]).
 pub(crate) fn open_regular(path: &Path) -> Option<File> {
-    regular(open_nonblocking(path).ok()?)
+    open_regular_with_meta(path).map(|(file, _)| file)
 }
 
-fn read_capped(file: File, cap: u64) -> Option<String> {
-    let mut text = String::new();
+fn read_capped((file, meta): (File, std::fs::Metadata), cap: u64) -> Option<String> {
+    let init = usize::try_from(meta.len().min(cap).saturating_add(1)).unwrap_or(0);
+    let mut text = String::with_capacity(init);
     file.take(cap).read_to_string(&mut text).ok()?;
     Some(text)
 }
 
 /// At most `cap` bytes of the regular file at `path`, as text.
 pub(crate) fn read_small(path: &Path, cap: u64) -> Option<String> {
-    read_capped(open_regular(path)?, cap)
+    read_capped(open_regular_with_meta(path)?, cap)
 }
 
 /// The registry entry for Claude Code process `pid`, or `None` when that pid is not a Claude Code session.
@@ -781,16 +788,9 @@ impl TailCache {
         started: Option<u64>,
         since: u64,
     ) -> Option<TailRead> {
-        let mut file = match open_regular(path) {
-            Some(file) => file,
+        let (mut file, before) = match open_regular_with_meta(path) {
+            Some(opened) => opened,
             None => {
-                self.clear();
-                return None;
-            }
-        };
-        let before = match file.metadata() {
-            Ok(before) => before,
-            Err(_) => {
                 self.clear();
                 return None;
             }
@@ -1161,8 +1161,8 @@ fn rows_back(
     path: &Path,
     mut visit: impl FnMut(Row<'_>) -> std::ops::ControlFlow<()>,
 ) -> Option<bool> {
-    let mut file = open_regular(path)?;
-    let len = file.metadata().ok()?.len();
+    let (mut file, meta) = open_regular_with_meta(path)?;
+    let len = meta.len();
     let mut hi = len;
     let mut cut: Vec<u8> = Vec::new();
     let mut inside = false;
@@ -1294,13 +1294,12 @@ fn began_before(path: &Path, floor: u64) -> bool {
 }
 
 fn existed_before(path: &Path, moment: u64) -> bool {
-    let Some(mut file) = open_regular(path) else {
+    let Some((mut file, meta)) = open_regular_with_meta(path) else {
         return false;
     };
-    let born = file
-        .metadata()
+    let born = meta
+        .created()
         .ok()
-        .and_then(|meta| meta.created().ok())
         .and_then(|at| at.duration_since(UNIX_EPOCH).ok())
         .map(|at| at.as_secs());
     born.is_some_and(|at| at < moment) || head_stamp(&mut file, true).is_some_and(|at| at < moment)
@@ -1634,8 +1633,8 @@ impl FooterCache {
 }
 
 fn read_tail(path: &Path) -> Option<Vec<u8>> {
-    let mut file = open_regular(path)?;
-    let len = file.metadata().ok()?.len();
+    let (mut file, meta) = open_regular_with_meta(path)?;
+    let len = meta.len();
     let start = len.saturating_sub(TAIL_BYTES);
     let mut bytes = read_range(&mut file, start, len)?;
     if start > 0 {
@@ -1657,7 +1656,7 @@ fn read_range_then(file: &mut File, from: u64, to: u64, then: &[u8]) -> Option<V
     let want = to.saturating_sub(from);
     let room = usize::try_from(want)
         .unwrap_or(0)
-        .saturating_add(then.len());
+        .saturating_add(then.len().max(1));
     let mut bytes = Vec::with_capacity(room);
     file.take(want).read_to_end(&mut bytes).ok()?;
     bytes.extend_from_slice(then);
@@ -2301,7 +2300,7 @@ fn read_git_head_in(home: Option<&Path>, cwd: &Path) -> GitHeadRead {
 
 fn read_head(path: &Path) -> Result<Option<String>, ()> {
     match open_nonblocking(path) {
-        Ok(file) => Ok(regular(file).and_then(|file| read_capped(file, MAX_GIT_FILE_BYTES))),
+        Ok(file) => Ok(regular(file).and_then(|pair| read_capped(pair, MAX_GIT_FILE_BYTES))),
         Err(error) if is_eperm(&error) => Err(()),
         Err(_) => Ok(None),
     }

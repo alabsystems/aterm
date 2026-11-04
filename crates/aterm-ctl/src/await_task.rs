@@ -2111,8 +2111,9 @@ mod tests {
 
     #[test]
     fn targets_group_by_the_instance_that_hosts_them() {
-        let dir = std::env::temp_dir().join(format!("aterm-await-task-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(dir.join("graph"));
+        let scratch = crate::test_scratch_dir("await-task");
+        let dir = scratch.path();
+        std::fs::create_dir_all(dir.join("graph")).expect("graph dir");
         let targets = vec![
             Target {
                 selector: "s-abc".into(),
@@ -2125,10 +2126,10 @@ mod tests {
                 fact_since: None,
             },
         ];
-        let pinned = group(targets.clone(), true, "/tmp/pinned.sock", Some(&dir)).unwrap();
+        let pinned = group(targets.clone(), true, "/tmp/pinned.sock", Some(dir)).unwrap();
         assert_eq!(pinned.len(), 1);
         assert_eq!(pinned[0].targets.len(), 2);
-        let err = group(targets, false, "/tmp/default.sock", Some(&dir)).unwrap_err();
+        let err = group(targets, false, "/tmp/default.sock", Some(dir)).unwrap_err();
         assert!(
             err.to_string().contains("ERR no such session @s-abc"),
             "{err}"
@@ -2141,11 +2142,10 @@ mod tests {
             }],
             false,
             "/tmp/default.sock",
-            Some(&dir),
+            Some(dir),
         )
         .unwrap();
         assert_eq!(local[0].sock, "/tmp/default.sock");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     const BUSY: &str = "@s-a1 rev=3 state=working agent=busy attention=- result_bytes=0";

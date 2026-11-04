@@ -94,3 +94,17 @@ pub(crate) fn count_glass_slab() {
 pub fn take_glass_slabs() -> usize {
     GLASS_SLABS.with(|n| n.replace(0))
 }
+
+thread_local! {
+    static BLOOM_PIXELS: Cell<usize> = const { Cell::new(0) };
+}
+
+pub(crate) fn count_bloom_pixel() {
+    BLOOM_PIXELS.with(|n| n.set(n.get() + 1));
+}
+
+/// This thread's pixels a bloom's blur laid light on ([`crate::bloom::apply_kept_off`]) since the
+/// last take, zeroed.
+pub fn take_bloom_pixels() -> usize {
+    BLOOM_PIXELS.with(|n| n.replace(0))
+}

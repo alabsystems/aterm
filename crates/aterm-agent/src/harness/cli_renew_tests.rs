@@ -1520,20 +1520,30 @@ fn a_page_that_stopped_a_sign_in_names_the_persons_renewal() {
     let store = env.accounts_store();
     let record = |outcome| {
         store
-            .transact_logins(at, &mut None, |_, logins| {
-                Ok(accounts::note_sign_in_attempt(
-                    logins, "w3", outcome, "mailbox", at,
-                ))
-            })
+            .transact_pool_logins_within(
+                &accounts::LOCK_LADDER,
+                &env.accounts_roster().unwrap(),
+                at,
+                &mut None,
+                |_, _, logins| {
+                    accounts::admit_workflow(logins, "w3")?;
+                    Ok(accounts::note_sign_in_attempt(
+                        logins, "w3", outcome, "mailbox", at,
+                    ))
+                },
+            )
             .expect("recorded");
     };
-    let step = "sign-in needed: Run aterm harness accounts renew w3 --cli claude in a terminal";
+    let step = format!(
+        "sign-in needed: Run {} in a terminal",
+        Step::Renew(Cli::Claude, "w3".into())
+    );
     record(accounts::AttemptOutcome::Failed);
     let (_, left, _) = acc(AccountsCmd::Report { json: false }, &env, &host);
-    assert!(!left.contains(step), "CONTROL: {left}");
+    assert!(!left.contains(&step), "CONTROL: {left}");
     record(accounts::AttemptOutcome::Blocked);
     let (_, report, _) = acc(AccountsCmd::Report { json: false }, &env, &host);
-    assert!(report.contains(step), "{report}");
+    assert!(report.contains(&step), "{report}");
     assert!(report.contains("sign-in: error blocked since"), "{report}");
     assert!(
         report.contains(
@@ -1607,11 +1617,18 @@ fn a_person_signs_a_row_its_page_stopped_in_its_own_browser() {
         }
         let at = env.now - 60;
         env.accounts_store()
-            .transact_logins(at, &mut None, |_, logins| {
-                Ok(accounts::note_sign_in_attempt(
-                    logins, "main", outcome, "mailbox", at,
-                ))
-            })
+            .transact_pool_logins_within(
+                &accounts::LOCK_LADDER,
+                &env.accounts_roster().unwrap(),
+                at,
+                &mut None,
+                |_, _, logins| {
+                    accounts::admit_workflow(logins, "main")?;
+                    Ok(accounts::note_sign_in_attempt(
+                        logins, "main", outcome, "mailbox", at,
+                    ))
+                },
+            )
             .expect("recorded");
         let mut host = RenewHost::new();
         host.tty = tty;
@@ -1679,15 +1696,22 @@ fn the_report_shows_a_rows_failed_automatic_sign_in_until_a_login_is_made() {
     let store = env.accounts_store();
     for label in ["w3", "main"] {
         store
-            .transact_logins(at, &mut None, |_, logins| {
-                Ok(accounts::note_sign_in_attempt(
-                    logins,
-                    label,
-                    accounts::AttemptOutcome::NoRoute,
-                    routes,
-                    at,
-                ))
-            })
+            .transact_pool_logins_within(
+                &accounts::LOCK_LADDER,
+                &env.accounts_roster().unwrap(),
+                at,
+                &mut None,
+                |_, _, logins| {
+                    accounts::admit_workflow(logins, label)?;
+                    Ok(accounts::note_sign_in_attempt(
+                        logins,
+                        label,
+                        accounts::AttemptOutcome::NoRoute,
+                        routes,
+                        at,
+                    ))
+                },
+            )
             .expect("recorded");
     }
     let (code, report, _) = acc(AccountsCmd::Report { json: false }, &env, &host);
@@ -2353,18 +2377,25 @@ fn a_repaired_browser_reopens_noninteractive_renewal_without_proving_its_identit
         std::fs::write(&browser, "fixture; never executed").unwrap();
         let wrong_at = env.now - 2;
         store
-            .transact_logins(env.now, &mut None, |state, logins| {
-                let mut events =
-                    accounts::note_auth(state, "work-2", accounts::Auth::SignedOut, wrong_at);
-                events.extend(accounts::note_wrong_account(logins, "work-2", wrong_at));
-                if repaired {
-                    events.push(
-                        accounts::Event::new(env.now - 1, accounts::Kind::SignIn, "work-2")
-                            .because("claude.ai window done session-kept"),
-                    );
-                }
-                Ok(events)
-            })
+            .transact_pool_logins_within(
+                &accounts::LOCK_LADDER,
+                &env.accounts_roster().unwrap(),
+                env.now,
+                &mut None,
+                |_, state, logins| {
+                    let mut events =
+                        accounts::note_auth(state, "work-2", accounts::Auth::SignedOut, wrong_at);
+                    events.extend(accounts::note_wrong_account(logins, "work-2", wrong_at));
+                    if repaired {
+                        accounts::admit_workflow(logins, "work-2")?;
+                        events.push(
+                            accounts::Event::new(env.now - 1, accounts::Kind::SignIn, "work-2")
+                                .because("claude.ai window done session-kept"),
+                        );
+                    }
+                    Ok(events)
+                },
+            )
             .unwrap();
         let mut host = RenewHost::new();
         host.tty = false;

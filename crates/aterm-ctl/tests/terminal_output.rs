@@ -59,6 +59,7 @@ struct Seen {
 fn run(tty: Tty, args: &[&str], reply: &[u8]) -> Seen {
     let scratch = aterm_tempfile::Builder::new()
         .prefix("at-tty-")
+        .suffix(".noindex")
         .tempdir_in("/tmp")
         .expect("a scratch dir");
     let socket = scratch.path().join("peer.sock");

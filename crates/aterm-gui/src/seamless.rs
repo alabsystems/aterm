@@ -1022,7 +1022,7 @@ pub(crate) fn read_regular_capped(path: &std::path::Path, max_bytes: u64) -> Opt
     if !metadata.is_file() || metadata.len() > max_bytes {
         return None;
     }
-    let capacity = usize::try_from(metadata.len()).ok()?;
+    let capacity = usize::try_from(metadata.len().saturating_add(1)).ok()?;
     let mut bytes = Vec::new();
     bytes.try_reserve_exact(capacity).ok()?;
     file.take(max_bytes.saturating_add(1))

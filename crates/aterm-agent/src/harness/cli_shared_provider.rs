@@ -16,16 +16,21 @@ pub use claude::{ClaudeProfile, read_claude_profile};
 #[path = "cli_shared_kimi.rs"]
 mod kimi;
 pub use kimi::KimiOauth;
+#[cfg(all(unix, not(test)))]
+pub(in crate::harness) use kimi::verify_or_refresh as verify_or_refresh_kimi;
 #[cfg(unix)]
 pub(in crate::harness) use kimi::{
-    KimiProof, NativeError as KimiNativeError, credential_path as kimi_credential_path,
-    expire_pending as expire_kimi_pending, observation_error as kimi_observation_error,
-    pending_expiry as kimi_pending_expiry, pending_files as kimi_pending_files,
+    KimiProof, NativeError as KimiNativeError, RejectedSnapshot as KimiRejectedSnapshot,
+    credential_path as kimi_credential_path, expire_pending as expire_kimi_pending,
+    observation_error as kimi_observation_error, pending_expiry as kimi_pending_expiry,
+    pending_files as kimi_pending_files, rejected_snapshot as kimi_rejected_snapshot,
     verify_native_classified as verify_native_kimi_classified,
+    verify_or_refresh_with_rejection as verify_or_refresh_kimi_with_rejection,
 };
 #[cfg(all(test, unix))]
 pub(in crate::harness) use kimi::{
     pending_proof_fixture as kimi_pending_proof_fixture, proof_fixture as kimi_proof_fixture,
+    rejection_fixture as kimi_rejection_fixture,
 };
 
 /// A provider-returned identity with private evidence of the staged files.
@@ -69,12 +74,17 @@ impl Execution {
 pub enum ObservationError {
     Unavailable(String),
     RecoveryRequired(String),
+    /// A prior confirmed rejection is still bound to the current local files.
+    /// This is a recovery reason, never authority to perform another login.
+    ReauthenticationRequired(String),
 }
 
 impl std::fmt::Display for ObservationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Unavailable(why) | Self::RecoveryRequired(why) => f.write_str(why),
+            Self::Unavailable(why)
+            | Self::RecoveryRequired(why)
+            | Self::ReauthenticationRequired(why) => f.write_str(why),
         }
     }
 }
@@ -397,7 +407,8 @@ fn codex_execution(outcome: super::super::login_drive::Outcome) -> Execution {
     match outcome {
         super::super::login_drive::Outcome::SignedIn { .. } => Execution::Completed,
         super::super::login_drive::Outcome::NotRun(why) => Execution::NotStarted(why),
-        super::super::login_drive::Outcome::Unverified(why) => Execution::Unknown(why),
+        super::super::login_drive::Outcome::PageNotOpened(why)
+        | super::super::login_drive::Outcome::Unverified(why) => Execution::Unknown(why),
         _ => Execution::Unknown("device-local Codex sign-in did not complete".into()),
     }
 }

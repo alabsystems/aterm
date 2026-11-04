@@ -45,10 +45,12 @@ fn a_silent_trust_service_refuses_every_code_check_at_once_and_its_answer_lifts_
         "the check waited instead of refusing"
     );
 
-    let dir = std::env::temp_dir().join(format!("aktrust-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("dir");
-    let sock = dir.join("k.sock");
+    let scratch = aterm_tempfile::Builder::new()
+        .prefix("aktrust-")
+        .suffix(".noindex")
+        .tempdir_in("/tmp")
+        .expect("dir");
+    let sock = scratch.path().join("k.sock");
     let _listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
     let dial = KeeperClient::connect(&sock, &id, HANG).expect_err("a silent trustd admitted");
     assert!(!refused_identity(&dial), "read as another build: {dial}");
@@ -77,5 +79,4 @@ fn a_silent_trust_service_refuses_every_code_check_at_once_and_its_answer_lifts_
         .expect("this build's own code, once trustd answers");
     id.admits_code_at(&exe)
         .expect("this binary meets its own requirement");
-    let _ = std::fs::remove_dir_all(&dir);
 }

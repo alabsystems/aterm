@@ -154,7 +154,7 @@ fn a_repaired_profile_reopens_the_ladder_inside_its_wrong_account_wait_and_backo
     ))
     .unwrap();
     store
-        .transact_logins(NOW, &mut None, |state, logins| {
+        .transact_pool_logins_within(&[], &desk.roster(), NOW, &mut None, |_, state, logins| {
             let mut events = accounts::note_auth(state, "w3", accounts::Auth::SignedOut, NOW);
             events.extend(accounts::note_wrong_account(logins, "w3", NOW));
             Ok(events)
@@ -178,9 +178,12 @@ fn a_repaired_profile_reopens_the_ladder_inside_its_wrong_account_wait_and_backo
         guard.last_attempt.insert("w3".into(), clock);
         guard.parked.insert("w3".into(), clock);
         guard.bot_checked.insert("w3".into(), clock);
+        let owner = guard.ladder_owners["w3"].clone();
+        guard.activity_owners.insert("w3".into(), owner);
     }
     store
-        .transact_logins(NOW + 1, &mut None, |_, _| {
+        .transact_pool_logins_within(&[], &desk.roster(), NOW + 1, &mut None, |_, _, logins| {
+            accounts::admit_workflow(logins, "w3")?;
             Ok(vec![
                 accounts::Event::new(NOW + 1, accounts::Kind::SignIn, "w3")
                     .because("claude.ai window done session-kept"),
@@ -228,10 +231,11 @@ fn a_repaired_profile_reopens_non_ladder_admission_inside_the_wrong_account_wait
         fs::create_dir_all(browser.parent().unwrap()).unwrap();
         fs::write(browser, b"inert browser marker; no queued work is run").unwrap();
         store
-            .transact_logins(NOW, &mut None, |state, logins| {
+            .transact_pool_logins_within(&[], &desk.roster(), NOW, &mut None, |_, state, logins| {
                 let mut events = accounts::note_auth(state, "w3", accounts::Auth::SignedOut, NOW);
                 events.extend(accounts::note_wrong_account(logins, "w3", NOW));
                 if repaired {
+                    accounts::admit_workflow(logins, "w3")?;
                     events.push(
                         accounts::Event::new(NOW + 1, accounts::Kind::SignIn, "w3")
                             .because("claude.ai window quit session-unknown"),
@@ -297,7 +301,12 @@ fn a_browser_completion_at_its_tasks_timestamp_still_answers_that_task() {
         browser_window_signed_in_token(&store, "w3", NOW),
         Some((NOW, 1))
     );
-    assert_eq!(unaddressed_sign_in_task_at(&store, &logins, "w3"), None);
+    // This fixture has no configured roster.
+    let raw = accounts::Row {
+        label: "w3".into(),
+        ..accounts::Row::default()
+    };
+    assert_eq!(unaddressed_sign_in_task_at(&store, &logins, &raw), None);
 }
 
 #[test]
@@ -397,6 +406,116 @@ fn an_expired_retry_keeps_its_owner_when_another_sign_in_is_running() {
     assert!(guard.ladder.retry_at("w3", later).is_none());
     assert!(guard.ladder.has_backoff("w3"));
     assert!(guard.ladder_owners.contains_key("w3"));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_login_reports_the_last_hold_before_its_ladder_can_retry() {
+    let desk = Desk::new("m30");
+    hand_roster(&desk, true);
+    let store = desk.store();
+    fs::create_dir_all(crate::harness::headless_oauth::browser_profile_dir(
+        &store.dir,
+        Some("w3"),
+    ))
+    .unwrap();
+    let bench = Bench {
+        browser: true,
+        ..Bench::ending(Renewal::AuthFailed)
+    };
+    let path = desk.roster();
+    let fx = bench.fx();
+    let ctx = LadderCtx::of(&fx, &path);
+    let started = Instant::now();
+    let raw = Roster::load(&path).unwrap();
+    let row = raw.row("w3").unwrap();
+    let LadderStep::Go { inputs, .. } =
+        ladder_route_with_clock(&desk.home, &store, row, NOW, &bench.guard, &ctx, &|| {
+            started
+        })
+    else {
+        panic!("the unchanged configured profile provides a route");
+    };
+    let records = store.read_account_records(Some(&path), NOW).unwrap();
+    let row = records.roster.row("w3").unwrap();
+    let raw = records.raw_roster.row("w3").unwrap();
+    let permit = AutoRenewPermit::claim(&bench.guard, "w3", started, false).unwrap();
+    permit.attribute_row(&store, Cli::Claude, row, raw, NOW, &records.logins);
+    let finished = started + Duration::from_secs(60);
+    let retry = {
+        let mut guard = bench.guard.lock().unwrap();
+        let wait = guard.ladder.failed("w3", &inputs, finished);
+        guard.ladder_owners.insert(
+            "w3".into(),
+            LoginOwner::new(&store, Cli::Claude, "w3", NOW + 60)
+                .observing(&records.logins)
+                .for_row(row)
+                .for_workflow(raw, &records.logins),
+        );
+        finished + wait
+    };
+    drop(permit);
+    let paths = [
+        store.state_file(),
+        store.state_witness_file(),
+        store.logins_file(),
+        store.logins_witness_file(),
+        store.ledger_path(),
+        store.wake_path(),
+        store.machine_file(),
+        store.dir.join("sync-commit.json"),
+        store.dir.join("sync-commit.seen"),
+        path.clone(),
+    ];
+    let images = paths.each_ref().map(|path| fs::read(path).ok());
+    let activity = {
+        let guard = bench.guard.lock().unwrap();
+        assert_eq!(guard.last_attempt.get("w3"), Some(&started));
+        assert_eq!(guard.ladder.retry_at("w3", finished), Some(retry));
+        login_activity_of(&guard, &store, Cli::Claude, NOW + 60, finished)
+    };
+    let cooldown = started + Duration::from_secs(900);
+    assert!(retry > cooldown, "the ladder starts at completion");
+    assert!(
+        AutoRenewPermit::claim(&bench.guard, "w3", cooldown - Duration::from_secs(1), false,)
+            .is_none()
+    );
+    // No mailbox, preparation, route or workflow input changes, and no explicit bypass:
+    // the automatic route still refuses when only the launch cooldown has expired.
+    assert!(matches!(
+        ladder_route_with_clock(
+            &desk.home,
+            &store,
+            row,
+            NOW + 900,
+            &bench.guard,
+            &ctx,
+            &|| cooldown,
+        ),
+        LadderStep::Held
+    ));
+    assert!(matches!(
+        ladder_route_with_clock(
+            &desk.home,
+            &store,
+            row,
+            NOW + 960,
+            &bench.guard,
+            &ctx,
+            &|| retry,
+        ),
+        LadderStep::Go { .. }
+    ));
+    assert!(AutoRenewPermit::claim(&bench.guard, "w3", retry, false).is_some());
+    assert_eq!(paths.each_ref().map(|path| fs::read(path).ok()), images);
+    assert_eq!(activity.len(), 1);
+    assert!(!activity[0].active);
+    assert!(activity[0].matches_row(row));
+    assert_eq!(
+        activity[0].next_at,
+        Some(NOW + 60 + i64::try_from(retry.duration_since(finished).as_secs()).unwrap()),
+        "a retry cannot precede the last hold on this account"
+    );
 }
 
 #[cfg(unix)]

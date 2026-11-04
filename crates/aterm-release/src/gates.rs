@@ -682,13 +682,59 @@ pub fn newest_published_source(mappings_json: &str) -> Result<PublishedSource> {
         .ok_or_else(|| Error::new("the publication ledger has no aterm row with a commit key"))
 }
 
+pub(crate) fn read_bounded_bytes(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let (file, meta) = aterm_uds::regular_file::open(path)?;
+    if meta.len() > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "file exceeds size limit",
+        ));
+    }
+    let cap = usize::try_from(meta.len().min(max_bytes))
+        .unwrap_or(0)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(cap);
+    file.take(max_bytes + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "file exceeds size limit",
+        ));
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn read_bounded_string(path: &Path, max_bytes: u64) -> std::io::Result<String> {
+    use std::io::Read as _;
+    let (file, meta) = aterm_uds::regular_file::open(path)?;
+    if meta.len() > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "file exceeds size limit",
+        ));
+    }
+    let cap = usize::try_from(meta.len().min(max_bytes))
+        .unwrap_or(0)
+        .saturating_add(1);
+    let mut text = String::with_capacity(cap);
+    file.take(max_bytes + 1).read_to_string(&mut text)?;
+    if text.len() as u64 > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "file exceeds size limit",
+        ));
+    }
+    Ok(text)
+}
+
 /// The commit a real cut releases.
 ///
 /// # Errors
 /// An unreadable or rowless ledger is a refusal.
 pub fn published_source() -> Result<PublishedSource> {
     let ledger = publication_mappings_path();
-    let text = fs::read_to_string(&ledger).map_err(|e| {
+    let text = read_bounded_string(&ledger, 64 << 20).map_err(|e| {
         Error::new(format!(
             "cannot read the publication ledger {} ({e}) — a real cut releases the commit \
              `pub publish` recorded there. Pull the engine (`git -C {} pull \
@@ -895,7 +941,7 @@ fn refuse_rewriting_info_attributes(git: &dyn GitRunner) -> Result<()> {
     )?
     .stdout_utf8();
     let path = PathBuf::from(at.trim_end_matches('\n'));
-    let text = match fs::read_to_string(&path) {
+    let text = match read_bounded_string(&path, 16 << 20) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => {
@@ -1546,7 +1592,7 @@ pub fn handoff_fixtures_line(found: Option<&HandoffFixtures>) -> String {
 
 /// Prove the public channel's source tree already carries the version being cut.
 pub fn channel_version_gate(repo: &Path, version: &str, offline: bool) -> Result<Option<String>> {
-    let local = fs::read_to_string(repo.join("Cargo.toml"))
+    let local = read_bounded_string(&repo.join("Cargo.toml"), 16 << 20)
         .map_err(|e| Error::new(format!("cannot read workspace Cargo.toml: {e}")))?;
     let Some(slug) = channel::update_channel_slug(&local)? else {
         return Ok(None);
@@ -1617,7 +1663,7 @@ fn locked_metadata_gate_with(
 ) -> std::result::Result<(), LockedMetadataError> {
     use LockedMetadataError::{Lockfile, Unavailable};
     let lock_path = repo.join("Cargo.lock");
-    let lock_before = fs::read(&lock_path).map_err(|error| {
+    let lock_before = read_bounded_bytes(&lock_path, 64 << 20).map_err(|error| {
         let why = format!("read committed Cargo.lock before release metadata check: {error}");
         if error.kind() == std::io::ErrorKind::NotFound {
             Lockfile(why)
@@ -1636,7 +1682,7 @@ fn locked_metadata_gate_with(
     let out = metadata
         .output()
         .map_err(|error| Unavailable(format!("failed to run locked targo metadata: {error}")))?;
-    let lock_after = match fs::read(&lock_path) {
+    let lock_after = match read_bounded_bytes(&lock_path, 64 << 20) {
         Ok(bytes) => bytes,
         Err(read_error) if read_error.kind() == std::io::ErrorKind::NotFound => {
             fs::write(&lock_path, &lock_before).map_err(|restore_error| {

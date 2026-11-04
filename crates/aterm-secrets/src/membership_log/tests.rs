@@ -1623,6 +1623,11 @@ fn a_thousand_record_sybil_quorum_flood_evaluates_without_cubic_passes() {
     // NEGATIVE CONTROL: the walk re-checks every actor at every step that differs from plain:
     // 704,154 calls, and the bound fails.
     let cost = super::eval::weigh_cost(&records);
+    eprintln!(
+        "flood: {} records, {N} candidates, {passes} authorization passes, {} is_member_upto calls",
+        records.len(),
+        cost.evaluations
+    );
     assert!(
         cost.evaluations <= 1029 * 1029 / 8,
         "{} is_member_upto calls weighing {N} candidates",
@@ -1633,6 +1638,7 @@ fn a_thousand_record_sybil_quorum_flood_evaluates_without_cubic_passes() {
 mod reach;
 mod readers;
 mod record_budgets;
+pub(super) mod signed;
 pub(super) mod weigh;
 
 /// A `[everyone]` entry.

@@ -242,10 +242,7 @@ mod tests {
 
     #[test]
     fn begin_with_replays_the_tape_it_was_handed_and_reads_no_file() {
-        let dir = aterm_tempfile::Builder::new()
-            .prefix("agh-taping-")
-            .tempdir()
-            .expect("a scratch directory");
+        let dir = crate::test_fixtures::scratch_dir("taping");
         let path = dir.path().join("handed.atape");
         let argv: Vec<String> = ["repo", "view", "alabsystems/aterm"]
             .map(String::from)
@@ -284,10 +281,7 @@ mod tests {
 
         use crate::wire::{Deadlines, Method, WireBody, WireRequest};
 
-        let dir = aterm_tempfile::Builder::new()
-            .prefix("agh-taping-")
-            .tempdir()
-            .expect("a scratch directory");
+        let dir = crate::test_fixtures::scratch_dir("taping");
         let sealed = dir.path().join("write-only");
         std::fs::create_dir(&sealed).expect("the parent");
         std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o300))

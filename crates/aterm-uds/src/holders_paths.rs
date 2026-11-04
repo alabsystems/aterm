@@ -1495,6 +1495,8 @@ pub fn write_open_files(pid: u32) -> io::Result<Vec<PathBuf>> {
 /// See the macOS twin.
 #[cfg(target_os = "linux")]
 pub fn write_open_files(pid: u32) -> io::Result<Vec<PathBuf>> {
+    use std::io::Read as _;
+
     const O_ACCMODE: u32 = 0o3;
     let proc_dir = PathBuf::from(format!("/proc/{pid}"));
     let rd = match std::fs::read_dir(proc_dir.join("fd")) {
@@ -1505,10 +1507,16 @@ pub fn write_open_files(pid: u32) -> io::Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     for entry in rd.flatten() {
         let name = entry.file_name();
-        let Ok(info) = std::fs::read_to_string(proc_dir.join("fdinfo").join(&name)) else {
+        let Ok(file) = std::fs::File::open(proc_dir.join("fdinfo").join(&name)) else {
             // Distinct branch.
             continue; // closed since the listing
         };
+        let mut info = String::with_capacity(256);
+        if std::io::Read::read_to_string(&mut std::io::Read::take(file, 64 * 1024), &mut info)
+            .is_err()
+        {
+            continue;
+        }
         let flags = info
             .lines()
             .find_map(|l| l.strip_prefix("flags:"))

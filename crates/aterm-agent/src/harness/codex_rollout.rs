@@ -101,18 +101,27 @@ pub fn tail_of(path: &Path, bytes: u64) -> Option<String> {
 
 /// Reads up to the last `bytes` of `path` starting no earlier than line-aligned `floor`.
 pub(crate) fn tail_after(path: &Path, floor: u64, bytes: u64) -> Option<String> {
-    let mut f = crate::harness::footer::open_regular(path)?;
-    tail_after_file(&mut f, floor, bytes)
+    let (mut f, meta) = crate::harness::footer::open_regular_with_meta(path)?;
+    tail_after_file_with_len(&mut f, meta.len(), floor, bytes)
 }
 
 /// Reads up to the last `bytes` of open `f` starting no earlier than line-aligned `floor`.
 pub(crate) fn tail_after_file(f: &mut std::fs::File, floor: u64, bytes: u64) -> Option<String> {
-    use std::io::{Read as _, Seek as _, SeekFrom};
     let len = f.metadata().ok()?.len();
+    tail_after_file_with_len(f, len, floor, bytes)
+}
+
+fn tail_after_file_with_len(
+    f: &mut std::fs::File,
+    len: u64,
+    floor: u64,
+    bytes: u64,
+) -> Option<String> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
     let from = len.saturating_sub(bytes).max(floor);
     f.seek(SeekFrom::Start(from)).ok()?;
     let want = usize::try_from(len.saturating_sub(from).min(bytes)).unwrap_or(0);
-    let mut buf = Vec::with_capacity(want.min(512 * 1024));
+    let mut buf = Vec::with_capacity(want.min(512 * 1024).saturating_add(1));
     f.take(bytes).read_to_end(&mut buf).ok()?;
     if from > floor {
         let Some(nl) = buf.iter().position(|&b| b == b'\n') else {
@@ -494,7 +503,8 @@ pub(crate) fn stream_open_ends_ref(
             if line.len() > max_line {
                 out.long += 1;
                 counted = true;
-                line = Vec::new();
+                // Drop the oversized allocation before skipping the rest of the row.
+                drop(std::mem::take(&mut line));
                 skipping = true;
             }
         }

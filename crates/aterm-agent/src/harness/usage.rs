@@ -1419,7 +1419,7 @@ pub fn kimi_usage_windows(rows: &[String]) -> Vec<PanelWindow> {
         } else if text.starts_with("Weekly limit") || text.starts_with("Week limit") {
             WEEK_WINDOW
         } else if text.starts_with("Monthly limit") {
-            "monthly"
+            super::accounts::MONTH_LIMIT
         } else {
             continue;
         };

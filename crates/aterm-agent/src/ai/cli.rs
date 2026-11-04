@@ -21,6 +21,7 @@ use super::permission::{self, Asker, Choice, Level};
 use super::review;
 use super::state::{self, Actor, Mark, Row, State};
 use super::store::Store;
+use crate::harness::accounts_step::Step;
 
 /// The usage text.
 pub const USAGE: &str = "\
@@ -323,7 +324,8 @@ pub fn look(env: &Env) -> Look {
     if let Some(why) = view.and_then(|a| a.refused.as_deref()) {
         settings.notes.push(format!(
             "accounts.toml is refused ({why}), so Claude reads as having no roster; \
-             `aterm harness accounts` says how to fix it"
+             `{}` says how to fix it",
+            Step::Report(crate::harness::accounts::Cli::Claude)
         ));
     } else if let Some(why) = view.and_then(|a| a.unread.as_deref()) {
         settings.notes.push(format!(
@@ -805,7 +807,7 @@ fn next_act(look: &Look) -> String {
 fn next_act_after(look: &Look, tried: &[&str]) -> String {
     state::health(&look.rows)
         .next_after(tried)
-        .unwrap_or_else(|| "aterm ai doctor".to_string())
+        .unwrap_or_else(|| Step::Doctor.to_string())
 }
 
 /// `aterm pkg install <id>` on this terminal, one step of `aterm ai doctor`'s or `aterm ai
@@ -821,7 +823,7 @@ fn install(env: &Env, runner: &dyn Runner, id: &str) -> Result<(), String> {
     ];
     match runner.terminal(&exe, &args, &env.vars, None) {
         Ok(0) => Ok(()),
-        Ok(code) => Err(format!("`aterm pkg install {id}` exited {code}")),
+        Ok(code) => Err(format!("`{}` exited {code}", Step::Install(id.to_owned()))),
         Err(why) => Err(why),
     }
 }
@@ -876,7 +878,7 @@ fn doctor_here(
                      Mac (`{}`)",
                     row.fix
                         .clone()
-                        .unwrap_or_else(|| format!("aterm ai login {id}"))
+                        .unwrap_or_else(|| Step::AiLogin(id.to_owned()).to_string())
                 ))
             })
         })
@@ -889,7 +891,8 @@ fn doctor_here(
             let id = row.connector.id;
             let _ = writeln!(
                 out,
-                "{id}: not started: nobody has asked for it here (`aterm ai login {id}` signs it in)"
+                "{id}: not started: nobody has asked for it here (`{}` signs it in)",
+                Step::AiLogin(id.to_owned())
             );
         }
         hold
@@ -1323,8 +1326,9 @@ fn login_verb(
                 .unwrap_or_default();
             let _ = writeln!(
                 err,
-                "aterm ai login: stdin is not a terminal, and `aterm ai login {id}`{alone} does \
-                 not end the refusal of {id}'s launches: a person at this Mac: {mend}{refused}"
+                "aterm ai login: stdin is not a terminal, and `{}`{alone} does not end the \
+                 refusal of {id}'s launches: a person at this Mac: {mend}{refused}",
+                Step::AiLogin(id.to_owned())
             );
             return ExitCode::from(2);
         }
@@ -1334,7 +1338,7 @@ fn login_verb(
              person runs `{}` in a terminal at this Mac",
             row.fix
                 .clone()
-                .unwrap_or_else(|| format!("aterm ai login {id}"))
+                .unwrap_or_else(|| Step::AiLogin(id.to_owned()).to_string())
         );
         return ExitCode::from(2);
     }
@@ -1692,7 +1696,11 @@ fn secret_of(path: &Path) -> Result<Vec<u8>, String> {
             return Err("its group or others have access to it: `chmod 600` it first".to_string());
         }
     }
-    let mut raw = Vec::new();
+    if meta.len() > SECRET_MAX {
+        return Err("too large to be a secret key".to_string());
+    }
+    let cap = usize::try_from(meta.len().min(SECRET_MAX).saturating_add(1)).unwrap_or(0);
+    let mut raw = Vec::with_capacity(cap);
     if let Err(e) = file.take(SECRET_MAX + 1).read_to_end(&mut raw) {
         scrub_vec(raw);
         return Err(crate::harness::one_line(&e.to_string(), 120));

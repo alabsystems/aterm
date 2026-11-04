@@ -1182,6 +1182,8 @@ pub(crate) struct RosterRecord {
 /// Process-wide session registry indexed by both [`SessionId`] and local `u64` ID.
 #[derive(Default)]
 pub(crate) struct SessionStore {
+    #[cfg(target_os = "macos")]
+    allocation_monitor: Arc<crate::allocation_monitor_host::Host>,
     by_id: HashMap<SessionId, SessionHandle>,
     by_local: HashMap<u64, SessionId>,
     roster: VecDeque<RosterRecord>,
@@ -1222,6 +1224,11 @@ pub(crate) fn new_store() -> Store {
 }
 
 impl SessionStore {
+    #[cfg(target_os = "macos")]
+    pub(crate) fn allocation_monitor(&self) -> Arc<crate::allocation_monitor_host::Host> {
+        Arc::clone(&self.allocation_monitor)
+    }
+
     /// Registers or replaces a [`SessionHandle`], updating both indices and appending to the roster journal.
     pub(crate) fn register(&mut self, handle: SessionHandle) {
         handle.ctx.native_policy.registered();

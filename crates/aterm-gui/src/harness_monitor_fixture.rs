@@ -39,12 +39,11 @@ fn read_in(path: &Path, home: &Path) -> Option<(Vec<TabComputer>, Vec<TabSpreads
     if !path.starts_with(home) {
         return None;
     }
-    let meta = path.metadata().ok()?;
-    if !meta.is_file() || meta.len() > MAX_BYTES {
+    let (file, meta) = crate::logging::open_regular_nonblock_with_meta(&path).ok()?;
+    if meta.len() > MAX_BYTES {
         return None;
     }
-    let file = std::fs::File::open(path).ok()?;
-    let mut raw = String::new();
+    let mut raw = String::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
     file.take(MAX_BYTES + 1).read_to_string(&mut raw).ok()?;
     if u64::try_from(raw.len()).ok()? > MAX_BYTES {
         return None;

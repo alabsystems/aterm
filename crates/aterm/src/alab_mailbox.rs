@@ -27,15 +27,6 @@ const REST: Duration = Duration::from_secs(24 * 60 * 60);
 /// How long a process that is ending waits for its passes still running.
 const SETTLE: Duration = Duration::from_secs(10);
 
-/// Whether this process may publish: a release build outside a build tool's tests, with no scratch
-/// state home and no CI, the holds the Commons runtime keeps.
-fn publishes() -> bool {
-    !cfg!(debug_assertions)
-        && std::env::var_os("CARGO_MANIFEST_DIR").is_none()
-        && std::env::var_os("ATERM_STATE_HOME").is_none()
-        && std::env::var_os("CI").is_none()
-}
-
 /// The registry's reading of what the harness noted.
 fn listing(seen: &Seen) -> Listing {
     Listing {
@@ -206,34 +197,55 @@ fn pass(listing: &Listing) -> Result<Discovered, String> {
         .map_err(|why| why.to_string())
 }
 
-/// Fill the code-fetch path's hook, where this process publishes.
+/// Fill the code-fetch path's hook, where this process holds a lab ([`crate::alab_view::holds`]),
+/// the holds the Commons runtime keeps.
 pub(crate) fn install() {
-    if !publishes() {
+    if !crate::alab_view::holds() {
         return;
     }
     aterm_agent::harness::mailbox_seen::install(Box::new(|seen: &Seen| {
-        let target = seen.target.as_deref();
-        if !RESTS.begin(&seen.login, target, Instant::now()) {
-            return;
-        }
-        let listing = listing(seen);
-        let spawned = std::thread::Builder::new()
-            .name("aterm-lab-mailbox".into())
-            .spawn(move || {
-                let done = pass(&listing);
-                log_pass(&done);
-                RESTS.end(
-                    &listing.login,
-                    listing.target.as_deref(),
-                    settled(&done),
-                    Instant::now(),
-                );
-            });
-        if spawned.is_err() {
-            RESTS.end(&seen.login, target, false, Instant::now());
-            aterm_log::debug!("lab mailbox discovery: no thread");
-        }
+        take_up(
+            &RESTS,
+            seen,
+            |body| {
+                std::thread::Builder::new()
+                    .name("aterm-lab-mailbox".into())
+                    .spawn(body)
+                    .map(drop)
+            },
+            pass,
+        );
     }));
+}
+
+/// The hook's take-up of what `seen` noted: where its pair is due in `rests`, a pass on the thread
+/// `spawn` starts, which ends the pair by whether the pass settled; where no thread starts, the
+/// pair is due again at once.
+fn take_up(
+    rests: &'static Rests,
+    seen: &Seen,
+    spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+    pass: fn(&Listing) -> Result<Discovered, String>,
+) {
+    let target = seen.target.as_deref();
+    if !rests.begin(&seen.login, target, Instant::now()) {
+        return;
+    }
+    let listing = listing(seen);
+    let spawned = spawn(Box::new(move || {
+        let done = pass(&listing);
+        log_pass(&done);
+        rests.end(
+            &listing.login,
+            listing.target.as_deref(),
+            settled(&done),
+            Instant::now(),
+        );
+    }));
+    if spawned.is_err() {
+        rests.end(&seen.login, target, false, Instant::now());
+        aterm_log::debug!("lab mailbox discovery: no thread");
+    }
 }
 
 /// Before the process returns from `main`: wait, a bounded while, for passes still running, so
@@ -246,14 +258,6 @@ pub(crate) fn settle() {
 mod tests {
     use super::*;
     use aterm_agent::harness::mailbox_seen::Address;
-
-    /// A test build never installs the hook, so no code fetch in a test binary reaches a live
-    /// registry, whatever its environment says.
-    /// NEGATIVE CONTROL: with `publishes` answering `true`, this fails.
-    #[test]
-    fn a_test_build_publishes_nothing() {
-        assert!(!publishes());
-    }
 
     /// A pair's list is taken up once a day in a process once a pass settled, whatever the
     /// spelling; another sign-in address on the same mailbox is its own pair, a running pass
@@ -327,5 +331,67 @@ mod tests {
         assert!(read.complete);
         assert_eq!(read.listed.len(), 1);
         assert!(read.listed[0].receives && !read.listed[0].own);
+    }
+
+    /// The hook's take-up ends each pair by its own pass: one that did not settle is due again at
+    /// once, one that settled rests, and where no thread starts the pair is due again and no pass
+    /// is left counted as running, so an ending process does not wait out [`SETTLE`] for it.
+    /// NEGATIVE CONTROL: with the thread ending its pair settled whatever its pass said, the
+    /// incomplete pair waits: `` an incomplete pass leaves its pair due ``; with the failed
+    /// spawn's `end` dropped, `` no pass is left running `` fails.
+    #[test]
+    fn a_take_up_ends_its_pair_by_its_pass_and_frees_it_when_no_thread_starts() {
+        use aterm_db::alab::discover::Outcome;
+        const LOGIN: &str = "owner@proton.example";
+        fn incomplete(_: &Listing) -> Result<Discovered, String> {
+            Ok(Discovered {
+                outcome: Outcome::Incomplete,
+                findings: Vec::new(),
+                records: 0,
+            })
+        }
+        fn unchanged(_: &Listing) -> Result<Discovered, String> {
+            Ok(Discovered {
+                outcome: Outcome::Unchanged,
+                findings: Vec::new(),
+                records: 0,
+            })
+        }
+        fn unreached(_: &Listing) -> Result<Discovered, String> {
+            panic!("no pass runs where no thread started")
+        }
+        let rests: &'static Rests = Box::leak(Box::new(Rests::new()));
+        let seen = |target: &str| Seen {
+            login: LOGIN.into(),
+            target: Some(target.into()),
+            addresses: Vec::new(),
+            complete: true,
+        };
+        let inline = |body: Box<dyn FnOnce() + Send>| {
+            body();
+            Ok(())
+        };
+        take_up(rests, &seen("a@example.test"), inline, incomplete);
+        take_up(rests, &seen("b@example.test"), inline, unchanged);
+        assert!(
+            rests.begin(LOGIN, Some("a@example.test"), Instant::now()),
+            "an incomplete pass leaves its pair due"
+        );
+        rests.end(LOGIN, Some("a@example.test"), false, Instant::now());
+        assert!(
+            !rests.begin(LOGIN, Some("b@example.test"), Instant::now()),
+            "a settled pass rests its pair"
+        );
+        take_up(
+            rests,
+            &seen("c@example.test"),
+            |_| Err(std::io::Error::other("no thread")),
+            unreached,
+        );
+        assert_eq!(*rests.running.lock().unwrap(), 0, "no pass is left running");
+        assert!(
+            rests.begin(LOGIN, Some("c@example.test"), Instant::now()),
+            "a pair whose thread never started is due again"
+        );
     }
 }

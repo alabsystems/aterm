@@ -15,8 +15,15 @@
 //!   so a reload costs that sum over every record and nothing else.
 //! - Sharing: rows live in chunks of 64 behind an `Arc`. A log's clones share every chunk, and
 //!   the first record a clone holds into a shared partial chunk copies that chunk alone.
+//!
+//! Sets of records are read from it the same way: the newest of a set ([`Reach::maximal`]) and,
+//! for records sorted into groups, each one's newest of its own group in its past
+//! ([`Reach::frontiers`]), by row unions rather than a pair test for every two records.
 
 use std::sync::Arc;
+
+mod frontier;
+pub(super) use frontier::Frontier;
 
 /// Rows per chunk.
 const ROWS: usize = 64;
@@ -53,6 +60,12 @@ pub(super) enum Mutant {
     OmitParentBit,
     /// A closure unions every root's row, even one already in the set.
     UnionEveryRoot,
+    /// The newest of a set keep a record a newer one's row already holds.
+    KeepCovered,
+    /// A frontier leaves out what the record's parents dominate.
+    IgnoreParents,
+    /// A grouped record's dominated set leaves out the records of its group in its past.
+    OmitOwnGroup,
 }
 
 #[cfg(test)]
@@ -61,6 +74,55 @@ thread_local! {
     pub(super) static MUTANT: std::cell::Cell<Option<Mutant>> = const { std::cell::Cell::new(None) };
     /// The row words [`Reach::closure`] ORed on this thread, counted (never timed).
     pub(super) static CLOSURE_ORS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// What reading sets from the index cost on this thread, counted (never timed).
+    pub(super) static WORK: std::cell::Cell<Work> = const { std::cell::Cell::new(Work::NONE) };
+}
+
+/// What reading sets from the index costs: row words read (each ORed, ANDed or compared once),
+/// single bits tested, and steps over the records a read hands out.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Work {
+    pub(super) words: usize,
+    pub(super) bits: usize,
+    pub(super) steps: usize,
+}
+
+#[cfg(test)]
+impl Work {
+    pub(super) const NONE: Self = Self {
+        words: 0,
+        bits: 0,
+        steps: 0,
+    };
+
+    /// Everything it counts, as one number.
+    pub(super) const fn total(self) -> usize {
+        self.words + self.bits + self.steps
+    }
+}
+
+/// Count `words` row words, `bits` bit tests and `steps` steps of work on this thread's
+/// [`WORK`]; nothing outside the tests.
+#[inline]
+pub(super) fn tally(words: usize, bits: usize, steps: usize) {
+    #[cfg(test)]
+    WORK.set(Work {
+        words: WORK.get().words + words,
+        bits: WORK.get().bits + bits,
+        steps: WORK.get().steps + steps,
+    });
+    #[cfg(not(test))]
+    let _ = (words, bits, steps);
+}
+
+/// Whether set `set`, whose word 0 is the index's word `base`, holds record `a`.
+#[inline]
+pub(super) fn holds(set: &[u64], base: usize, a: usize) -> bool {
+    a / 64 >= base
+        && set
+            .get(a / 64 - base)
+            .is_some_and(|word| (word >> (a % 64)) & 1 == 1)
 }
 
 /// Rows `64 * index ..` packed in order: the first holds `index` words, each later one
@@ -171,7 +233,13 @@ impl Reach {
             let (past, own) = match first.take() {
                 Some(Mutant::OmitParentRow) => (&[][..], true),
                 Some(Mutant::OmitParentBit) => (past, false),
-                Some(Mutant::UnionEveryRoot) | None => (past, true),
+                Some(
+                    Mutant::UnionEveryRoot
+                    | Mutant::KeepCovered
+                    | Mutant::IgnoreParents
+                    | Mutant::OmitOwnGroup,
+                )
+                | None => (past, true),
             };
             #[cfg(not(test))]
             let own = true;
@@ -189,7 +257,8 @@ impl Reach {
         self.len += 1;
     }
 
-    fn row(&self, b: usize) -> &[u64] {
+    /// Record `b`'s strict past: its `ceil(b / 64)` words.
+    pub(super) fn row(&self, b: usize) -> &[u64] {
         self.chunks[b / ROWS].row(b % ROWS)
     }
 
@@ -232,15 +301,57 @@ impl Reach {
         #[cfg(not(test))]
         let every = false;
         for root in roots {
+            tally(0, 1, 0);
             if !every && (set[root / 64] >> (root % 64)) & 1 == 1 {
                 continue;
             }
             #[cfg(test)]
             CLOSURE_ORS.set(CLOSURE_ORS.get() + self.row(root).len());
+            tally(self.row(root).len(), 0, 0);
             self.union_past_into(root, &mut set);
             set[root / 64] |= 1 << (root % 64);
         }
         set
+    }
+
+    /// The records of `set` (indexed records, ascending) that lie in no other's past: its newest.
+    ///
+    /// Records are taken highest first, and each newest one ORs its row, from the lowest record's
+    /// word on, into what the newest so far have in their pasts: a record already there lies in
+    /// a newer one's past, since a record of `set` that follows it is newest or lies in the past
+    /// of a newest one, and either comes first. So it costs a bit test per record and one row per
+    /// newest record, never a test of each pair.
+    ///
+    /// # Panics
+    /// A record of `set` is not indexed, or (in a debug build) `set` is not ascending.
+    pub(super) fn maximal(&self, set: &[usize]) -> Vec<usize> {
+        let (Some(&lo), Some(&hi)) = (set.first(), set.last()) else {
+            return Vec::new();
+        };
+        assert!(hi < self.len, "the newest of indexed records");
+        debug_assert!(set.windows(2).all(|pair| pair[0] < pair[1]));
+        let base = lo / 64;
+        let mut covered = vec![0; hi / 64 + 1 - base];
+        #[cfg(test)]
+        let keep = MUTANT.get() == Some(Mutant::KeepCovered);
+        #[cfg(not(test))]
+        let keep = false;
+        let mut newest = Vec::new();
+        for &i in set.iter().rev() {
+            tally(0, 1, 0);
+            if !keep && holds(&covered, base, i) {
+                continue;
+            }
+            newest.push(i);
+            if let Some(past) = self.row(i).get(base..) {
+                tally(past.len(), 0, 0);
+                for (word, more) in covered.iter_mut().zip(past) {
+                    *word |= more;
+                }
+            }
+        }
+        newest.reverse();
+        newest
     }
 
     /// The bytes its rows hold allocated, every chunk's whole reservation included.

@@ -304,11 +304,11 @@ impl TranscriptCursor {
             });
         }
         self.readable = false;
-        let mut file = super::footer::open_regular(&self.path).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "not a readable regular file")
-        })?;
+        let (mut file, meta) =
+            super::footer::open_regular_with_meta(&self.path).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "not a readable regular file")
+            })?;
         self.readable = true;
-        let meta = file.metadata()?;
         let len = meta.len();
         let id = open_identity(&file, &meta).map(|(dev, ino)| FileId { dev, ino });
         let mut read: u64 = 0;
@@ -627,17 +627,15 @@ impl SessionUsage {
     /// Bind the step fold `tap` to the transcript as it is now (its length, its identity, asked of the open file as the cursor asks it, [`open_identity`]).
     pub fn bind_tap(&self, tap: &mut StepFold) {
         let path = self.main.path();
-        let Some(file) = super::footer::open_regular(path) else {
+        let Some((file, meta)) = super::footer::open_regular_with_meta(path) else {
             return;
         };
-        if let Ok(meta) = file.metadata() {
-            tap.read_at(
-                path_fp(path),
-                open_identity(&file, &meta),
-                meta.len(),
-                false,
-            );
-        }
+        tap.read_at(
+            path_fp(path),
+            open_identity(&file, &meta),
+            meta.len(),
+            false,
+        );
     }
 
     /// Where the vendor keeps this session's subagent transcripts: `<project>/<session>/subagents` beside `<project>/<session>.jsonl`.

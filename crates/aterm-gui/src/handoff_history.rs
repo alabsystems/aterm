@@ -171,6 +171,9 @@ fn read_sidecar(
             return Err("a frame longer than the sidecar");
         }
         frame.clear();
+        if let Ok(cap) = usize::try_from(size.saturating_add(1)) {
+            let _ = frame.try_reserve(cap);
+        }
         (&mut reader)
             .take(size)
             .read_to_end(&mut frame)

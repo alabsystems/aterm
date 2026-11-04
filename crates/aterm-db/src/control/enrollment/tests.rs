@@ -192,89 +192,83 @@ fn frontier_log_enrollment_carries_the_source_mark_and_retries_without_new_recor
 
 #[test]
 fn frontier_large_log_enrollment_reopens_selected_witness() {
-    use aterm_secrets::membership_log::{Body, LEGACY_RECORDS, RecordBudgets, encode_records};
-    const LARGER: RecordBudgets = RecordBudgets {
-        held: 8192,
-        ..RecordBudgets::PRODUCTION
-    };
-    LARGER.within(|| {
-        let lab = Lab::new(true);
-        client::test_sign_genesis(
-            &lab.paths[0],
-            &lab.root.path().join("membership.genesis"),
-            &lab.signer,
-        )
-        .unwrap();
-        let initial = client::load_records(&lab.paths[0]).unwrap();
-        client::save_records(&lab.paths[1], &initial.encode()).unwrap();
-        let mut log = initial.log().unwrap().clone();
-        let bootstrap = lab.bootstrap(0);
-        let request = bootstrap.request().unwrap();
-        bootstrap
-            .device()
-            .with_seed(|seed| {
-                while log.held_count() <= LEGACY_RECORDS {
-                    let count = log.held_count();
-                    let record = log
-                        .draft(
-                            &request.binding().actor(),
-                            count as u64 + 1,
-                            Body::Name {
-                                name: format!("before-new-member-{count}"),
-                            },
-                        )
-                        .sign(seed, *request.binding().incarnation())?;
-                    log.insert(record)?;
-                }
-                Ok::<(), aterm_secrets::Error>(())
-            })
-            .unwrap();
-        aterm_secrets::fsx::write_atomic(
-            &lab.paths[0].records_file().with_extension("crossed"),
-            b"crossed\n",
-            0o600,
-        )
-        .unwrap();
-        aterm_secrets::fsx::write_atomic(
-            &lab.paths[0].records_file(),
-            &encode_records(log.records()),
-            0o600,
-        )
-        .unwrap();
-        let pending = lab.pending();
-        let owner = Endpoint::from_bootstrap(&lab.bootstrap(0))
-            .unwrap()
-            .unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        thread::scope(|scope| {
-            let server = scope.spawn(|| {
-                LARGER.within(|| {
-                    owner.exchange(
-                        Connection::admit(listener.accept().unwrap().0, Scope::Loopback).unwrap(),
-                        Side::Responder,
-                        &mut Repair::default(),
+    use aterm_secrets::membership_log::{Body, LEGACY_RECORDS, encode_records};
+    let lab = Lab::new(true);
+    client::test_sign_genesis(
+        &lab.paths[0],
+        &lab.root.path().join("membership.genesis"),
+        &lab.signer,
+    )
+    .unwrap();
+    let initial = client::load_records(&lab.paths[0]).unwrap();
+    client::save_records(&lab.paths[1], &initial.encode()).unwrap();
+    let mut log = initial.log().unwrap().clone();
+    let bootstrap = lab.bootstrap(0);
+    let request = bootstrap.request().unwrap();
+    bootstrap
+        .device()
+        .with_seed(|seed| {
+            while log.held_count() <= LEGACY_RECORDS {
+                let count = log.held_count();
+                let record = log
+                    .draft(
+                        &request.binding().actor(),
+                        count as u64 + 1,
+                        Body::Name {
+                            name: format!("before-new-member-{count}"),
+                        },
                     )
-                })
-            });
-            let peer = pending.exchange(
-                Connection::connect(address, Scope::Loopback, Duration::from_secs(60)).unwrap(),
-                Side::Initiator,
+                    .sign(seed, *request.binding().incarnation())?;
+                log.insert(record)?;
+            }
+            Ok::<(), aterm_secrets::Error>(())
+        })
+        .unwrap();
+    aterm_secrets::fsx::write_atomic(
+        &lab.paths[0].records_file().with_extension("crossed"),
+        b"crossed\n",
+        0o600,
+    )
+    .unwrap();
+    aterm_secrets::fsx::write_atomic(
+        &lab.paths[0].records_file(),
+        &encode_records(log.records()),
+        0o600,
+    )
+    .unwrap();
+    let pending = lab.pending();
+    let owner = Endpoint::from_bootstrap(&lab.bootstrap(0))
+        .unwrap()
+        .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    thread::scope(|scope| {
+        let server = scope.spawn(|| {
+            owner.exchange(
+                Connection::admit(listener.accept().unwrap().0, Scope::Loopback).unwrap(),
+                Side::Responder,
                 &mut Repair::default(),
-            );
-            let server = server.join().unwrap();
-            assert!(server.is_ok() && peer.is_ok(), "{server:?} {peer:?}");
+            )
         });
-        let bootstrap = lab.bootstrap(1);
-        let witness = bootstrap.log_witness().unwrap().unwrap();
-        assert!(witness.held_count() > LEGACY_RECORDS);
-        assert!(
-            aterm_secrets::membership_log::decode_records(&encode_records(witness.records()))
-                .is_err()
+        let peer = pending.exchange(
+            Connection::connect(address, Scope::Loopback, Duration::from_secs(60)).unwrap(),
+            Side::Initiator,
+            &mut Repair::default(),
         );
-        assert!(Endpoint::from_bootstrap(&bootstrap).unwrap().is_some());
-        assert!(client::records_marked_crossed(&lab.paths[1]).unwrap());
+        let server = server.join().unwrap();
+        assert!(server.is_ok() && peer.is_ok(), "{server:?} {peer:?}");
     });
+    let bootstrap = lab.bootstrap(1);
+    let witness = bootstrap.log_witness().unwrap().unwrap();
+    assert!(witness.held_count() > LEGACY_RECORDS);
+    assert_eq!(
+        aterm_secrets::membership_log::decode_records(&encode_records(witness.records()))
+            .unwrap()
+            .len(),
+        witness.held_count()
+    );
+    assert!(Endpoint::from_bootstrap(&bootstrap).unwrap().is_some());
+    assert!(client::records_marked_crossed(&lab.paths[1]).unwrap());
 }
 
 /// A member refuses a device it has not approved before it sends its hello, so the pending device

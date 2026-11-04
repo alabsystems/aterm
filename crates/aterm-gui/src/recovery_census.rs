@@ -391,8 +391,9 @@ fn panic_report_time(path: &Path) -> Option<u64> {
 
 fn marker_signal(path: &Path) -> Option<u8> {
     use std::io::Read as _;
-    let file = crate::logging::open_regular_nonblock(path).ok()?;
-    let mut head = String::new();
+    let (file, meta) = crate::logging::open_regular_nonblock_with_meta(path).ok()?;
+    let cap = usize::try_from(meta.len().min(256).saturating_add(1)).unwrap_or(0);
+    let mut head = String::with_capacity(cap);
     file.take(256).read_to_string(&mut head).ok()?;
     let after = head.split("fatal signal ").nth(1)?;
     after
@@ -546,13 +547,10 @@ fn scan_logs(dir: &Path, pid: u32, birth: u64) -> LogFacts {
     let older: PathBuf = crate::logging::rotated_path(&current);
     let pid_token = pid.to_string();
     for path in [older, current] {
-        let Ok(meta) = std::fs::symlink_metadata(&path) else {
-            continue;
-        };
-        if !meta.file_type().is_file() || budget == 0 {
+        if budget == 0 {
             continue;
         }
-        let Ok(file) = std::fs::File::open(&path) else {
+        let Ok((file, meta)) = aterm_uds::regular_file::open(&path) else {
             continue;
         };
         let take = meta.len().min(budget);

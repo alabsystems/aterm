@@ -1143,9 +1143,23 @@ fn swarm_holds(config_path: Option<&Path>) -> bool {
 }
 
 fn read_config_text(config_path: Option<&Path>) -> Option<String> {
+    use std::io::Read as _;
+    const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
     let path = config_path?;
-    match std::fs::read_to_string(path) {
-        Ok(text) => Some(text),
+    match aterm_uds::regular_file::open(path) {
+        Ok((file, meta)) => {
+            if meta.len() > MAX_CONFIG_BYTES {
+                return None;
+            }
+            let cap = usize::try_from(meta.len().min(MAX_CONFIG_BYTES))
+                .unwrap_or(0)
+                .saturating_add(1);
+            let mut text = String::with_capacity(cap);
+            file.take(MAX_CONFIG_BYTES + 1)
+                .read_to_string(&mut text)
+                .ok()?;
+            (text.len() as u64 <= MAX_CONFIG_BYTES).then_some(text)
+        }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Some(String::new()),
         Err(_) => None,
     }

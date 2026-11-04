@@ -1445,7 +1445,12 @@ fn read_regular_nofollow_bounded(path: &Path, max_bytes: usize) -> Option<String
     if !meta.is_file() || meta.len() > max_bytes as u64 {
         return None;
     }
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(meta.len())
+            .unwrap_or(0)
+            .min(max_bytes)
+            .saturating_add(1),
+    );
     file.take((max_bytes as u64).saturating_add(1))
         .read_to_end(&mut bytes)
         .ok()?;

@@ -681,6 +681,8 @@ fn bloom_kept_off(
             if src.iter().all(|&c| c <= 0.0) {
                 continue;
             }
+            #[cfg(any(test, debug_assertions))]
+            crate::test_counters::count_bloom_pixel();
             let idx = py * w + px;
             frame.pixels[idx] = screen(frame.pixels[idx], src);
         }

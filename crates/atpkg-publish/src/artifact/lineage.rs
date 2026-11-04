@@ -37,7 +37,7 @@ fn is_compiled_output(path: &Path) -> bool {
     if named {
         return true;
     }
-    let mut head = Vec::with_capacity(8);
+    let mut head = Vec::with_capacity(9);
     if crate::identity::open_regular_nonblock(path)
         .and_then(|(f, _)| f.take(8).read_to_end(&mut head))
         .is_err()

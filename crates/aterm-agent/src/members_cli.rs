@@ -901,13 +901,20 @@ fn said_no_wait(
         Err(why) => Some(Some(why)),
     };
     match (heard, waits) {
-        (_, Ok(Follows::Bootstrapping(follows, why))) => {
+        (heard, Ok(Follows::Bootstrapping(follows, why))) => {
             let next = if *follows == Follows::Runs {
                 "this Mac's vault subscriber retries setup automatically"
             } else {
                 "setup is saved here for the vault subscriber"
             };
             let _ = writeln!(out, "ALab vault setup has not finished ({why}); {next}");
+            // The members' half still says how it went: a browse macOS refused (Local Network
+            // privacy) or one that heard nobody is the person's to read here too.
+            let _ = match heard {
+                None => writeln!(out, "an ALab member on this network heard this Mac's ask"),
+                Some(None) => writeln!(out, "no ALab member answers on this network yet"),
+                Some(Some(why)) => writeln!(out, "{why}; no ALab member was asked"),
+            };
         }
         (None, _) => {
             let _ = writeln!(out, "{}", join::let_in(at));
@@ -1754,6 +1761,56 @@ mod tests {
             !out.contains(join::LET_IN),
             "no membership or queued vault request yet: {out}"
         );
+        assert!(
+            out.contains("no ALab member answers on this network yet"),
+            "the members' half is said too: {out}"
+        );
+    }
+
+    /// A vault setup that has not finished still says how the members' half went: a browse
+    /// macOS refused names Local Network privacy, and a member that heard is said as such.
+    /// NEGATIVE CONTROL: the arm that printed only the vault's line (round 8's vault-phrase row
+    /// read it and could not tell a refused browse from an empty one) fails each assertion.
+    #[test]
+    fn an_unfinished_vault_setup_still_says_how_the_members_ask_went() {
+        let bootstrapping = || {
+            Ok(Follows::Bootstrapping(
+                Box::new(Follows::Runs),
+                "first fetch unavailable".to_owned(),
+            ))
+        };
+        let refused = format!(
+            "browsing _alab._tcp: {}",
+            aterm_secrets::client::LOCAL_NETWORK_REFUSED
+        );
+        let said = |heard: Result<&[Heard], String>| {
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = said_no_wait(
+                join::JoinPlace::Home,
+                heard,
+                &[],
+                bootstrapping(),
+                &mut out,
+                &mut err,
+            );
+            assert_eq!(code, 0);
+            String::from_utf8(out).unwrap()
+        };
+        let out = said(Err(refused.clone()));
+        assert!(
+            out.starts_with("ALab vault setup has not finished"),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!("{refused}; no ALab member was asked")),
+            "{out}"
+        );
+        let out = said(Ok(&[]));
+        assert!(
+            out.contains("no ALab member answers on this network yet"),
+            "{out}"
+        );
+        assert!(!out.contains("Local Network"), "{out}");
     }
 
     #[test]

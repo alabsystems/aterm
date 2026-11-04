@@ -200,7 +200,7 @@ fn self_and_the_multiplexer_boundary_read_the_rewritten_form() {
 #[cfg(unix)]
 #[test]
 fn a_session_after_its_verb_is_followed_to_the_instance_hosting_it() {
-    let scratch = aterm_tempfile::TempDir::new_in("/tmp").expect("scratch dir");
+    let scratch = crate::test_scratch_dir("vf-host");
     let dir = scratch.path().join("rv");
     std::fs::create_dir_all(dir.join("graph")).expect("graph dir");
     let sock = dir.join("aterm-4004.sock");
@@ -245,10 +245,8 @@ fn the_socket_hears_the_protocols_form_and_a_word_that_names_no_session_as_typed
     use std::io::{BufRead, Write};
     use std::os::unix::net::UnixListener;
 
-    let dir = std::env::temp_dir().join(format!("aterm-ctl-verbfirst-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&dir);
-    let sock = dir.join("s.sock");
-    let _ = std::fs::remove_file(&sock);
+    let scratch = crate::test_scratch_dir("verbfirst");
+    let sock = scratch.path().join("s.sock");
     let listener = UnixListener::bind(&sock).expect("bind mock socket");
     let cases: [(&[&str], &str); 7] = [
         (&["status", "@s-ab12"], "@s-ab12 status"),
@@ -304,18 +302,14 @@ fn the_socket_hears_the_protocols_form_and_a_word_that_names_no_session_as_typed
     let heard = srv.join().expect("server");
     let want: Vec<&str> = cases.iter().map(|(_, sent)| *sent).collect();
     assert_eq!(heard, want);
-    let _ = std::fs::remove_file(&sock);
-    let _ = std::fs::remove_dir(&dir);
 }
 
 /// `--help` after a verb-first read is that read's entry, answered offline: `read` is `text`
 /// there too, on either side of the selector.
 #[test]
 fn help_after_a_verb_first_read_is_its_entry_with_no_dial() {
-    let nowhere = std::env::temp_dir().join(format!(
-        "aterm-ctl-verbfirst-none-{}.sock",
-        std::process::id()
-    ));
+    let scratch = crate::test_scratch_dir("vf-help");
+    let nowhere = scratch.path().join("none.sock");
     let nowhere = nowhere.to_str().expect("utf8 path").to_owned();
     for typed in [
         "read @s-ab12 --help",

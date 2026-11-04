@@ -3135,6 +3135,15 @@ pub(super) const CAUSE_ACCOUNT: &str = "account:";
 /// What an account move answers where a restart of another kind was in flight for the conversation ([`restart_as`], [`carried_word`]).
 pub const IN_FLIGHT_OTHER: &str = "wait:restart-in-flight";
 
+/// What a restart in place answers where it would supersede the conversation's record
+/// ([`supersedes`]) but for the native restart's operation still in it (`St::native`,
+/// `native_prepare`): the record was carried, so its operation is observed and completed
+/// (`native_restart::complete`), and the restart asked is no part of that carry. A deferral, so
+/// the loop asks it again under the same ask (on its back-off, or a move put off to a quiet moment
+/// at a later turn end), when the record carries no native move and is superseded
+/// ([`native_carried`]).
+pub const NATIVE_CARRIED: &str = "wait:native-carried";
+
 /// What a restart in place answers where it was asked of another process than the tab's agent
 /// now ([`asked_of`]): the process it was asked of no longer holds the tab, and no other process
 /// is restarted in its place.
@@ -3167,13 +3176,15 @@ pub(super) fn asked_of(why: &Restart, snap: &Snapshot) -> bool {
 /// asked with a word for a restart never made. The asked restart is made of the asker instead,
 /// its own record the conversation's from its claim; the record's carry-on, owed the asker and
 /// not booked typed (a carry-on booked typed leaves the record `Done`), goes with it, and the
-/// relaunch after the restart is owed its own. Not where the record holds a native restart's state
-/// (`St::native`, `native_prepare`), whose host operation its carry observes and completes
-/// (`native_restart::complete`): that record is carried as before. Never for an account move,
-/// whose record of the same account is the move asked ([`carried_word`]), nor where the record is
-/// the asked restart's own ([`its_own`], by its `ask`): asked again after its relaunch answered a
-/// wait (the process it started not yet registered, its ledger's evidence unread), carrying it
-/// adopts the process that restart started, which a restart made over it would end.
+/// relaunch after the restart is owed its own. Where the record still holds a native restart's
+/// operation (`St::native`, `native_prepare`), whose host operation only its carry observes and
+/// completes (`native_restart::complete`), [`restart_as`] carries it first and answers
+/// [`NATIVE_CARRIED`] ([`native_carried`]): asked again, the restart supersedes the record the
+/// carry left with no native move in it. Never for an account move, whose record of the same
+/// account is the move asked ([`carried_word`]), nor where the record is the asked restart's own
+/// ([`its_own`], by its `ask`): asked again after its relaunch answered a wait (the process it
+/// started not yet registered, its ledger's evidence unread), carrying it adopts the process that
+/// restart started, which a restart made over it would end.
 pub(super) fn supersedes(
     why: &Restart,
     ask: &RestartAsk,
@@ -3185,10 +3196,23 @@ pub(super) fn supersedes(
     !matches!(why, Restart::Account { .. })
         && !its_own(why, ask, st)
         && matches!(st.phase, upgrade::Phase::Relaunched { .. })
-        && st.native.is_none()
-        && st.native_prepare.is_empty()
         && (st.relaunched_pid == sf.pid
             || relaunch_of(k, sf, session, st.pid, st.shell) == Relaunch::Ours)
+}
+
+/// The word [`restart_as`] answers after carrying a record the restart asked supersedes but for
+/// its native move (`step`, the carry's word): the carry's own deferral or dry run as it stands,
+/// and [`NATIVE_CARRIED`] for anything else it answered, the record's relaunch adopted or ended,
+/// since none of that is the restart asked.
+pub(super) fn native_carried(step: String) -> String {
+    if ["wait:", "busy:", "would-"]
+        .iter()
+        .any(|head| step.starts_with(head))
+    {
+        step
+    } else {
+        NATIVE_CARRIED.to_string()
+    }
 }
 
 /// Whether the record `st` is the restart `why`'s own, asked again as `ask` ([`supersedes`]): the
@@ -3870,7 +3894,9 @@ pub(super) fn account_login(roster: &accounts::Roster, label: &str) -> Option<St
 /// [`restart_with`] under `roster` ([`restart_under`]). A restart asked of another process than
 /// the tab's agent makes none ([`asked_of`]); the conversation's record in flight answers the
 /// restart asked by being carried ([`carried_word`]) unless the restart supersedes it
-/// ([`supersedes`]); the record it claims keeps its `ask` ([`St::ask`]).
+/// ([`supersedes`]), and one it supersedes that still holds a native restart's operation is
+/// carried first and answered by [`native_carried`], superseded at the restart's re-ask; the
+/// record it claims keeps its `ask` ([`St::ask`]).
 pub(super) fn restart_as(
     opts: &Opts,
     why: &Restart,
@@ -3935,10 +3961,16 @@ pub(super) fn restart_as(
         if selected.is_some_and(|s| !s.is_current()) {
             return said(r, "wait:account-changed");
         }
-        if !supersedes(why, ask, &st, &sf, &session, k) {
+        let supersedes = supersedes(why, ask, &st, &sf, &session, k);
+        let native = st.native.is_some() || !st.native_prepare.is_empty();
+        if !supersedes || native {
             let cause = st.cause.clone();
             let carried = carry_in_flight(opts, r, st, &session, &tab);
-            let step = carried_word(why, &cause, carried.step.clone());
+            let step = if supersedes {
+                native_carried(carried.step.clone())
+            } else {
+                carried_word(why, &cause, carried.step.clone())
+            };
             return said(carried, step);
         }
     }

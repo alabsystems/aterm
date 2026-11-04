@@ -5,7 +5,7 @@
 
 use super::super::cli::shared_provider::{
     KimiNativeError, expire_kimi_pending, kimi_credential_path, kimi_pending_expiry,
-    kimi_pending_files, verify_native_kimi_classified,
+    kimi_pending_files, verify_native_kimi_classified, verify_or_refresh_kimi_with_rejection,
 };
 use super::*;
 use aterm_secrets::SecretBytes;
@@ -15,6 +15,8 @@ use aterm_secrets::SecretBytes;
 mod tests;
 
 const PREFIX: &[u8] = b"aterm.kimi-pending.v1\0";
+const REPLACEMENT_PREFIX: &[u8] = b"aterm.kimi-pending.v2\0";
+const REJECTED_PREFIX: &[u8] = b"aterm.kimi-refresh-rejected.v1\0";
 const FILE_MAX: usize = 2 * 1024 * 1024;
 const COOKIES_MAX: usize = super::super::google_browser_store::MAX_BYTES;
 const MAX: usize = FILE_MAX * 2 + COOKIES_MAX + 8192;
@@ -25,6 +27,22 @@ struct Candidate {
     credential: SecretBytes,
     cookies: SecretBytes,
     previous: Option<[u8; 32]>,
+    predecessor: Option<[u8; 32]>,
+}
+
+struct RefreshGuard(FederationScope);
+impl std::fmt::Debug for RefreshGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("KimiRefreshGuard(opaque)")
+    }
+}
+impl aterm_http::Guard for RefreshGuard {
+    fn is_authorized(&self) -> bool {
+        self.0
+            .check_attempt()
+            .and_then(|()| self.0.current())
+            .is_ok()
+    }
 }
 
 pub(in crate::harness) struct Journal {
@@ -34,8 +52,9 @@ pub(in crate::harness) struct Journal {
     candidate: Option<Candidate>,
     files: Option<([u8; 32], [u8; 32])>,
     resumed: bool,
+    rejection_observed: bool,
     fallback_cookies: Option<(SecretBytes, Option<[u8; 32]>)>,
-    _native_claim: super::super::browser_window::ProfileLock,
+    _native_claim: std::sync::Arc<super::super::browser_window::ProfileLock>,
 }
 
 fn digest(bytes: &[u8]) -> [u8; 32] {
@@ -60,7 +79,12 @@ fn scope_digest(scope: &FederationScope) -> Result<[u8; 32], String> {
         hash.update(field.as_bytes());
     }
     hash.update(scope.revision);
-    if scope.attempt.admission.is_some() {
+    if scope
+        .attempt
+        .admission
+        .as_ref()
+        .is_some_and(login_drive::RecoveryAdmission::is_shared_root)
+    {
         hash.update(b"\0shared-root-admission.v1\0");
     }
     Ok(hash.finalize())
@@ -87,7 +111,22 @@ fn decode(
     scope: [u8; 32],
     key: login_drive::RecoveryKey,
 ) -> Result<Option<Candidate>, String> {
-    let mut rest = bytes.strip_prefix(PREFIX).ok_or(UNAVAILABLE)?;
+    if let Some(rest) = bytes.strip_prefix(REJECTED_PREFIX) {
+        if rest.len() != 64 {
+            return Err(UNAVAILABLE.into());
+        }
+        // This checkpoint deliberately contains no recoverable grant. A later
+        // admission cannot resurrect its predecessor either.
+        return Ok(None);
+    }
+    let replacement = bytes.starts_with(REPLACEMENT_PREFIX);
+    let mut rest = bytes
+        .strip_prefix(if replacement {
+            REPLACEMENT_PREFIX
+        } else {
+            PREFIX
+        })
+        .ok_or(UNAVAILABLE)?;
     let saved_scope = rest.get(..32).ok_or(UNAVAILABLE)?;
     rest = &rest[32..];
     let saved_key = rest.get(..32).ok_or(UNAVAILABLE)?;
@@ -111,6 +150,26 @@ fn decode(
     let config = field(&mut rest, FILE_MAX)?;
     let credential = field(&mut rest, FILE_MAX)?;
     let cookies = field(&mut rest, COOKIES_MAX)?;
+    let predecessor = if replacement {
+        match rest.first().copied().ok_or(UNAVAILABLE)? {
+            0 => {
+                rest = &rest[1..];
+                None
+            }
+            1 => {
+                let hash = rest
+                    .get(1..33)
+                    .ok_or(UNAVAILABLE)?
+                    .try_into()
+                    .map_err(|_| UNAVAILABLE)?;
+                rest = &rest[33..];
+                Some(hash)
+            }
+            _ => return Err(UNAVAILABLE.into()),
+        }
+    } else {
+        None
+    };
     if !rest.is_empty() || config.is_empty() || credential.is_empty() {
         return Err(UNAVAILABLE.into());
     }
@@ -122,10 +181,92 @@ fn decode(
         credential: SecretBytes::from(credential),
         cookies: SecretBytes::from(cookies),
         previous,
+        predecessor,
     }))
 }
 
 impl Journal {
+    pub(super) fn native_claim(&self) -> std::sync::Arc<super::super::browser_window::ProfileLock> {
+        self._native_claim.clone()
+    }
+    fn checkpoint_current(
+        &mut self,
+        request: &login_drive::Request<'_>,
+        home: &Path,
+    ) -> Result<(), String> {
+        if self.rejection_observed {
+            return self.checkpoint_rejected(request);
+        }
+        self.check_context(request)?;
+        if let Ok((config, credential)) = kimi_pending_files(request.staging, self.scope.region)
+            && self.files != Some((digest(config.as_slice()), digest(credential.as_slice())))
+        {
+            self.capture(request, None, home)?;
+        }
+        Ok(())
+    }
+    fn checkpoint_rejected(&mut self, request: &login_drive::Request<'_>) -> Result<(), String> {
+        self.check_context(request)?;
+        // Once the provider rejected this attempt, even a failed storage write
+        // must not turn a later generic error into a cached usable seed.
+        self.rejection_observed = true;
+        let mut rejected = REJECTED_PREFIX.to_vec();
+        rejected.extend_from_slice(&scope_digest(&self.scope)?);
+        rejected.extend_from_slice(&self.key.0);
+        self.storage.save(&rejected).map_err(str::to_owned)
+    }
+
+    fn renew_recorded(
+        &mut self,
+        request: &login_drive::Request<'_>,
+        scope: &FederationScope,
+        now: i64,
+        deadline: Instant,
+    ) -> Result<Option<KimiProof>, KimiNativeError> {
+        let journal = std::cell::RefCell::new(self);
+        verify_or_refresh_kimi_with_rejection(
+            request.staging,
+            scope.region,
+            &scope.expected,
+            now,
+            deadline,
+            std::sync::Arc::new(RefreshGuard(scope.clone())),
+            &|| journal.borrow_mut().checkpoint_rejected(request),
+        )
+    }
+
+    /// Verify or renew current retained files without adopting an older
+    /// completion's cookies. A rotated grant survives a later identity outage.
+    pub(in crate::harness) fn observe_current(
+        &mut self,
+        request: &login_drive::Request<'_>,
+        home: &Path,
+        deadline: Instant,
+    ) -> Result<Option<KimiProof>, super::super::cli::shared_provider::ObservationError> {
+        use super::super::cli::shared_provider::{ObservationError, kimi_observation_error};
+        self.check_context(request)
+            .map_err(ObservationError::Unavailable)?;
+        let now = aterm_time::unix_secs()
+            .and_then(|n| i64::try_from(n).ok())
+            .ok_or_else(|| {
+                ObservationError::Unavailable("Kimi account clock is unavailable".into())
+            })?;
+        let scope = self.scope.clone();
+        let result = self.renew_recorded(request, &scope, now, deadline);
+        self.check_context(request)
+            .map_err(ObservationError::Unavailable)?;
+        if matches!(
+            &result,
+            Err(KimiNativeError::RefreshRejected | KimiNativeError::PreviouslyRejected)
+        ) {
+            self.checkpoint_rejected(request)
+                .map_err(ObservationError::Unavailable)?;
+        } else {
+            self.checkpoint_current(request, home)
+                .map_err(ObservationError::Unavailable)?;
+        }
+        result.map_err(kimi_observation_error)
+    }
     pub(in crate::harness) fn open(
         request: &login_drive::Request<'_>,
         home: &Path,
@@ -165,11 +306,18 @@ impl Journal {
         let directory = scope
             .attempt
             .state
-            .join(if scope.attempt.admission.is_some() {
-                "pending-native-kimi-google-shared"
-            } else {
-                "pending-native-kimi-google"
-            })
+            .join(
+                if scope
+                    .attempt
+                    .admission
+                    .as_ref()
+                    .is_some_and(login_drive::RecoveryAdmission::is_shared_root)
+                {
+                    "pending-native-kimi-google-shared"
+                } else {
+                    "pending-native-kimi-google"
+                },
+            )
             .join(aterm_codec::hex::encode_lower(&account.finalize()));
         let (storage, plaintext) =
             super::super::pending_native_store::Store::open(&directory, home, MAX)
@@ -191,8 +339,9 @@ impl Journal {
             candidate,
             files,
             resumed: false,
+            rejection_observed: false,
             fallback_cookies: None,
-            _native_claim: native_claim,
+            _native_claim: std::sync::Arc::new(native_claim),
         }))
     }
 
@@ -242,6 +391,9 @@ impl Journal {
                 return Err("Kimi pending Google scope differs from its native completion".into());
             }
         }
+        if self.rejection_observed {
+            return self.checkpoint_rejected(request);
+        }
         if self.resumed {
             return self.check(request);
         }
@@ -266,7 +418,22 @@ impl Journal {
         {
             return Err(UNAVAILABLE.into());
         }
-        let mut bytes = PREFIX.to_vec();
+        // Native token storage fsyncs its replacement file before rename, but
+        // does not fsync the directory. That rename may be lost at a crash even
+        // when our later encrypted checkpoint survived. Bind repair to the exact
+        // prior credential and the identical pinned config, never any other file.
+        let predecessor = request
+            .admission
+            .filter(|a| a.is_shared_root())
+            .and_then(|_| {
+                self.files
+                    .filter(|(config_hash, credential_hash)| {
+                        *config_hash == digest(config.as_slice())
+                            && *credential_hash != digest(credential.as_slice())
+                    })
+                    .map(|(_, credential_hash)| credential_hash)
+            });
+        let mut bytes = REPLACEMENT_PREFIX.to_vec();
         bytes.extend_from_slice(&scope_digest(&self.scope)?);
         bytes.extend_from_slice(&self.key.0);
         if let Some(hash) = previous {
@@ -279,6 +446,12 @@ impl Journal {
             bytes.extend_from_slice(&(field.len() as u32).to_be_bytes());
             bytes.extend_from_slice(field);
         }
+        if let Some(hash) = predecessor {
+            bytes.push(1);
+            bytes.extend_from_slice(&hash);
+        } else {
+            bytes.push(0);
+        }
         let bytes = SecretBytes::from(bytes);
         self.storage.save(bytes.as_slice()).map_err(str::to_owned)?;
         self.files = Some((digest(config.as_slice()), digest(credential.as_slice())));
@@ -286,30 +459,40 @@ impl Journal {
     }
 
     /// Observe the exact retained root staging without invoking a consumed
-    /// native action. Only absent files can be restored from this completion.
+    /// native action. Restore absent files, or replace the exact journaled
+    /// predecessor credential while retaining the identical pinned config.
     pub(in crate::harness) fn observe_existing(
         &mut self,
         request: &login_drive::Request<'_>,
         home: &Path,
         deadline: Instant,
     ) -> Result<Option<KimiProof>, super::super::cli::shared_provider::ObservationError> {
-        self.observe_existing_using(request, home, deadline, |scope, now| {
-            verify_native_kimi_classified(
-                request.staging,
-                scope.region,
-                &scope.expected,
-                now,
-                deadline,
-            )
+        self.observe_existing_with(request, home, deadline, |journal, scope, now| {
+            journal.renew_recorded(request, scope, now, deadline)
         })
     }
 
+    #[cfg(test)]
     fn observe_existing_using(
         &mut self,
         request: &login_drive::Request<'_>,
         home: &Path,
         deadline: Instant,
         read: impl FnOnce(&FederationScope, i64) -> Result<Option<KimiProof>, KimiNativeError>,
+    ) -> Result<Option<KimiProof>, super::super::cli::shared_provider::ObservationError> {
+        self.observe_existing_with(request, home, deadline, |_, scope, now| read(scope, now))
+    }
+
+    fn observe_existing_with(
+        &mut self,
+        request: &login_drive::Request<'_>,
+        home: &Path,
+        deadline: Instant,
+        read: impl FnOnce(
+            &mut Self,
+            &FederationScope,
+            i64,
+        ) -> Result<Option<KimiProof>, KimiNativeError>,
     ) -> Result<Option<KimiProof>, super::super::cli::shared_provider::ObservationError> {
         use super::super::cli::shared_provider::{ObservationError, kimi_observation_error};
         if request.admission.is_none() {
@@ -342,11 +525,18 @@ impl Journal {
             ),
         ];
         let mut missing = Vec::new();
+        let mut replacements = Vec::new();
         for (path, expected) in &files {
             match aterm_secrets::fsx::read_private(path, FILE_MAX)
                 .map_err(|_| ObservationError::Unavailable(UNAVAILABLE.into()))?
             {
                 Some(bytes) if bytes.as_slice() != *expected => {
+                    if *path == kimi_credential_path(request.staging, self.scope.region)
+                        && candidate.predecessor == Some(digest(bytes.as_slice()))
+                    {
+                        replacements.push((path, *expected, digest(bytes.as_slice())));
+                        continue;
+                    }
                     // A new native completion needs its own proof. Its predecessor's
                     // unpublished cookies stay quarantined; no existing file is replaced.
                     return Ok(None);
@@ -354,6 +544,24 @@ impl Journal {
                 Some(_) => {}
                 None => missing.push((path, *expected)),
             }
+        }
+        for (path, bytes, predecessor) in replacements {
+            self.check_context(request)
+                .map_err(ObservationError::Unavailable)?;
+            if Instant::now() >= deadline {
+                return Err(ObservationError::Unavailable(
+                    "Kimi recovery deadline expired".into(),
+                ));
+            }
+            let current = aterm_secrets::fsx::read_private(path, FILE_MAX)
+                .map_err(|_| ObservationError::Unavailable(UNAVAILABLE.into()))?;
+            if current.as_ref().map(|bytes| digest(bytes.as_slice())) != Some(predecessor) {
+                return Err(ObservationError::Unavailable(
+                    "Kimi predecessor changed during recovery".into(),
+                ));
+            }
+            aterm_secrets::fsx::write_atomic(path, bytes, 0o600)
+                .map_err(|_| ObservationError::Unavailable(UNAVAILABLE.into()))?;
         }
         for (path, bytes) in missing {
             self.check_context(request)
@@ -387,12 +595,31 @@ impl Journal {
             .ok_or_else(|| {
                 ObservationError::Unavailable("Kimi account clock is unavailable".into())
             })?;
-        let native = read(&self.scope, now)
-            .map_err(kimi_observation_error)?
-            .ok_or_else(|| {
-                ObservationError::Unavailable("Kimi retained credential was not verified".into())
-            })?;
-        self.check(request).map_err(ObservationError::Unavailable)?;
+        let scope = self.scope.clone();
+        let native = match read(self, &scope, now) {
+            Err(KimiNativeError::Temporary) => {
+                self.fallback_cookies = Some((candidate.cookies, candidate.previous));
+                self.checkpoint_current(request, home)
+                    .map_err(ObservationError::Unavailable)?;
+                return Err(kimi_observation_error(KimiNativeError::Temporary));
+            }
+            Err(
+                error @ (KimiNativeError::RefreshRejected | KimiNativeError::PreviouslyRejected),
+            ) => {
+                self.checkpoint_rejected(request)
+                    .map_err(ObservationError::Unavailable)?;
+                return Err(kimi_observation_error(error));
+            }
+            result => result.map_err(kimi_observation_error)?,
+        }
+        .ok_or_else(|| {
+            ObservationError::Unavailable("Kimi retained credential was not verified".into())
+        })?;
+        native
+            .check_native(request.staging, self.scope.region, &self.scope.expected)
+            .map_err(ObservationError::Unavailable)?;
+        self.check_context(request)
+            .map_err(ObservationError::Unavailable)?;
         let session = if candidate.cookies.is_empty() {
             None
         } else {
@@ -411,14 +638,21 @@ impl Journal {
                 })?,
             )
         };
-        PendingFederation {
+        let pending = PendingFederation {
             scope: self.scope.clone(),
             session,
             native: Some(native),
+        };
+        let (config, credential) = kimi_pending_files(request.staging, self.scope.region)
+            .map_err(ObservationError::Unavailable)?;
+        if self.files != Some((digest(config.as_slice()), digest(credential.as_slice()))) {
+            self.capture(request, Some(&pending), home)
+                .map_err(ObservationError::Unavailable)?;
         }
-        .commit_recovered(request, self, deadline)
-        .map(Some)
-        .map_err(ObservationError::Unavailable)
+        pending
+            .commit_recovered(request, self, deadline)
+            .map(Some)
+            .map_err(ObservationError::Unavailable)
     }
 
     pub(in crate::harness) fn has_native_seed(&self) -> bool {
@@ -431,7 +665,15 @@ impl Journal {
         home: &Path,
         deadline: Instant,
     ) -> Result<Option<PendingFederation>, String> {
-        self.resume_using(request, home, deadline, |scope, now| {
+        self.resume_with(request, home, deadline, |journal, scope, now| {
+            if scope
+                .attempt
+                .admission
+                .as_ref()
+                .is_some_and(|a| !a.is_shared_root())
+            {
+                return journal.renew_recorded(request, scope, now, deadline);
+            }
             verify_native_kimi_classified(
                 request.staging,
                 scope.region,
@@ -442,6 +684,7 @@ impl Journal {
         })
     }
 
+    #[cfg(test)]
     fn resume_using(
         &mut self,
         request: &login_drive::Request<'_>,
@@ -449,8 +692,33 @@ impl Journal {
         deadline: Instant,
         read: impl FnOnce(&FederationScope, i64) -> Result<Option<KimiProof>, KimiNativeError>,
     ) -> Result<Option<PendingFederation>, String> {
+        self.resume_with(request, home, deadline, |_, scope, now| read(scope, now))
+    }
+
+    fn resume_with(
+        &mut self,
+        request: &login_drive::Request<'_>,
+        home: &Path,
+        deadline: Instant,
+        read: impl FnOnce(
+            &mut Self,
+            &FederationScope,
+            i64,
+        ) -> Result<Option<KimiProof>, KimiNativeError>,
+    ) -> Result<Option<PendingFederation>, String> {
         self.scope.check_request(request)?;
         self.storage.unchanged().map_err(str::to_owned)?;
+        if request.admission.is_some_and(|a| !a.is_shared_root()) {
+            let native = self
+                .observe_existing_with(request, home, deadline, read)
+                .map_err(|error| error.to_string())?;
+            self.resumed = native.is_some();
+            return Ok(native.map(|native| PendingFederation {
+                scope: self.scope.clone(),
+                session: None,
+                native: Some(native),
+            }));
+        }
         let Some(candidate) = self.candidate.take() else {
             return Ok(None);
         };
@@ -484,7 +752,8 @@ impl Journal {
             self.fallback_cookies = Some((candidate.cookies, candidate.previous));
             return Ok(None);
         }
-        let result = read(&self.scope, now);
+        let scope = self.scope.clone();
+        let result = read(self, &scope, now);
         self.check(request)?;
         if Instant::now() >= deadline {
             return Err("Kimi recovery deadline expired".into());

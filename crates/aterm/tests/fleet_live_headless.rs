@@ -1398,10 +1398,19 @@ fn a_driver_owns_a_plain_shell_without_ai_or_the_hosts_direct_command() {
         blocks.contains(" entering ").then_some(())
     });
     let command = "pwd; printf 'probe-before\\n'; i=0; while [ $i -lt 64 ]; do printf 'middle\\n'; i=$((i+1)); done; printf 'probe-after\\n'; (exit 7)";
+    // A drive's turn is capped at 22 s, below the hang detector, so the turn waits only for its
+    // submit (its whole timeout, not the default 2 s window) and the exit below is the detector's.
     let (_, turn) = drive_ok(
         &issuer.tmp,
         &target,
-        &[&at, "turn", "timeout=20000", command],
+        &[
+            &at,
+            "turn",
+            "settle=submitted",
+            "submit_window=20000",
+            "timeout=20000",
+            command,
+        ],
     );
     assert!(turn.contains("submitted=1"), "{turn}");
     let block = aterm_spec::wait::until_within(HANG, "the exact command's exit", || {
@@ -1434,6 +1443,11 @@ fn a_driver_owns_a_plain_shell_without_ai_or_the_hosts_direct_command() {
         "retained output beyond the visible grid: {output}"
     );
     assert_eq!(output.lines().filter(|line| *line == "middle").count(), 64);
+    // The prompt's return is the detector's; the drive's `await idle` then reads a quiet that
+    // is already there.
+    aterm_spec::wait::until_within(HANG, "the shell back at its prompt", || {
+        (field(&status(&member, sid), "phase") == Some("idle")).then_some(())
+    });
     let (idle, _) = drive_ok(
         &issuer.tmp,
         &target,
@@ -1448,7 +1462,14 @@ fn a_driver_owns_a_plain_shell_without_ai_or_the_hosts_direct_command() {
     drive_ok(
         &issuer.tmp,
         &target,
-        &[&at, "turn", "settle=submitted", "timeout=20000", "/bin/cat"],
+        &[
+            &at,
+            "turn",
+            "settle=submitted",
+            "submit_window=20000",
+            "timeout=20000",
+            "/bin/cat",
+        ],
     );
     aterm_spec::wait::until_within(HANG, "the owned shell's live foreground job", || {
         (field(&status(&member, sid), "program") == Some("cat")).then_some(())

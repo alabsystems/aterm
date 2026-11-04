@@ -22,22 +22,27 @@ fn not_regular() -> io::Error {
 
 /// Opens an existing regular metadata file without following its final link.
 #[cfg(unix)]
-pub(crate) fn open_regular(path: &Path) -> io::Result<std::fs::File> {
+pub(crate) fn open_regular_with_meta(
+    path: &Path,
+) -> io::Result<(std::fs::File, std::fs::Metadata)> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
     let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW)
         .open(path)?;
-    if !file.metadata()?.file_type().is_file() {
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
         return Err(not_regular());
     }
-    Ok(file)
+    Ok((file, metadata))
 }
 
 /// Windows form of the existing regular-file admission, refusing reparse points.
 #[cfg(windows)]
-pub(crate) fn open_regular(path: &Path) -> io::Result<std::fs::File> {
+pub(crate) fn open_regular_with_meta(
+    path: &Path,
+) -> io::Result<(std::fs::File, std::fs::Metadata)> {
     use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
 
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
@@ -53,12 +58,14 @@ pub(crate) fn open_regular(path: &Path) -> io::Result<std::fs::File> {
     {
         return Err(not_regular());
     }
-    Ok(file)
+    Ok((file, metadata))
 }
 
 /// Portable fallback with before/after regular-file checks on other targets.
 #[cfg(not(any(unix, windows)))]
-pub(crate) fn open_regular(path: &Path) -> io::Result<std::fs::File> {
+pub(crate) fn open_regular_with_meta(
+    path: &Path,
+) -> io::Result<(std::fs::File, std::fs::Metadata)> {
     let before = std::fs::symlink_metadata(path)?;
     if !before.file_type().is_file() {
         return Err(not_regular());
@@ -78,13 +85,16 @@ pub(crate) fn open_regular(path: &Path) -> io::Result<std::fs::File> {
             "package metadata changed while it was opened",
         ));
     }
-    Ok(file)
+    Ok((file, opened))
+}
+
+pub(crate) fn open_regular(path: &Path) -> io::Result<std::fs::File> {
+    open_regular_with_meta(path).map(|(file, _)| file)
 }
 
 /// Read one regular, non-link file through the same handle used for admission.
 pub(crate) fn read_bounded_regular(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
-    let mut file = open_regular(path)?;
-    let before = file.metadata()?;
+    let (mut file, before) = open_regular_with_meta(path)?;
     let limit_u64 = u64::try_from(limit).unwrap_or(u64::MAX);
     if before.len() > limit_u64 {
         return Err(too_large(limit));
@@ -121,8 +131,9 @@ pub(crate) fn read_bounded_regular(path: &Path, limit: usize) -> io::Result<Vec<
 
 /// Reads at most `limit` leading bytes of a regular, non-link file.
 pub(crate) fn read_head(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
-    let file = open_regular(path)?;
-    let mut head = Vec::with_capacity(limit);
+    let (file, before) = open_regular_with_meta(path)?;
+    let cap = usize::try_from(before.len()).unwrap_or(limit).min(limit);
+    let mut head = Vec::with_capacity(cap);
     file.take(u64::try_from(limit).unwrap_or(u64::MAX))
         .read_to_end(&mut head)?;
     Ok(head)
@@ -138,8 +149,7 @@ pub(crate) fn read_regular_lines(
     mut visit: impl FnMut(&str) -> io::Result<bool>,
 ) -> io::Result<()> {
     use std::io::BufRead as _;
-    let file = open_regular(path)?;
-    let before = file.metadata()?;
+    let (file, before) = open_regular_with_meta(path)?;
     let budget = before
         .len()
         .checked_add(1)
@@ -151,8 +161,9 @@ pub(crate) fn read_regular_lines(
     let mut reader = std::io::BufReader::new(file.take(budget));
     let mut seen = 0_u64;
     let mut eof = false;
+    let mut bytes = Vec::new();
     loop {
-        let mut bytes = Vec::new();
+        bytes.clear();
         let count = std::io::Read::by_ref(&mut reader)
             .take(line_budget)
             .read_until(b'\n', &mut bytes)?;

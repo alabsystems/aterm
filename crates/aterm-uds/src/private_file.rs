@@ -120,12 +120,32 @@ pub fn read_private_with_metadata(
     max: usize,
 ) -> Result<(Vec<u8>, std::fs::Metadata), PrivateFileError> {
     let (file, metadata) = open_private(dir, name)?;
-    read_capped(file, max).map(|bytes| (bytes, metadata))
+    read_capped_with_len(file, metadata.len(), max).map(|bytes| (bytes, metadata))
 }
 
 /// `file`'s bytes, refused when there are more than `max` ([`read_capped_into`] for a vector).
+#[cfg(test)]
 fn read_capped(file: std::fs::File, max: usize) -> Result<Vec<u8>, PrivateFileError> {
-    let mut bytes = Vec::with_capacity(max.min(64 * 1024) + 1);
+    let len = file.metadata().map_err(PrivateFileError::Io)?.len();
+    read_capped_with_len(file, len, max)
+}
+
+fn read_capped_with_len(
+    file: std::fs::File,
+    file_len: u64,
+    max: usize,
+) -> Result<Vec<u8>, PrivateFileError> {
+    if file_len > max as u64 {
+        return Err(PrivateFileError::Malformed(
+            "longer than such a file can be",
+        ));
+    }
+    let init = usize::try_from(file_len)
+        .unwrap_or(max)
+        .min(max)
+        .min(64 * 1024)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(init);
     file.take((max as u64).saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(PrivateFileError::Io)?;
@@ -230,8 +250,8 @@ impl<'a> JudgedDir<'a> {
     /// # Errors
     /// As [`read_private`].
     pub fn read(&self, name: &str, max: usize) -> Result<Vec<u8>, PrivateFileError> {
-        let (file, _meta) = self.open(name)?;
-        read_capped(file, max)
+        let (file, meta) = self.open(name)?;
+        read_capped_with_len(file, meta.len(), max)
     }
 }
 

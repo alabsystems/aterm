@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 
 use aterm_json::Value;
 
+use super::accounts::Cli;
+use super::accounts_step::Step;
 use super::codex_rollout::is_thread_id;
 use super::upgrade::{ArgvRefusal, Version};
 
@@ -441,6 +443,18 @@ pub enum AuthPathUnread {
     Unreadable(PathBuf, String),
 }
 
+impl AuthPathUnread {
+    /// The step that puts a build that keeps a row's login here: an update of one that is here, an
+    /// install where none is.
+    #[must_use]
+    pub fn served_by(&self) -> Step {
+        match self {
+            Self::Unnamed(_) | Self::Missing(_) => Step::install(Cli::Codex),
+            _ => Step::Update(Cli::Codex.id().to_owned()),
+        }
+    }
+}
+
 impl std::fmt::Display for AuthPathUnread {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -514,8 +528,8 @@ pub fn auth_path_unread(program: &Path) -> Option<AuthPathUnread> {
 #[must_use]
 pub fn unread_fix(default: Option<&str>) -> String {
     match default {
-        Some(label) => format!("aterm harness accounts use {label} --cli codex"),
-        None => "aterm harness accounts adopt-default <label> --email <e> --cli codex".to_string(),
+        Some(label) => Step::Use(Cli::Codex, label.to_owned()).to_string(),
+        None => Step::adopt_default(Cli::Codex).to_string(),
     }
 }
 
@@ -525,7 +539,7 @@ pub fn unread_fix(default: Option<&str>) -> String {
 /// a codex-alab that holds [`AUTH_PATH_MARK`]. It starts lower-case: [`only_default_in`] joins
 /// it after "; ".
 #[must_use]
-pub fn unread_advice(default: Option<&str>) -> String {
+pub fn unread_advice(default: Option<&str>, served_by: &Step) -> String {
     let (pin, steps) = match default {
         Some(_) => (
             "pinning the account on this machine's own login",
@@ -542,7 +556,8 @@ pub fn unread_advice(default: Option<&str>) -> String {
     };
     format!(
         "{pin} ({steps}) runs Codex on that login; once atpkg serves a codex-alab from its \
-         cd79a420c on (`aterm pkg update codex` then), `{UNPIN_FIX}` lets the pool pick again"
+         cd79a420c on (`{served_by}` then), `{unpin}` lets the pool pick again",
+        unpin = unpin_fix()
     )
 }
 
@@ -573,7 +588,7 @@ pub enum DefaultRow {
         until: i64,
     },
     /// No login of the row `label` here is current (none is stored, or its last one on record
-    /// ended): Codex's own sign-in in this machine's default home ([`DEFAULT_SIGN_IN`]) makes
+    /// ended): Codex's own sign-in in this machine's default home ([`default_sign_in`]) makes
     /// one.
     SignedOut {
         /// The row's label.
@@ -618,7 +633,7 @@ pub fn only_default(why: &AuthPathUnread, row: Option<&str>, default: &DefaultRo
 /// [`only_default`] for a launch the owner's pin holds to `pinned`, a row of its own: the pin
 /// stays where it is whatever the row on this machine's own login does, so that row serves only
 /// once the pin on `pinned` ends, by its own pin ([`unread_fix`]) or the pin's end
-/// ([`UNPIN_FIX`]). A walled row serves once its wall ends with the pin on `pinned` ended: the
+/// ([`unpin_fix`]). A walled row serves once its wall ends with the pin on `pinned` ended: the
 /// pin's end may come at any time, its own pin only once the wall ends (a pin clears the row's
 /// walls, which the next usage read would put back). A signed-out row's sign-in is followed by
 /// its pin.
@@ -678,15 +693,18 @@ fn only_default_in(
              account is started on it"
         ),
     };
+    let served_by = why.served_by();
+    let build_served = || build_served_by(&served_by);
     let then = match default {
         DefaultRow::Unlisted => format!(
             "the roster lists no row on that login; {}",
-            unread_advice(None)
+            unread_advice(None, &served_by)
         ),
         DefaultRow::Moved(label) => format!(
             "`{label}`, the row that login was listed as, was signed in to a login of its own, so \
              no row of the roster is on that login now, and no Codex account the pool lists can \
-             run on this build until {BUILD_SERVED}; {}",
+             run on this build until {}; {}",
+            build_served(),
             if let Took::Carried(rotation_off) = took {
                 format!(
                     "{} a worker whose starter carries no row's `{AUTH_PATH_ENV}` takes no row \
@@ -706,7 +724,7 @@ fn only_default_in(
                     .to_string()
             }
         ),
-        DefaultRow::Serves(label) => unread_advice(Some(label)),
+        DefaultRow::Serves(label) => unread_advice(Some(label), &served_by),
         DefaultRow::Walled {
             label,
             window,
@@ -723,14 +741,17 @@ fn only_default_in(
                     "`{label}`, the row on that login, is at its `{window}` limit ({reset}), and \
                      the owner's pin holds every launch to `{own}`, so no Codex account can run \
                      on this build until that pin ends and `{label}`'s wall ends at {until} \
-                     (`{UNPIN_FIX}` ends the pin at any time, `{}` once that wall ends), or \
-                     until {BUILD_SERVED}",
-                    unread_fix(Some(label))
+                     (`{}` ends the pin at any time, `{}` once that wall ends), or \
+                     until {}",
+                    unpin_fix(),
+                    unread_fix(Some(label)),
+                    build_served()
                 ),
                 None => format!(
                     "`{label}`, the row on that login, is at its `{window}` limit ({reset}), so \
                      no Codex account can run on this build until {until}, when `{label}` serves \
-                     again, or until {BUILD_SERVED}"
+                     again, or until {}",
+                    build_served()
                 ),
             }
         }
@@ -745,18 +766,29 @@ fn only_default_in(
         },
         DefaultRow::Other { label, why } => format!(
             "`{label}`, the row on that login, cannot take it now ({why}), and no other Codex \
-             account can run on this build until {BUILD_SERVED}"
+             account can run on this build until {}",
+            build_served()
         ),
     };
     format!("{lead}; {then}")
 }
 
 /// The owner's pin's end, which hands the Codex pool its pick again.
-pub const UNPIN_FIX: &str = "aterm harness accounts use --auto --cli codex";
+#[must_use]
+pub fn unpin_fix() -> String {
+    Step::Auto(Cli::Codex).to_string()
+}
 
 /// When a Codex program that keeps a row's login its own comes, in [`only_default`]'s words.
-pub const BUILD_SERVED: &str =
-    "atpkg serves a codex-alab from its cd79a420c on (`aterm pkg update codex` then)";
+#[must_use]
+pub fn build_served() -> String {
+    build_served_by(&Step::Update(Cli::Codex.id().to_owned()))
+}
+
+/// [`build_served`] where `step` puts that build here ([`AuthPathUnread::served_by`]).
+fn build_served_by(step: &Step) -> String {
+    format!("atpkg serves a codex-alab from its cd79a420c on (`{step}` then)")
+}
 
 /// The sign-in of the row on this machine's own login on a Codex program that keeps no row's
 /// login its own ([`auth_path_unread`]): Codex's own sign-in in its default home, which
@@ -764,12 +796,15 @@ pub const BUILD_SERVED: &str =
 /// `~/.codex/auth.json` and leaving the row on that login. A pool sign-in (`aterm harness
 /// accounts login|renew`) would bind the row to a login of its own, which such a build never
 /// runs, so it refuses that row there ([`default_row_staging`]).
-pub const DEFAULT_SIGN_IN: &str = "aterm ai login codex";
+#[must_use]
+pub fn default_sign_in() -> String {
+    Step::ai_login(Cli::Codex).to_string()
+}
 
 /// What a launch on a Codex program that keeps no row's login its own ([`auth_path_unread`])
 /// says of `label`, the row on this machine's own login, while no login of it here is current
 /// (none is stored, or its last one on record ended): no row the pool lists can run on that
-/// build, and Codex's own sign-in in this machine's default home ([`DEFAULT_SIGN_IN`]) signs
+/// build, and Codex's own sign-in in this machine's default home ([`default_sign_in`]) signs
 /// that login in, keeping `label` on it, in again where a login of it is stored here (`stored`,
 /// [`signed_out_says`]).
 #[must_use]
@@ -778,12 +813,13 @@ pub fn signed_out_default(label: &str, stored: bool) -> String {
     format!(
         "`{label}`, the row on that login, is {state}, so no Codex account the pool lists can \
          run on this build: Codex's own sign-in in this machine's default home, \
-         `{DEFAULT_SIGN_IN}`, signs that login {sign_in} and keeps `{label}` on it"
+         `{}`, signs that login {sign_in} and keeps `{label}` on it",
+        default_sign_in()
     )
 }
 
 /// What [`DefaultRow::SignedOut`] says of its row by whether a login of it is stored here
-/// (`stored`): its state, and how Codex's own sign-in ([`DEFAULT_SIGN_IN`]) brings that ended
+/// (`stored`): its state, and how Codex's own sign-in ([`default_sign_in`]) brings that ended
 /// login back (`in again`), or, where none is stored (never made here, or removed since), signs
 /// it in (`in`), which is true either way.
 #[must_use]
@@ -799,33 +835,36 @@ pub const fn signed_out_says(stored: bool) -> (&'static str, &'static str) {
 /// machine's own login, is not made while this machine's Codex keeps no row's login its own
 /// (`why`): it would bind the row to a staged login of its own, which that build never runs, so
 /// no row of the pool would be left on the one login it runs. The row's sign-in there is
-/// Codex's own ([`DEFAULT_SIGN_IN`]).
+/// Codex's own ([`default_sign_in`]).
 #[must_use]
 pub fn default_row_staging(label: &str, why: &AuthPathUnread) -> String {
     format!(
         "`{label}` is the row on this machine's own login, the only login this machine's Codex \
          runs ({why}): a sign-in here would bind `{label}` to a login of its own, which that \
          build never runs, so it is not made; Codex's own sign-in in its default home, \
-         `{DEFAULT_SIGN_IN}` (while that login is signed out), signs this machine's own login in \
-         and keeps `{label}` on it, and this sign-in runs once {BUILD_SERVED}; nothing was run"
+         `{}` (while that login is signed out), signs this machine's own login in \
+         and keeps `{label}` on it, and this sign-in runs once {}; nothing was run",
+        default_sign_in(),
+        build_served()
     )
 }
 
 /// The binary `program` execs: the one an atpkg launcher script names (a `sh` twin, or on
 /// Windows a `.cmd` one, whose lines start with `@`; [`super::upgrade_catalog::twin_binary`]),
 /// else `program` itself; `None` for a bare word, a relative path, and a script that names no
-/// binary so.
+/// binary so. Off Windows a file that starts with `@` is no launcher, as no other host runs one.
 fn exec_target(program: &Path) -> Option<PathBuf> {
     use std::io::Read as _;
     if !program.is_absolute() {
         return None;
     }
-    let Some(file) = super::footer::open_regular(program) else {
+    let Some((file, meta)) = super::footer::open_regular_with_meta(program) else {
         return Some(program.to_path_buf());
     };
-    let mut head = Vec::new();
+    let cap = usize::try_from(meta.len().min(LAUNCHER_MAX + 1).saturating_add(1)).unwrap_or(0);
+    let mut head = Vec::with_capacity(cap);
     file.take(LAUNCHER_MAX + 1).read_to_end(&mut head).ok()?;
-    if head.starts_with(b"#!") || head.starts_with(b"@") {
+    if head.starts_with(b"#!") || (cfg!(windows) && head.starts_with(b"@")) {
         if head.len() as u64 > LAUNCHER_MAX {
             return None;
         }
@@ -894,24 +933,29 @@ fn file_holds(path: &Path, needle: &[u8]) -> std::io::Result<bool> {
 }
 
 /// A codex-alab package laid out at `root` for another crate's test: `codex-package.json`, the
-/// [`ALAB_BUILD_JSON`] marker and `bin/codex`, whose bytes spell [`AUTH_PATH_MARK`] where
-/// `reads_auth_path` (so [`auth_path_unread`] passes it) and elsewhere only [`AUTH_PATH_ENV`]'s
-/// bare name, as a codex-alab from 355ba0a940 to before cd79a420c does. It returns the binary's
-/// path; nothing runs it.
+/// [`ALAB_BUILD_JSON`] marker and `bin/codex` (`bin/codex.exe` on Windows, as atpkg names a
+/// build's executable: `atpkg::store::ToolName::exe_file`), whose bytes spell
+/// [`AUTH_PATH_MARK`] where `reads_auth_path` (so [`auth_path_unread`] passes it) and elsewhere
+/// only [`AUTH_PATH_ENV`]'s bare name, as a codex-alab from 355ba0a940 to before cd79a420c
+/// does. It returns the binary's path; nothing runs it.
 ///
 /// # Panics
 /// A fixture file cannot be written.
 #[cfg(any(test, debug_assertions))]
 #[must_use]
 pub fn lay_package(root: &Path, reads_auth_path: bool) -> PathBuf {
+    let tool = atpkg::store::ToolName::new("codex").expect("a tool name");
+    let entry = format!("bin/{}", tool.exe_file());
     std::fs::create_dir_all(root.join("bin")).expect("package bin");
     std::fs::write(
         root.join(PACKAGE_JSON),
-        r#"{"layoutVersion": 1, "version": "0.1.0-dev.1+codex.0.164.0.g000000000", "entrypoint": "bin/codex"}"#,
+        format!(
+            r#"{{"layoutVersion": 1, "version": "0.1.0-dev.1+codex.0.164.0.g000000000", "entrypoint": "{entry}"}}"#
+        ),
     )
     .expect("package manifest");
     std::fs::write(root.join(ALAB_BUILD_JSON), "{}").expect("package marker");
-    let exe = root.join("bin/codex");
+    let exe = root.join(entry);
     let named = if reads_auth_path {
         AUTH_PATH_MARK
     } else {

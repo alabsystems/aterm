@@ -1084,6 +1084,7 @@ fn retain_native_leaf_raster(
         }
     }
     cache.native_damage = None;
+    cache.native_pointer_style_only = false;
 }
 
 #[cfg(test)]
@@ -10597,6 +10598,7 @@ impl App {
                     }
                     cache.native = None;
                     cache.native_damage = None;
+                    cache.native_pointer_style_only = false;
                     let row = leaf.rect.origin.y.round().max(0.0) as usize;
                     let col = leaf.rect.origin.x.round().max(0.0) as usize;
                     if let Some(window) = self.windows.get_mut(&id) {
@@ -12992,15 +12994,21 @@ impl App {
                 fp
             };
             let settings_fp = ws.overlay_fp();
-            let find_fp = ws.search.as_ref().map_or(0, |s| s.fingerprint());
-            let relaunch_fp = self.relaunch.as_ref().map_or(0, |n| n.fingerprint());
+            let find_fp = ws
+                .search
+                .as_ref()
+                .map(crate::app_search::SearchState::fingerprint);
+            let relaunch_fp = self
+                .relaunch
+                .as_ref()
+                .map(crate::relaunch_notice::RelaunchNotice::fingerprint);
             let badge_fp =
                 crate::build_badge::fingerprint(self.config.show_build_badge_or_default());
             let level_up_fp = self
                 .level_up
                 .as_ref()
                 .filter(|_| !(ws.drag_hover && !ws.overlay_open()))
-                .map_or(0, |l| l.fingerprint(frame_started));
+                .map(|l| l.fingerprint(frame_started));
             let band_fp = ws.band.band_fp(
                 &self.messages,
                 usize::from(ws.cols),
@@ -13028,8 +13036,11 @@ impl App {
                 pane_selection_fp: crate::fold_pane_selection_fp(0, 0, &selection),
                 active_pane_mark: 0,
                 tab_strip,
-                tab_menu_fp: crate::tab_menu::fingerprint(ws.tab_menu.as_ref(), ws.tab_menu_rect)
-                    ^ crate::autopilot_menu::fingerprint(self.autopilot_menu.as_ref(), id),
+                tab_menu_fp: crate::tab_menu::fingerprint(ws.tab_menu.as_ref(), ws.tab_menu_rect),
+                autopilot_menu_fp: crate::autopilot_menu::fingerprint(
+                    self.autopilot_menu.as_ref(),
+                    id,
+                ),
                 settings_fp,
                 find_fp,
                 pill_fp,
@@ -13806,7 +13817,7 @@ impl App {
         let (visible_width, visible_height) = backend.frame_size(input_rows, input_cols);
         let destination_height = ws
             .win_px
-            .map_or_else(|| visible_height, |size| size.height.max(1) as usize);
+            .map_or(visible_height, |size| size.height.max(1) as usize);
         let source_crop_top =
             backend.configure_gpu_visible_y(input_rows, input_cols, destination_height);
         let present_crop = aterm_gpu::PresentCrop {
@@ -14031,7 +14042,7 @@ impl App {
             let (visible_width, visible_height) = backend.frame_size(input_rows, input_cols);
             let destination_height = ws
                 .win_px
-                .map_or_else(|| visible_height, |size| size.height.max(1) as usize);
+                .map_or(visible_height, |size| size.height.max(1) as usize);
             let source_crop_top =
                 backend.configure_gpu_visible_y(input_rows, input_cols, destination_height);
             let present_crop = aterm_gpu::PresentCrop {
@@ -16707,8 +16718,11 @@ impl App {
             .windows
             .get(&wid)
             .and_then(|ws| ws.search.as_ref())
-            .map_or(0, |s| s.fingerprint());
-        let relaunch_fp = self.relaunch.as_ref().map_or(0, |n| n.fingerprint());
+            .map(crate::app_search::SearchState::fingerprint);
+        let relaunch_fp = self
+            .relaunch
+            .as_ref()
+            .map(crate::relaunch_notice::RelaunchNotice::fingerprint);
         let badge_fp = crate::build_badge::fingerprint(self.config.show_build_badge_or_default());
         let deck_fp = self.stats_deck_fp(wid);
         let drag_covers = self
@@ -16719,7 +16733,7 @@ impl App {
             .level_up
             .as_ref()
             .filter(|_| !drag_covers)
-            .map_or(0, |l| l.fingerprint(now));
+            .map(|l| l.fingerprint(now));
         let band_fp = self.windows.get(&wid).map_or(0, |ws| {
             ws.band.band_fp(
                 &self.messages,
@@ -16766,15 +16780,20 @@ impl App {
             pane_selection_fp,
             active_pane_mark: ActivePaneMark::key_term(active_pane_mark),
             tab_strip,
-            tab_menu_fp: self.windows.get(&wid).map_or(0, |ws| {
+            tab_menu_fp: self.windows.get(&wid).and_then(|ws| {
                 crate::tab_menu::fingerprint(ws.tab_menu.as_ref(), ws.tab_menu_rect)
-            }) ^ crate::autopilot_menu::fingerprint(self.autopilot_menu.as_ref(), wid),
+            }),
+            autopilot_menu_fp: crate::autopilot_menu::fingerprint(
+                self.autopilot_menu.as_ref(),
+                wid,
+            ),
             settings_fp,
             find_fp,
             pill_fp: overlay_fp,
-            preedit_fp: self.windows.get(&wid).map_or(0, |ws| {
-                crate::preedit_fingerprint(&ws.preedit, ws.preedit_caret)
-            }),
+            preedit_fp: self
+                .windows
+                .get(&wid)
+                .and_then(|ws| crate::preedit_fingerprint(&ws.preedit, ws.preedit_caret)),
             scroll_frac_px: 0,
             relaunch_fp,
             badge_fp,

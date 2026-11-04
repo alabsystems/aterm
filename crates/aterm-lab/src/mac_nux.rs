@@ -35,7 +35,8 @@ use crate::paths::paths;
 use crate::{Fail, LAB, Res, stop};
 
 pub const USAGE: &str = "\
-  nux [--app PATH] [--scenario ROW,...] [--standard-user] [--person [--later] | --reader] [--no-clt | --vanilla]
+  nux [--app PATH] [--scenario ROW,...] [--standard-user | --sudo-asks] [--person [--later] | --reader]
+      [--no-clt | --vanilla]
       [--repeat N] [--image REF] [--keep] [--record [FILE]]
                 what a person meets on a new Mac, each row in a fresh clone of REF's prepared base (as dmg):
                 the app built here (ship dev-app made release-shaped: aterm.app, com.aterm.aterm, hardened
@@ -54,6 +55,9 @@ pub const USAGE: &str = "\
                 row whose input did not reset it says NOT MEASURED).
                 --reader: the person base with nobody at the console: in every row the guest helper reads
                 each dialog's words through Accessibility and posts no input, answering none.
+                --sudo-asks: the image's administrator's sudo asks its password for every command but
+                the lane's own root reads (/bin/sh and pkill), as a new Mac's first account's does, so
+                setup's one Mac password shows as a prompt nobody answers (the image's own rule needs none).
                 --no-clt: a base with the Command Line Tools removed (xcode-select -p fails); --vanilla:
                 REF's cirruslabs -vanilla image (NOT RUN when it must be pulled with under 71 GB free).
                 --repeat N: each row N times, each in its own clone. Every row also reads the dialog census
@@ -572,6 +576,9 @@ pub struct Ask {
     pub app: Option<PathBuf>,
     pub scenarios: Vec<Scenario>,
     pub standard_user: bool,
+    /// The administrator's sudo asks its password for all but the lane's own root reads
+    /// ([`SUDO_ASKS_RULE`]).
+    pub sudo_asks: bool,
     /// The person base: the guest helper acting as the person at the console.
     pub person: bool,
     /// The person answers System Settings' Quit & Reopen sheet with Later (else Quit & Reopen).
@@ -623,6 +630,12 @@ pub fn parse(args: &[String], image: String) -> Result<Ask, Fail> {
         None => ALL.to_vec(),
     };
     let standard_user = take_flag(&mut a, "--standard-user");
+    let sudo_asks = take_flag(&mut a, "--sudo-asks");
+    if sudo_asks && standard_user {
+        return Err(Fail::usage(
+            "mac nux: --sudo-asks is the administrator's sudo; a --standard-user account has none",
+        ));
+    }
     let person = take_flag(&mut a, "--person");
     let later = take_flag(&mut a, "--later");
     if later && !person {
@@ -685,6 +698,7 @@ pub fn parse(args: &[String], image: String) -> Result<Ask, Fail> {
         app,
         scenarios,
         standard_user,
+        sudo_asks,
         person,
         later,
         reader,
@@ -906,6 +920,20 @@ fn drive_cells_within(row: &mut Row, label: &str, d: &Drive, limit: Duration) {
         format!("{label}prompts"),
         Value::Count(u64::try_from(d.prompts.len()).unwrap_or(u64::MAX)),
     );
+    if !d.prompts.is_empty() {
+        // What each prompt said, so one the quiet-line rule answered (a line left open 1.5 s, a
+        // progress line among them) reads apart from a question.
+        row.cell(
+            format!("{label}prompt words"),
+            Value::Text(
+                d.prompts
+                    .iter()
+                    .map(|(_, _, text)| format!("{text:?}"))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ),
+        );
+    }
     if let Some(waited) = d.quiet_waited_ms.filter(|w| *w > 0) {
         row.cell(
             format!("{label}of it waiting to tell a prompt"),
@@ -2531,7 +2559,12 @@ fn typed_cell(typed: &[Typed], skipped: usize) -> Value {
 /// on while both stand still: the person at System Settings' Full Disk Access page, its sheet and
 /// the app's question, and the app's quit and reopen (2026-10-28's 20:00 first-launch row:
 /// setup= stood still from 154.6 s, and the wait ended at 219.3 s, mid-password, so the sheet's
-/// press at 263.5 s and the reopen came after the row stopped looking).
+/// press at 263.5 s and the reopen came after the row stopped looking). Apple's `softwareupdate`
+/// running (the elevation's install of the Command Line Tools) is one more act at each look that
+/// sees it, kept in the guest's `installer-seen.txt` so the count grows, as
+/// the install moves setup on while `setup=` stands still for minutes (round 9's no-CLT row: the
+/// detector ended the wait at 86 s, the install still under way, and read developer mode then);
+/// [`WATCH`] bounds it.
 fn setup_reading(g: &Guest) -> Result<crate::mac_nux_guest::Reading, Fail> {
     let sessions = g.run(&format!("{} ctl ls 2>/dev/null", g.aterm), STEP)?;
     let at = first_session(&sessions).map_or_else(String::new, |sid| format!("@{sid} "));
@@ -2544,7 +2577,9 @@ fn setup_reading(g: &Guest) -> Result<crate::mac_nux_guest::Reading, Fail> {
              open(my $o, \">>\", \"{GUEST_NUX}/{SETUP_READINGS}\") and printf $o \"setup %d %s\\n\", time * 1000, $1'; \
              echo '--- record'; cat \"$HOME/{SETUP_RECORD}\" 2>/dev/null; \
              echo; echo '--- acts'; cat {GUEST_NUX}/person.txt {GUEST_NUX}/{PROCS_RECORD} 2>/dev/null \
-             | grep -E '^(click|typed|up|down) '; true",
+             | grep -E '^(click|typed|up|down) '; \
+             i={GUEST_NUX}/installer-seen.txt; pgrep -x softwareupdate >/dev/null \
+             && echo \"up $(date +%s) installer $(date +%s)\" >> $i; cat $i 2>/dev/null; true",
             g.aterm
         ),
         STEP,
@@ -2583,7 +2618,7 @@ fn wait_setup(g: &Guest, row: &mut Row, label: &str, from_ms: u64) -> Result<Opt
                 row.cell(
                     format!("{label}setup done"),
                     Value::Missing(format!(
-                        "it stood at {stood} from {} ms to {at} ms, with no new press by the person and no aterm process starting or going, and the one-minute no-progress hang detector ended the wait",
+                        "it stood at {stood} from {} ms to {at} ms, with no new press by the person, no aterm process starting or going and no softwareupdate running, and the one-minute no-progress hang detector ended the wait",
                         from_ms + since_ms
                     )),
                 );
@@ -3045,6 +3080,21 @@ fn root_command(standard: bool, cmd: &str) -> String {
     }
 }
 
+/// `--sudo-asks`'s rule in place of the image's `admin ALL=(ALL) NOPASSWD: ALL`
+/// (`/etc/sudoers.d/admin-nopasswd`): the lane's own root reads ([`root_command`]'s `/bin/sh`, the
+/// log stream's `pkill`) stay passwordless, and every other command, setup's elevation among them,
+/// falls to the stock `%admin ALL = (ALL) ALL`, which asks the password.
+pub const SUDO_ASKS_RULE: &str = "admin ALL=(ALL) NOPASSWD: /bin/sh, /usr/bin/pkill";
+
+/// The script, as root, that puts [`SUDO_ASKS_RULE`] in place: written under a dotted name (which
+/// sudo's include directory skips), checked by `visudo -c`, then renamed over the image's rule.
+fn sudo_asks_script() -> String {
+    format!(
+        "set -e; f=/private/etc/sudoers.d/.aterm-nux-sudo-asks; printf '%s\n' '{SUDO_ASKS_RULE}' > $f; \
+         chmod 440 $f; /usr/sbin/visudo -c -q -f $f; mv -f $f /private/etc/sudoers.d/admin-nopasswd"
+    )
+}
+
 /// What each of the account's shell prompts prints first ([`PROMPT_MARKER`]): the line [`DRIVE`]
 /// waits for under `$NUX_SHELL`.
 pub const SHELL_READY: &str = "nux-shell-ready";
@@ -3165,6 +3215,16 @@ fn guest(
             "the guest's packet filter did not take the vault port's null route: {}",
             squeeze(rules.trim(), 200)
         )));
+    }
+    if ask.sudo_asks {
+        vm.sh(&root_command(false, &sudo_asks_script()), STEP)?;
+        // The account's sudo must now ask: `-k` drops any cached credential, `-n` refuses to ask.
+        let asks = vm.sh("sudo -k -n /usr/bin/true >/dev/null 2>&1; echo $?", STEP)?;
+        if asks.trim() == "0" {
+            return Err(Fail::die(
+                "--sudo-asks: the administrator's sudo still runs /usr/bin/true with no password",
+            ));
+        }
     }
     let uid = vm.sh("id -u", STEP)?.trim().to_owned();
     let developer = vm
@@ -3833,6 +3893,7 @@ fn first_launch(g: &Guest, ask: &Ask, row: &mut Row) -> Result<(), Fail> {
     }
     // The page at each milestone the records name, from before the open on.
     let captures = capture::Captures::start(g);
+    watch_elevations(g)?;
     // What the app asks after the ALab vault while it is watched: System State's watch for the
     // vault looks on a Mac that has none.
     start_mdns(g)?;
@@ -3858,6 +3919,7 @@ fn first_launch(g: &Guest, ask: &Ask, row: &mut Row) -> Result<(), Fail> {
     }
     presses_cells(row, &g.presses.borrow(), ask.person);
     tab_git(g, row, "git", "once setup's wait ended")?;
+    elevation_cells(g, ask, row, open_ms)?;
     // Before the reads below: the ~/Desktop control's own consent dialog is no milestone.
     captures.stop(g);
     reopen_cells(g, ask, row, open_ms)?;
@@ -4073,6 +4135,308 @@ fn first_launch(g: &Guest, ask: &Ask, row: &mut Row) -> Result<(), Fail> {
     Ok(())
 }
 
+/// Where the elevation watch ([`watch_elevations`]) appends what it saw.
+const ELEVATIONS: &str = "elevations.txt";
+
+/// What the root half of setup's one elevation runs, in its argv
+/// (`aterm_machines::init_clt`'s `sudo -k -p 'Mac password: ' aterm machines here apply --plain`).
+const ELEVATION_ARGV: &str = "machines here apply";
+
+/// Start the elevation watch: every 200 ms the guest's process table, each process whose argv
+/// names [`ELEVATION_ARGV`] appended as `<epoch s> <pid> <ppid> <user> <command>`. A `sudo`
+/// there whose parent is no such `sudo` is one ask for the Mac password (its `-k` drops any
+/// cached credential, so each run asks where the account's sudo needs one; a `sudo` under it is
+/// its `use_pty` monitor); a root process there is the root half running.
+fn watch_elevations(g: &Guest) -> Result<(), Fail> {
+    g.sh(
+        &root_command(
+            g.standard,
+            &format!(": > {ACCOUNTING} && /usr/sbin/accton {ACCOUNTING}"),
+        ),
+        STEP,
+    )?;
+    g.sh(
+        &format!(
+            "f={GUEST_NUX}/{ELEVATIONS}; : > $f; nohup /bin/sh -c 'while :; do t=$(date +%s); \
+             ps -axww -o pid=,ppid=,user=,command= | while read -r p pp u c; do case \"$c\" in \
+             *\"{ELEVATION_ARGV}\"*) echo \"$t $p $pp $u $c\";; esac; done; sleep 0.2; done' \
+             >> $f 2>/dev/null </dev/null & echo $! > $f.pid"
+        ),
+        STEP,
+    )?;
+    Ok(())
+}
+
+/// Each process the elevation watch saw, once, at its first sighting.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Elevations {
+    /// `(first seen, epoch s; pid)` of each `sudo` asking to run the root half.
+    pub asks: Vec<(u64, u32)>,
+    /// `(first seen, epoch s; pid)` of each root half running as root.
+    pub root_runs: Vec<(u64, u32)>,
+}
+
+/// [`Elevations`] over the watch's lines ([`watch_elevations`]): the watch's own shell (whose
+/// argv quotes the pattern) is neither, and a `sudo` whose parent is a `sudo` of the elevation
+/// is that one's `use_pty` monitor, no ask of its own. Pure.
+#[must_use]
+pub fn read_elevations(text: &str) -> Elevations {
+    let mut e = Elevations::default();
+    // Each sudo of the elevation: (first seen, pid, ppid).
+    let mut sudos: Vec<(u64, u32, u32)> = Vec::new();
+    for line in text.lines() {
+        let mut words = line.splitn(5, ' ');
+        let (Some(at), Some(pid), Some(ppid), Some(user), Some(command)) = (
+            words.next(),
+            words.next(),
+            words.next(),
+            words.next(),
+            words.next(),
+        ) else {
+            continue;
+        };
+        let (Ok(at), Ok(pid), Ok(ppid)) =
+            (at.parse::<u64>(), pid.parse::<u32>(), ppid.parse::<u32>())
+        else {
+            continue;
+        };
+        let program = command.split_whitespace().next().unwrap_or("");
+        if !command.contains(ELEVATION_ARGV) || program.ends_with("sh") || program == "ps" {
+            continue;
+        }
+        if program.rsplit('/').next() == Some("sudo") {
+            if !sudos.iter().any(|(_, p, _)| *p == pid) {
+                sudos.push((at, pid, ppid));
+            }
+        } else if user == "root" && !e.root_runs.iter().any(|(_, p)| *p == pid) {
+            e.root_runs.push((at, pid));
+        }
+    }
+    e.asks = sudos
+        .iter()
+        .filter(|(_, _, ppid)| !sudos.iter().any(|(_, p, _)| p == ppid))
+        .map(|(at, pid, _)| (*at, *pid))
+        .collect();
+    e
+}
+
+/// Where the guest's BSD process accounting (`accton(8)`) writes while the elevation is watched
+/// ([`watch_elevations`]): each process that exits leaves its command name and user, however
+/// briefly it ran. The 200 ms process watch misses a root half that ends inside a sample (round
+/// 9's CLT base: developer mode on and the rule in place, the watch empty), and this image's
+/// `sudo` logs no run it allows to the unified log (read in a guest: only refusals show).
+const ACCOUNTING: &str = "/var/account/nux-elevation";
+
+/// How many `aterm` processes ran as root in `lastcomm(1)`'s report of [`ACCOUNTING`]: in a row
+/// that runs no `aterm` as root itself, each is one run of the elevation's root half, its `sudo`
+/// one ask. Pure.
+#[must_use]
+pub fn root_aterm_runs(lastcomm: &str) -> usize {
+    lastcomm
+        .lines()
+        .filter(|line| {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            words.first() == Some(&"aterm") && words.get(2) == Some(&"root")
+        })
+        .count()
+}
+
+/// [`Elevations`] with the root halves process accounting counted (`accounted`,
+/// [`root_aterm_runs`]): runs the watch missed are added, each with its ask, at no known time
+/// (`(0, 0)`, which [`sightings`] names as accounted). Pure.
+#[must_use]
+pub fn with_accounting(mut seen: Elevations, accounted: usize) -> Elevations {
+    while seen.root_runs.len() < accounted {
+        seen.root_runs.push((0, 0));
+    }
+    while seen.asks.len() < seen.root_runs.len() {
+        seen.asks.push((0, 0));
+    }
+    seen
+}
+
+/// `n` sightings as `<n>: at <s> s, …` after `open_ms` (epoch ms).
+fn sightings(seen: &[(u64, u32)], open_ms: u64) -> String {
+    format!(
+        "{}: {}",
+        seen.len(),
+        seen.iter()
+            .map(|(at, _)| if *at == 0 {
+                "too quick for the watch (process accounting)".to_owned()
+            } else {
+                format!("at {} s", (at * 1000).saturating_sub(open_ms) / 1000)
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+/// What setup's one early elevation asked and did (`docs/DESIGN-init-on-by-default-2026-10-25.md`,
+/// owner ruling 2026-11-02): how many times it asked for the Mac password (the row fails on more
+/// than one), whether the account's sudo asks one at all (the image's administrator's asks none,
+/// so no prompt can show there: the ask is counted by its `sudo` process instead), the prompts
+/// still on screen, and what it was to apply with no press: developer mode, the naming rule, the
+/// Mac's own names; then the PTY keeper, on by default.
+fn elevation_cells(g: &Guest, ask: &Ask, row: &mut Row, open_ms: u64) -> Result<(), Fail> {
+    let text = g.sh(
+        &format!(
+            "f={GUEST_NUX}/{ELEVATIONS}; kill $(cat $f.pid) 2>/dev/null; cat $f 2>/dev/null || true"
+        ),
+        STEP,
+    )?;
+    let report = g.sh(
+        &format!(
+            "{}; /usr/bin/lastcomm -f {ACCOUNTING} 2>/dev/null || true",
+            root_command(g.standard, "/usr/sbin/accton")
+        ),
+        STEP,
+    )?;
+    let seen = with_accounting(read_elevations(&text), root_aterm_runs(&report));
+    row.cell(
+        "setup's Mac password asks (target 1)",
+        if seen.asks.is_empty() {
+            Value::Text("0: no sudo of the elevation ran".into())
+        } else {
+            Value::Text(sightings(&seen.asks, open_ms))
+        },
+    );
+    if seen.asks.len() > 1 {
+        row.fail(format!(
+            "setup asked for the Mac password {} times, not once",
+            seen.asks.len()
+        ));
+    }
+    row.cell(
+        "the elevation's root half ran",
+        Value::Text(sightings(&seen.root_runs, open_ms)),
+    );
+    let asks = g.sh("sudo -k -n /usr/bin/true >/dev/null 2>&1; echo $?", STEP)?;
+    let password = asks.trim() != "0";
+    row.cell(
+        "the account's sudo asks a password",
+        Value::Text(if password {
+            "yes".into()
+        } else {
+            "no (the image's NOPASSWD rule): no prompt can show, so each ask is its sudo process"
+                .into()
+        }),
+    );
+    let ls = g.run(&format!("{} ctl ls 2>/dev/null", g.aterm), STEP)?;
+    let mut on_screen = 0;
+    for (sid, _) in session_programs(&ls) {
+        let text = g.run(&format!("{} ctl @{sid} text trim 2>&1", g.aterm), STEP)?;
+        on_screen += text.lines().filter(|l| l.contains("Mac password:")).count();
+    }
+    row.cell(
+        "Mac password prompts on screen at the end",
+        Value::Count(on_screen as u64),
+    );
+    let developer = g.sh(
+        "/usr/sbin/DevToolsSecurity -status 2>&1; \
+         /usr/sbin/dseditgroup -o checkmember -m \"$(id -un)\" _developer 2>&1",
+        STEP,
+    )?;
+    let enabled = developer.contains("currently enabled");
+    row.cell(
+        "developer mode (DevToolsSecurity), no press",
+        Value::Text(squeeze(
+            &developer.split_whitespace().collect::<Vec<_>>().join(" "),
+            160,
+        )),
+    );
+    let rule = g.sh(
+        &root_command(
+            g.standard,
+            &format!(
+                "r={rule}; if [ -f $r ]; then stat -f '%Su %Lp' $r; grep -c ' NOPASSWD: /usr/sbin/scutil ^--set ' $r; \
+                 else echo absent; fi; [ -e {refused} ] && echo refused-kept || true",
+                rule = aterm_types::macos_setup::ADMITTED_NAME_RULE,
+                refused = aterm_types::macos_setup::ADMITTED_NAME_RULE_REFUSED,
+            ),
+        ),
+        STEP,
+    )?;
+    let words: Vec<&str> = rule.split_whitespace().collect();
+    // In place: root's, 0440, and one scutil line per name the rule sets.
+    let rule_in_place = words.starts_with(&["root", "440", "3"]);
+    let rule = if words.first() == Some(&"absent") {
+        words.join(" ")
+    } else {
+        format!(
+            "{} {}, {} scutil lines{}",
+            words.first().unwrap_or(&"?"),
+            words.get(1).unwrap_or(&"?"),
+            words.get(2).unwrap_or(&"?"),
+            if words.contains(&"refused-kept") {
+                ", a refused rule kept"
+            } else {
+                ""
+            }
+        )
+    };
+    row.cell("the naming rule, no press", Value::Text(rule));
+    let names = g.sh(
+        "for p in ComputerName LocalHostName HostName; do printf '%s=%s; ' $p \"$(scutil --get $p 2>&1)\"; done",
+        STEP,
+    )?;
+    row.cell(
+        "this Mac's own names (a label comes only with an admission)",
+        Value::Text(squeeze(names.trim(), 200)),
+    );
+    if !password && !ask.standard_user {
+        // No password stands between the elevation and its steps here: each is owed.
+        if !enabled {
+            row.fail("developer mode is off after setup, with no password to wait on".into());
+        }
+        if !rule_in_place {
+            row.fail(
+                "the naming rule is not in place after setup, with no password to wait on".into(),
+            );
+        } else {
+            rule_names_cell(g, row)?;
+        }
+    }
+    let keeper = g.run(&format!("{} keeper status 2>&1 | head -2", g.aterm), STEP)?;
+    let keeper = keeper.split_whitespace().collect::<Vec<_>>().join(" ");
+    row.cell(
+        "PTY keeper, on by default",
+        Value::Text(squeeze(&keeper, 120)),
+    );
+    if !keeper.starts_with("keeper=running") {
+        row.fail(format!(
+            "the PTY keeper is not running: {}",
+            squeeze(&keeper, 80)
+        ));
+    }
+    Ok(())
+}
+
+/// What the naming rule setup left lets the account do with no password, the name an admission
+/// would give (`m7`) and a name none would (`nux-evil`): the image's `NOPASSWD: ALL` would let
+/// both, so the account's sudo first asks a password for all but the lane's root reads
+/// ([`sudo_asks_script`]), and the rule alone stands between the account and `scutil`. The
+/// guest's Computer Name changes to `m7`, which no later cell of the row reads. The row fails
+/// unless the label passes and the other name is refused.
+fn rule_names_cell(g: &Guest, row: &mut Row) -> Result<(), Fail> {
+    g.sh(&root_command(false, &sudo_asks_script()), STEP)?;
+    let said = g.sh(
+        "s=/usr/sbin/scutil; sudo -k -n $s --set ComputerName m7 >/dev/null 2>&1; echo label=$?; \
+         sudo -k -n $s --set ComputerName nux-evil >/dev/null 2>&1; echo other=$?; \
+         echo name=\"$($s --get ComputerName 2>&1)\"",
+        STEP,
+    )?;
+    let said = said.split_whitespace().collect::<Vec<_>>().join(" ");
+    let named = said.contains("label=0") && !said.contains("other=0") && said.contains("name=m7");
+    row.cell(
+        "the naming rule names this Mac by a label with no password, and nothing else",
+        Value::Text(format!("{} ({said})", if named { "yes" } else { "no" })),
+    );
+    if !named {
+        row.fail(format!("the naming rule did not hold: {said}"));
+    }
+    Ok(())
+}
+
 /// `<git> --version` typed at the first tab's shell (`git`: the name or a path; `label` names
 /// when), and the last line it printed with its exit, read back once it ended or after the
 /// one-minute hang detector.
@@ -4080,7 +4444,7 @@ fn tab_git(g: &Guest, row: &mut Row, git: &str, label: &str) -> Result<(), Fail>
     let cell = format!("{git} in the first tab {label}");
     // The shell's tab, never merely the first listed: a typed line is only a shell's to run. A
     // first tab is a shell that must come back to its prompt (finding 20: one listing right
-    // after the previous probe named only the toolset and Command Line Tools tabs), so the wait
+    // after the previous probe named only the toolset and Mac Setup tabs), so the wait
     // for it is the one-minute hang detector, and what the first listing named is kept.
     let started = Instant::now();
     let mut first_miss: Option<String> = None;
@@ -5584,8 +5948,10 @@ pub fn cmd_nux(args: &[String]) -> Res {
         },
         if ask.standard_user {
             "standard user"
+        } else if ask.sudo_asks {
+            "the image's administrator, its sudo asking a password"
         } else {
-            "the image's administrator"
+            "the image's administrator, its sudo asking no password"
         },
         if ask.keep { ", clones kept" } else { "" },
         if ask.person {
@@ -5755,7 +6121,16 @@ mod tests {
         );
         // The reader reads what the person would answer: one or the other.
         let ask = parse(&args(&["--reader", "--no-clt"]), golden.into()).unwrap();
-        assert!(ask.reader && !ask.person && ask.no_clt);
+        assert!(ask.reader && !ask.person && ask.no_clt && !ask.sudo_asks);
+        // A sudo that asks is the administrator's: a standard account has none.
+        let ask = parse(&args(&["--sudo-asks", "--reader"]), golden.into()).unwrap();
+        assert!(ask.sudo_asks && ask.reader);
+        assert_eq!(
+            parse(&args(&["--sudo-asks", "--standard-user"]), golden.into())
+                .unwrap_err()
+                .code,
+            2
+        );
         assert_eq!(
             parse(&args(&["--reader", "--person"]), golden.into())
                 .unwrap_err()
@@ -6001,7 +6376,7 @@ mod tests {
             local_network_blocks(&blocks),
             [(Some(1_793_197_104_716), 777)]
         );
-        let ps = "  777 /Applications/aterm.app/Contents/MacOS/aterm\n  827 /Applications/aterm.app/Contents/MacOS/aterm acaffiene serve\n";
+        let ps = "  777 /Applications/aterm.app/Contents/MacOS/aterm\n  827 /Applications/aterm.app/Contents/MacOS/aterm acaffeine serve\n";
         let commands = ps_commands(ps);
         assert_eq!(
             commands.get(&777).map(String::as_str),
@@ -6246,6 +6621,73 @@ mod tests {
             launch.setup.iter().map(|(ms, _)| *ms).collect::<Vec<_>>(),
             [704, 2000, 4000, 10160]
         );
+    }
+
+    #[test]
+    fn an_elevation_is_its_sudo_once_and_its_root_half_once_and_the_watch_is_neither() {
+        let watch = "1000 501 1 admin /bin/sh -c while :; do case \"$c\" in *\"machines here apply\"*) ...\n\
+                     1001 812 700 root /usr/bin/sudo -k -p Mac password:  /Applications/aterm.app/Contents/MacOS/aterm machines here apply --plain\n\
+                     1001 813 501 admin ps -axww -o pid=,ppid=,user=,command= machines here apply\n\
+                     1002 812 700 root /usr/bin/sudo -k -p Mac password:  /Applications/aterm.app/Contents/MacOS/aterm machines here apply --plain\n\
+                     1002 815 812 root /usr/bin/sudo -k -p Mac password:  /Applications/aterm.app/Contents/MacOS/aterm machines here apply --plain\n\
+                     1002 814 815 root /Applications/aterm.app/Contents/MacOS/aterm machines here apply --plain\n\
+                     1003 814 815 root /Applications/aterm.app/Contents/MacOS/aterm machines here apply --plain\n\
+                     1003 900 700 admin /Applications/aterm.app/Contents/MacOS/aterm ctl ls\n";
+        let seen = read_elevations(watch);
+        // sudo 815 is 812's use_pty monitor (round 8's first run counted it as a second ask).
+        assert_eq!(seen.asks, [(1001, 812)]);
+        assert_eq!(seen.root_runs, [(1002, 814)]);
+        assert_eq!(sightings(&seen.asks, 1_000_500), "1: at 0 s");
+        // Negative control: a second sudo under no sudo (the password asked again) is a second
+        // ask, which the row fails on; a root half the account ran as itself is no root run.
+        let again = format!(
+            "{watch}1300 950 700 root /usr/bin/sudo -k -p Mac password:  /x/aterm machines here apply --plain\n\
+             1301 951 950 admin /x/aterm machines here apply --plain\n"
+        );
+        let seen = read_elevations(&again);
+        assert_eq!(seen.asks, [(1001, 812), (1300, 950)]);
+        assert_eq!(seen.root_runs, [(1002, 814)]);
+        assert_eq!(
+            read_elevations("garbage\n1 x 1 root sudo machines here apply\n"),
+            Elevations::default()
+        );
+    }
+
+    /// A root half too quick for the watch is still counted from process accounting, with its
+    /// ask; one the watch saw is not counted twice; only `aterm` run as root counts.
+    #[test]
+    fn a_quick_elevation_counts_from_process_accounting_once() {
+        let report = "sudo       -S      admin    __         0.00 secs Wed Nov  4 11:47 (0:00:00.00)\n\
+                      aterm      -       root     __         0.02 secs Wed Nov  4 11:47 (0:00:00.31)\n\
+                      aterm      -       admin    __         0.10 secs Wed Nov  4 11:47 (0:00:02.00)\n\
+                      DevToolsSecuri -   root     __         0.00 secs Wed Nov  4 11:47 (0:00:00.01)\n";
+        assert_eq!(root_aterm_runs(report), 1);
+        let quick = with_accounting(Elevations::default(), 1);
+        assert_eq!(quick.asks, [(0, 0)]);
+        assert_eq!(quick.root_runs, [(0, 0)]);
+        assert_eq!(
+            sightings(&quick.asks, 1_000_000),
+            "1: too quick for the watch (process accounting)"
+        );
+        let watched = Elevations {
+            asks: vec![(1001, 812)],
+            root_runs: vec![(1002, 814)],
+        };
+        let both = with_accounting(watched, 1);
+        assert_eq!(
+            both.asks,
+            [(1001, 812)],
+            "the watch's run is the accounted one"
+        );
+        assert_eq!(both.root_runs, [(1002, 814)]);
+        // Negative control: a second root half is a second ask, which the row fails on; a sudo
+        // still at its prompt (seen, not yet accounted) stays one.
+        assert_eq!(with_accounting(Elevations::default(), 2).asks.len(), 2);
+        let waiting = Elevations {
+            asks: vec![(1001, 812)],
+            root_runs: Vec::new(),
+        };
+        assert_eq!(with_accounting(waiting, 0).asks, [(1001, 812)]);
     }
 
     #[test]

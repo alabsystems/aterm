@@ -579,7 +579,9 @@ fn sgr(r: &mut Rng, caps: Caps) -> Vec<u8> {
         let fg_or_attr = |r: &mut Rng| -> String {
             let attrs = u64::from(caps.sgr_attrs);
             match r.below(9 + attrs + 4 * u64::from(caps.truecolour)) {
-                0 => r.pick(&["0", "1", "4", "7", "22", "24", "27"]).to_string(),
+                0 => r
+                    .pick(&["0", "1", "4", "7", "22", "24", "27", "59"])
+                    .to_string(),
                 1 | 2 => (30 + r.below(8)).to_string(),
                 3 => "39".to_string(),
                 4 => (90 + r.below(8)).to_string(),

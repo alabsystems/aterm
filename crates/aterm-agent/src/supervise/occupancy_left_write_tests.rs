@@ -577,6 +577,7 @@ fn a_wakes_line_is_the_breaks_one_line_and_cruise_carries_nothing_over_it() {
             Arc::new(DoorHost::default())
         };
         let set = move |m: &mut Mock| {
+            m.cursor_on_caret = true;
             if left {
                 enter_refused(m);
             }
@@ -1080,4 +1081,155 @@ fn a_doors_line_left_is_no_persons_draft() {
         ago.is_none_or(|ago| ago >= Duration::from_secs(30 * 60)),
         "no person typing in the door's own line: {ago:?}"
     );
+}
+
+/// A LINE LEFT, ITS CARET HOME, STANDS (the reviews of `bd67622c8c` and `98b9c4d903`): a wait nudge left
+/// unsent, then read plain, whole or as a person's edit of it, with the cursor at column 2 (a person's
+/// Home over it), then sent by the person's Enter. The rows alone read that cursor as a suggestion's, so
+/// the line was released as cleared, and the door typed it again after the person sent it. Its glyph's
+/// cell says it stands: it settles once, told, with the cursor past it or home on it, and so does a read
+/// whose cell is refused, which cannot say it went.
+/// NEGATIVE CONTROLS: `left_seen` by the rows alone, and the home runs' rows say `why=cleared` and the
+/// line is typed twice; `left_seen` asking the cell to say typed, and the refused run does.
+#[test]
+fn a_line_left_with_its_caret_home_stands() {
+    let line = templates::wait_nudge(31 * MIN);
+    let edited = format!("{} and fix the parser", line.text());
+    for (text, col, refused) in [
+        (line.text(), 12_usize, false),
+        (line.text(), 2, false),
+        (line.text(), 2, true),
+        (edited.as_str(), 12, false),
+        (edited.as_str(), 2, false),
+    ] {
+        let at_s = vec![0, 31 * 60, 32 * 60, 33 * 60, 60 * 60, 90 * 60];
+        let script = Script {
+            set: &enter_refused,
+            ..Script::new("left-home", Occupancy::Prompt, &at_s)
+        };
+        let ran = script.run(&mut |s, i| {
+            if i == 0 {
+                submits(s, 5);
+            }
+            if i == 2 {
+                standing(s, text);
+                s.ctl.m.cursor_on_caret = true;
+                s.ctl.m.cell_attrs = "none";
+                s.ctl.m.cell_unreadable = refused;
+                s.ctl.m.screen_cols.insert(0, col);
+                submits(s, 5);
+            }
+            if i == 3 {
+                s.ctl.m.screens = vec![break_screen()];
+                s.ctl.m.served = 0;
+                s.ctl.m.cell_unreadable = false;
+                s.ctl.m.screen_cols.remove(&0);
+                s.ctl.m.cell_attrs = "dim";
+                submits(s, 6);
+            }
+        });
+        let rows = hold_rows(&ran);
+        assert!(
+            !rows
+                .iter()
+                .any(|(_, reason)| reason.contains("why=cleared")),
+            "{text:?} col {col}: {rows:#?}"
+        );
+        let typed = ran
+            .writes()
+            .iter()
+            .filter(|w| w.starts_with("send "))
+            .count();
+        assert_eq!(typed, 1, "{text:?} col {col}: {rows:#?}");
+    }
+}
+
+/// A LINE LEFT THEN CLEARED SETTLES UNDER A SUGGESTION AT HOME (the review of `367dfeea26`, on base as
+/// well): a wait nudge left unsent, then gone, a grey suggestion at home in its place, on one row with
+/// the cursor home or a row under it, or on two rows. Every reader of that screen calls it no draft (the
+/// loop's and the door's `composer_draft`, each upgrade gate), so it settles as cleared and the next
+/// due line is typed. A line standing past its text asks no cell, however long it stands.
+/// NEGATIVE CONTROLS: `left_seen` answering by `typed_draft_in`, which takes the two rows and the row
+/// under for typed with no cell asked, as on `367dfeea26`, and those arms never settle, the next line
+/// never typed; `left_seen` asking the door's cell whatever the rows say, and a standing line asks one
+/// cell at each look.
+#[test]
+fn a_line_left_then_cleared_settles_under_a_suggestion_at_home() {
+    let line = templates::wait_nudge(31 * MIN);
+    let lone = drafted(break_screen(), "keep going, then merge when ready");
+    let caret = lone
+        .iter()
+        .position(|r| r.starts_with("❯ keep"))
+        .expect("the caret");
+    let mut two = lone.clone();
+    two.insert(caret + 1, "  and then the rest of it".to_string());
+    for (what, shown, row) in [
+        ("one row, home", lone.clone(), caret),
+        ("two rows, home", two, caret),
+        ("one row, a row under", lone.clone(), caret + 1),
+    ] {
+        let at_s = vec![0, 31 * 60, 32 * 60, 33 * 60, 60 * 60, 90 * 60];
+        let script = Script {
+            set: &enter_refused,
+            ..Script::new("left-suggestion", Occupancy::Prompt, &at_s)
+        };
+        let ran = script.run(&mut |s, i| {
+            if i == 0 {
+                submits(s, 5);
+            }
+            if i == 2 {
+                standing(s, line.text());
+                s.ctl.m.cursor_on_caret = true;
+                s.ctl.m.cell_attrs = "none";
+                s.ctl.m.screen_cols.insert(0, 12);
+                submits(s, 5);
+            }
+            if i == 3 {
+                s.ctl.m.screens = vec![shown.clone()];
+                s.ctl.m.served = 0;
+                s.ctl.m.cell_attrs = "dim";
+                s.ctl.m.dim_past = true;
+                s.ctl.m.cursor_on_caret = false;
+                s.ctl.m.cursor_row = Some(row);
+                s.ctl.m.screen_cols.insert(0, 2);
+                submits(s, 5);
+            }
+        });
+        let rows = hold_rows(&ran);
+        assert!(
+            rows.iter()
+                .any(|(_, reason)| reason.contains("why=cleared")),
+            "{what}: {rows:#?}"
+        );
+        let typed = ran
+            .writes()
+            .iter()
+            .filter(|w| w.starts_with("send "))
+            .count();
+        assert_eq!(typed, 2, "{what}: {rows:#?}");
+    }
+    let mut at_s = vec![0, 31 * 60, 32 * 60];
+    at_s.extend((33..93).map(|minute| minute * 60));
+    let script = Script {
+        set: &enter_refused,
+        ..Script::new("left-standing", Occupancy::Prompt, &at_s)
+    };
+    let ran = script.run(&mut |s, i| {
+        if i == 0 {
+            submits(s, 5);
+        }
+        if i == 2 {
+            standing(s, line.text());
+            s.ctl.m.cursor_on_caret = true;
+            s.ctl.m.cell_attrs = "none";
+            s.ctl.m.screen_cols.insert(0, 12);
+            submits(s, 5);
+        }
+    });
+    let cells = ran
+        .requests()
+        .iter()
+        .filter(|r| r.starts_with("cell "))
+        .count();
+    assert!(cells <= 2, "{cells} cells over {} looks", at_s.len());
 }

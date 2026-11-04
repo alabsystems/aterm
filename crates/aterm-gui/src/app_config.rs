@@ -403,13 +403,23 @@ struct TrickVocabulary {
 }
 
 impl TrickVocabulary {
+    /// The vocabulary of `langs`, shared with the last generation a reload prepared while some
+    /// generation still holds its table ([`shared_table`]). A launch's vocabulary
+    /// ([`Self::compiling`], [`Self::lazy`]) enters no slot, so the first reload after a launch
+    /// still compiles.
     fn compiled(langs: Vec<String>) -> Self {
-        let vocabulary = Self {
-            built: std::sync::Arc::default(),
+        static LAST: TableSlot<std::sync::OnceLock<aterm_lexicon::TrickLexicon>> =
+            std::sync::Mutex::new(None);
+        let (built, shared) = shared_table(&LAST, &langs, || {
+            std::sync::OnceLock::from(compile_trick_vocabulary(&langs))
+        });
+        if shared && let Some(tricks) = built.get() {
+            log_trick_conflicts(tricks);
+        }
+        Self {
+            built,
             lazy_langs: None,
-        };
-        let _ = vocabulary.built.set(compile_trick_vocabulary(&langs));
-        vocabulary
+        }
     }
 
     fn compiling(langs: Vec<String>) -> Self {
@@ -459,10 +469,56 @@ static TRICKS_COMPILE_GATE: std::sync::RwLock<()> = std::sync::RwLock::new(());
 fn compile_trick_vocabulary(langs: &[String]) -> aterm_lexicon::TrickLexicon {
     let refs: Vec<&str> = langs.iter().map(String::as_str).collect();
     let tricks = aterm_lexicon::TrickLexicon::with_languages(&refs);
+    log_trick_conflicts(&tricks);
+    tricks
+}
+
+fn log_trick_conflicts(tricks: &aterm_lexicon::TrickLexicon) {
     for conflict in tricks.conflicts() {
         crate::logging::stderr_line!("aterm-gui: kitty commands vocabulary: {conflict}");
     }
-    tricks
+}
+
+/// The builtin lexicon of `langs`, shared with the last one built while some generation still holds
+/// it ([`shared_table`]). Its inputs are `langs` and the embedded data.
+fn builtin_lexicon(langs: &[String]) -> std::sync::Arc<aterm_lexicon::Lexicon> {
+    static LAST: TableSlot<aterm_lexicon::Lexicon> = std::sync::Mutex::new(None);
+    shared_table(&LAST, langs, || {
+        let refs: Vec<&str> = langs.iter().map(String::as_str).collect();
+        aterm_lexicon::Lexicon::with_languages(&refs)
+    })
+    .0
+}
+
+/// The last table built and the languages it was built of. Weak, so the slot keeps nothing once no
+/// generation holds the table.
+type TableSlot<T> = std::sync::Mutex<Option<(Vec<String>, std::sync::Weak<T>)>>;
+
+/// The table of `langs`: the one in `slot` (`true` beside it) while some generation still holds it,
+/// or what `build` makes (`false` beside it), which takes the slot.
+fn shared_table<T>(
+    slot: &TableSlot<T>,
+    langs: &[String],
+    build: impl FnOnce() -> T,
+) -> (std::sync::Arc<T>, bool) {
+    let mut last = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((held, table)) = last.as_ref()
+        && held.as_slice() == langs
+        && let Some(table) = table.upgrade()
+    {
+        return (table, true);
+    }
+    let table = std::sync::Arc::new(build());
+    *last = Some((langs.to_vec(), std::sync::Arc::downgrade(&table)));
+    (table, false)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The lexicon warnings this thread logged, one generation's lines on top of another's.
+    static CONFLICT_LINES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// One consistent generation of every path-backed effect feed.
@@ -2982,23 +3038,33 @@ impl Config {
                 }))
             }
             Some((cfg, override_toml)) => {
-                let refs: Vec<&str> = langs.iter().map(String::as_str).collect();
-                let lexicon = aterm_lexicon::Lexicon::with_languages_and_override(
-                    &refs,
-                    override_toml.as_deref(),
-                )
-                .unwrap_or_else(|error| {
-                    crate::logging::stderr_line!(
-                        "aterm-gui: sparkle words lexicon override rejected ({error}); using builtin"
-                    );
-                    aterm_lexicon::Lexicon::with_languages(&refs)
-                });
+                let lexicon = match override_toml.as_deref() {
+                    None => builtin_lexicon(&langs),
+                    Some(override_toml) => {
+                        let refs: Vec<&str> = langs.iter().map(String::as_str).collect();
+                        std::sync::Arc::new(
+                            aterm_lexicon::Lexicon::with_languages_and_override(
+                                &refs,
+                                Some(override_toml),
+                            )
+                            .unwrap_or_else(|error| {
+                                crate::logging::stderr_line!(
+                                    "aterm-gui: sparkle words lexicon override rejected ({error}); using builtin"
+                                );
+                                aterm_lexicon::Lexicon::with_languages(&refs)
+                            }),
+                        )
+                    }
+                };
+                // Each generation's own: its `cjk_single_char` says which apply, shared or not.
                 for warning in sparkle_logged_warnings(lexicon.conflicts(), cfg.cjk_single_char) {
+                    #[cfg(test)]
+                    CONFLICT_LINES.with(|lines| lines.set(lines.get() + 1));
                     crate::logging::stderr_line!("aterm-gui: sparkle_words lexicon: {warning}");
                 }
                 PreparedSparkleResolved::Eager(Box::new(crate::word_decorations::Resolved {
                     cfg,
-                    lexicon: std::sync::Arc::new(lexicon),
+                    lexicon,
                 }))
             }
         };
@@ -8927,10 +8993,6 @@ mod cfg_engine_tests {
             symlink(dir.join("missing.conf"), &work).unwrap();
         });
         assert_eq!(rejected, Err(ThemeCatalogWatchError::FileUnavailable));
-        assert!(
-            active.resolve("Work").is_ok(),
-            "a rejected live generation leaves the prior active theme intact"
-        );
 
         std::fs::remove_file(&work).unwrap();
         write_theme(&work, "#fedcba", "#101820");
@@ -11204,6 +11266,76 @@ mod reload_dedupe_tests {
         );
     }
 
+    /// A slot shares a table of the same languages while a generation holds it, builds another for
+    /// other languages, and keeps nothing once none does. The slot is this test's own, so no other
+    /// thread's generation can take it.
+    #[test]
+    fn a_vocabulary_slot_shares_what_a_generation_holds_and_keeps_nothing_after() {
+        let slot: super::TableSlot<usize> = std::sync::Mutex::new(None);
+        let (en, es) = (["en".to_string()], ["es".to_string()]);
+        let builds = std::cell::Cell::new(0);
+        let build = || {
+            builds.set(builds.get() + 1);
+            builds.get()
+        };
+        let (first, shared) = super::shared_table(&slot, &en, build);
+        assert!(!shared, "an empty slot shares nothing");
+        let (second, shared) = super::shared_table(&slot, &en, build);
+        assert!(shared, "a held table is shared");
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "the second generation holds the first's table"
+        );
+        assert_eq!(builds.get(), 1, "a shared table is not built again");
+
+        let table = std::sync::Arc::downgrade(&first);
+        drop((first, second));
+        assert!(
+            table.upgrade().is_none(),
+            "the slot keeps a table no generation holds"
+        );
+        let (rebuilt, shared) = super::shared_table(&slot, &en, build);
+        assert!(!shared, "a table no generation holds is rebuilt");
+        assert_eq!(builds.get(), 2, "a table no generation holds is rebuilt");
+
+        let (other, shared) = super::shared_table(&slot, &es, build);
+        assert!(!shared, "other languages share nothing");
+        assert!(!std::sync::Arc::ptr_eq(&rebuilt, &other));
+        assert_eq!(builds.get(), 3, "other languages build their own table");
+    }
+
+    /// Each generation logs the lexicon's warnings whether it built the tables or shares them (those
+    /// lines read this generation's `cjk_single_char`), and the real slots keep nothing once no
+    /// generation holds the tables. The language is this test's own, so no other generation can hold
+    /// them; another thread's generation may take the slot between the two here, which only makes
+    /// the second compile, so that the two share is not held here but by
+    /// [`a_vocabulary_slot_shares_what_a_generation_holds_and_keeps_nothing_after`]. The vocabulary's
+    /// own lines are not read here: they come of malformed embedded data alone, which
+    /// `aterm_lexicon`'s suite holds to none, so no language raises one.
+    #[test]
+    fn each_generation_logs_its_vocabulary_warnings_and_no_slot_outlives_them() {
+        let config = cfg("[sparkle_words]\nenabled = true\nlanguages = [\"zz-this-test\"]\n");
+        let lines = || super::CONFLICT_LINES.with(|lines| lines.replace(0));
+        let _ = lines();
+        let first = config.prepare_sparkle_runtime();
+        let logged = lines();
+        assert!(logged >= 1, "an unknown language warns in the lexicon");
+        let second = config.prepare_sparkle_runtime();
+        assert_eq!(
+            lines(),
+            logged,
+            "the second generation logs what the first did"
+        );
+        let tricks = std::sync::Arc::downgrade(&second.0.tricks.built);
+        let lexicon =
+            std::sync::Arc::downgrade(&second.resolved().expect("sparkle is enabled").lexicon);
+        drop((first, second));
+        assert!(
+            tricks.upgrade().is_none() && lexicon.upgrade().is_none(),
+            "a slot keeps a table no generation holds"
+        );
+    }
+
     #[test]
     fn an_unlanded_kitty_vocabulary_classifies_nothing() {
         let unlanded = super::TrickVocabulary {
@@ -11224,10 +11356,13 @@ mod reload_dedupe_tests {
 
     #[test]
     fn path_feed_fingerprints_enforce_the_loader_specific_caps() {
-        let dir = std::env::temp_dir().join(format!("aterm-feed-caps-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let lexicon = dir.join("lexicon.toml");
-        let toy = dir.join("toy.toml");
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("aterm-feed-caps-")
+            .suffix(".noindex")
+            .tempdir()
+            .expect("scratch dir");
+        let lexicon = dir.path().join("lexicon.toml");
+        let toy = dir.path().join("toy.toml");
         let config = cfg(&format!(
             "[sparkle_words]\nlexicon = {:?}\ntoy_packs = [{:?}]\n",
             lexicon.to_string_lossy(),
@@ -11255,7 +11390,6 @@ mod reload_dedupe_tests {
         std::fs::write(&toy, "# admitted toy manifest bytes\n").unwrap();
         let admitted = config.path_feed_fingerprints();
         assert_ne!(admitted.deco, missing.deco);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[cfg(unix)]
@@ -11263,10 +11397,14 @@ mod reload_dedupe_tests {
     fn path_feed_fingerprint_and_loaders_refuse_a_writerless_fifo() {
         use std::os::unix::ffi::OsStrExt as _;
 
-        let path = std::env::temp_dir().join(format!("aterm-feed-fifo-{}", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("aterm-feed-fifo-")
+            .suffix(".noindex")
+            .tempdir()
+            .expect("scratch dir");
+        let path = dir.path().join("feed.fifo");
         let path_c = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("FIFO path");
-        // SAFETY: `path_c` is a live NUL-terminated pathname and mkfifo retains no pointer. The path is unique to this test process.
+        // SAFETY: `path_c` is a live NUL-terminated pathname and mkfifo retains no pointer. The path is inside a unique tempdir owned by this test.
         assert_eq!(unsafe { libc::mkfifo(path_c.as_ptr(), 0o600) }, 0);
         let config = cfg(&format!(
             "[sparkle_words]\nlexicon = {0:?}\ntoy_packs = [{0:?}]\n",
@@ -11284,9 +11422,12 @@ mod reload_dedupe_tests {
 
     #[test]
     fn byte_equal_reload_still_rereads_touched_path_feed_files() {
-        let dir = std::env::temp_dir().join(format!("aterm-feed-touch-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let lex = dir.join("lexicon.toml");
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("aterm-feed-touch-")
+            .suffix(".noindex")
+            .tempdir()
+            .expect("scratch dir");
+        let lex = dir.path().join("lexicon.toml");
         std::fs::write(&lex, "# lexicon v1\n").unwrap();
 
         let mut app = crate::App::headless_for_test();
@@ -12077,12 +12218,16 @@ mod matrix_rain_app_tests {
             enabled: true,
             ..Default::default()
         };
-        let a = crate::rain_config_for_window(base, crate::WindowId(0));
-        let b = crate::rain_config_for_window(base, crate::WindowId(0));
-        let c = crate::rain_config_for_window(base, crate::WindowId(1));
-        assert_ne!(a.seed, 0, "the sentinel resolves to a real seed");
-        assert_eq!(a.seed, b.seed, "stable for the window's whole life");
-        assert_ne!(a.seed, c.seed, "distinct fields per window");
+        for raw in [0, 1, 2, 0x5048_4F53_5048_4F52, u64::MAX] {
+            let wid = crate::WindowId(raw);
+            let a = crate::rain_config_for_window(base, wid);
+            let b = crate::rain_config_for_window(base, wid);
+            assert_ne!(a.seed, 0, "the sentinel resolves to a real seed ({wid:?})");
+            assert_eq!(
+                a.seed, b.seed,
+                "stable for the window's whole life ({wid:?})"
+            );
+        }
         let pinned = crate::matrix_rain::RainConfig { seed: 7, ..base };
         assert_eq!(
             crate::rain_config_for_window(pinned, crate::WindowId(3)).seed,

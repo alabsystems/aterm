@@ -423,6 +423,10 @@ fn transition_with(
 fn broker_rotation_and_policy_updates_reclaim_slots_without_evicting_other_grants() {
     // Filling all slots checks rotation and policy retention, independently of
     // how long authenticated fixture I/O waits for a core. Expiry advances below.
+    // The first two grants, the 64th slot and one middle grant's rotation at the full table issue
+    // for real; the other 61 slots start as `test_fill`'s. So only a slot cap that counts the map
+    // is exercised: one that counted issues (`state.serial`) would never reach 64 here, and
+    // nothing else pins it.
     let lease_clock = Instant::now();
     let within = Duration::from_secs(120);
     let (f, mut broker, first, grant) = setup_on_with_lease_clock(1, Some(lease_clock));
@@ -434,10 +438,17 @@ fn broker_rotation_and_policy_updates_reclaim_slots_without_evicting_other_grant
         })
         .collect::<Vec<_>>();
     publish(&f, grants.clone());
-    let tokens = grants
+    let tokens = grants[..2]
         .iter()
         .map(|g| broker.issue_until(g.id, within, deadline()).unwrap())
         .collect::<Vec<_>>();
+    broker.test_fill(tokens[1].bytes(), &grants[2..63]);
+    broker
+        .issue_until(grants[63].id, within, deadline())
+        .unwrap();
+    broker
+        .issue_until(grants[31].id, within, deadline())
+        .unwrap();
     let replacement = broker
         .issue_until(grants[0].id, within, deadline())
         .unwrap();

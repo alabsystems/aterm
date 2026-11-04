@@ -1626,6 +1626,93 @@ fn the_gate_reads_the_composer_past_a_drawn_caret_as_the_loop_does() {
     }
 }
 
+/// Muse Code's gate reads the cursor as the loop does ([`crate::supervise::screen::cursor_home`]): the
+/// hint's ink on the first glyph is no draft only with the cursor home, on the caret's row or, on a
+/// lone line, the row under it. Anywhere else, or with no cursor on the rows read, it says neither and
+/// no cell is asked, as there the loop holds. A blank first row over text on a later row is a draft
+/// with no cell asked, as to the loop and Claude Code's gate, whatever a blank's cell is drawn in. A
+/// cell that does not say, refused or inside an unfinished frame, is a draft too.
+/// NEGATIVE CONTROLS: the gate asking for the cursor exactly at the caret on a lone line, as on
+/// `bd67622c8c`, and a suggestion the loop types over holds this gate on the row under it and on two
+/// rows; `composer_holds_no_draft` asking a blank first row's cell, as on `98b9c4d903`, and a person's
+/// two rows read as no draft where a blank is drawn in the hint's ink, so the upgrade's line is typed
+/// into them; `composer_empty` taking a cell that does not say for grey, and the two replies below
+/// read as no draft, so the upgrade's line is typed over a draft it could not read.
+#[test]
+fn the_gate_reads_the_cursor_as_the_loop_does() {
+    let lone = fixture_rows(aterm_phase::muse::fixtures::DRAFT_1_4_10);
+    let (caret, lines) = aterm_phase::muse::composer_draft(&lone).expect("a composer");
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    let mut two = lone.clone();
+    two.insert(caret + 1, "  and the release notes".to_string());
+    assert_eq!(
+        aterm_phase::muse::composer_draft(&two).map(|(_, l)| l.len()),
+        Some(2)
+    );
+    let mut blank_first = two.clone();
+    blank_first[caret] = "❯".to_string();
+    assert_eq!(
+        aterm_phase::muse::composer_draft(&blank_first).map(|(_, l)| l[0].is_empty()),
+        Some(true)
+    );
+    let hint = "OK %20 676c74 111318 none";
+    let screen_of = |rows: &[String], cursor| super::super::Screen {
+        rows: rows.to_vec(),
+        cursor,
+        seq: 20,
+        first: 0,
+        generation: None,
+        human: crate::supervise::screen::HumanInput::Never,
+        title: None,
+    };
+    for (rows, cursor, empty) in [
+        (&lone, Some((caret, 2)), true),
+        (&lone, Some((caret + 1, 2)), true),
+        (&lone, Some((caret, 9)), false),
+        (&lone, Some((0, 2)), false),
+        (&lone, None, false),
+        (&two, Some((caret, 2)), true),
+        (&two, Some((caret + 1, 2)), false),
+        (&blank_first, Some((caret, 2)), false),
+        (&blank_first, Some((caret + 1, 2)), false),
+    ] {
+        let scr = screen_of(rows, cursor);
+        let (mut c, server) = super::super::tests::fake_tab(vec![hint]);
+        assert_eq!(composer_empty(&mut c, TAB, &scr), empty, "{cursor:?}");
+        drop(c);
+        let asked: Vec<String> = empty
+            .then(|| format!("@{TAB} cell {caret} 2"))
+            .into_iter()
+            .collect();
+        assert_eq!(server.join().expect("server"), asked, "{cursor:?}");
+    }
+    for reply in [
+        "ERR no such verb: cell",
+        "OK %20 676c74 111318 none frame=open",
+    ] {
+        let scr = screen_of(&lone, Some((caret, 2)));
+        let (mut c, server) = super::super::tests::fake_tab(vec![reply]);
+        assert!(!composer_empty(&mut c, TAB, &scr), "{reply}");
+        drop(c);
+        server.join().expect("server");
+    }
+    // The prompt-history search (measured on 1.4.14), over an old prompt and over an empty
+    // composer, its cursor on its query: no composer the upgrade's line could go into, no cell asked.
+    // NEGATIVE CONTROL: `composer_empty` not asking `muse::history_search`, and the empty one reads
+    // empty.
+    for text in [
+        aterm_phase::muse::fixtures::HISTORY_SEARCH,
+        aterm_phase::muse::fixtures::HISTORY_SEARCH_EMPTY,
+    ] {
+        let rows = fixture_rows(text);
+        let scr = screen_of(&rows, aterm_phase::prompt::fixtures::cursor(text));
+        let (mut c, server) = super::super::tests::fake_tab(vec![hint]);
+        assert!(!composer_empty(&mut c, TAB, &scr), "{rows:#?}");
+        drop(c);
+        assert_eq!(server.join().expect("server"), Vec::<String>::new());
+    }
+}
+
 #[test]
 fn an_in_flight_muse_relaunch_waits_out_a_hand_and_counts_staleness_from_seen_exit() {
     let rig = Rig::new("hand-and-exit-clock", 137, true, false, Log::Crash, true);
@@ -2204,6 +2291,8 @@ fn a_carry_on_left_unanswered_is_read_for_what_it_did() {
     let muted = |rig: &mut Rig| {
         rig.opts.timings.drive_reply = Duration::from_millis(200);
     };
+    // Only the carry-on's own line is waited out; every answered exchange waits the hang detector.
+    let _answered = crate::AnsweredBut::set(|l| l.contains(upgrade::HARNESS_MARK));
     let mut reached = adopted("unanswered-reached");
     muted(&mut reached);
     reached.on_harness_line(Some(crate::harness::UNANSWERED), true);

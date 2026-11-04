@@ -46,6 +46,7 @@ pub mod plist;
 pub mod port;
 pub mod protocol;
 pub mod release_probe;
+pub mod root_steps;
 pub mod sessions;
 pub mod sync;
 

@@ -1758,3 +1758,28 @@ fn no_candidate_asks_nothing_and_misses_nothing() {
     network.refresh(&mut transport, &[]);
     assert_eq!(seen(), (0, 0, 0), "no try, no miss");
 }
+
+/// A debug build's private attachment is one loopback address and never reads the LAN, so the
+/// gate is never asked; an invalid setting refuses rather than falling back to the LAN; and with
+/// none the candidates are the LAN's IPv4 addresses, an unreadable LAN reading offline.
+#[test]
+fn a_private_attachment_is_loopback_alone_and_never_reads_the_lan() {
+    let loopback: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let lan: std::net::SocketAddr = "192.168.1.5:0".parse().unwrap();
+    assert_eq!(
+        usable_addresses(Ok(Some(49152)), || panic!("read the LAN")),
+        Ok(vec![loopback])
+    );
+    assert!(matches!(
+        usable_addresses(Err(crate::Error::new("unguarded")), || panic!("read the LAN")),
+        Err(Status::Refused(refusal)) if refusal.step == "isolated attachment"
+    ));
+    assert_eq!(
+        usable_addresses(Ok(None), || Ok(vec![lan, "[fe80::1]:0".parse().unwrap()])),
+        Ok(vec![lan])
+    );
+    assert_eq!(
+        usable_addresses(Ok(None), || Err(std::io::Error::other("down"))),
+        Err(Status::Offline)
+    );
+}

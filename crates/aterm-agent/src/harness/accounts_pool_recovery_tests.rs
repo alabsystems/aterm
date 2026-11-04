@@ -2,6 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
+use crate::harness::accounts_overlay::model_provider;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 fn pending_renewal(world: &World, cli: Cli, staging: &Path, create: bool) {
@@ -333,8 +334,7 @@ pub(crate) fn recovery_transition(
             next.insert("case", state["case"] + 1);
         }
         "Observe" => {
-            let cli =
-                [Cli::Codex, Cli::Grok, Cli::Kimi][usize::try_from(state["provider"] - 1).unwrap()];
+            let cli = model_provider(state["provider"]);
             let (outcome, [coherent, once, preserved, unpolled]) = observe(cli, state["case"]);
             next.insert("phase", 1);
             next.insert("outcome", outcome);

@@ -451,6 +451,7 @@ fn the_workers_suggestion_is_typed_over_with_the_continuation_never_accepted() {
     m.sends_gen = true;
     m.human_seq = Some(0);
     m.help = FENCED_HELP.to_string();
+    m.cursor_on_caret = true;
     m.screen_cols.insert(2, 12);
     m.vanish_after = Some(2);
     let (lines, _) = watch_lines(&mut m, &hosted(30));
@@ -485,6 +486,7 @@ fn the_workers_suggestion_is_typed_over_with_the_continuation_never_accepted() {
         suggesting("Stage 1 is in."),
         ended(STOP),
     ]);
+    m.cursor_on_caret = true;
     m.turn_releases = Some(1);
     m.vanish_after = Some(2);
     let (lines, _) = watch_lines(&mut m, &hosted(30));
@@ -524,6 +526,7 @@ fn a_suggestion_under_claude_codes_drawn_caret_is_typed_over() {
         m.sends_gen = true;
         m.human_seq = Some(0);
         m.help = FENCED_HELP.to_string();
+        m.cursor_on_caret = true;
         m.screen_cols.insert(2, 12);
         m.vanish_after = Some(2);
         m.cells = [
@@ -4655,6 +4658,7 @@ fn claude_echo(
     m.sends_gen = true;
     m.human_seq = Some(0);
     m.help = FENCED_HELP.to_string();
+    m.cursor_on_caret = true;
     m.screen_cols.extend(typed.iter().copied());
     m.vanish_after = Some(2);
     m.exit_when = Some(|m| m.attention.is_some());
@@ -5184,6 +5188,7 @@ fn the_windows_host_types_the_continuation_over_the_workers_suggestion_under_its
         m.sends_gen = true;
         m.human_seq = Some(0);
         m.help = FENCED_HELP.to_string();
+        m.cursor_on_caret = true;
         m.screen_cols.insert(2, 12);
         m.vanish_after = Some(2);
         m.verb_replies.insert(
@@ -13386,6 +13391,73 @@ fn the_shell_a_turn_left_under_an_idle_compaction_is_told_as_the_agents_own_work
     }
 }
 
+/// THE MONITOR A TURN LEFT UNDER A PROGRESS ROW ITS WORKFLOW OUTLIVED IS TOLD AS THE AGENT'S OWN
+/// WORK: 2.1.304 leaves a workflow's progress row drawn at its full bar after the workflow ended
+/// (`claude-2.1.304-agents-panel-workflow-done-3m20s-120col.txt`), and a monitor still running,
+/// named by the done row, comes after its rule in the reader's order. Before, the work the turn
+/// left was read by that one rule, `a workflow running`, so the screen named none, and the
+/// canary climbed on the title's witness: it called the screen one this build does not read and
+/// the wait one it does not classify, and told the host the record of an unread screen.
+#[test]
+fn the_monitor_a_turn_left_under_an_outlived_progress_row_is_told_as_the_agents_own_work() {
+    let mut monitored = aterm_phase::prompt::fixtures::screen(include_str!(
+        "../../../aterm-phase/src/fixtures/claude-2.1.304-agents-panel-workflow-done-3m20s-120col.txt"
+    ));
+    monitored
+        .iter_mut()
+        .find(|r| r.starts_with("✻ Brewed for 3m 20s"))
+        .expect("the done row")
+        .push_str(" · 1 monitor still running");
+    let (dir, path) = journal_file("stuck-left-monitor-outlived");
+    let host = Arc::new(LadderHost::default());
+    let mut m = Mock::new(vec![busy_screen(), monitored.clone()]);
+    m.title = Some("✳ Long tool call inside a workflow".to_string());
+    m.cursor_on_caret = true;
+    m.cursor_col = Some(2);
+    m.vanish_after = Some(14);
+    m.stall_sleep = Some(Duration::from_millis(25));
+    let opts = SuperviseOpts {
+        journal: Some(path.clone()),
+        idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+        policy: SupervisorConfig {
+            autopilot: crate::supervise::config::Autopilot::Land,
+            ..hosted(60).policy
+        },
+        ..hosted(60)
+    };
+    let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+        s.setup.stuck_after = Duration::from_millis(30);
+    });
+    let (records, _) = journal_records(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+    let kind = |k: &str| -> Vec<String> {
+        records
+            .iter()
+            .filter(|r| r.line.starts_with(k))
+            .map(|r| r.line.clone())
+            .collect()
+    };
+    let (stuck, stalled) = (kind("STUCK"), kind("STALLED"));
+    assert!(
+        stuck.len() == 1
+            && stuck[0].contains("(a monitor still running)")
+            && !stuck[0].contains("title"),
+        "{stuck:#?}\n{lines:#?}"
+    );
+    assert!(
+        stalled.len() == 1 && !stalled[0].contains("does not classify"),
+        "{stalled:#?}\n{lines:#?}"
+    );
+    let told = host.told.lock().unwrap().clone();
+    assert_eq!(
+        told.first().map(String::as_str),
+        Some("own-work:some"),
+        "the record is the work's: {told:#?}"
+    );
+    assert!(!told.iter().any(|t| t == "unread:some"), "{told:#?}");
+    assert_eq!(count(&m, "turn"), 0, "the ladder types nothing");
+}
+
 #[test]
 fn a_dialog_no_reader_names_climbs_to_a_record_and_a_line_and_its_end_withdraws_both() {
     let notice = crate::supervise::prompt::fixtures::screen(
@@ -18749,12 +18821,10 @@ fn a_draft_cleared_at_a_weekly_limit_lets_the_move_be_asked() {
         .position(|r| r == "❯")
         .expect("the caret row");
     drafted[caret] = draft.to_string();
-    // The cursor on the caret's row, after the draft or home at column 2.
     let at = |s: &Session<'_, Mock>, rows: &[String], cursor_col: usize| {
         s.turn_of(Screen {
             rows: rows.to_vec(),
             seq: 102,
-            cursor_row: caret,
             cursor_col,
             ..Screen::default()
         })
@@ -32896,6 +32966,318 @@ fn a_host_step_that_moved_the_session_spends_the_count_on_the_harness() {
         "the relaunch's keys spend the count"
     );
     assert_eq!(run(false), (true, true, true), "a step that moved nothing");
+}
+
+/// TWO RESTART RUNS OF ONE CAUSE FIRST ASKED IN ONE SECOND ARE TWO ASKS: a run ends at a restart
+/// made, and the next run of that cause, asked within the same Unix second, minted the same
+/// `memory@<second>`, so the relaunch took its ask for the first run's and carried that run's
+/// record (`relaunch::its_own`), answering `adopted` with nothing signalled. Each run's ask is
+/// now its own, and a run asked again after a deferral keeps its ask (the restore by the second
+/// a later loop makes is `a_fallbacks_relaunch_in_flight_when_its_loop_ends_is_made_at_its_first_ask`).
+#[test]
+fn two_restart_runs_of_one_cause_asked_in_one_second_are_two_asks() {
+    let host = AccountHost::scripted(&[None], &["adopted", "adopted", "wait:changed", "adopted"]);
+    let mut m = Mock::new(vec![idle_screen(); 6]);
+    m.cursor_on_caret = true;
+    let opts = SuperviseOpts {
+        idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+        ..hosted(30)
+    };
+    let mut s = session(&mut m, Some("@s-1".to_string()));
+    s.set_clock(TEST_NOW, PDT);
+    let screen = s.screen().expect("the point");
+    let point = s.turn_of(screen);
+    let _ = s
+        .turn_end_at_point(&point, Some(Duration::from_secs(6)), &opts)
+        .expect("the decision");
+    for _ in 0..4 {
+        s.restart_agent(
+            &point,
+            &Restart::Memory,
+            "memory-restart@v1",
+            TurnEndAction::Nothing,
+            &opts,
+            &[],
+            &mut Alone,
+        )
+        .expect("the restart");
+    }
+    assert_eq!(s.now_unix(), TEST_NOW, "one second throughout");
+    let asks: Vec<String> = host
+        .asks
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|a| a.word().to_string())
+        .collect();
+    assert_eq!(asks.len(), 4, "{asks:?}");
+    assert_eq!(asks[0], format!("memory@{TEST_NOW}"), "the first run's");
+    assert!(
+        asks[0] != asks[1] && asks[1] != asks[2] && asks[0] != asks[2],
+        "three runs, three asks: {asks:?}"
+    );
+    assert_eq!(
+        asks[2], asks[3],
+        "a run asked again keeps its ask: {asks:?}"
+    );
+}
+
+/// A LOOP'S FIRST RESTART RUN IS PAST EVERY RUN ITS JOURNAL SHOWS ASKED: a loop that starts in the
+/// second an earlier loop's run of the same cause was asked in mints a new run past it
+/// (`journaled_restart_floor`), so it never takes the earlier run's record for its own. The
+/// journal's note of a run names the run's ask, its second the run's (a run minted ahead of its
+/// note is `a_run_a_later_loop_reads_from_the_journal_is_read_at_its_own_second`), and a note of
+/// another session's is not this one's. NEGATIVE CONTROL: with the journal's floor out of
+/// `seed_from_ledger_text`, the ask is `memory@<that second>`.
+#[test]
+fn a_loops_first_restart_run_is_past_every_run_its_journal_shows_asked() {
+    use crate::supervise::journal::JournalRecord;
+    let ask_after = |sid: &str| {
+        let (dir, ledger) = ledger_at(&format!("restart-floor-{}", sid.trim_start_matches('@')));
+        std::fs::write(&ledger, "").expect("the ledger");
+        let note = |at: i64, line: &str| {
+            JournalRecord::of_line(at * 1000 + 400, Some(sid), line, None).to_json() + "\n"
+        };
+        let journal = note(
+            TEST_NOW - 5,
+            &format!(
+                "HOST seq=2 restart:model ask=model@{} step=wait:resume",
+                TEST_NOW - 5
+            ),
+        ) + &note(
+            TEST_NOW,
+            &format!("HOST seq=9 restart:memory ask=memory@{TEST_NOW} step=adopted"),
+        ) + &note(TEST_NOW, "NOTE seq=9 nothing restarted here");
+        std::fs::write(
+            crate::supervise::approvals::journal_beside(&ledger),
+            journal,
+        )
+        .expect("the journal");
+        let host = AccountHost::scripted(&[None], &["adopted"]);
+        let mut m = Mock::new(vec![idle_screen(); 3]);
+        m.cursor_on_caret = true;
+        let opts = SuperviseOpts {
+            idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+            ..hosted(30)
+        };
+        let mut s = session(&mut m, Some("@s-1".to_string()));
+        s.set_clock(TEST_NOW, PDT);
+        let _ = s.seed_from_ledger(&ledger, TEST_NOW * 1000, false);
+        let screen = s.screen().expect("the point");
+        let point = s.turn_of(screen);
+        let _ = s
+            .turn_end_at_point(&point, Some(Duration::from_secs(6)), &opts)
+            .expect("the decision");
+        s.restart_agent(
+            &point,
+            &Restart::Memory,
+            "memory-restart@v1",
+            TurnEndAction::Nothing,
+            &opts,
+            &[],
+            &mut Alone,
+        )
+        .expect("the restart");
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+        let asks = host.asks.lock().unwrap().clone();
+        asks.iter()
+            .map(|a| a.word().to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        ask_after("@s-1"),
+        [format!("memory@{}", TEST_NOW + 1)],
+        "past the journal's newest run"
+    );
+    assert_eq!(
+        ask_after("@s-2"),
+        [format!("memory@{TEST_NOW}")],
+        "CONTROL: another session's journal"
+    );
+}
+
+/// A MOVE BACK PUT OFF TO A QUIET MOMENT KEEPS ITS ASK: a model-back answered a wait after its
+/// ask claimed the conversation's record (`wait:resume`: the process its relaunch started not yet
+/// registered) is deferred, and the point goes on with the act it would have taken
+/// (`DEFERRED`). That act ended the run, so the next turn end asked the move as another restart,
+/// `model-back@<a later second>`; the relaunch read the record the first ask claimed, landed in
+/// the process asking, as another restart's and superseded it (`relaunch::supersedes`): one move
+/// back, two relaunches. The act a deferral goes on with keeps the deferred restart's run. A
+/// restart made ends it, and CONTROL: any later act that is no restart still does.
+#[test]
+fn a_model_back_asked_again_after_its_deferral_is_its_first_ask() {
+    let host = AccountHost::scripted(
+        &[None],
+        &["wait:resume", "adopted", "wait:resume", "wait:resume"],
+    );
+    let mut m = Mock::new(vec![idle_screen(); 12]);
+    m.cursor_on_caret = true;
+    let opts = SuperviseOpts {
+        idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+        ..hosted(30)
+    };
+    let mut s = session(&mut m, Some("@s-1".to_string()));
+    s.set_clock(TEST_NOW, PDT);
+    let screen = s.screen().expect("the point");
+    let point = s.turn_of(screen);
+    let _ = s
+        .turn_end_at_point(&point, Some(Duration::from_secs(6)), &opts)
+        .expect("the decision");
+    let back = Restart::ModelBack { to: None };
+    let mut heard = Heard::default();
+    for at in 0..4 {
+        if at == 3 {
+            s.turn_end_execute(&point, TurnEndAction::Nothing, &opts, &[], &mut Alone)
+                .expect("another act");
+        }
+        s.restart_agent(
+            &point,
+            &back,
+            crate::supervise::policy::turn_end::RULE_MODEL_RESTORE,
+            TurnEndAction::Nothing,
+            &opts,
+            &[],
+            &mut heard,
+        )
+        .expect("the restart");
+    }
+    assert!(
+        heard
+            .noted
+            .iter()
+            .any(|n| n.starts_with("DEFERRED ") && n.contains("restart:model-back")),
+        "{:?}",
+        heard.noted
+    );
+    let asks: Vec<String> = host
+        .asks
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|a| a.word().to_string())
+        .collect();
+    assert_eq!(asks.len(), 4, "{asks:?}");
+    assert_eq!(asks[0], asks[1], "asked again after its deferral: {asks:?}");
+    assert_ne!(asks[1], asks[2], "a restart made ends its run: {asks:?}");
+    assert_ne!(asks[2], asks[3], "CONTROL: another act ends it: {asks:?}");
+}
+
+/// A RUN A LATER LOOP READS FROM THE JOURNAL IS READ AT ITS OWN SECOND: a run minted past the
+/// wall clock (`Session::restart_floor`: a second run in one second) was journaled at the second
+/// the host answered it, and a later loop read that second back as the run's. The fallback's move
+/// it restored waiting was asked `model@<the note's second>` where the record its run's ask
+/// claimed keeps `model@<the run's>` (`St::ask`), so `relaunch::its_own` missed it and the
+/// landed relaunch was superseded; and the later loop's floor fell short of the run minted
+/// ahead, so its next run of that cause shared that run's ask. The note now carries the ask
+/// (`HOST … restart:<kind> ask=<ask> step=…`), and both readers take the run's second from it.
+#[test]
+fn a_run_a_later_loop_reads_from_the_journal_is_read_at_its_own_second() {
+    use crate::supervise::journal::JournalRecord;
+    let model = Restart::Model {
+        to: "sonnet".to_string(),
+    };
+    let ask_words = |host: &AccountHost| {
+        host.asks
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|a| a.word().to_string())
+            .collect::<Vec<_>>()
+    };
+    let first = AccountHost::scripted(&[None], &["adopted", "wait:changed", "busy:another-sweep"]);
+    let mut heard = Heard::default();
+    {
+        let mut m = Mock::new(vec![idle_screen(); 8]);
+        m.cursor_on_caret = true;
+        let opts = SuperviseOpts {
+            idle_host: Some(Arc::clone(&first) as Arc<dyn IdleHost>),
+            ..hosted(30)
+        };
+        let mut s = session(&mut m, Some("@s-1".to_string()));
+        s.set_clock(TEST_NOW, PDT);
+        let screen = s.screen().expect("the point");
+        let point = s.turn_of(screen);
+        let _ = s
+            .turn_end_at_point(&point, Some(Duration::from_secs(6)), &opts)
+            .expect("the decision");
+        for why in [&Restart::Memory, &Restart::Memory, &model] {
+            s.restart_agent(
+                &point,
+                why,
+                "restart@v1",
+                TurnEndAction::Nothing,
+                &opts,
+                &[],
+                &mut heard,
+            )
+            .expect("the restart");
+        }
+        assert_eq!(s.now_unix(), TEST_NOW, "one second throughout");
+    }
+    let earlier = ask_words(&first);
+    assert_eq!(
+        earlier,
+        [
+            format!("memory@{TEST_NOW}"),
+            format!("memory@{}", TEST_NOW + 1),
+            format!("model@{}", TEST_NOW + 2),
+        ],
+        "the earlier loop's runs, two minted ahead"
+    );
+    let (dir, ledger) = ledger_at("journal-run-second");
+    std::fs::write(&ledger, "").expect("the ledger");
+    let journal: String = heard
+        .noted
+        .iter()
+        .map(|line| {
+            JournalRecord::of_line(TEST_NOW * 1000 + 400, Some("@s-1"), line, None).to_json() + "\n"
+        })
+        .collect();
+    std::fs::write(
+        crate::supervise::approvals::journal_beside(&ledger),
+        journal,
+    )
+    .expect("the journal");
+    let later = AccountHost::scripted(&[None], &["busy:another-sweep", "busy:another-sweep"]);
+    {
+        let mut m = Mock::new(vec![idle_screen(); 6]);
+        m.cursor_on_caret = true;
+        let opts = SuperviseOpts {
+            idle_host: Some(Arc::clone(&later) as Arc<dyn IdleHost>),
+            ..hosted(30)
+        };
+        let mut s = session(&mut m, Some("@s-1".to_string()));
+        s.set_clock(TEST_NOW, PDT);
+        let _ = s.seed_from_ledger(&ledger, TEST_NOW * 1000, false);
+        let screen = s.screen().expect("the point");
+        let point = s.turn_of(screen);
+        let _ = s
+            .turn_end_at_point(&point, Some(Duration::from_secs(6)), &opts)
+            .expect("the decision");
+        for why in [&model, &Restart::Memory] {
+            s.restart_agent(
+                &point,
+                why,
+                "restart@v1",
+                TurnEndAction::Nothing,
+                &opts,
+                &[],
+                &mut Alone,
+            )
+            .expect("the restart");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    let asked = ask_words(&later);
+    assert_eq!(
+        asked[0], earlier[2],
+        "the move restored waiting is the earlier run's ask: {asked:?} after {earlier:?}"
+    );
+    assert!(
+        !earlier.contains(&asked[1]),
+        "a new run is past every run the journal shows: {asked:?} after {earlier:?}"
+    );
 }
 
 #[test]

@@ -229,6 +229,8 @@ mod tests {
             .unwrap()
             .recipient()
             .to_bech32();
+        // The server it reads from here on is its own on loopback, which answers.
+        let _answering = ServersAnswering::set();
         approve_request(&admin, &recipient).unwrap();
         sync(&restarted, None).unwrap();
         assert!(matches!(

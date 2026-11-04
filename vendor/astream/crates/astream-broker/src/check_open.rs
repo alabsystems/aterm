@@ -95,7 +95,7 @@ pub enum InterruptedStep {
 
 impl BrokerLog {
     /// A CHECK THAT WRITES NOTHING of whether an open would serve the log at `path` as its
-    /// files stand: under `key` by the bound open's rules ([`open_encrypted_bound`]), or
+    /// files stand: under `key` by `open_encrypted_bound`'s rules (with `at-rest`), or
     /// keyless by [`open_with`]'s. It opens the log and its held store read-write, as the
     /// open does, and writes through neither: no file is created, cut, flushed, renamed or
     /// removed, and every sidecar stays byte for byte as it was, `<log>.id` included, which
@@ -103,7 +103,6 @@ impl BrokerLog {
     /// cover). The log's lock is held while it reads and released when it returns. Claim
     /// `broker.check-open`.
     ///
-    /// [`open_encrypted_bound`]: BrokerLog::open_encrypted_bound
     /// [`open_with`]: BrokerLog::open_with
     ///
     /// # Errors
@@ -283,3 +282,7 @@ fn bound(_path: &Path, _existing: &[u8], _key: &[u8; 32]) -> io::Result<Option<A
 #[cfg(all(test, feature = "retention"))]
 #[path = "check_open_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "check_open_basic_tests.rs"]
+mod basic_tests;

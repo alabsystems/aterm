@@ -1443,6 +1443,107 @@ fn a_codex_row_reads_its_own_state_and_its_rollouts_facts() {
     assert_eq!(claude_row["model"], "Opus 5.5");
 }
 
+/// A CODEX ROW'S `bg=` IS ITS OWN RECORD'S COUNT: the background terminals codex-alab's session
+/// record names (`backgroundTerminals`, which the rollout tap puts on its own slot,
+/// [`crate::session_timeline::SessionTimeline::set_codex_terminals`]) while the group it was read
+/// for is in front, with an identified reader or none; `-` where the record names none or another
+/// program is in front. The count publishes no survey facts, so the row keeps its screen's `rows=`
+/// and `cmd=`. A Claude row keeps its screen's count. A `gauges()` that preferred the claim to the
+/// screen is an equivalent mutant: no codex screen draws a count aterm reads.
+#[test]
+fn a_codex_row_takes_bg_from_its_own_records_count() {
+    let store = crate::session_store::new_store();
+    let codex = crate::session_store::test_handle(7);
+    codex_session(&codex);
+    codex
+        .term
+        .lock()
+        .unwrap()
+        .process(b"a row on the codex screen\r\n");
+    store.write().unwrap().register(codex.clone());
+    let row = |n: usize| {
+        let out = survey_rows(&store, SurveyLevel::Content, usize::MAX, &here());
+        fields(out.lines().nth(n).expect("the row"))
+    };
+    let count = |count: Option<u32>| {
+        assert!(
+            codex
+                .ctx
+                .timeline
+                .lock()
+                .unwrap()
+                .set_codex_terminals(CODEX_PGID, count),
+            "codex is in front"
+        );
+    };
+
+    let before = row(2);
+    assert_eq!(before["bg"], "-", "nothing published: {before:?}");
+    assert!(
+        before["rows"].contains("a row on the codex screen"),
+        "a codex row with no rollout reads its screen: {before:?}"
+    );
+    let (rows, cmd) = (before["rows"].clone(), before["cmd"].clone());
+
+    count(Some(2));
+    let counted = row(2);
+    assert_eq!(counted["bg"], "2", "{counted:?}");
+    assert_eq!(
+        counted["rows"], rows,
+        "a count is no survey fact: {counted:?}"
+    );
+    assert_eq!(counted["cmd"], cmd, "{counted:?}");
+    count(Some(0));
+    assert_eq!(row(2)["bg"], "0", "none running");
+    count(None);
+    assert_eq!(row(2)["bg"], "-", "an older codex-alab's record names none");
+
+    count(Some(2));
+    {
+        let mut tl = codex.ctx.timeline.lock().unwrap();
+        tl.note_foreground_group(CODEX_PGID + 1);
+        tl.set_program(CODEX_PGID + 1, Some("codex".into()));
+        tl.publish_agent(
+            "unknown",
+            None,
+            None,
+            Some(aterm_phase::Program::Codex),
+            crate::session_timeline::AgentStamp {
+                generation: crate::control::ScreenGen { epoch: 1, seq: 8 },
+                fp: 0xc0df,
+            },
+        );
+    }
+    assert_eq!(
+        row(2)["bg"],
+        "-",
+        "another identified agent in front: the count was read for another group"
+    );
+
+    let bare = crate::session_store::test_handle(8);
+    {
+        let mut tl = bare.ctx.timeline.lock().unwrap();
+        tl.note_foreground_group(CODEX_PGID);
+        tl.set_program(CODEX_PGID, Some("codex-alab".into()));
+        assert!(tl.set_codex_terminals(CODEX_PGID, Some(2)));
+    }
+    store.write().unwrap().register(bare);
+    let bare_row = row(3);
+    assert_eq!(
+        bare_row["program_kind"], "program",
+        "no reader identified it: {bare_row:?}"
+    );
+    assert_eq!(
+        bare_row["bg"], "2",
+        "the claim stands without a reader: {bare_row:?}"
+    );
+
+    let claude = crate::session_store::test_handle(9);
+    claude_session(&claude);
+    store.write().unwrap().register(claude);
+    assert_eq!(row(4)["bg"], "2", "a Claude row keeps its screen's count");
+}
+
 /// THE AGENT'S ACTIVE GOAL: a Claude row's from its footer facts, a codex row's from its rollout
 /// tap's facts, the words at `content` and a flag at `facts`; a session with none says `-`.
 #[test]

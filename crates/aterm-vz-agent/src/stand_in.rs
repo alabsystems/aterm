@@ -106,7 +106,15 @@ pub fn run(args: &[OsString]) -> ExitCode {
         }
         // The kernel's view of its credentials (Linux): `Uid:`, `Gid:` and `Groups:`.
         "ids" => {
-            let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+            use std::io::Read as _;
+            let status = std::fs::File::open("/proc/self/status")
+                .ok()
+                .and_then(|f| {
+                    let mut buf = String::with_capacity(4096);
+                    f.take(64 * 1024).read_to_string(&mut buf).ok()?;
+                    Some(buf)
+                })
+                .unwrap_or_default();
             for line in status.lines() {
                 if ["Uid:", "Gid:", "Groups:"]
                     .iter()

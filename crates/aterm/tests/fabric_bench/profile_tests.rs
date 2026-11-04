@@ -89,16 +89,26 @@ fn an_arm_is_looked_up_where_cargo_writes_its_profile() {
 
 #[test]
 fn a_rewritten_binary_is_another_identity() {
-    let dir = std::env::temp_dir().join(format!("fabric-identity-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("scratch");
-    let exe = dir.join("aterm");
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let exe = dir.path().join("data-only-not-executed");
     std::fs::write(&exe, b"one build").expect("write");
     let first = identity(&exe).expect("reads");
     assert_eq!(identity(&exe), Ok(first.clone()), "one file reads the same");
-    assert!(first.starts_with("9 bytes, modified "), "{first}");
+    let before = std::fs::metadata(&exe).expect("metadata");
+    std::fs::write(&exe, b"two build").expect("same-length rewrite");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&exe)
+        .expect("open")
+        .set_times(std::fs::FileTimes::new().set_modified(before.modified().expect("mtime")))
+        .expect("restore mtime");
+    let after = std::fs::metadata(&exe).expect("metadata");
+    assert_eq!(before.len(), after.len());
+    assert_eq!(before.modified().unwrap(), after.modified().unwrap());
+    assert_ne!(identity(&exe).expect("reads changed bytes"), first);
     std::fs::write(&exe, b"another build").expect("write");
     assert_ne!(identity(&exe).expect("reads"), first);
-    std::fs::remove_dir_all(&dir).expect("cleanup");
+    drop(dir);
     assert!(identity(&exe).is_err(), "no file is no identity");
 }
 

@@ -541,8 +541,51 @@ pub(crate) struct ServeRole {
     last: Option<(crate::client::AlabRoleContext, String)>,
 }
 
+#[cfg(all(test, unix))]
+mod role_tests;
+
 #[cfg(unix)]
 impl ServeRole {
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "VaultRoleRetention",
+            action = "Warm",
+            reason = "The process already established a role from available authenticated evidence"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "VaultRoleRetention",
+            action = "LoseCustody",
+            reason = "The observer classifies missing or unavailable evidence before role retention"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "VaultRoleRetention",
+            action = "ChangeContext",
+            reason = "Configuration or recipient changes produce a distinct context in the observer"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "VaultRoleRetention",
+            action = "Deny",
+            reason = "The observer supplies authenticated denial independently of readiness"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "VaultRoleRetention",
+            action = "Observe",
+            project = "aterm_secrets::cli::role_tests::role_transition"
+        )
+    )]
     fn apply(
         &mut self,
         observation: crate::client::AlabRoleObservation,
@@ -5160,6 +5203,8 @@ mod tests {
     #[test]
     fn approving_by_code_records_the_request_for_this_macs_approver() {
         use crate::client::{self, Paths};
+
+        let _answering = client::ServersAnswering::set();
         let root = aterm_tempfile::tempdir().expect("tempdir");
         let server = crate::server::start(
             std::net::TcpListener::bind("127.0.0.1:0").expect("bind"),
@@ -5196,6 +5241,8 @@ mod tests {
     #[test]
     fn approving_by_code_records_admission_for_an_existing_document_recipient() {
         use crate::client::{self, AdmissionMethod, Paths};
+
+        let _answering = client::ServersAnswering::set();
         let root = aterm_tempfile::tempdir().expect("tempdir");
         let server = crate::server::start(
             std::net::TcpListener::bind("127.0.0.1:0").expect("bind"),

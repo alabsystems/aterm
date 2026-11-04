@@ -350,11 +350,17 @@ fn lock_within(dir: &Path, wait: Duration) -> std::io::Result<Option<SeriesLock>
 
 /// The last `fig` row in the end of the file at `path`, looking back [`LAST_FIG_BYTES`].
 fn last_fig(path: &Path) -> Option<SeriesRow> {
-    let mut file = super::footer::open_regular(path)?;
-    let len = file.metadata().ok()?.len();
+    let (mut file, meta) = super::footer::open_regular_with_meta(path)?;
+    let len = meta.len();
     let from = len.saturating_sub(LAST_FIG_BYTES);
     file.seek(SeekFrom::Start(from)).ok()?;
-    let mut text = String::new();
+    let cap = usize::try_from(
+        len.saturating_sub(from)
+            .min(LAST_FIG_BYTES)
+            .saturating_add(1),
+    )
+    .unwrap_or(0);
+    let mut text = String::with_capacity(cap);
     file.take(LAST_FIG_BYTES).read_to_string(&mut text).ok()?;
     text.lines()
         .rev()
@@ -667,12 +673,10 @@ impl Tail {
         if file.seek(SeekFrom::Start(self.offset)).is_err() {
             return false;
         }
-        let mut bytes = Vec::new();
-        if file
-            .take(READ_MAX.min(stamp.len.saturating_sub(self.offset)))
-            .read_to_end(&mut bytes)
-            .is_err()
-        {
+        let max_read = READ_MAX.min(stamp.len.saturating_sub(self.offset));
+        let cap = usize::try_from(max_read.saturating_add(1)).unwrap_or(0);
+        let mut bytes = Vec::with_capacity(cap);
+        if file.take(max_read).read_to_end(&mut bytes).is_err() {
             return false;
         }
         let whole = bytes

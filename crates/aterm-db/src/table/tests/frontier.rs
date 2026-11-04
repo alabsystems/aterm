@@ -5,6 +5,7 @@
 
 use super::Lab;
 use crate::table::{Scope, Session, store::Store};
+use astream_wire::sync::MAX_PARENTS;
 use aterm_secrets::{
     client,
     commons::{
@@ -13,6 +14,11 @@ use aterm_secrets::{
         journal::Journal,
         roster::{Grant, LEGACY_MAX_MEMBERS, Role},
     },
+};
+use std::{
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
+    path::{Path, PathBuf},
+    sync::OnceLock,
 };
 
 pub(crate) fn wires(lab: &Lab, writer: usize, scope: Scope) -> Vec<Vec<u8>> {
@@ -37,7 +43,127 @@ pub(crate) fn receive(lab: &Lab, writer: usize, scope: Scope, wires: &[Vec<u8>])
     }
 }
 
+/// Each writer's first record in `scope`, sealed by that writer's own session: what its first
+/// product write appends (no predecessor, no parents), with none of that write's table upkeep. A
+/// receiver verifies and interprets it like any other. A test that seals its far writers keeps the
+/// last one, past `LEGACY_MAX_MEMBERS`, on the product path, and its control is that test's own.
+pub(crate) fn first_records(
+    lab: &Lab,
+    writers: std::ops::Range<usize>,
+    scope: Scope,
+    payload: impl Fn(usize, &Session<'_>) -> Vec<u8>,
+) -> Vec<Vec<u8>> {
+    writers
+        .map(|writer| {
+            let bootstrap = lab.bootstrap(writer);
+            let session = Session::open(&bootstrap).unwrap();
+            super::seal(
+                &session,
+                scope,
+                crate::crypto::Causal {
+                    sequence: 1,
+                    previous: None,
+                    parents: &[],
+                },
+                &payload(writer, &session),
+            )
+            .unwrap()
+        })
+        .collect()
+}
+
+/// One path under a built lab's home, with its mode and, for a file, its bytes.
+enum Entry {
+    Dir(u32),
+    File(Vec<u8>, u32),
+}
+
+/// One built lab, read into memory for [`wide_lab`] to lay down again.
+struct Template {
+    entries: Vec<(PathBuf, Entry)>,
+    signer: String,
+    source: PathBuf,
+    // Every copy's `source.toml` names this home's vault file by its absolute path, so the home
+    // stays until the process exits (`fs_lane::remove_at_exit`).
+    _home: aterm_tempfile::TempDir,
+}
+
+fn read_tree(root: &Path, rel: &Path, into: &mut Vec<(PathBuf, Entry)>) {
+    for entry in std::fs::read_dir(root.join(rel)).unwrap() {
+        let entry = entry.unwrap();
+        let rel = rel.join(entry.file_name());
+        let meta = std::fs::symlink_metadata(entry.path()).unwrap();
+        let mode = meta.permissions().mode() & 0o7777;
+        if meta.is_dir() {
+            into.push((rel.clone(), Entry::Dir(mode)));
+            read_tree(root, &rel, into);
+        } else {
+            assert!(meta.is_file(), "a lab makes no link: {}", rel.display());
+            into.push((rel, Entry::File(std::fs::read(entry.path()).unwrap(), mode)));
+        }
+    }
+}
+
+/// `MAX_PARENTS + 1` admitted writers, for a test that needs the finished lab and not a fresh
+/// enrollment: its own copy of the Macs of one [`built_wide_lab`] per process, so production
+/// enrollment still runs once and no test sees another's writes. The copies are not independent in
+/// two places: they name one vault file (`source.toml`), and equal Macs share the content-keyed
+/// process caches of `aterm-secrets` (`OBSERVE_COMMONS_CACHE`, `BINDINGS` and others), which hold
+/// no Mac's path and answer equal bytes alike. One test reaches that vault today, the activation
+/// test, whose `admin_open` only reads it, as another test's would: it would take the `PublishLock`
+/// only to put Mac 0's cached copy back over a file it judged stale (unverifiable or older), which
+/// this one is not. A test that publishes to the vault, or changes a Mac's vault-derived state so
+/// that `admin_open` would put a copy back, writes it for every copy, and calls [`built_wide_lab`]
+/// instead, as any other width must.
 pub(crate) fn wide_lab(writers: usize) -> Lab {
+    static TEMPLATE: OnceLock<Template> = OnceLock::new();
+    assert_eq!(writers, MAX_PARENTS + 1, "the template holds this width");
+    let built = TEMPLATE.get_or_init(|| {
+        let lab = built_wide_lab(writers);
+        let mut entries = Vec::new();
+        read_tree(lab._home.path(), Path::new(""), &mut entries);
+        aterm_spec::fs_lane::remove_at_exit(lab._home.path());
+        Template {
+            entries,
+            signer: lab.signer,
+            source: lab.source,
+            _home: lab._home,
+        }
+    });
+    aterm_spec::fs_lane::join();
+    let home = aterm_tempfile::tempdir().unwrap();
+    for (rel, entry) in &built.entries {
+        let at = home.path().join(rel);
+        match entry {
+            Entry::Dir(mode) => std::fs::DirBuilder::new().mode(*mode).create(&at).unwrap(),
+            Entry::File(bytes, mode) => {
+                std::io::Write::write_all(
+                    &mut std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(*mode)
+                        .open(&at)
+                        .unwrap(),
+                    bytes,
+                )
+                .unwrap();
+            }
+        }
+    }
+    let paths = (0..writers)
+        .map(|n| client::Paths::for_home(&home.path().join(format!("m{}", n + 1))))
+        .collect();
+    Lab {
+        _home: home,
+        paths,
+        signer: built.signer.clone(),
+        source: built.source.clone(),
+    }
+}
+
+/// `writers` admitted writers on a lab of their own, enrolled through production: 63 at genesis,
+/// the next two by `enroll_commons_member`, the rest in one rotation.
+pub(crate) fn built_wide_lab(writers: usize) -> Lab {
     let lab = Lab::with_enrolled(&vec![Role::Writer; writers], LEGACY_MAX_MEMBERS);
     // Each writer's cached bootstrap, read once: its device, request, journal folder and trust
     // are what every step below needs of it, and none of them changes as the roster grows.

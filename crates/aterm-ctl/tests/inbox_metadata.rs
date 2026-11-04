@@ -21,6 +21,7 @@ fn run_inbox(args: &[&str], reply: &[u8]) -> Output {
 fn run_verb(verb: &str, args: &[&str], reply: &[u8]) -> Output {
     let scratch = aterm_tempfile::Builder::new()
         .prefix("at-inbox-")
+        .suffix(".noindex")
         .tempdir_in("/tmp")
         .unwrap();
     let socket = scratch.path().join("peer.sock");

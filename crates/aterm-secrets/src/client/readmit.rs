@@ -119,8 +119,30 @@ pub struct ProofAdmissionCapacity {
     pub within_limit: bool,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// MUTANT of [`ProofAdmissionCapacity::observe`], on for one test thread: the reserve as it
+    /// was before the budgets split, every held record counted against [`PROVEN_FILL`] of the
+    /// held total, and no keyed share.
+    pub(super) static RESERVE_OVER_ALL: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// MUTANT of [`decide`], on for one test thread: the admission's batch judged by its weighed
+    /// records alone, with none of its `Wrap`s, so the `Admit` may fit where the `Wrap`s that
+    /// hand the entrant each newest epoch do not.
+    pub(super) static BATCH_WITHOUT_WRAPS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
 impl ProofAdmissionCapacity {
     /// Inspect the same complete record counts and predicate as [`decide`].
+    #[cfg_attr(
+        all(unix, any(test, debug_assertions)),
+        aterm_spec_anchor::refines(
+            machine = "SwarmRecordsCapacity",
+            action = "Prove",
+            project = "aterm_secrets::client::readmit::tests::records_capacity_transition"
+        )
+    )]
     #[must_use]
     pub fn observe(log: &Log) -> Self {
         let counts = log.counts();
@@ -128,6 +150,19 @@ impl ProofAdmissionCapacity {
         let reserve = |budget: usize| (budget * PROVEN_FILL.0).div_ceil(PROVEN_FILL.1);
         let weighed_limit = reserve(budgets.weighed);
         let keyed_limit = reserve(budgets.keyed);
+        #[cfg(test)]
+        if RESERVE_OVER_ALL.with(std::cell::Cell::get) {
+            let held_limit = reserve(budgets.held);
+            return Self {
+                weighed_records: counts.held(),
+                weighed_limit: held_limit,
+                keyed_records: 0,
+                keyed_limit,
+                held_records: counts.held(),
+                held_cap: budgets.held,
+                within_limit: counts.held() < held_limit,
+            };
+        }
         Self {
             weighed_records: counts.weighed,
             weighed_limit,
@@ -429,6 +464,14 @@ fn claimed_label(log: &Log, seat: &MemberId) -> Option<String> {
 /// how many `Wrap`s an admission by `me` signs beside its `Admit` ([`Log::admission_wraps`]): an
 /// admission whose whole batch would pass a bound of the log, its bytes counted at each record
 /// kind's longest ([`Kind::most_bytes`]), is refused here, before any of it is signed.
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::refines(
+        machine = "SwarmRecordsCapacity",
+        action = "Prove",
+        project = "aterm_secrets::client::readmit::tests::records_capacity_transition"
+    )
+)]
 pub(super) fn decide(
     log: &Log,
     me: &MemberId,
@@ -593,6 +636,12 @@ pub(super) fn decide(
         weighed: weighed.len(),
         keyed: wraps,
     };
+    #[cfg(test)]
+    let batch = if BATCH_WITHOUT_WRAPS.with(std::cell::Cell::get) {
+        RecordCounts { keyed: 0, ..batch }
+    } else {
+        batch
+    };
     // Its bytes are not known before it is signed: each record at its kind's longest.
     let bytes = weighed
         .iter()
@@ -681,9 +730,7 @@ fn pre_possession_pass(
     }
     let source = records_bound(paths, &store).map_err(|_| None)?;
     if !proven.reader.can_take(source) {
-        return Err(Some(
-            "the joining device cannot receive this membership history".to_owned(),
-        ));
+        return Err(Some(proven.reader.refusal(source)));
     }
     let binding = proving.request.binding();
     if let Some(why) =
@@ -806,10 +853,9 @@ pub fn admit_by_proof(paths: &Paths, proven: &Proven<'_>, now_ms: u64) -> crate:
     let Some((mut store, mut log, _, opened)) = held_log(paths)? else {
         return Ok(Readmit::NotHere);
     };
-    if !proven.reader.can_take(records_bound(paths, &store)?) {
-        return Ok(Readmit::Refused(
-            "the joining device cannot receive this membership history".to_owned(),
-        ));
+    let source = records_bound(paths, &store)?;
+    if !proven.reader.can_take(source) {
+        return Ok(Readmit::Refused(proven.reader.refusal(source)));
     }
     let binding = proven.request.binding();
     if let Some(why) = roster_keeps_out(paths, Some(&opened), binding, proven.node, Some(&lock))? {
@@ -952,9 +998,7 @@ pub fn admit_by_proof(paths: &Paths, proven: &Proven<'_>, now_ms: u64) -> crate:
     }
     let source = records_bound(paths, &store)?;
     if !proven.reader.can_take(source) {
-        return Ok(Readmit::Refused(
-            "the proof admission exceeds the joining device's record capacity".to_owned(),
-        ));
+        return Ok(Readmit::Refused(proven.reader.refusal(source)));
     }
     let admission = LogAdmission {
         source,

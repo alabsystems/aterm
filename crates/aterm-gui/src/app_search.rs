@@ -435,6 +435,19 @@ pub(crate) struct SearchState {
     pub(crate) anchor_col: u16,
 }
 
+/// Structural repaint key for an open [`SearchState`], folded into [`crate::RepaintKey`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SearchRepaintKey {
+    pub(crate) query_hash: u64,
+    pub(crate) query_len: usize,
+    pub(crate) cursor: usize,
+    pub(crate) current: usize,
+    pub(crate) matches_len: usize,
+    pub(crate) searched_lines: Option<usize>,
+    pub(crate) flags: u8,
+    pub(crate) point_match: Option<(i32, u16, u32)>,
+}
+
 impl SearchState {
     /// Replace the whole query (recall, find-again, scripted seeds) and park the caret at its end, keeping [`Self::cursor`] on a char boundary.
     pub(crate) fn set_query(&mut self, query: String) {
@@ -607,19 +620,10 @@ impl SearchState {
         }
     }
 
-    /// Repaint fingerprint of the find bar: FNV-1a over the fields [`splice_find_bar`](crate::App::splice_find_bar) paints, folded into [`RepaintKey`](crate::RepaintKey) so an edit that does not move the highlight still presents (the key builders use `0` with no find open).
-    pub(crate) fn fingerprint(&self) -> u64 {
-        let mut h = aterm_hash::Fnv1a64::new();
-        h.write(self.query.as_bytes());
-        for word in [
-            self.cursor as u64,
-            self.current as u64,
-            self.matches.len() as u64,
-            self.searched_lines.map_or(0, |lines| lines as u64 + 1),
-        ] {
-            h.write(&word.to_le_bytes());
-        }
-        for flag in [
+    /// Structural repaint key of the find bar over the fields [`splice_find_bar`](crate::App::splice_find_bar) paints, folded into [`RepaintKey`](crate::RepaintKey) so an edit that does not move the highlight still presents (`None` with no find open).
+    pub(crate) fn fingerprint(&self) -> SearchRepaintKey {
+        let mut flags = 0u8;
+        for (bit, flag) in [
             self.case_sensitive,
             self.is_regex,
             self.regex_error,
@@ -628,15 +632,22 @@ impl SearchState {
             self.cut_short,
             self.history_away,
             self.results_dirty,
-        ] {
-            h.write_u8(u8::from(flag));
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            flags |= u8::from(flag) << bit;
         }
-        if let Some((row, start, end)) = self.point_match {
-            h.write(&row.to_le_bytes());
-            h.write(&start.to_le_bytes());
-            h.write(&end.to_le_bytes());
+        SearchRepaintKey {
+            query_hash: aterm_hash::fnv1a_64(self.query.as_bytes()),
+            query_len: self.query.len(),
+            cursor: self.cursor,
+            current: self.current,
+            matches_len: self.matches.len(),
+            searched_lines: self.searched_lines,
+            flags,
+            point_match: self.point_match,
         }
-        h.finish()
     }
 }
 
@@ -743,11 +754,8 @@ impl App {
         }
         self.front_terminal(wid).is_some()
             && self.windows.get(&wid).is_some_and(|ws| {
-                ws.search.as_ref().map_or_else(
-                    || {
-                        !self.search_last_query.is_empty()
-                            || !self.guest_search_last_query.is_empty()
-                    },
+                ws.search.as_ref().map_or(
+                    !self.search_last_query.is_empty() || !self.guest_search_last_query.is_empty(),
                     |search| !search.query.is_empty(),
                 )
             })

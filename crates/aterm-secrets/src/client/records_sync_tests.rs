@@ -2172,7 +2172,7 @@ fn numeric_incompatible_source_never_changes_records_or_crossing_state() {
                 initially_crossed,
                 crate::crossing::Faults::default(),
                 Some(crate::crossing::RecordsBound::of(
-                    crate::crossing::fixture::RAISED.held,
+                    2 * crate::membership_log::RecordBudgets::PRODUCTION.held,
                     true,
                 )),
                 range,

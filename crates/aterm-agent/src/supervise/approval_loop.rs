@@ -40,7 +40,7 @@ enum Act {
 const REASKED_AFTER: usize = 2;
 
 /// The pause before a re-asked question answered `answered` times is answered again.
-pub(super) fn reask_pause(answered: usize) -> Duration {
+pub(crate) fn reask_pause(answered: usize) -> Duration {
     let n = u32::try_from(answered.saturating_sub(REASKED_AFTER)).unwrap_or(u32::MAX);
     crate::supervise::ladder::doubling(REFUSAL_PAUSE, n, PRESS_RETRY_MAX)
 }

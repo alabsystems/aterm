@@ -60,10 +60,12 @@ pub fn zone_offset_in(root: &Path, zone: &str, unix: i64) -> Option<i64> {
     };
     #[cfg(not(unix))]
     let file = std::fs::File::open(root.join(zone)).ok()?;
-    if !file.metadata().ok()?.is_file() {
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.len() > MOST as u64 {
         return None;
     }
-    let mut bytes = Vec::new();
+    let cap = usize::try_from(meta.len()).unwrap_or(0).saturating_add(1);
+    let mut bytes = Vec::with_capacity(cap);
     std::io::Read::read_to_end(
         &mut std::io::Read::take(file, (MOST + 1) as u64),
         &mut bytes,

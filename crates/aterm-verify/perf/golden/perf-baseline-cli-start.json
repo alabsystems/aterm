@@ -1,0 +1,7 @@
+{
+  "_comment": "aterm CLI-START baseline: the median instructions retired, in millions, of one fresh aterm process per arm (`aterm --version`, `aterm ctl --help`, `aterm ctl --sock <headless lab instance> @<sid> status`), read by proc_pid_rusage (RUSAGE_INFO_V4) before the reap, release build. SMALLER-IS-BETTER: a median above baseline x ceiling_ratio fails. The lane runs at the load it finds and reports it. Re-record with targo --unverified verify perf --record cli-start.",
+  "version_minstr": 52.658,
+  "ctl_help_minstr": 52.167,
+  "ctl_status_minstr": 51.999,
+  "ceiling_ratio": 1.250
+}

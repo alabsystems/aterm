@@ -1788,8 +1788,8 @@ impl Mock {
         };
         (row, col)
     }
-    /// Whether a read of screen `i` finds the cursor past column 2 on its caret's row, or off its
-    /// rows, which a read takes for its caret's.
+    /// Whether a read of screen `i` finds the cursor past column 2 on its caret's row, or past it off
+    /// its rows, where a fixture that names only a column has it.
     fn typed_past(&self, i: usize) -> bool {
         let (row, col) = self.cursor_of(i);
         let caret = self.screens[i]
@@ -3822,10 +3822,8 @@ fn stop_in_every_wait(
     sid: Option<&str>,
     script: impl Fn() -> Mock,
 ) -> Vec<String> {
-    let ledger = std::env::temp_dir().join(format!(
-        "aterm-stop-sweep-{tag}-{}.jsonl",
-        std::process::id()
-    ));
+    let dir = crate::supervise::ScratchDir::new("stop-sweep", tag);
+    let ledger = dir.join("ledger.jsonl");
     let mut armed = Vec::new();
     for k in 1..=SWEEP_CAP {
         let mut m = script();
@@ -6788,6 +6786,8 @@ fn every_kind_is_dismissed_over_a_workflow_wait_on_the_busy_read() {
     }
 }
 
+/// NEGATIVE CONTROL: When the card drops digits instead of consuming the `0` inside
+/// `survey_land`, the loop backspaces the stranded `0` and never reports `DISMISSED survey`.
 #[test]
 fn a_late_vendor_timer_takes_the_0_inside_the_landing_time_and_is_never_backspaced() {
     for debounce_ms in [40, 220] {
@@ -6818,6 +6818,29 @@ fn a_late_vendor_timer_takes_the_0_inside_the_landing_time_and_is_never_backspac
             "no noise: {lines:?}"
         );
     }
+
+    let base = workflow_screen();
+    let mut dropped = Mock::new(vec![
+        with_survey(base.clone()),
+        with_zero(with_survey(base.clone())),
+        base,
+    ]);
+    dropped.card_debounce = Some(Duration::from_millis(40));
+    dropped.card_drops_digits = true;
+    dropped.vanish_after = Some(3);
+    dropped.stall_sleep = Some(Duration::from_millis(500));
+    let (lines, _) = watch_lines_with(&mut dropped, &dismissing(), |s| {
+        s.set_survey_land(Duration::from_millis(400));
+    });
+    assert!(
+        dropped.presses().iter().any(|p| *p == "key backspace"),
+        "a stranded 0 past survey_land is backspaced: {:#?}",
+        dropped.requests
+    );
+    assert!(
+        !lines.iter().any(|l| l.starts_with("DISMISSED survey seq=")),
+        "never dismissed when the card kept sitting: {lines:?}"
+    );
 }
 
 #[test]
@@ -7064,6 +7087,13 @@ fn a_draft_of_more_than_one_row_is_typed() {
             &aterm_phase::ClaudeReader,
             &draft(&["❯", "  and the lexer"], 1, 15, first)
         ));
+        // Home on two rows: no measured suggestion is drawn on two (each is cut to one), so the rows
+        // alone call grey text there neither, and what rests on them (an echo, the probe's
+        // `/usage`) goes by its words.
+        assert!(typed_draft(
+            &aterm_phase::ClaudeReader,
+            &draft(&["❯ Fix the parser", "  and the lexer"], 0, 2, first)
+        ));
         assert!(typed_draft(
             &aterm_phase::ClaudeReader,
             &draft(&["❯ hi"], 0, 4, first)
@@ -7077,9 +7107,10 @@ fn a_draft_of_more_than_one_row_is_typed() {
             &draft(&["❯"], 0, 2, first)
         ));
     }
+    // A cursor off the rows read says nothing, as one off the composer does, and that holds.
     let mut off = draft(&["❯ Try \"fix lint errors\""], 0, 2, 0);
     off.cursor_row = 99;
-    assert!(!typed_draft(&aterm_phase::ClaudeReader, &off));
+    assert!(typed_draft(&aterm_phase::ClaudeReader, &off));
 }
 
 #[test]
@@ -9929,11 +9960,17 @@ fn a_span_is_read_once_and_the_continuations_back_off_ten_then_thirty() {
         ..auto(30)
     };
     let mut out: Vec<u8> = Vec::new();
+    let clock = virtual_clock();
+    clock.stamp_by_script();
+    m.run_on(&clock);
     let mut s = session(&mut m, None);
+    s.set_fx(Fx::over(ClockSource::Scripted(clock)));
+    s.set_clock(TEST_NOW, PDT);
+    s.set_clock_running();
     s.set_zone_lookup(test_zones);
     s.set_turn_end_timing(quick_turn_end(&[
-        Duration::from_millis(10),
-        Duration::from_millis(30),
+        Duration::from_secs(10),
+        Duration::from_secs(30),
     ]));
     let _ = s.watch(&resuming(&opts, None), &mut out);
     let lines: Vec<String> = String::from_utf8(out)
@@ -9956,8 +9993,8 @@ fn a_span_is_read_once_and_the_continuations_back_off_ten_then_thirty() {
         .map(|r| r.t)
         .collect();
     assert_eq!(sent.len(), 3, "{lines:#?}");
-    assert!(sent[1] - sent[0] >= 10, "{sent:?}");
-    assert!(sent[2] - sent[1] >= 30, "{sent:?}");
+    assert!(sent[1] - sent[0] >= 10_000, "{sent:?}");
+    assert!(sent[2] - sent[1] >= 30_000, "{sent:?}");
     assert!(
         got.last()
             .is_some_and(|l| l.starts_with("EXIT session gone")),

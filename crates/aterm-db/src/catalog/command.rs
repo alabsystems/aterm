@@ -159,6 +159,7 @@ fn membership_history(paths: &Paths, deadline: std::time::Instant) -> Value {
             "network_id": aterm_codec::hex::encode_lower(&history.network),
             "retained_records": history.retained_records(),
             "complete_records": history.complete.held(),
+            "complete_inventory_sha256": aterm_codec::hex::encode_lower(&history.complete_inventory_sha256),
             "waiting_records": history.waiting,
             "complete_weighed_records": history.complete.weighed,
             "complete_keyed_records": history.complete.keyed,

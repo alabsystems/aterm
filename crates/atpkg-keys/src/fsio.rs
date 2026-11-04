@@ -54,7 +54,8 @@ pub fn read_bytes_up_to(path: &str, cap: u64) -> std::io::Result<Vec<u8>> {
     #[cfg(unix)]
     open.custom_flags(libc::O_NONBLOCK);
     let f = open.open(path)?;
-    let ft = f.metadata()?.file_type();
+    let meta = f.metadata()?;
+    let ft = meta.file_type();
     if !ft.is_file() {
         return Err(std::io::Error::other(concat(&[
             path,
@@ -63,7 +64,8 @@ pub fn read_bytes_up_to(path: &str, cap: u64) -> std::io::Result<Vec<u8>> {
             ", not a regular file",
         ])));
     }
-    let mut bytes = Vec::new();
+    let mut bytes =
+        Vec::with_capacity(usize::try_from(meta.len().min(cap).saturating_add(1)).unwrap_or(0));
     f.take(cap.saturating_add(1)).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > cap {
         let mib = 1024 * 1024;

@@ -3,6 +3,7 @@
 
 //! The subject taxonomy (§3.3).
 
+use astream_wire::WakeClass;
 pub use aterm_types::fabric_grammar::{is_principal, is_topic, PRINCIPAL_MAX};
 
 /// A fleet name segment: the same bounded lowercase grammar, without a class prefix.
@@ -46,8 +47,8 @@ pub struct InAddr {
     pub sid: String,
     /// The sender, cap-forced at the broker.
     pub src: String,
-    /// The message kind.
-    pub kind: String,
+    /// The message kind, the `<kind>` segment astream's [`WakeClass::parse`] read.
+    pub kind: WakeClass,
 }
 
 /// Parse an `in` subject by position from the left, against the fleet and node this bridge serves:
@@ -66,14 +67,14 @@ pub fn parse_in(fleet: &str, node: &str, subject: &str) -> Result<InAddr, Reject
     if !is_principal(sid) || !sid.starts_with("s-") || !is_principal(src) {
         return Err(Reject::Malformed);
     }
-    if !crate::body::is_kind(kind) {
+    let Some(kind) = WakeClass::parse(kind) else {
         return Err(Reject::Malformed);
-    }
+    };
     Ok(InAddr {
         node: node.to_string(),
         sid: sid.to_string(),
         src: src.to_string(),
-        kind: kind.to_string(),
+        kind,
     })
 }
 
@@ -229,7 +230,7 @@ mod tests {
                 node: "n-a".into(),
                 sid: "s-b".into(),
                 src: "s-1".into(),
-                kind: "answer".into(),
+                kind: WakeClass::Answer,
             })
         );
     }

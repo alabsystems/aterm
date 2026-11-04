@@ -74,7 +74,8 @@ pub(crate) enum Mutant {
     FreshSeqOnRetry,
     /// A receipt left owed by a kill takes a fresh sequence on its retry.
     FreshReceiptSeq,
-    /// A sender's next post goes out before its last one is answered.
+    /// A sender's next post goes out before its last one is answered against a broker that does
+    /// not gap-fence ([`Opts::gap_fences`]), as it does against one that does.
     PipelineSender,
     /// The inbox commit the bridge owed kept across a move that took what it names.
     KeepOwedCommitAcrossMove,
@@ -124,6 +125,10 @@ pub(crate) enum Mutant {
     /// cut short of the grace included (`Bridge::park_and_take`), so a commit that pass
     /// would carry goes alone.
     ShortParkSendsTheHeldCommit,
+    /// The bus mirror's take goes the round it falls due though nothing would carry it, as
+    /// before critic item E04 (`Bridge::mirror_rides_nothing`): a sender's snapshot of its own
+    /// post's mail count lands in a writer batch of its own, ahead of the delivery's commit.
+    MirrorSendsAnUnowedSlotAtOnce,
     /// The bus mirror's first pass after an attach runs ahead of what the loop holds queued
     /// while the open has yet to make the pin's fence, as before critic item D06
     /// (`Bridge::mirror_yields`): the first delivery an attach or a handoff finds waiting
@@ -142,8 +147,31 @@ pub(crate) enum Mutant {
     /// (`Bridge::mirror_key_on_the_media`): the control of the fence's law (critic item D06),
     /// under which an open's first take can be answered with no pin of this build on the media.
     TakeAheadOfTheFence,
-    /// A drain peeks the outbox with a post still in flight, its answer not read first.
+    /// A drain peeks the outbox with a post still in flight, its answer not read first, and
+    /// sends what it lists.
     PeekPastOwedPost,
+    /// A pipelining drain skips a listed post by what is owed when it reaches the post, not by
+    /// what was owed at the peek (C12 step 0').
+    LiveOwedSkip,
+    /// The bridge never lifts the gap fences its refused writes set (`Bridge::lift_gap_fences`).
+    KeepGapFences,
+    /// The attach's replay of the in-flight journal does not hold the gap fences
+    /// (`Bridge::fences_held` stays off in `Bridge::settle_in_flight`): a refused entry's fence
+    /// is lifted at the next entry's publish, so a later post of its sender lands ahead of its
+    /// retry. Its control is a bridge unit test on a real broker
+    /// (`the_attachs_replay_holds_the_fences_a_refused_entry_set`).
+    LiftFencesDuringReplay,
+    /// A post's first pin is made with an earlier post of its sender in the same words still
+    /// owed (`Bridge::settle_same_words` skipped): the pin's head lies below that post's record,
+    /// and its retry's read back takes that record for its own. Its control is a bridge unit
+    /// test on a real broker (`a_senders_second_post_in_the_same_words_lands_after_the_first`).
+    PinAheadOfSameWords,
+    /// The bridge pipelines a sender's posts on the `Hello`'s offer of the fence alone and
+    /// never asks for it (`Bridge::ask_gap_fences`), so the broker does not fence its link.
+    NeverAskForTheFence,
+    /// A post goes out though an answer read since its drain reached it held its sender
+    /// (`Bridge::unsendable`).
+    SendPastAHeldSender,
     /// Every read of an owed ack waits for it (`Bridge::try_settle_one`).
     WaitForEveryAck,
     /// At an idle moment the loop reads an owed post's answer only once it has arrived.
@@ -208,6 +236,11 @@ pub(crate) enum Mutant {
     /// record retention still holds there reads as gone, so a session's fetch of it is
     /// answered `retained` and a dedup's read back finds nothing to verify.
     ReadAtWithoutTheHeld,
+    /// A relayed (`via=`) record is classified by a local rule that skips astream's relayed
+    /// demotion (`Bridge::classify_delivery`): it keeps the kind it claims unless another of
+    /// [`astream_wire::WakeClass::classify_for_sender`]'s rules demotes it. Its control is a
+    /// bridge unit test (`classify_delivery_is_astreams_sender_demotion_in_every_cell`).
+    RelayedKeepsItsKind,
     /// A read of a session's lane that met its filter's oldest goes on at the floor on the
     /// link, never read again told (`Bridge::lane_page`, the reading before the F3 review): a
     /// record retention still holds below the oldest is skipped, and the session is told it
@@ -357,6 +390,13 @@ pub(crate) struct Opts {
     pub(crate) hold_acks: bool,
     /// The broker rolls back some of the node's batches ([`bus::State::refuse_next`]).
     pub(crate) refused_batches: bool,
+    /// The broker GAP-FENCES the publishes of a connection that asks ([`bus::State::gap_fences`]),
+    /// as `aterm link broker` opens it, and the bridge asks: three seeds in four, by blocks of 128
+    /// (`(seed / 128) % 4 != 3`), so every seed of the committed sweep (1..=128) fences. The
+    /// fourth is a broker an older build opened, against which a sender keeps one post in
+    /// flight; the committed seeds run there too, with this turned off
+    /// (`every_seed_holds_every_law_against_a_broker_that_does_not_gap_fence`).
+    pub(crate) gap_fences: bool,
     /// A sibling under this node's id.
     pub(crate) sibling: bool,
     /// A sibling that races an attach ([`bus::Race`]).
@@ -493,6 +533,7 @@ impl Opts {
             window: ((seed / 32) % 2 == 1).then_some(SCALED_WINDOW),
             hold_acks: (seed / 4) % 2 == 1,
             refused_batches: true,
+            gap_fences: (seed / 128) % 4 != 3,
             sibling: false,
             race: false,
             alias: false,
@@ -644,6 +685,10 @@ pub(crate) struct Stats {
     /// alone ([`bus::Broker::commit_writes`]).
     pub(crate) commits_corked: u64,
     pub(crate) commits_alone: u64,
+    /// Publishes the broker refused behind a gap fence, and lifts that took one down
+    /// ([`bus::Broker::fence_counts`]).
+    pub(crate) gap_fenced: u64,
+    pub(crate) fences_lifted: u64,
     /// WRITE errors the device injected ([`Opts::write_errors`], [`super::device::WriteErrors`]).
     pub(crate) writes_failed: u64,
     pub(crate) unlinks_failed: u64,
@@ -950,7 +995,12 @@ fn sender(src: &str, body: &Body) -> String {
 /// A subject of mail on this node's lanes, `/f/<F>/in/<node>/<sid>/<src>/<kind>`: `(sid, src,
 /// kind)`.
 fn in_lane(subject: &str) -> Option<(&str, &str, &str)> {
-    let rest = subject.strip_prefix(&format!("/f/{FLEET}/in/{NODE}/"))?;
+    let rest = subject
+        .strip_prefix("/f/")?
+        .strip_prefix(FLEET)?
+        .strip_prefix("/in/")?
+        .strip_prefix(NODE)?
+        .strip_prefix('/')?;
     let mut segs = rest.split('/');
     match (segs.next(), segs.next(), segs.next(), segs.next()) {
         (Some(sid), Some(src), Some(kind), None) => Some((sid, src, kind)),
@@ -1005,6 +1055,7 @@ impl World {
         };
         let broker = bus::Broker::new(tier, table);
         lock(&broker.state).mutant = opts.arm;
+        lock(&broker.state).gap_fences = opts.gap_fences;
         broker.retain(opts.rules());
         if opts.journal {
             broker.keep_journal();
@@ -3764,6 +3815,7 @@ pub(crate) fn run(opts: &Opts) -> Outcome {
         w.stats.seen_before_ack,
     ) = w.core.broker.held_counts();
     (w.stats.commits_corked, w.stats.commits_alone) = w.core.broker.commit_writes();
+    (w.stats.gap_fenced, w.stats.fences_lifted) = w.core.broker.fence_counts();
     {
         let s = lock(&w.core.broker.state);
         w.stats.retention_ticks = s.ret.ticks;

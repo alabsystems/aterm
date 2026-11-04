@@ -127,6 +127,7 @@ pub(crate) use control_session::harness_act_face;
 pub(crate) use control_session::mint_turn_id_for_test;
 #[cfg(test)]
 pub(crate) use control_session::own_turn_ids;
+pub(crate) use control_session::self_claim_write;
 #[cfg(any(unix, test))]
 pub(crate) use control_session::turn_ids_for_handoff;
 #[cfg(unix)]
@@ -2176,7 +2177,7 @@ impl ControlReply {
     pub(crate) fn prepare_retention_for_test(&mut self) -> Result<(), String> {
         self.retention
             .as_mut()
-            .map_or_else(|| Ok(()), ReplyHandoff::prepare_write)
+            .map_or(Ok(()), ReplyHandoff::prepare_write)
     }
 }
 
@@ -6877,7 +6878,23 @@ fn drive_owned(sid: &SessionId, node: &str) -> Option<bool> {
         .find(|spawned| &spawned.sid == sid && spawned.node == node)
         .map(|spawned| spawned.shell);
     live.or_else(|| {
-        let recorded = std::fs::read_to_string(drive_worker_file(sid)?).ok()?;
+        use std::io::Read as _;
+        const MAX_DRIVE_WORKER_BYTES: u64 = 1024;
+        let path = drive_worker_file(sid)?;
+        let (file, meta) = aterm_uds::regular_file::open(&path).ok()?;
+        if meta.len() > MAX_DRIVE_WORKER_BYTES {
+            return None;
+        }
+        let cap = usize::try_from(meta.len().min(MAX_DRIVE_WORKER_BYTES))
+            .unwrap_or(0)
+            .saturating_add(1);
+        let mut recorded = String::with_capacity(cap);
+        file.take(MAX_DRIVE_WORKER_BYTES + 1)
+            .read_to_string(&mut recorded)
+            .ok()?;
+        if recorded.len() as u64 > MAX_DRIVE_WORKER_BYTES {
+            return None;
+        }
         (recorded.trim() == node).then_some(false)
     })
 }
@@ -7116,6 +7133,27 @@ fn serve_request_line(
         return Some(ServeDisposition::Close);
     }
     let head = request.head();
+    if head.verb == "allocation" {
+        let reply = {
+            #[cfg(target_os = "macos")]
+            {
+                crate::control_allocation_monitor::serve(
+                    stream,
+                    head.rest,
+                    scope,
+                    head.selector.is_some(),
+                    store,
+                    proxy,
+                )
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                "ERR allocation monitor unsupported on this platform\n".to_string()
+            }
+        };
+        out.push_owned(reply.into_bytes());
+        return Some(ServeDisposition::Close);
+    }
     if head.verb == "askpass" {
         let response = if head.selector.is_some() {
             crate::control_askpass::public_reply("ERR askpass refused takes no @<sid>\n")
@@ -10295,6 +10333,41 @@ fn serve_session_verb(
                     .map_err(|_| "recovery observation busy".to_string())?;
                 Ok(crate::harness_recovery_verb::snapshot(&timeline))
             })
+        }
+        "harness" if rest.split_whitespace().next() == Some("fact") => {
+            crate::harness_fact_verb::cmd(
+                ctx,
+                rest,
+                scope.is_owner_class(),
+                serving_connection(),
+                &|holder: &str| prove_self_claim_for(ctx, holder, master),
+                crate::harness_fact_verb::Reads {
+                    board: &crate::vitals_jobs::BOARD,
+                    lives: crate::vitals_jobs::leader_lives,
+                    state_dir: &aterm_types::dirs::state_dir,
+                    clock: &|| {
+                        (
+                            std::time::Instant::now(),
+                            aterm_agent::supervise::journal::unix_ms(),
+                        )
+                    },
+                },
+                || {
+                    if let Some(config) = ctx.native_policy.config() {
+                        // Installed only by the explicit display-free private-host Rust factory.
+                        return Ok(crate::harness_policy_verb::configured_facts(
+                            ctx, config, 1, true, true, false,
+                        ));
+                    }
+                    control_media::call_main_within(
+                        proxy,
+                        crate::harness_fact_verb::FACT_HOP,
+                        |tx| Wake::ReadHarnessPolicy { session, reply: tx },
+                    )
+                    .map_err(|e| e.to_string())
+                    .and_then(|facts| facts)
+                },
+            )
         }
         "harness" => crate::harness_policy_verb::cmd(rest, scope.is_owner_class(), || {
             if let Some(config) = ctx.native_policy.config() {

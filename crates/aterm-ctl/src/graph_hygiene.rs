@@ -154,7 +154,7 @@ mod tests {
 
     /// A scratch dir removed on drop, short enough for socket paths.
     fn scratch() -> aterm_tempfile::TempDir {
-        aterm_tempfile::TempDir::new_in("/tmp").expect("scratch dir")
+        crate::test_scratch_dir("hygiene")
     }
 
     /// A live instance rewrote the sid after it was read dead: the rewrite

@@ -6,7 +6,7 @@
 
 use super::Terminal;
 
-use aterm_types::duration_to_nanos;
+use aterm_types::BatchStages;
 
 /// One reading of the clocks the terminal pipeline depends on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +50,15 @@ pub struct KittyAnimationStep {
     pub advanced: bool,
     /// When the next frame is due, `None` when nothing plays on screen.
     pub next_frame_at: Option<aterm_time::Instant>,
+}
+
+/// The profiling diagnostic's clock: real latency, which never feeds grid state.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "profiling diagnostic, gated: measures real latency and never feeds grid state"
+)]
+fn profiling_now() -> aterm_time::Instant {
+    aterm_time::Instant::now()
 }
 
 impl Terminal {
@@ -119,66 +128,34 @@ impl Terminal {
         if pinned_offset > 0 {
             self.grid.pin_viewport_to_live_for_output_batch();
         }
-        let damage_class: super::custody::OutputDamage;
         let selection_before = self.text_selection.has_selection();
 
-        if self.transient.pipeline_timestamps.profiling_enabled {
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "profiling diagnostic, gated: measures real latency and never feeds grid state"
-            )]
-            let entry = aterm_time::Instant::now();
-            let parse_start = entry;
-            self.advance_parser_archiving(input);
-            if self.transient.pending_parser_reset {
-                self.finish_ris_batch();
-            }
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "profiling diagnostic, gated: measures real latency and never feeds grid state"
-            )]
-            let parse_end = aterm_time::Instant::now();
-
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "profiling diagnostic, gated: measures real latency and never feeds grid state"
-            )]
-            let grid_start = aterm_time::Instant::now();
-            damage_class = self.post_process(lines_before, was_alt);
-            self.alt_archive_epilogue();
-            self.note_batch_end();
-            self.observe_at(self.transient.process_now);
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "profiling diagnostic, gated: measures real latency and never feeds grid state"
-            )]
-            let grid_end = aterm_time::Instant::now();
-
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "profiling diagnostic, gated: measures real latency and never feeds grid state"
-            )]
-            let total = entry.elapsed();
-            self.record_pipeline_timestamps(
-                parse_end - parse_start,
-                grid_end - grid_start,
-                total,
-                input.len(),
-            );
-        } else {
-            self.advance_parser_archiving(input);
-            if self.transient.pending_parser_reset {
-                self.finish_ris_batch();
-            }
-            damage_class = self.post_process(lines_before, was_alt);
-            self.alt_archive_epilogue();
-            self.note_batch_end();
-            self.observe_at(self.transient.process_now);
-
-            let ts = &mut self.transient.pipeline_timestamps;
-            ts.last_process_bytes = u32::try_from(input.len()).unwrap_or(u32::MAX);
-            ts.process_sequence = ts.process_sequence.wrapping_add(1);
+        // One body for every batch; the clock is read only where profiling is on as it begins.
+        let entry = self
+            .transient
+            .pipeline_timestamps
+            .profiling_enabled
+            .then(profiling_now);
+        self.advance_parser_archiving(input);
+        if self.transient.pending_parser_reset {
+            self.finish_ris_batch();
         }
+        let parse_end = entry.map(|_| profiling_now());
+        let damage_class = self.post_process(lines_before, was_alt);
+        self.alt_archive_epilogue();
+        self.note_batch_end();
+        self.observe_at(self.transient.process_now);
+        let stages = entry.zip(parse_end).map(|(entry, parse_end)| {
+            let grid_end = profiling_now();
+            BatchStages {
+                parse: parse_end - entry,
+                grid: grid_end - parse_end,
+                total: grid_end - entry,
+            }
+        });
+        self.transient
+            .pipeline_timestamps
+            .note_batch(input.len(), stages);
 
         if std::mem::take(&mut self.shell.probe_transitioned) {
             self.host_journal.push(super::HostOp::ForegroundJob {
@@ -233,23 +210,6 @@ impl Terminal {
         self.grid.assert_structural_invariants();
 
         self.refresh_mode_mirror();
-    }
-
-    /// Store per-stage pipeline durations in transient state.
-    #[inline]
-    fn record_pipeline_timestamps(
-        &mut self,
-        parse: std::time::Duration,
-        grid: std::time::Duration,
-        total: std::time::Duration,
-        bytes: usize,
-    ) {
-        let ts = &mut self.transient.pipeline_timestamps;
-        ts.parse_duration_ns = duration_to_nanos(parse);
-        ts.grid_duration_ns = duration_to_nanos(grid);
-        ts.process_total_ns = duration_to_nanos(total);
-        ts.last_process_bytes = u32::try_from(bytes).unwrap_or(u32::MAX);
-        ts.process_sequence = ts.process_sequence.wrapping_add(1);
     }
 
     /// RIS side effects the handler cannot reach, run after the parser and
@@ -613,6 +573,78 @@ mod tests {
         t.process(first);
         t.process(second);
         t
+    }
+
+    /// Every batch is counted and its size kept, profiled or not, a RIS's included: a renderer
+    /// that reuses a snapshot while `process_sequence` stands still sees a batch that marks no
+    /// damage (a title) in a shipped build, which profiles nothing, as in a test build, which
+    /// does, and no count a RIS restarted matches a snapshot taken before it. A profiled batch
+    /// times its stages, which add up to its total; an unprofiled one keeps the last timings, and
+    /// a RIS keeps the profiling switch.
+    /// NEGATIVE CONTROLS: with an unprofiled batch left uncounted, `` profiling false: two
+    /// batches are two `` fails; with the stages dropped (`stages = None`), `` profiling true: the
+    /// batch is timed `` fails; with a RIS restarting the count, `` a RIS batch is counted ``
+    /// fails.
+    #[test]
+    fn every_batch_is_counted_and_sized_whether_or_not_it_is_profiled() {
+        const UNTIMED: u64 = u64::MAX;
+        for profiling in [false, true] {
+            let mut t = Terminal::new(4, 20);
+            let ts = &mut t.transient.pipeline_timestamps;
+            ts.profiling_enabled = profiling;
+            (
+                ts.parse_duration_ns,
+                ts.grid_duration_ns,
+                ts.process_total_ns,
+            ) = (UNTIMED, UNTIMED, UNTIMED);
+            let before = ts.process_sequence;
+            t.process(b"\x1b]0;retitled\x07");
+            t.process(b"x");
+            let ts = t.transient.pipeline_timestamps;
+            assert_eq!(
+                ts.process_sequence.wrapping_sub(before),
+                2,
+                "profiling {profiling}: two batches are two"
+            );
+            assert_eq!(
+                ts.last_process_bytes, 1,
+                "profiling {profiling}: the last size"
+            );
+            let timed = (
+                ts.parse_duration_ns,
+                ts.grid_duration_ns,
+                ts.process_total_ns,
+            );
+            if profiling {
+                assert_ne!(
+                    ts.process_total_ns, UNTIMED,
+                    "profiling true: the batch is timed"
+                );
+                assert_eq!(
+                    ts.parse_duration_ns.checked_add(ts.grid_duration_ns),
+                    Some(ts.process_total_ns),
+                    "the stages add up to the total: {timed:?}"
+                );
+            } else {
+                assert_eq!(
+                    timed,
+                    (UNTIMED, UNTIMED, UNTIMED),
+                    "an unprofiled batch keeps the last timings"
+                );
+            }
+
+            t.process(b"\x1bc");
+            let ts = t.transient.pipeline_timestamps;
+            assert_eq!(
+                ts.process_sequence.wrapping_sub(before),
+                3,
+                "profiling {profiling}: a RIS batch is counted"
+            );
+            assert_eq!(
+                ts.profiling_enabled, profiling,
+                "a RIS keeps the profiling switch"
+            );
+        }
     }
 
     fn row_text(t: &Terminal, row: u16) -> String {

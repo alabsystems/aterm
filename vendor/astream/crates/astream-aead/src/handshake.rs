@@ -147,7 +147,8 @@ pub(crate) fn write_hs_msg<W: Write>(w: &mut W, pubkey: &[u8; 32]) -> io::Result
 
 pub(crate) fn read_hs_msg<R: Read>(r: &mut R) -> io::Result<[u8; 32]> {
     let mut msg = [0u8; HS_MSG_LEN];
-    r.read_exact(&mut msg)?;
+    let read_exact_op: fn(&mut R, &mut [u8]) -> io::Result<()> = Read::read_exact;
+    read_exact_op(r, &mut msg)?;
     if !has_hs_magic(&msg) || !handshake_version_valid(hs_msg_version(&msg)) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -173,7 +174,8 @@ pub(crate) fn ephemeral() -> io::Result<(StaticSecret, [u8; 32])> {
     Ok((secret, public))
 }
 
-const fn build_hs_info(client_pub: &[u8; 32], server_pub: &[u8; 32]) -> [u8; 84] {
+#[inline(always)]
+const fn hs_info_label_lo() -> [u8; 16] {
     [
         HS_LABEL[0],
         HS_LABEL[1],
@@ -191,10 +193,17 @@ const fn build_hs_info(client_pub: &[u8; 32], server_pub: &[u8; 32]) -> [u8; 84]
         HS_LABEL[13],
         HS_LABEL[14],
         HS_LABEL[15],
-        HS_LABEL[16],
-        HS_LABEL[17],
-        HS_LABEL[18],
-        HS_LABEL[19],
+    ]
+}
+
+#[inline(always)]
+const fn hs_info_label_hi() -> [u8; 4] {
+    [HS_LABEL[16], HS_LABEL[17], HS_LABEL[18], HS_LABEL[19]]
+}
+
+#[inline(always)]
+const fn hs_info_client_lo(client_pub: &[u8; 32]) -> [u8; 16] {
+    [
         client_pub[0],
         client_pub[1],
         client_pub[2],
@@ -211,6 +220,12 @@ const fn build_hs_info(client_pub: &[u8; 32], server_pub: &[u8; 32]) -> [u8; 84]
         client_pub[13],
         client_pub[14],
         client_pub[15],
+    ]
+}
+
+#[inline(always)]
+const fn hs_info_client_hi(client_pub: &[u8; 32]) -> [u8; 16] {
+    [
         client_pub[16],
         client_pub[17],
         client_pub[18],
@@ -227,6 +242,12 @@ const fn build_hs_info(client_pub: &[u8; 32], server_pub: &[u8; 32]) -> [u8; 84]
         client_pub[29],
         client_pub[30],
         client_pub[31],
+    ]
+}
+
+#[inline(always)]
+const fn hs_info_server_lo(server_pub: &[u8; 32]) -> [u8; 16] {
+    [
         server_pub[0],
         server_pub[1],
         server_pub[2],
@@ -243,6 +264,12 @@ const fn build_hs_info(client_pub: &[u8; 32], server_pub: &[u8; 32]) -> [u8; 84]
         server_pub[13],
         server_pub[14],
         server_pub[15],
+    ]
+}
+
+#[inline(always)]
+const fn hs_info_server_hi(server_pub: &[u8; 32]) -> [u8; 16] {
+    [
         server_pub[16],
         server_pub[17],
         server_pub[18],
@@ -259,6 +286,26 @@ const fn build_hs_info(client_pub: &[u8; 32], server_pub: &[u8; 32]) -> [u8; 84]
         server_pub[29],
         server_pub[30],
         server_pub[31],
+    ]
+}
+
+const fn build_hs_info(client_pub: &[u8; 32], server_pub: &[u8; 32]) -> [u8; 84] {
+    let [l0, l1, l2, l3, l4, l5, l6, l7, l8, l9, l10, l11, l12, l13, l14, l15] = hs_info_label_lo();
+    let [l16, l17, l18, l19] = hs_info_label_hi();
+    let [c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13, c14, c15] =
+        hs_info_client_lo(client_pub);
+    let [c16, c17, c18, c19, c20, c21, c22, c23, c24, c25, c26, c27, c28, c29, c30, c31] =
+        hs_info_client_hi(client_pub);
+    let [s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15] =
+        hs_info_server_lo(server_pub);
+    let [s16, s17, s18, s19, s20, s21, s22, s23, s24, s25, s26, s27, s28, s29, s30, s31] =
+        hs_info_server_hi(server_pub);
+    [
+        l0, l1, l2, l3, l4, l5, l6, l7, l8, l9, l10, l11, l12, l13, l14, l15, l16, l17, l18, l19,
+        c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13, c14, c15, c16, c17, c18, c19,
+        c20, c21, c22, c23, c24, c25, c26, c27, c28, c29, c30, c31, s0, s1, s2, s3, s4, s5, s6, s7,
+        s8, s9, s10, s11, s12, s13, s14, s15, s16, s17, s18, s19, s20, s21, s22, s23, s24, s25,
+        s26, s27, s28, s29, s30, s31,
     ]
 }
 
@@ -313,12 +360,8 @@ fn agree(
     ))
 }
 
-/// The bytes both sides bind into every record's AAD: the ephemeral public keys in
-/// a fixed order (client, then server), as THIS side observed them. An active MITM
-/// that relays different ephemerals to each leg produces different transcripts, so
-/// its records fail to open on the far side. The identity handshake binds the same
-/// bytes, which are also what its peers sign.
-pub(crate) const fn transcript(client_pub: &[u8; 32], server_pub: &[u8; 32]) -> [u8; 64] {
+#[inline(always)]
+const fn hs_transcript_q0(client_pub: &[u8; 32]) -> [u8; 16] {
     [
         client_pub[0],
         client_pub[1],
@@ -336,6 +379,12 @@ pub(crate) const fn transcript(client_pub: &[u8; 32], server_pub: &[u8; 32]) -> 
         client_pub[13],
         client_pub[14],
         client_pub[15],
+    ]
+}
+
+#[inline(always)]
+const fn hs_transcript_q1(client_pub: &[u8; 32]) -> [u8; 16] {
+    [
         client_pub[16],
         client_pub[17],
         client_pub[18],
@@ -352,6 +401,12 @@ pub(crate) const fn transcript(client_pub: &[u8; 32], server_pub: &[u8; 32]) -> 
         client_pub[29],
         client_pub[30],
         client_pub[31],
+    ]
+}
+
+#[inline(always)]
+const fn hs_transcript_q2(server_pub: &[u8; 32]) -> [u8; 16] {
+    [
         server_pub[0],
         server_pub[1],
         server_pub[2],
@@ -368,6 +423,12 @@ pub(crate) const fn transcript(client_pub: &[u8; 32], server_pub: &[u8; 32]) -> 
         server_pub[13],
         server_pub[14],
         server_pub[15],
+    ]
+}
+
+#[inline(always)]
+const fn hs_transcript_q3(server_pub: &[u8; 32]) -> [u8; 16] {
+    [
         server_pub[16],
         server_pub[17],
         server_pub[18],
@@ -384,6 +445,28 @@ pub(crate) const fn transcript(client_pub: &[u8; 32], server_pub: &[u8; 32]) -> 
         server_pub[29],
         server_pub[30],
         server_pub[31],
+    ]
+}
+
+/// The bytes both sides bind into every record's AAD: the ephemeral public keys in
+/// a fixed order (client, then server), as THIS side observed them. An active MITM
+/// that relays different ephemerals to each leg produces different transcripts, so
+/// its records fail to open on the far side. The identity handshake binds the same
+/// bytes, which are also what its peers sign.
+pub(crate) const fn transcript(client_pub: &[u8; 32], server_pub: &[u8; 32]) -> [u8; 64] {
+    let [c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13, c14, c15] =
+        hs_transcript_q0(client_pub);
+    let [c16, c17, c18, c19, c20, c21, c22, c23, c24, c25, c26, c27, c28, c29, c30, c31] =
+        hs_transcript_q1(client_pub);
+    let [s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15] =
+        hs_transcript_q2(server_pub);
+    let [s16, s17, s18, s19, s20, s21, s22, s23, s24, s25, s26, s27, s28, s29, s30, s31] =
+        hs_transcript_q3(server_pub);
+    [
+        c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13, c14, c15, c16, c17, c18, c19,
+        c20, c21, c22, c23, c24, c25, c26, c27, c28, c29, c30, c31, s0, s1, s2, s3, s4, s5, s6, s7,
+        s8, s9, s10, s11, s12, s13, s14, s15, s16, s17, s18, s19, s20, s21, s22, s23, s24, s25,
+        s26, s27, s28, s29, s30, s31,
     ]
 }
 

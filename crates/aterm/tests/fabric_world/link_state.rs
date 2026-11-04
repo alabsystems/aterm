@@ -211,8 +211,12 @@ fn a_killed_broker_stalls_the_fabric_and_a_restart_reconnects() {
 /// `connected`.**
 #[test]
 fn a_broker_path_nothing_listens_on_is_stalled_and_never_connected() {
-    let nowhere = format!("/tmp/atl-r13-nowhere-{}.sock", std::process::id());
-    let _ = std::fs::remove_file(&nowhere);
+    let dir = harness::sock_dir("r13-nosock");
+    let nowhere = dir
+        .path()
+        .join("nowhere.sock")
+        .to_string_lossy()
+        .into_owned();
     let w = World::boot_at("r13-nosock", &[], &[], Some(&nowhere));
     let sid = boot_sid(&w);
 
@@ -246,10 +250,8 @@ fn a_broker_path_nothing_listens_on_is_stalled_and_never_connected() {
 /// life of the process, reporting nothing; the endpoint said `connected`.
 #[test]
 fn a_broker_that_accepts_but_never_acks_is_stalled_no_ack() {
-    let dir = format!("/tmp/atl-stub13-{}", std::process::id());
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("stub dir");
-    let stub = format!("{dir}/s.sock");
+    let dir = harness::sock_dir("stub13");
+    let stub = dir.path().join("s.sock").to_string_lossy().into_owned();
     let listener = harness::kept(UnixListener::bind(&stub).expect("bind the stub"));
     std::thread::spawn(move || {
         for stream in listener.incoming() {
@@ -284,7 +286,6 @@ fn a_broker_that_accepts_but_never_acks_is_stalled_no_ack() {
             && kv(&s, "fabric_link_age_ms") == Some("-"),
         "never connected: {s}"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// **A BRIDGE THAT CANNOT FINISH ITS ATTACH NEVER READS `connected`, AND

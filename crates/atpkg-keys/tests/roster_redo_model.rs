@@ -31,8 +31,11 @@ struct Fixture {
 
 impl Fixture {
     fn new(label: &str, predecessor_present: bool) -> Self {
+        let end = label.floor_char_boundary(24);
+        let prefix = format!("atpkg-roster-redo-{}-", &label[..end]);
         let root = aterm_tempfile::Builder::new()
-            .prefix(&format!("atpkg-roster-redo-model-{label}-"))
+            .prefix(&prefix)
+            .suffix(".noindex")
             .tempdir()
             .expect("create roster model fixture");
         let roster = root.path().join("aterm-machines.toml");

@@ -1741,9 +1741,10 @@ where
             return None;
         }
         let len = meta.len();
+        let win_cap = usize::try_from(len.min(WINDOW).saturating_add(1)).unwrap_or(0);
         if len > WINDOW {
             use std::io::{Seek, SeekFrom};
-            let mut tail = Vec::new();
+            let mut tail = Vec::with_capacity(win_cap);
             let offset = i64::try_from(WINDOW).unwrap_or(131_072);
             if f.seek(SeekFrom::End(-offset)).is_ok()
                 && (&mut f).take(WINDOW).read_to_end(&mut tail).is_ok()
@@ -1753,7 +1754,7 @@ where
             }
             let _ = f.seek(SeekFrom::Start(0));
         }
-        let mut head = Vec::new();
+        let mut head = Vec::with_capacity(win_cap);
         f.take(WINDOW).read_to_end(&mut head).ok()?;
         parse(&head)
     };
@@ -2033,7 +2034,8 @@ fn read_jsonl_tail(path: &Path, window: u64) -> Option<(Vec<u8>, u64)> {
     let len = metadata.len();
     let mut cur = window.clamp(1024, MAX_WINDOW);
     loop {
-        let mut buf = Vec::new();
+        let cap = usize::try_from(len.min(cur).saturating_add(1)).unwrap_or(0);
+        let mut buf = Vec::with_capacity(cap);
         if len > cur {
             f.seek(SeekFrom::Start(len - cur)).ok()?;
             (&mut f).take(cur).read_to_end(&mut buf).ok()?;

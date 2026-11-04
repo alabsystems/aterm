@@ -161,13 +161,15 @@ impl Record {
         })
     }
 
-    /// The value of `key` in the recorded environment.
+    /// The value of `key` in the recorded environment, its last setting winning. On Windows a
+    /// name is found without regard to ASCII case, as that environment answers it: a test whose
+    /// `PATH` cargo set still holds it under the `Path` it inherited.
     #[must_use]
     pub fn var(&self, key: &str) -> Option<&OsStr> {
         self.env
             .iter()
             .rev()
-            .find(|(k, _)| k == key)
+            .find(|(k, _)| k == key || (cfg!(windows) && k.eq_ignore_ascii_case(key)))
             .map(|(_, v)| v.as_os_str())
     }
 
@@ -370,13 +372,26 @@ pub fn take_test_executables(log: &mut String) -> Result<Vec<TestExe>, String> {
     let mut kept = String::with_capacity(log.len());
     for line in log.split_inclusive('\n') {
         let t = line.trim_end_matches(['\n', '\r']);
-        if !t.starts_with("{\"reason\":") {
-            kept.push_str(line);
+        let Ok(message) = aterm_json::from_str::<crate::compiler_message::UnitMessage>(t) else {
+            if t.starts_with("{\"reason\":") {
+                bad.get_or_insert_with(|| t.chars().take(120).collect::<String>());
+            } else {
+                kept.push_str(line);
+            }
             continue;
-        }
-        let Ok(v) = aterm_json::from_str::<aterm_json::Value>(t) else {
-            bad.get_or_insert_with(|| t.chars().take(120).collect::<String>());
-            continue;
+        };
+        let v = match message {
+            crate::compiler_message::UnitMessage::Unit(value) => value,
+            crate::compiler_message::UnitMessage::Other => {
+                if !t.starts_with("{\"reason\":") {
+                    kept.push_str(line);
+                }
+                continue;
+            }
+            crate::compiler_message::UnitMessage::Ambiguous(_) => {
+                bad.get_or_insert_with(|| "ambiguous compiler message fields".into());
+                continue;
+            }
         };
         if v.get("reason").and_then(aterm_json::Value::as_str) != Some("compiler-artifact") {
             continue;
@@ -393,11 +408,13 @@ pub fn take_test_executables(log: &mut String) -> Result<Vec<TestExe>, String> {
             continue;
         }
         let target = v.get("target");
-        let kinds: Vec<&str> = target
-            .and_then(|t| t.get("kind"))
-            .and_then(aterm_json::Value::as_array)
-            .map(|a| a.iter().filter_map(aterm_json::Value::as_str).collect())
-            .unwrap_or_default();
+        let kinds = match crate::compiler_message::artifact_target_kinds(&v) {
+            Ok(kinds) => kinds,
+            Err(reason) => {
+                bad.get_or_insert_with(|| reason.to_owned());
+                continue;
+            }
+        };
         let name = target
             .and_then(|t| t.get("name"))
             .and_then(aterm_json::Value::as_str)
@@ -1194,6 +1211,25 @@ mod tests {
         let bytes = r.encode();
         assert_eq!(Record::decode(&bytes), Some(r.clone()));
         assert_eq!(r.var("NL"), Some(OsStr::new("one\ntwo")));
+        let inherited = Record {
+            env: vec![
+                ("K".into(), "first".into()),
+                ("Path".into(), "a".into()),
+                ("K".into(), "last".into()),
+            ],
+            ..r.clone()
+        };
+        assert_eq!(inherited.var("Path"), Some(OsStr::new("a")));
+        assert_eq!(
+            inherited.var("K"),
+            Some(OsStr::new("last")),
+            "the last setting wins"
+        );
+        assert_eq!(
+            inherited.var("PATH"),
+            cfg!(windows).then_some(OsStr::new("a")),
+            "a name in another case is the same variable on Windows alone"
+        );
         assert_eq!(Record::decode(&bytes[..bytes.len() - 1]), None, "cut short");
         assert_eq!(
             Record::decode(&bytes[..bytes.len() - 3]),
@@ -1221,17 +1257,7 @@ mod tests {
         assert_eq!(recs[0].argv, ["/t/a", "--skip", "m::"]);
         assert_eq!(recs[1].argv, ["/t/b"]);
         assert_eq!(recs[0].cwd, std::env::current_dir().expect("cwd"));
-        assert_eq!(
-            recs[0].var("CARGO_PKG_NAME"),
-            std::env::var_os("CARGO_PKG_NAME").as_deref()
-        );
-        assert!(
-            recs[0]
-                .env
-                .iter()
-                .any(|(k, v)| k.eq_ignore_ascii_case("PATH")
-                    && Some(v.as_os_str()) == std::env::var_os("PATH").as_deref())
-        );
+        assert_eq!(recs[0].var("PATH"), std::env::var_os("PATH").as_deref());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -1325,6 +1351,59 @@ mod tests {
             take_test_executables(&mut torn).is_err(),
             "a torn message is no list"
         );
+    }
+
+    #[test]
+    fn mixed_type_target_kinds_do_not_select_test_executables() {
+        let valid = artifact("/built/x", "lib", "x", true);
+        for kinds in [r#"["lib"]"#, r#"["rlib","lib"]"#] {
+            let mut positive = valid.replace(r#"["lib"]"#, kinds);
+            assert_eq!(take_test_executables(&mut positive).unwrap().len(), 1);
+        }
+        for kinds in [r#"["lib",7]"#, r#"[null,"lib"]"#, r#"["lib",{}]"#] {
+            let malformed = valid.replace(r#"["lib"]"#, kinds);
+            for mut wire in [
+                malformed.clone(),
+                format!("{valid}{malformed}"),
+                format!("{malformed}{valid}"),
+            ] {
+                assert!(take_test_executables(&mut wire).is_err(), "{kinds}");
+            }
+        }
+    }
+
+    #[test]
+    fn ambiguous_compiler_artifacts_do_not_select_test_executables() {
+        let valid = artifact("/built/x", "lib", "x", true);
+        for mut wire in [
+            valid.clone(),
+            format!("  {valid}"),
+            valid.replacen("\"reason\"", r#""\u0072eason""#, 1),
+            valid.replacen(
+                '{',
+                r#"{"extra":[1,-1,1.5,true,false,null,{"text":"ok"}],"#,
+                1,
+            ),
+        ] {
+            assert_eq!(take_test_executables(&mut wire).unwrap().len(), 1);
+            assert!(wire.is_empty());
+        }
+        let mut diagnostic = "human diagnostic\n{\"human\":1}\n{\"reason\":\"compiler-message\",\"message\":{}}\n{\"reason\":\"build-finished\",\"success\":true}\n".to_owned();
+        assert!(take_test_executables(&mut diagnostic).unwrap().is_empty());
+        assert_eq!(diagnostic, "human diagnostic\n{\"human\":1}\n");
+        for message in include_str!("testdata/ambiguous-compiler-artifacts.jsonl").lines() {
+            for before in [true, false] {
+                let valid = artifact("/built/x", "lib", "x", true);
+                let wire = if before {
+                    format!("{valid}{message}\n")
+                } else {
+                    format!("{message}\n{valid}")
+                };
+                let mut output = format!("human diagnostic\n{wire}");
+                assert!(take_test_executables(&mut output).is_err(), "{message}");
+                assert_eq!(output, "human diagnostic\n");
+            }
+        }
     }
 
     /// THE PLAN ADDS UP OR IT IS NOT A PLAN: every record meets the header cargo

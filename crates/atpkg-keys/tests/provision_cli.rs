@@ -50,8 +50,11 @@ fn pins_fixture(master_entry: &str) -> String {
 
 /// A private scratch tree for one test, removed when the test ends however it ends.
 fn scratch(name: &str) -> aterm_tempfile::TempDir {
+    let end = name.floor_char_boundary(24);
+    let prefix = format!("atpkg-keys-cli-{}-", &name[..end]);
     aterm_tempfile::Builder::new()
-        .prefix(&format!("atpkg-keys-cli-{name}-"))
+        .prefix(&prefix)
+        .suffix(".noindex")
         .tempdir()
         .expect("scratch dir")
 }

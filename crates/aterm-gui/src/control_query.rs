@@ -1588,7 +1588,7 @@ pub(crate) fn cmd_devtools(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
 
 /// The usage line every malformed `permissions` form answers.
 pub(crate) const PERMISSIONS_USAGE: &str =
-    "ERR usage: permissions walk now [fda|devtools|accessibility|debugger]...\n";
+    "ERR usage: permissions walk now [fda|devtools|accessibility]...\n";
 
 /// Parses `permissions walk now [<subject>…]` on the control thread: the subjects named, in
 /// order, so a malformed form is a usage error and never a wake.

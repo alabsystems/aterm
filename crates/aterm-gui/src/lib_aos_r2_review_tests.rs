@@ -125,39 +125,59 @@ fn a_key_is_private_unless_aterm_sees_it_echoed() {
     };
     let unreadable = || None;
     assert_eq!(
-        key_privacy(true, false, true, tty(false, true)),
+        key_privacy(true, false, true, false, tty(false, true)),
         Some(NO_ECHO_KEY)
     );
     assert_eq!(
-        key_privacy(false, true, true, tty(true, true)),
+        key_privacy(false, true, true, false, tty(true, true)),
         Some(SECURE_ENTRY)
     );
     assert_eq!(
-        key_privacy(false, false, false, tty(true, true)),
+        key_privacy(false, false, false, false, tty(true, true)),
         None,
         "cooked echo"
     );
     assert_eq!(
-        key_privacy(false, false, false, tty(true, false)),
+        key_privacy(false, false, false, false, tty(true, false)),
         None,
         "raw echo"
     );
     assert_eq!(
-        key_privacy(false, false, false, tty(false, false)),
+        key_privacy(false, false, false, false, tty(false, false)),
         Some(RAW_KEY),
         "raw, no echo, no prompt"
     );
     assert_eq!(
-        key_privacy(false, false, true, tty(false, false)),
+        key_privacy(false, false, true, false, tty(false, false)),
         None,
         "raw at an open prompt of aterm's shell"
     );
     assert_eq!(
-        key_privacy(false, false, false, unreadable),
+        key_privacy(false, false, false, false, unreadable),
         Some(RAW_KEY),
         "unreadable"
     );
-    assert_eq!(key_privacy(false, false, true, unreadable), None);
+    assert_eq!(key_privacy(false, false, true, false, unreadable), None);
+    assert_eq!(
+        key_privacy(false, false, false, true, unreadable),
+        None,
+        "a key that carries no text, the tty unreadable"
+    );
+    assert_eq!(
+        key_privacy(false, false, false, true, tty(false, false)),
+        None,
+        "a key that carries no text, raw with no echo"
+    );
+    assert_eq!(
+        key_privacy(true, false, false, true, tty(false, true)),
+        Some(NO_ECHO_KEY),
+        "a tty that swallows input wins over no text"
+    );
+    assert_eq!(
+        key_privacy(false, true, false, true, unreadable),
+        Some(SECURE_ENTRY),
+        "Secure Keyboard Entry wins over no text"
+    );
 }
 
 #[cfg(unix)]

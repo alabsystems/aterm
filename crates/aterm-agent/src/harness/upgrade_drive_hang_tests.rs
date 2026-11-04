@@ -434,7 +434,11 @@ fn a_step_whose_status_is_never_answered_waits() {
     let dir = ScratchDir::new("upgrade", "hang-step");
     let (mute, asked) = instance(&dir.join("mute"), version);
     let opts = dialling(&dir, &mute, UNANSWERED_BOUND);
-    let stepped = within_detector("the step", move || step(&opts).step);
+    let stepped = within_detector("the step", move || {
+        // The answered probe waits the hang detector; only `status` is waited out.
+        let _answered = crate::AnsweredBut::set(|l| version(l).is_none());
+        step(&opts).step
+    });
     assert_eq!(stepped, "wait:tab-not-live");
     let status = format!("@{TAB} status");
     assert_eq!(heard(&asked, &status), ["version".to_string(), status]);
@@ -495,6 +499,8 @@ fn a_look_the_window_never_answers_ends_and_asks_again() {
     let opts = dialling(&dir, &held, UNANSWERED_BOUND);
     let settle = format!("@{TAB} meta unset attention owner={ATTENTION_OWNER}");
     let mut view = within_detector("the unanswered settle's look", move || {
+        // The answered probe and roster wait the hang detector; only the settle is waited out.
+        let _answered = crate::AnsweredBut::set(|l| version(l).is_none() && l != "who");
         view.refresh_keeping(&opts, &mut |_, _| {});
         view
     });
@@ -605,7 +611,11 @@ fn the_claims_read_bounds_its_probe() {
         version(l).or_else(|| (l == "who").then(|| who(42)))
     });
     let opts = dialling(&dir, &live, 2 * MUST_HAPPEN);
-    let tabs = within_detector("the answered claims read", move || instance_tabs(&opts));
+    let tabs = within_detector("the answered claims read", move || {
+        // Both answered, the probe and the roster wait the hang detector, not CLAIMS_WAIT.
+        let _answered = crate::AnsweredBut::set(|l| version(l).is_none() && l != "who");
+        instance_tabs(&opts)
+    });
     assert_eq!(
         tabs,
         vec![LiveTab {

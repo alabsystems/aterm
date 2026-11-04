@@ -37,6 +37,8 @@ aterm-digest = { workspace = true }
 # delivered and decodes a PNG only to compose Kitty animation frames.
 aterm-png = { workspace = true }
 aterm-types = { workspace = true }
+# `aterm_alloc::heap::table_bytes`: the Kitty tables a replay carry charges (`ReplayCarry::memory_used`).
+aterm-alloc = { workspace = true }
 # The one dark/light classifier (`aterm_messages::ink::bg_is_light`), which the
 # reported colour scheme (DSR 996 / mode 2031) shares with the chrome.
 # aterm-messages depends only on aterm-time, aterm-types and aterm-grapheme,

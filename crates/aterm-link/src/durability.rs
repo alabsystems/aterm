@@ -12,6 +12,45 @@ pub const FLAG: &str = "--durability";
 /// Dev-only volume seam environment variable.
 pub const VOLUME_SEAM: &str = "ATERM_LINK_BROKER_VOLUME";
 
+/// The bytes of decoded records aterm's broker keeps in memory (astream's
+/// `OpenOptions::resident_budget`, set by every [`Durability::options`]): the newest retained
+/// records up to it, the newest one always. It reads every older retained record back from the
+/// log file when a reader asks for it, through the same decode and, on a sealed log, the same
+/// bound open the open's scan applies. So the decoded records no longer grow with the history
+/// its retention rules keep (up to 7 days and 352 MiB, `broker_rules`), but the broker's memory
+/// still does: every retained record, resident or cold, keeps its slot in astream's residency
+/// tier and its key in the dedup index, 28.09 B a record of one consecutive producer (24.00 of
+/// it the slot; astream's `broker_index_bench`, `DESIGN-aterm-fabric` §14 question 8), about
+/// 28 MB a million records. Taking a cold record below one slot is that question's part (c),
+/// which is not built.
+pub const RESIDENT_BUDGET: usize = 16 * 1024 * 1024;
+
+/// Dev-only seam replacing [`RESIDENT_BUDGET`]: a byte count, or `none` for no budget (every
+/// retained record resident). The fabric ledger's D10d set ran its no-budget arm under `none`.
+/// No test sets it: a test that needs records cold holds its own broker to a budget (astream's
+/// `OpenOptions::resident_budget` or `Broker::set_resident_budget`), as the sealed cold read
+/// (`at_rest_tests`) and fabric world's cold refill (`bridge_recovery`) do at 0, which keeps
+/// the newest record alone so every read below the head is a cold one.
+pub const RESIDENT_BUDGET_SEAM: &str = "ATERM_LINK_RESIDENT_BUDGET";
+
+/// The residency budget [`Durability::options`] sets: [`RESIDENT_BUDGET`], or what
+/// [`RESIDENT_BUDGET_SEAM`] names in a build with the dev seams ([`budget_of`]).
+#[must_use]
+pub fn resident_budget() -> Option<usize> {
+    budget_of(aterm_types::dev_seam!(RESIDENT_BUDGET_SEAM).as_deref())
+}
+
+/// The residency budget [`RESIDENT_BUDGET_SEAM`]'s value `seam` names: `none` for no budget, a
+/// byte count for that many bytes, and [`RESIDENT_BUDGET`] for no seam or any other value.
+#[must_use]
+pub fn budget_of(seam: Option<&std::ffi::OsStr>) -> Option<usize> {
+    match seam.and_then(std::ffi::OsStr::to_str) {
+        Some("none") => None,
+        Some(bytes) => Some(bytes.parse().unwrap_or(RESIDENT_BUDGET)),
+        None => Some(RESIDENT_BUDGET),
+    }
+}
+
 /// Legacy relaxed-mode boot mark suffix (`<log>.aterm-relaxed`).
 pub const MARK_SUFFIX: &str = ".aterm-relaxed";
 
@@ -81,13 +120,24 @@ impl Durability {
         }
     }
 
-    /// Broker [`astream_broker::OpenOptions`] for this tier, attaching [`escalation`] on weak tiers.
+    /// Broker [`astream_broker::OpenOptions`] for this tier, attaching [`escalation`] on weak tiers
+    /// and bounding the decoded records it keeps in memory to [`resident_budget`] on every tier.
+    ///
+    /// Every tier OFFERS GAP FENCES (`sticky_batch_refusal`, astream's `DESIGN-aterm-fabric` §14
+    /// Q7), which its `Hello` says: on a connection that asks (`FenceGaps`), once a producer's
+    /// write is refused nothing it sent after it on that connection lands until it lifts the
+    /// fence, so a bridge keeps several of a sender's posts in flight only against a broker
+    /// opened here, once it asked (`Bridge::pipelines_posts`). A connection that never asks, a
+    /// bridge of an older build's among them, is served unfenced, so a refusal it does not
+    /// retry next holds back nothing it writes after it.
     #[must_use]
     pub fn options(self) -> astream_broker::OpenOptions {
-        let mut opts = astream_broker::OpenOptions::new(self.tier());
+        let mut opts =
+            astream_broker::OpenOptions::new(self.tier()).with_sticky_batch_refusal(true);
         if self != Durability::Strict {
             opts.escalation = escalation();
         }
+        opts.resident_budget = resident_budget();
         opts
     }
 
@@ -385,7 +435,8 @@ pub fn read_mark(log: &Path) -> Mark {
     if !meta.is_file() {
         return Mark::Unreadable;
     }
-    let mut bytes = Vec::with_capacity(256);
+    let mut bytes =
+        Vec::with_capacity(usize::try_from(meta.len().min(4096).saturating_add(1)).unwrap_or(256));
     if f.take(4096).read_to_end(&mut bytes).is_err() {
         return Mark::Unreadable;
     }
@@ -739,6 +790,20 @@ mod tests {
         );
     }
 
+    /// Every broker aterm opens is bounded to [`RESIDENT_BUDGET`] unless the dev seam names
+    /// another budget, or none. NEGATIVE CONTROL: a value that is no budget leaves the default,
+    /// never an unbounded broker.
+    #[test]
+    fn the_residency_budget_is_aterms_unless_the_seam_names_one() {
+        use std::ffi::OsStr;
+        assert_eq!(budget_of(None), Some(RESIDENT_BUDGET));
+        assert_eq!(budget_of(Some(OsStr::new("0"))), Some(0));
+        assert_eq!(budget_of(Some(OsStr::new("4096"))), Some(4096));
+        assert_eq!(budget_of(Some(OsStr::new("none"))), None);
+        assert_eq!(budget_of(Some(OsStr::new("16MiB"))), Some(RESIDENT_BUDGET));
+        assert_eq!(budget_of(Some(OsStr::new(""))), Some(RESIDENT_BUDGET));
+    }
+
     #[test]
     fn ordered_is_served_ordered_with_aterms_table() {
         use astream_broker::{ServedInfo, ServedReason, Tier};
@@ -751,6 +816,13 @@ mod tests {
         assert_eq!(Durability::Ordered.options().escalation, escalation());
         assert_eq!(Durability::Relaxed.options().escalation, escalation());
         assert!(Durability::Strict.options().escalation.is_empty());
+        for tier in [Durability::Strict, Durability::Ordered, Durability::Relaxed] {
+            assert_eq!(
+                tier.options().resident_budget,
+                resident_budget(),
+                "{tier:?}"
+            );
+        }
         let dir = scratch();
         let log = dir.path().join("bus.log");
         let opened = open(&log, None, Durability::Ordered, Some(test_boot(1))).unwrap();

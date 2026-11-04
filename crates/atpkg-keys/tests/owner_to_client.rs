@@ -20,8 +20,11 @@ const NOW: i64 = 1_785_801_600;
 
 /// A test's own directory, removed when the test ends, failed or not.
 fn scratch(label: &str) -> aterm_tempfile::TempDir {
+    let end = label.floor_char_boundary(24);
+    let prefix = format!("atpkg-o2c-{}-", &label[..end]);
     aterm_tempfile::Builder::new()
-        .prefix(&format!("atpkg-o2c-{label}-"))
+        .prefix(&prefix)
+        .suffix(".noindex")
         .tempdir()
         .unwrap()
 }

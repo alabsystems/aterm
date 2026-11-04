@@ -185,6 +185,7 @@ pub fn variant(ask: &super::Ask) -> String {
         (ask.person, "person"),
         (ask.later, "later"),
         (ask.standard_user, "standard"),
+        (ask.sudo_asks, "sudoasks"),
         (ask.no_clt, "noclt"),
         (ask.vanilla, "vanilla"),
     ]

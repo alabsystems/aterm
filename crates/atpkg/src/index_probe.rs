@@ -216,7 +216,8 @@ fn read_stamp(file: &mut File) -> Option<(u64, char, SystemTime)> {
     if metadata.len() > MAX_STAMP_BYTES {
         return None;
     }
-    let mut text = String::new();
+    let mut text =
+        String::with_capacity(usize::try_from(metadata.len().saturating_add(1)).unwrap_or(0));
     file.seek(std::io::SeekFrom::Start(0)).ok()?;
     file.take(MAX_STAMP_BYTES).read_to_string(&mut text).ok()?;
     let mut fields = text.split_ascii_whitespace();

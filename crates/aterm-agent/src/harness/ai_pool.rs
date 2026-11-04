@@ -346,7 +346,12 @@ pub(crate) fn read_bounded_bytes(path: &Path, max_bytes: u64) -> Option<Vec<u8>>
         return None;
     }
     let cap = usize::try_from(max_bytes).unwrap_or(usize::MAX);
-    let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(meta.len())
+            .unwrap_or(0)
+            .min(cap)
+            .saturating_add(1),
+    );
     file.take(max_bytes.saturating_add(1))
         .read_to_end(&mut bytes)
         .ok()?;

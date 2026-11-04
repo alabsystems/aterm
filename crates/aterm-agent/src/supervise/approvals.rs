@@ -323,6 +323,52 @@ impl SelfClaimRow<'_> {
     }
 }
 
+/// A FACT A PROVEN SELF-CLAIM'S ACT CARRIED (gap 23): aterm's own turn-end fact row
+/// (`fact-<kind>@v1`, `typed`, `command` the sentence, `reason`
+/// [`fact_outcome_reason`](super::occupancy::door::fact_outcome_reason) at the turn-end door),
+/// with the claim's holder ([`SELF_CLAIM_HOLDER`]) after it.
+/// [`seed_rows_in`](super::occupancy::door::seed_rows_in) seeds it told, [`is_fact_line`] keeps
+/// it out of every reader of acts, and `harness::stats` books it to its holder, never to aterm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelfClaimFactRow<'a> {
+    /// The claim's holder (`codex-alab@<pid>`).
+    pub holder: &'a str,
+    /// The fact its act carried, as it was offered.
+    pub fact: &'a super::facts::Fact,
+}
+
+impl SelfClaimFactRow<'_> {
+    /// The row as one JSON object, `ts` and `sid` given.
+    #[must_use]
+    pub fn to_json(&self, ts: i64, sid: Option<&str>) -> String {
+        use super::occupancy::door::{FactDoor, Told, fact_outcome_reason};
+        let reason = fact_outcome_reason(self.fact.key, FactDoor::TurnEnd, Told::Typed);
+        let row = Row {
+            rule_id: self.fact.key.kind.rule(),
+            outcome: Outcome::Typed,
+            command: &self.fact.text,
+            reason: &reason,
+            box_seq: 0,
+        }
+        .to_json(ts, sid);
+        let head = row.strip_suffix('}').unwrap_or(&row);
+        format!("{head},\"{SELF_CLAIM_HOLDER}\":{}}}", json_str(self.holder))
+    }
+
+    /// The holder and the rule of a ledger line `v` that is a self-claim's fact row: a `typed`
+    /// row of a fact kind's rule that names a holder.
+    #[must_use]
+    pub fn of(v: &aterm_json::Value) -> Option<(&str, &str)> {
+        let text = |k: &str| v.get(k).and_then(aterm_json::Value::as_str);
+        let rule = text("rule_id")?;
+        super::facts::FactKind::of_rule(rule)?;
+        if text("decision")? != Outcome::Typed.word() {
+            return None;
+        }
+        Some((text(SELF_CLAIM_HOLDER)?, rule))
+    }
+}
+
 #[must_use]
 pub fn last_act_count_in(body: &str, sid: Option<&str>) -> Option<(i64, Option<SleepStamp>)> {
     let last = *typed_at_in(body, sid).last()?;
@@ -441,6 +487,36 @@ pub fn book_self_claim(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     Ledger::open(Some(path), sid, warn).write_self_claim(t_ms, row, warn)
+}
+
+/// BOOK A FACT A PROVEN SELF-CLAIM'S ACT CARRIED ([`SelfClaimFactRow`]) in session `sid`'s
+/// ledger at `path`, stamped `t_ms`, as [`book_self_claim`] books its act: through
+/// [`Ledger::write_self_claim_fact`] under the lock the ledger's cut holds ([`ledger_stripe`]).
+/// The line, or `None` where nothing was written (why in `warn`).
+pub fn book_self_claim_fact(
+    path: &Path,
+    sid: Option<&str>,
+    t_ms: i64,
+    row: &SelfClaimFactRow<'_>,
+    warn: &mut dyn Write,
+) -> Option<String> {
+    let ledger_cut = ledger_stripe(path);
+    let _held = ledger_cut
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Ledger::open(Some(path), sid, warn).write_self_claim_fact(t_ms, row, warn)
+}
+
+/// The text of the session ledger at `path` for a reader beside the loop (a proven self-claim's
+/// facts account seeds from it once): `Ok(None)` where none stands; an error where one stands
+/// that is no regular file, is not UTF-8 or is longer than [`HELD_BYTES`], so its reader seeds
+/// nothing rather than reading part of it as all of it.
+///
+/// # Errors
+///
+/// The file could not be opened or read, or is one of the above.
+pub fn read_ledger_text(path: &Path) -> std::io::Result<Option<String>> {
+    crate::harness::accounts::read_bounded(path, HELD_BYTES as u64)
 }
 
 fn cut_rows(
@@ -988,6 +1064,21 @@ impl Ledger {
         &mut self,
         t_ms: i64,
         row: &SelfClaimRow<'_>,
+        warn: &mut dyn Write,
+    ) -> Option<String> {
+        if !self.journal.is_on() {
+            return None;
+        }
+        let line = row.to_json(t_ms, self.sid.as_deref());
+        self.journal.append_raw(&line, warn).then_some(line)
+    }
+
+    /// Append a fact a proven self-claim's act carried ([`SelfClaimFactRow`]) stamped `t_ms`,
+    /// through the one append the loop's own rows take.
+    pub fn write_self_claim_fact(
+        &mut self,
+        t_ms: i64,
+        row: &SelfClaimFactRow<'_>,
         warn: &mut dyn Write,
     ) -> Option<String> {
         if !self.journal.is_on() {

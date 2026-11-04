@@ -180,7 +180,14 @@ fn case(custody: i64, seen: i64, kind: i64, prior: bool, legacy: bool) -> [(&'st
     let home = host.home.borrow().clone().unwrap();
     let after_logins = store.load_logins(host.now).unwrap().0;
     if !published {
-        assert_eq!(after_logins, before_logins, "{err}");
+        let admitted = accounts::Logins::from_json(
+            std::str::from_utf8(host.before.borrow().as_ref().unwrap()[2].as_ref().unwrap())
+                .unwrap(),
+            host.now,
+        )
+        .unwrap();
+        assert_eq!(admitted.labels, before_logins.labels, "{err}");
+        assert_eq!(after_logins, admitted, "{err}");
     }
     let path = if kind == 0 {
         host.root.join("retained-profile.json")

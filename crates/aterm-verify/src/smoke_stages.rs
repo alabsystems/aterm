@@ -108,14 +108,21 @@ struct Sandbox {
     tmp: PathBuf,
     rundir: PathBuf,
     cfgdir: PathBuf,
+    /// The scratch world's marker value ([`aterm_types::world::state_home`] of its HOME).
+    state: PathBuf,
     gui_log: PathBuf,
     child: Option<SmokeChild>,
 }
 
 impl Sandbox {
+    /// A scratch world whose `aterm.toml` is `extra`, the smoke's root keys and a scratch world's
+    /// lanes off ([`aterm_types::world::LANES_OFF`]): the handed bundle's window would otherwise
+    /// browse the local network (macOS's consent prompt on the desk), submit that bundle's keeper
+    /// job into the login's launchd domain, and run its update and package lanes.
     fn with_config(tag: &str, extra: &str) -> Option<Self> {
         let tmp = crate::mktemp_dir(tag).ok()?;
         std::fs::create_dir(tmp.join("home")).ok()?;
+        let state = aterm_types::world::state_home(&tmp.join("home"))?;
         let rundir = tmp.join("run");
         std::fs::create_dir_all(rundir.join("aterm")).ok()?;
         chmod_700(&rundir)?;
@@ -126,10 +133,8 @@ impl Sandbox {
         std::fs::write(
             cfgdir.join("aterm/aterm.toml"),
             format!(
-                "{extra}agents_auto_prime = false\nbell_sound = false\n\
-                 [update]\nenabled = false\nauto_apply = false\n\
-                 [packages]\nenabled = false\n\
-                 [machine]\nuniversal_control = \"leave\"\n"
+                "{extra}agents_auto_prime = false\nbell_sound = false\n{}",
+                aterm_types::world::LANES_OFF
             ),
         )
         .ok()?;
@@ -138,6 +143,7 @@ impl Sandbox {
             tmp,
             rundir,
             cfgdir,
+            state,
             gui_log,
             child: None,
         })
@@ -145,6 +151,24 @@ impl Sandbox {
 
     fn sock(&self) -> PathBuf {
         self.rundir.join("aterm/aterm.sock")
+    }
+
+    /// The command that starts the bundle's window `gui` in this world: the run's own
+    /// environment without its `ATERM_*` variables ([`gui_env`]), then this world's HOME, folders
+    /// and marker ([`aterm_types::world::MARKER`], set after the strip so it is the world's), and
+    /// its control socket.
+    fn gui_command(&self, ctx: &Ctx, gui: &Path) -> Command {
+        let mut cmd = Command::new(gui);
+        gui_env(ctx, &mut cmd);
+        cmd.current_dir(&ctx.root)
+            .env("PATH", &ctx.path_env)
+            .env("HOME", self.tmp.join("home"))
+            .env("XDG_RUNTIME_DIR", &self.rundir)
+            .env("XDG_CONFIG_HOME", &self.cfgdir)
+            .env("SHELL", "/bin/sh")
+            .env(aterm_types::world::MARKER, &self.state);
+        cmd.arg("--control-sock").arg(self.sock());
+        cmd
     }
 
     /// End the instance with its group ([`SmokeChild::retire`]); `groups` sweeps the group
@@ -208,17 +232,8 @@ fn bring_up(ctx: &Ctx, r: &mut Report, sb: &mut Sandbox, bundle: &crate::Measure
             return Ready::Stopped;
         }
     };
-    let mut cmd = Command::new(&gui);
-    gui_env(ctx, &mut cmd);
-    cmd.current_dir(&ctx.root)
-        .env("PATH", &ctx.path_env)
-        .env("HOME", sb.tmp.join("home"))
-        .env("XDG_RUNTIME_DIR", &sb.rundir)
-        .env("XDG_CONFIG_HOME", &sb.cfgdir)
-        .env("SHELL", "/bin/sh")
-        .stdout(log)
-        .stderr(log2);
-    cmd.arg("--control-sock").arg(sb.sock());
+    let mut cmd = sb.gui_command(ctx, &gui);
+    cmd.stdout(log).stderr(log2);
     let groups = ctx.exec_env().stage_groups;
     let made = |pgid| {
         if let Some(groups) = groups {
@@ -984,7 +999,7 @@ pub fn hardware_key_verdict(posted: u64, summary: &str, reply: &str) -> Result<S
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::EnvSnapshot;
     use crate::scope::Scope;
@@ -1486,11 +1501,52 @@ mod tests {
             Some(false),
             "{toml}"
         );
+        assert_eq!(
+            lanes_left_on(&doc),
+            Vec::<String>::new(),
+            "the bundle's window starts no lane of the login's account: {toml}"
+        );
 
         let mut r = Report::new("t");
         sb.teardown(&mut r, None);
         assert!(!sb.tmp.exists(), "the sandbox removes itself");
         assert_eq!(r.outcomes().count(), 0, "a clean teardown says nothing");
+    }
+
+    /// Each entry of [`aterm_types::world::LANES_OFF`] that `doc` does not hold with the same
+    /// value, as `table.key`.
+    pub(crate) fn lanes_left_on(doc: &aterm_toml::Value) -> Vec<String> {
+        let off = aterm_toml::from_str::<aterm_toml::Value>(aterm_types::world::LANES_OFF)
+            .expect("the lanes-off tables are one document");
+        let mut on = Vec::new();
+        for (table, keys) in off.as_table().expect("a document is a table") {
+            for (key, value) in keys.as_table().expect("each entry is a table") {
+                if doc.get(table).and_then(|held| held.get(key)) != Some(value) {
+                    on.push(format!("{table}.{key}"));
+                }
+            }
+        }
+        on
+    }
+
+    /// The handed bundle is a release build: its window reads no development seam, so the
+    /// converge runner's window lane stays off only for the scratch world's marker, and the
+    /// `_alab._tcp` browse for the marker and the world's `[swarm]` table both. The strip of the
+    /// run's own `ATERM_*` variables would otherwise leave the marker out. The window's command
+    /// carries it at the state folder under the world's HOME.
+    #[test]
+    fn the_smoke_window_carries_the_scratch_worlds_marker() {
+        let ctx = ctx();
+        let mut sb = Sandbox::with_config("atl", SMOKE_CONFIG).expect("sandbox");
+        let cmd = sb.gui_command(&ctx, Path::new("/bin/true"));
+        let marker = cmd
+            .get_envs()
+            .find(|(name, _)| name.to_str() == Some(aterm_types::world::MARKER))
+            .and_then(|(_, value)| value.map(std::ffi::OsStr::to_owned));
+        let state = aterm_types::world::state_home(&sb.tmp.join("home")).expect("a state folder");
+        assert_eq!(marker, Some(state.into_os_string()), "{cmd:?}");
+        let mut r = Report::new("t");
+        sb.teardown(&mut r, None);
     }
 
     #[test]

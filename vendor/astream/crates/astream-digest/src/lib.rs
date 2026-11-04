@@ -509,25 +509,56 @@ const fn sha256_ring_word(w: &mut [u32; 16], t: usize) -> u32 {
 /// The tests hold it to the form it replaced, kept beside them as
 /// `compress_reference`, over random states and blocks, and through every digest the crate's
 /// vectors and length sweeps pin.
+const fn schedule_q0(block: &[u8; BLOCK_LEN]) -> [u32; 4] {
+    [
+        load_be_u32(&[block[0], block[1], block[2], block[3]]),
+        load_be_u32(&[block[4], block[5], block[6], block[7]]),
+        load_be_u32(&[block[8], block[9], block[10], block[11]]),
+        load_be_u32(&[block[12], block[13], block[14], block[15]]),
+    ]
+}
+
+const fn schedule_q1(block: &[u8; BLOCK_LEN]) -> [u32; 4] {
+    [
+        load_be_u32(&[block[16], block[17], block[18], block[19]]),
+        load_be_u32(&[block[20], block[21], block[22], block[23]]),
+        load_be_u32(&[block[24], block[25], block[26], block[27]]),
+        load_be_u32(&[block[28], block[29], block[30], block[31]]),
+    ]
+}
+
+const fn schedule_q2(block: &[u8; BLOCK_LEN]) -> [u32; 4] {
+    [
+        load_be_u32(&[block[32], block[33], block[34], block[35]]),
+        load_be_u32(&[block[36], block[37], block[38], block[39]]),
+        load_be_u32(&[block[40], block[41], block[42], block[43]]),
+        load_be_u32(&[block[44], block[45], block[46], block[47]]),
+    ]
+}
+
+const fn schedule_q3(block: &[u8; BLOCK_LEN]) -> [u32; 4] {
+    [
+        load_be_u32(&[block[48], block[49], block[50], block[51]]),
+        load_be_u32(&[block[52], block[53], block[54], block[55]]),
+        load_be_u32(&[block[56], block[57], block[58], block[59]]),
+        load_be_u32(&[block[60], block[61], block[62], block[63]]),
+    ]
+}
+
+const fn load_schedule_16(block: &[u8; BLOCK_LEN]) -> [u32; 16] {
+    let q0 = schedule_q0(block);
+    let q1 = schedule_q1(block);
+    let q2 = schedule_q2(block);
+    let q3 = schedule_q3(block);
+    [
+        q0[0], q0[1], q0[2], q0[3], q1[0], q1[1], q1[2], q1[3], q2[0], q2[1], q2[2], q2[3], q3[0],
+        q3[1], q3[2], q3[3],
+    ]
+}
+
 const fn compress(state: &mut [u32; 8], block: &[u8; BLOCK_LEN]) {
     // 1. The first sixteen words of the message schedule W: the block, big-endian.
-    let mut w = [0u32; 16];
-    w[0] = load_be_u32(&[block[0], block[1], block[2], block[3]]);
-    w[1] = load_be_u32(&[block[4], block[5], block[6], block[7]]);
-    w[2] = load_be_u32(&[block[8], block[9], block[10], block[11]]);
-    w[3] = load_be_u32(&[block[12], block[13], block[14], block[15]]);
-    w[4] = load_be_u32(&[block[16], block[17], block[18], block[19]]);
-    w[5] = load_be_u32(&[block[20], block[21], block[22], block[23]]);
-    w[6] = load_be_u32(&[block[24], block[25], block[26], block[27]]);
-    w[7] = load_be_u32(&[block[28], block[29], block[30], block[31]]);
-    w[8] = load_be_u32(&[block[32], block[33], block[34], block[35]]);
-    w[9] = load_be_u32(&[block[36], block[37], block[38], block[39]]);
-    w[10] = load_be_u32(&[block[40], block[41], block[42], block[43]]);
-    w[11] = load_be_u32(&[block[44], block[45], block[46], block[47]]);
-    w[12] = load_be_u32(&[block[48], block[49], block[50], block[51]]);
-    w[13] = load_be_u32(&[block[52], block[53], block[54], block[55]]);
-    w[14] = load_be_u32(&[block[56], block[57], block[58], block[59]]);
-    w[15] = load_be_u32(&[block[60], block[61], block[62], block[63]]);
+    let mut w = load_schedule_16(block);
 
     // 2. Initialise the working variables with the current hash value.
     let mut v = *state;

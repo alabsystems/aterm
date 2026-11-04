@@ -465,6 +465,8 @@ struct AgentRun {
     who: aterm_phase::Program,
     by_screen: bool,
     tracker: TurnTracker,
+    /// Its harness turns' pairing between reads (a codex run's, gap 25).
+    pairs: transcript::HarnessPairs,
 }
 
 /// HOW LONG AN END aterm ASKED FOR STANDS ([`SessionLog::ask_end`]): the restart act's deadline
@@ -939,12 +941,19 @@ impl SessionLog {
         self.clock = clock;
     }
 
-    /// The instant the turn tracker wants [`Self::tick`] at (monotonic ms), if a settle is pending.
+    /// The instant the agent run wants [`Self::tick`] at (monotonic ms): the turn tracker's, if a
+    /// settle is pending, or its pair wake's, if the clock alone settles a harness turn still
+    /// waiting for its act ([`Self::harness_pair`]), the sooner.
     pub(crate) fn wake(&self) -> Option<u64> {
         self.agent
             .as_ref()
             .filter(|a| self.log.is_open(a.node))
-            .and_then(|a| a.tracker.wake_at())
+            .and_then(|a| {
+                [a.tracker.wake_at(), a.pairs.wake]
+                    .into_iter()
+                    .flatten()
+                    .min()
+            })
     }
 
     fn resync(&mut self) {
@@ -1153,6 +1162,7 @@ impl SessionLog {
         let close = Close::new(Out::Session(out), Src::Aterm, Conf::Exact)
             .by(by)
             .fields(f);
+        self.harness_last(Node::SESSION, at);
         let _ = self.log.close_session(close, at);
         self.cmd = None;
         self.fg = None;
@@ -1526,6 +1536,7 @@ impl SessionLog {
         at: Stamp,
     ) -> Result<u64, aterm_slog::Refused> {
         self.settle_program(node, at);
+        self.harness_last(node, at);
         self.log.close(node, close, at)
     }
 
@@ -1902,6 +1913,7 @@ impl SessionLog {
                 return;
             }
             if self.agent.as_ref().is_some_and(|a| a.node == fg.node) {
+                self.harness_last(fg.node, at);
                 self.agent = None;
             }
             if program.is_some() {
@@ -1972,6 +1984,7 @@ impl SessionLog {
                 who,
                 by_screen: false,
                 tracker,
+                pairs: transcript::HarnessPairs::default(),
             });
             self.note_agent_cmd(node);
         }
@@ -2022,6 +2035,9 @@ impl SessionLog {
     /// The agent run ends at `at`, its command's end `cmd` when it held the front until then
     /// ([`Self::run_end`]).
     fn close_agent(&mut self, cmd: Option<CmdEnd>, at: Stamp) {
+        if let Some(node) = self.agent.as_ref().map(|a| a.node) {
+            self.harness_last(node, at);
+        }
         if let Some(a) = self.agent.take() {
             // The named agent's run is the front run: closing it is the
             // front run's to do (`foreground_moved`).
@@ -2074,6 +2090,7 @@ impl SessionLog {
                     who: reader,
                     by_screen: true,
                     tracker: TurnTracker::new(node),
+                    pairs: transcript::HarnessPairs::default(),
                 });
                 self.note_agent_cmd(node);
             }
@@ -2234,12 +2251,28 @@ impl SessionLog {
             .and_then(|a| a.tracker.ctl_turn_caused(log, by, ledger, cause, at))
     }
 
-    /// The host's settle wake: a resting word that has held closes its turn.
+    /// The host's settle wake: a resting word that has held closes its turn, and at its pair wake a
+    /// codex run's waiting harness turns are paired again ([`Self::harness_pair`]); the next
+    /// wake, either's still to come.
     pub(crate) fn tick(&mut self, at: Stamp) -> Option<u64> {
         self.reconcile_person(at);
         self.resync();
+        if self
+            .agent
+            .as_ref()
+            .and_then(|a| a.pairs.wake)
+            .is_some_and(|w| w <= at.mono_ms)
+        {
+            self.harness_pair(None, at);
+        }
         let Self { log, agent, .. } = self;
-        agent.as_mut().and_then(|a| a.tracker.tick(log, at))
+        agent.as_mut().and_then(|a| {
+            let settle = a.tracker.tick(log, at);
+            [settle, a.pairs.wake.filter(|w| *w > at.mono_ms)]
+                .into_iter()
+                .flatten()
+                .min()
+        })
     }
 
     /// What the handoff manifest carries: the epoch and the node-id counters plus [`LOG_ID_RESERVE`], remembered as this process's ceiling.
@@ -2551,35 +2584,42 @@ impl crate::App {
         }
     }
 
-    /// `Wake::SessionLogMoved`: the footer thread or the render path moved session `id`'s log (phase 3B), and its watchers were rung where the move took the log's owed wake.
+    /// `Wake::SessionLogMoved`: the footer thread, a rollout read or the render path moved session `id`'s log (phase 3B), and its watchers were rung where the move took the log's owed wake. Its settle wake is noted, and its harness pairing's read wait handed to the rollout tap's ask ([`crate::session_status::StatusObserver::note_pair_wait`]).
     pub(crate) fn on_session_log_moved(&mut self, id: u64) {
         let Some(s) = self.pool.get(id) else {
             return;
         };
-        let wake = s
-            .ctx
-            .timeline
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .slog_wake();
+        let (wake, wait) = {
+            let timeline = s.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+            (timeline.slog_wake(), timeline.slog().harness_wait())
+        };
         self.session_status.slog_wakes.note(id, wake);
+        self.session_status
+            .note_pair_wait(id, wait.map(|(wait, ms)| (wait, log_instant(ms))));
         self.follow_clause(id);
     }
 
-    /// THE SESSION LOG's settle ticks: each session whose turn tracker's wake is due is ticked under its timeline's leaf lock (the lock the sweep takes on this thread), and its next wake replaces the entry.
+    /// THE SESSION LOG's settle ticks: each session whose turn tracker's wake is due is ticked under its timeline's leaf lock (the lock the sweep takes on this thread), its next wake replaces the entry, and its harness pairing's read wait as the tick left it goes to the rollout tap's ask ([`crate::session_status::StatusObserver::note_pair_wait`]).
     pub(crate) fn tick_session_logs(&mut self) {
         if self.session_status.slog_wakes.is_empty() {
             return;
         }
         let now = crate::turn_ledger::now_ms();
         for id in self.session_status.slog_wakes.due(now) {
-            let (wake, owed) = self.pool.get(id).map_or((None, false), |s| {
+            let (wake, owed, wait) = self.pool.get(id).map_or((None, false, None), |s| {
                 let mut timeline = s.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
-                (timeline.slog_tick(), timeline.slog_take_wake())
+                let wake = timeline.slog_tick();
+                (
+                    wake,
+                    timeline.slog_take_wake(),
+                    timeline.slog().harness_wait(),
+                )
             });
             self.session_status
                 .slog_wakes
                 .note(id, wake.filter(|w| *w > now));
+            self.session_status
+                .note_pair_wait(id, wait.map(|(wait, ms)| (wait, log_instant(ms))));
             if owed {
                 self.follow_clause(id);
             }
@@ -2588,10 +2628,15 @@ impl crate::App {
 
     /// The soonest settle tick owed, as an instant for the loop's deadline fold (`DeadlineOwner::SessionLog`), or `None` while no turn rests.
     pub(crate) fn next_session_log_wake(&self) -> Option<std::time::Instant> {
-        let wake = self.session_status.slog_wakes.next()?;
-        let now = crate::turn_ledger::now_ms();
-        Some(std::time::Instant::now() + std::time::Duration::from_millis(wake.saturating_sub(now)))
+        Some(log_instant(self.session_status.slog_wakes.next()?))
     }
+}
+
+/// The instant the log's monotonic `ms` ([`crate::turn_ledger::now_ms`]'s clock) falls at, or now
+/// once it passed.
+fn log_instant(ms: u64) -> std::time::Instant {
+    let now = crate::turn_ledger::now_ms();
+    std::time::Instant::now() + std::time::Duration::from_millis(ms.saturating_sub(now))
 }
 
 /// The `log` verb's usage line.

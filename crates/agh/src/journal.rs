@@ -815,7 +815,7 @@ impl Journal {
         if len > JOURNAL_MAX {
             return Err(self.full(len));
         }
-        let mut bytes = Vec::new();
+        let mut bytes = Vec::with_capacity(usize::try_from(len.saturating_add(1)).unwrap_or(0));
         (&file)
             .take(JOURNAL_MAX + 1)
             .read_to_end(&mut bytes)

@@ -8,8 +8,9 @@
 //! a process projects once; after that a background thread reads the registry's log and its
 //! inventory every five minutes and projects again only when the inventory moved
 //! (`LabRead::Unchanged`), while every caller gets the held projection at once. Once a projection
-//! names this Mac, an owner-private `named` file beside `settled` records it; while a failed read
-//! then leaves no projection held, the source is `pending` (the harness reads no sheet meanwhile)
+//! names this Mac, an owner-private `named` file beside `settled` records it; while a failed read,
+//! or one that finds this Mac's history of the registry partial, then leaves no projection held,
+//! the source is `pending` (the harness reads no sheet meanwhile)
 //! and a caller looks again after 15 seconds. Only syncs, the accounts list and the mail routes ask, never a typing
 //! path, so typing never waits on it. `[alab] roster = false` in `aterm.toml` turns the source
 //! off on this Mac. A test, a debug build and a build tool's run hold no lab (inert, as the other
@@ -49,12 +50,20 @@ const LOOK_EVERY: Duration = Duration::from_secs(300);
 const RETRY_FAILED: Duration = Duration::from_secs(15);
 
 /// Whether this process may hold a lab: a release build outside a build tool's tests, with no
-/// scratch state root.
+/// scratch state root and no CI. The lab's roster source here, [`crate::alab_mailbox`],
+/// [`crate::alab_register`] and [`crate::alab_seen`] hold on this answer; the journal sink
+/// (`crate::alab_journal`) does not ask it.
 pub(crate) fn holds() -> bool {
-    !cfg!(debug_assertions)
-        && std::env::var_os("CARGO_MANIFEST_DIR").is_none()
-        && std::env::var_os("ATERM_STATE_HOME").is_none()
-        && std::env::var_os("CI").is_none()
+    lab_hooks_on(!cfg!(debug_assertions), |key| std::env::var_os(key))
+}
+
+/// [`holds`] for a build (`release`) and an environment (`var`) passed in, so a test reaches a
+/// shipped build's answer.
+fn lab_hooks_on(release: bool, var: impl Fn(&str) -> Option<std::ffi::OsString>) -> bool {
+    release
+        && var("CARGO_MANIFEST_DIR").is_none()
+        && var("ATERM_STATE_HOME").is_none()
+        && var("CI").is_none()
 }
 
 /// Whether `aterm.toml` at `config` turns the roster source off (`[alab] roster = false`).
@@ -123,16 +132,14 @@ pub(crate) fn round(paths: &Paths, report: &aterm_db::runtime::RepairRound) {
     }
     // Only the round's completion gate admits a witness: a cancelled, interrupted, deferred or
     // failed round, or one whose witness names another peer, table or inventory, settles nothing.
-    let Some(witness) = report
-        .matching_inventory()
-        .filter(|witness| witness.inventory().count > 0)
-    else {
+    let Some(table) = witness_table(
+        report
+            .matching_inventory()
+            .map(|witness| (witness.inventory().count, witness.scope().digest())),
+        || Registry::at(paths.clone()).table().ok().flatten(),
+    ) else {
         return;
     };
-    let table = witness.scope().digest();
-    if Registry::at(paths.clone()).table().ok().flatten() != Some(table) {
-        return;
-    }
     let Some(dir) = settled_dir() else {
         return;
     };
@@ -147,6 +154,17 @@ pub(crate) fn round(paths: &Paths, report: &aterm_db::runtime::RepairRound) {
             Some(0o600),
         );
     }
+}
+
+/// The registry table a completed round's witness (`witness`: the operations it counts and its
+/// table) settles: its table where it counts at least one operation and the registry holds that
+/// table now (`held`, read only where there is such a witness), else none.
+fn witness_table(
+    witness: Option<(usize, [u8; 32])>,
+    held: impl FnOnce() -> Option<[u8; 32]>,
+) -> Option<[u8; 32]> {
+    let (_, table) = witness.filter(|(count, _)| *count > 0)?;
+    (held() == Some(table)).then_some(table)
 }
 
 /// Each mailbox key this Mac can name the login of, to that login lower-cased: a login of
@@ -271,8 +289,70 @@ struct Held {
     placed: BTreeMap<String, String>,
     inventory: Option<Inventory>,
     looked: Option<Instant>,
-    /// The last read failed, no projection is held, and a projection named this Mac before.
+    /// The last read failed or found this Mac's history of the registry partial, no projection
+    /// is held, and a projection named this Mac before.
     failed: bool,
+}
+
+/// One look's change to what is held, from what it `read` (a failed read as its error's words),
+/// this Mac's `settled` witness and mailbox `logins`, and whether a projection named this Mac
+/// before (`named`, read only where a failed or partial read leaves nothing held), at `now`.
+/// Returns whether the read's projection names this Mac, which the caller records
+/// ([`note_named`]).
+fn look(
+    held: &mut Held,
+    read: Result<Option<LabRead>, String>,
+    settled: bool,
+    logins: &BTreeMap<String, String>,
+    named: impl FnOnce() -> bool,
+    now: Instant,
+) -> bool {
+    held.looked = Some(now);
+    // A failed read, and one that finds this Mac's history of the registry partial, says nothing
+    // of the lab: what was held stays, and with nothing held a Mac the lab named is pending, so
+    // the sheet path never labels a row after a machine the lab names meanwhile.
+    held.failed =
+        matches!(read, Err(_) | Ok(Some(LabRead::Partial))) && held.lab.is_none() && named();
+    match read {
+        Ok(Some(LabRead::Projected(view, inventory))) => {
+            held.inventory = Some(inventory);
+            held.placed = view.mailboxes();
+            held.lab = Some(Arc::new(harness_lab(&view, settled, logins)));
+            view.my_label().is_some()
+        }
+        Ok(Some(LabRead::Unchanged)) => {
+            let mailboxes = named_mailboxes(&held.placed, logins);
+            if let Some(lab) = held
+                .lab
+                .as_mut()
+                .filter(|lab| lab.settled != settled || lab.mailboxes != mailboxes)
+            {
+                let lab = Arc::make_mut(lab);
+                lab.settled = settled;
+                lab.mailboxes = mailboxes;
+            }
+            false
+        }
+        Ok(None) => {
+            held.inventory = None;
+            held.placed.clear();
+            held.lab = None;
+            false
+        }
+        // A partial history keeps what was held; the next look reads again.
+        Ok(Some(LabRead::Partial)) => false,
+        // A failed read keeps what was held; the next look reads again.
+        Err(why) => {
+            aterm_log::debug!("lab view: {why}");
+            false
+        }
+    }
+}
+
+/// Whether a caller looks at the registry at `now`: at the first look, and once [`RETRY_FAILED`]
+/// passed since one that left the source pending (`failed`); the refresher looks otherwise.
+fn due(looked: Option<Instant>, failed: bool, now: Instant) -> bool {
+    looked.is_none_or(|at| failed && now.saturating_duration_since(at) >= RETRY_FAILED)
 }
 
 struct Cache {
@@ -295,7 +375,9 @@ impl Cache {
         let read = if turned_off(&self.config) {
             Ok(None)
         } else {
-            registry.lab(&self.config, was)
+            registry
+                .lab(&self.config, was)
+                .map_err(|why| why.to_string())
         };
         let settled = settled(&registry);
         let logins = mailbox_names(&self.paths);
@@ -303,39 +385,11 @@ impl Cache {
             .held
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        held.looked = Some(Instant::now());
-        held.failed =
-            read.is_err() && held.lab.is_none() && settled_dir().is_some_and(|dir| named_in(&dir));
-        match read {
-            Ok(Some(LabRead::Projected(view, inventory))) => {
-                if view.my_label().is_some()
-                    && let Some(dir) = settled_dir()
-                {
-                    note_named(&dir);
-                }
-                held.inventory = Some(inventory);
-                held.placed = view.mailboxes();
-                held.lab = Some(Arc::new(harness_lab(&view, settled, &logins)));
-            }
-            Ok(Some(LabRead::Unchanged)) => {
-                let mailboxes = named_mailboxes(&held.placed, &logins);
-                if let Some(lab) = held
-                    .lab
-                    .as_mut()
-                    .filter(|lab| lab.settled != settled || lab.mailboxes != mailboxes)
-                {
-                    let lab = Arc::make_mut(lab);
-                    lab.settled = settled;
-                    lab.mailboxes = mailboxes;
-                }
-            }
-            Ok(None) => {
-                held.inventory = None;
-                held.placed.clear();
-                held.lab = None;
-            }
-            // A failed read keeps what was held; the next look reads again.
-            Err(why) => aterm_log::debug!("lab view: {why}"),
+        let named = || settled_dir().is_some_and(|dir| named_in(&dir));
+        if look(&mut held, read, settled, &logins, named, Instant::now())
+            && let Some(dir) = settled_dir()
+        {
+            note_named(&dir);
         }
     }
 
@@ -355,17 +409,14 @@ impl Cache {
 
 impl alab_roster::Source for &'static Cache {
     fn lab(&self) -> Option<Arc<Lab>> {
-        let (first, retry) = {
+        let due = {
             let held = self
                 .held
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            (
-                held.looked.is_none(),
-                held.failed && held.looked.is_some_and(|at| at.elapsed() >= RETRY_FAILED),
-            )
+            due(held.looked, held.failed, Instant::now())
         };
-        if first || retry {
+        if due {
             self.refresh();
             self.start_refresher();
         }
@@ -449,6 +500,219 @@ mod tests {
     #[test]
     fn a_test_holds_no_lab() {
         assert!(!holds());
+    }
+
+    fn nothing_held() -> Held {
+        Held {
+            lab: None,
+            placed: BTreeMap::new(),
+            inventory: None,
+            looked: None,
+            failed: false,
+        }
+    }
+
+    /// A projection whose facts row binds this Mac to a machine labelled `label` (`None`: the
+    /// label is conflicted).
+    fn naming(label: Option<&str>) -> LabRead {
+        let mut view = LabView::default();
+        view.me = Some("pk-me".into());
+        view.machines.insert(
+            "pk-me".into(),
+            aterm_db::alab::view::Machine {
+                pk: "pk-me".into(),
+                label: label.map(str::to_owned),
+                aliases: Vec::new(),
+                live: true,
+            },
+        );
+        LabRead::Projected(Box::new(view), Inventory([7; 32]))
+    }
+
+    /// What a look holds. A failed read and a partial history keep the held lab, and with none
+    /// held are pending only on a Mac the lab named; a projection is held and says whether it
+    /// names this Mac; an unchanged read brings the held lab's witness up to date; no lab clears
+    /// what was held. Whether the lab named this Mac is read only where it decides.
+    /// NEGATIVE CONTROL: with a partial history read as no lab, `` a partial history: a Mac the
+    /// lab named is pending `` fails; with `named` dropped from `failed`, `` a failed read: a Mac
+    /// the lab never named reads the sheet `` fails.
+    #[test]
+    fn a_look_keeps_the_lab_through_an_unread_history_and_pends_only_where_the_lab_named_this_mac()
+    {
+        let logins = BTreeMap::new();
+        let now = Instant::now();
+        let unasked =
+            || -> bool { panic!("`named` is read only where a look leaves nothing held") };
+        let failed = || Err::<Option<LabRead>, String>("custody unreadable".into());
+        for (read, what) in [
+            (failed(), "a failed read"),
+            (Ok(Some(LabRead::Partial)), "a partial history"),
+        ] {
+            let mut held = nothing_held();
+            assert!(!look(
+                &mut held,
+                read.clone(),
+                false,
+                &logins,
+                || false,
+                now
+            ));
+            assert!(
+                !held.failed,
+                "{what}: a Mac the lab never named reads the sheet"
+            );
+            let mut held = nothing_held();
+            assert!(!look(&mut held, read, false, &logins, || true, now));
+            assert!(held.failed, "{what}: a Mac the lab named is pending");
+            assert!(held.lab.is_none(), "{what}");
+            assert_eq!(held.looked, Some(now), "{what}");
+        }
+
+        let mut held = nothing_held();
+        assert!(
+            look(
+                &mut held,
+                Ok(Some(naming(Some("m3")))),
+                false,
+                &logins,
+                unasked,
+                now
+            ),
+            "a projection that names this Mac"
+        );
+        let lab = held.lab.clone().expect("the projection is held");
+        assert_eq!(lab.me.as_deref(), Some("m3"));
+        assert!(!lab.settled && !held.failed);
+        assert_eq!(held.inventory, Some(Inventory([7; 32])));
+        for (read, what) in [
+            (Ok(Some(LabRead::Partial)), "a partial history"),
+            (failed(), "a failed read"),
+        ] {
+            assert!(!look(&mut held, read, false, &logins, unasked, now));
+            assert!(
+                held.lab
+                    .as_ref()
+                    .is_some_and(|kept| Arc::ptr_eq(kept, &lab)),
+                "{what} keeps the lab"
+            );
+            assert!(!held.failed, "{what}: a held lab is not pending");
+            assert_eq!(held.inventory, Some(Inventory([7; 32])), "{what}");
+        }
+        assert!(!look(
+            &mut held,
+            Ok(Some(LabRead::Unchanged)),
+            true,
+            &logins,
+            unasked,
+            now
+        ));
+        assert!(
+            held.lab.as_ref().is_some_and(|lab| lab.settled),
+            "an unchanged read brings the held lab's witness up to date"
+        );
+        assert!(!look(&mut held, Ok(None), true, &logins, unasked, now));
+        assert!(
+            held.lab.is_none() && held.inventory.is_none() && held.placed.is_empty(),
+            "no lab clears what was held"
+        );
+        assert!(
+            !look(
+                &mut nothing_held(),
+                Ok(Some(naming(None))),
+                false,
+                &logins,
+                unasked,
+                now
+            ),
+            "a projection whose label for this Mac is conflicted does not name it"
+        );
+    }
+
+    /// A caller looks at the first look and, while a failed look left the source pending, again
+    /// once 15 seconds passed; otherwise the refresher looks.
+    /// NEGATIVE CONTROL: with `failed` ignored, `` the refresher looks while a lab is held ``
+    /// fails; with `>` for `>=`, `` 15 s after a pending look `` fails.
+    #[test]
+    fn a_caller_looks_first_and_again_only_15_s_after_a_pending_look() {
+        let at = Instant::now();
+        let after = |secs| at + Duration::from_secs(secs);
+        assert!(
+            !due(Some(at), false, after(3600)),
+            "the refresher looks while a lab is held"
+        );
+        assert!(due(None, false, at), "the first look");
+        assert!(due(None, true, at), "the first look");
+        assert!(!due(Some(at), true, after(14)), "14 s after a pending look");
+        assert!(due(Some(at), true, after(15)), "15 s after a pending look");
+        assert!(!due(Some(after(1)), true, at), "a look stamped after now");
+    }
+
+    /// A completed round settles a table only where its witness counts an operation and names
+    /// the table the registry holds here, and the held table is read only for such a witness.
+    /// NEGATIVE CONTROL: without the `count > 0` filter, `` an empty witness `` settles the held
+    /// table.
+    #[test]
+    fn a_round_settles_only_a_witness_that_counts_an_operation_of_the_table_held_here() {
+        const HELD: [u8; 32] = [1; 32];
+        const OTHER: [u8; 32] = [2; 32];
+        let unread = || -> Option<[u8; 32]> { panic!("the held table is read only for a witness") };
+        assert_eq!(
+            witness_table(Some((0, HELD)), || Some(HELD)),
+            None,
+            "an empty witness"
+        );
+        assert_eq!(
+            witness_table(Some((3, OTHER)), || Some(HELD)),
+            None,
+            "another table"
+        );
+        assert_eq!(
+            witness_table(Some((3, HELD)), || None),
+            None,
+            "no table held here"
+        );
+        assert_eq!(witness_table(None, unread), None, "no witness");
+        assert_eq!(
+            witness_table(Some((0, HELD)), unread),
+            None,
+            "an empty witness"
+        );
+        assert_eq!(witness_table(Some((3, HELD)), || Some(HELD)), Some(HELD));
+    }
+
+    /// A shipped build holds a lab only in the person's own environment: a build tool's run, a
+    /// scratch state root and CI each hold it off, a variable that only resembles one does not,
+    /// and a debug build holds none whatever its environment.
+    /// NEGATIVE CONTROL: with the `ATERM_STATE_HOME` clause dropped, the scratch-root row holds a
+    /// lab: `` a release build with ATERM_STATE_HOME set ``.
+    #[test]
+    fn a_shipped_build_holds_a_lab_only_in_the_persons_own_environment() {
+        let env = |set: &'static [&'static str]| {
+            move |key: &str| set.contains(&key).then(|| std::ffi::OsString::from("1"))
+        };
+        const LOOKALIKES: &[&str] = &[
+            "XDG_STATE_HOME",
+            "ATERM_STATE_HOME_X",
+            "CIRCLECI",
+            "CARGO_HOME",
+        ];
+        assert!(
+            lab_hooks_on(true, env(LOOKALIKES)),
+            "only lookalikes are set"
+        );
+        assert!(
+            !lab_hooks_on(true, env(&["XDG_STATE_HOME", "CARGO_MANIFEST_DIR"])),
+            "a release build with CARGO_MANIFEST_DIR set"
+        );
+        assert!(
+            !lab_hooks_on(true, env(&["ATERM_STATE_HOME_X", "ATERM_STATE_HOME"])),
+            "a release build with ATERM_STATE_HOME set"
+        );
+        assert!(
+            !lab_hooks_on(true, env(&["CIRCLECI", "CI"])),
+            "a release build with CI set"
+        );
+        assert!(!lab_hooks_on(false, env(&[])), "a debug build");
     }
 
     /// `[alab] roster = false` turns the source off; anything else, or no file, leaves it on.

@@ -3,9 +3,10 @@
 
 //! THE REMAINING §4.1 MARKS (plan §3.2).
 
-use aterm_core::terminal::program_state::{ProgramState, ProgramStateWord};
+use aterm_core::terminal::program_state::{ProgramBlockedKind, ProgramState, ProgramStateWord};
 use aterm_slog::{
-    Amend, BoundedText, BoundedToken, Claimed, Conf, Fields, Key, Kind, Mark, Node, Src, Stamp, Val,
+    Amend, BoundedText, BoundedToken, Claimed, ClaimedBox, ClaimedReport, Conf, Fields, Key, Kind,
+    Mark, Node, Src, Stamp, Val,
 };
 
 use super::{SessionLog, name_fp, tok, with};
@@ -96,23 +97,56 @@ pub(crate) struct ProgramWords {
     /// What it claims of its turn (`None`: no report shown), which a codex-alab's turns follow
     /// ([`SessionLog::claim_turn`]).
     pub(crate) claimed: Option<Claimed>,
+    /// The box it shows: a `blocked` report on a permission or a question (none on a login, or a
+    /// `blocked` naming no kind), which a codex-alab's claimed box steps follow
+    /// ([`SessionLog::claim_box`]).
+    pub(crate) boxed: Option<ClaimedBox>,
+    /// The engine's sequence where the report began (`ProgramStateReport::began`): its box's
+    /// identity.
+    pub(crate) began: u64,
 }
 
 impl ProgramWords {
-    /// The words of the shown report `shown` (`None`: none shown).
-    pub(crate) fn of(shown: Option<ProgramState>) -> Self {
+    /// The words of the shown report `shown` (`None`: none shown), which began at the engine's
+    /// sequence `began`.
+    pub(crate) fn of(shown: Option<ProgramState>, began: u64) -> Self {
         shown.map_or(
             ProgramWords {
                 state: "none",
                 ask: None,
                 claimed: None,
+                boxed: None,
+                began,
             },
             |s| ProgramWords {
                 state: s.state.as_str(),
                 ask: s.kind.map(|k| k.as_str()),
                 claimed: Some(claimed_of(s.state)),
+                boxed: boxed_of(s),
+                began,
             },
         )
+    }
+
+    /// What the mark claims of the program's box.
+    pub(crate) const fn report(self) -> ClaimedReport {
+        ClaimedReport {
+            boxed: self.boxed,
+            began: self.began,
+        }
+    }
+}
+
+/// The box a shown report `s` claims: an approval on `blocked:permission`, a question on
+/// `blocked:question`, and none on a login, a `blocked` that names no kind, or another state.
+fn boxed_of(s: ProgramState) -> Option<ClaimedBox> {
+    if s.state != ProgramStateWord::Blocked {
+        return None;
+    }
+    match s.kind? {
+        ProgramBlockedKind::Permission => Some(ClaimedBox::Approval),
+        ProgramBlockedKind::Question => Some(ClaimedBox::Question),
+        ProgramBlockedKind::Auth => None,
     }
 }
 
@@ -543,10 +577,11 @@ impl SessionLog {
         }
     }
 
-    /// `mark <run> program state= [ask=] [coalesced=]`, and a codex-alab's turn by each one
-    /// written ([`Self::claim_turn`]).
-    pub(crate) fn observe_program(&mut self, shown: Option<ProgramState>, at: Stamp) {
-        let words = ProgramWords::of(shown);
+    /// `mark <run> program state= [ask=] [coalesced=]`, and a codex-alab's turn and box by each
+    /// one written ([`Self::claim_turn`], [`Self::claim_box`]); `began` is where the shown report
+    /// began in the engine.
+    pub(crate) fn observe_program(&mut self, shown: Option<ProgramState>, began: u64, at: Stamp) {
+        let words = ProgramWords::of(shown, began);
         let run = self.front_run();
         self.enter_program_run(run, at);
         let p = &mut self.observed.program;
@@ -680,6 +715,37 @@ impl SessionLog {
         if let Some(claimed) = words.claimed {
             self.claim_turn(node, claimed, event_at, at);
         }
+        self.claim_box(node, words.report(), event_at, at);
+    }
+
+    /// THE CLAIM'S BOXES (GAP 26): a codex-alab's screen opens no step, so its run's approval
+    /// and question steps follow the program marks written on it, each after its turn moved
+    /// ([`Self::claim_turn`]), so a box that begins a turn hangs from it: a mark `blocked` on a
+    /// permission or a question opens one step at `src=engine conf=claim`
+    /// (`aterm_slog::TurnTracker::claim_box`), one per box its report's `began` names, and the
+    /// next mark that stops showing that box ends it, attributed by the input bound to it as a
+    /// screen step is. Every written mark reaches it, `state=none` included, so the run's
+    /// bucket bounds the boxes as it bounds the marks: a box whose `blocked` coalesced away
+    /// past the burst is no step. As [`Self::claim_turn`] does, the box moves at the state's
+    /// observation time `event_at`, so a mark the bucket delayed neither opens its box after
+    /// the edge that ends its turn nor drags that turn's close to the flush; person
+    /// reconciliation keeps the flush clock `at`. Nothing moves unless `run` is a codex's.
+    fn claim_box(&mut self, run: Node, report: ClaimedReport, event_at: Stamp, at: Stamp) {
+        if self.codex_run() != Some(run) {
+            return;
+        }
+        self.reconcile_person(at);
+        self.resync();
+        let Self { log, agent, .. } = self;
+        if let Some(a) = agent.as_mut() {
+            let _ = a.tracker.claim_box(log, report, event_at);
+        }
+    }
+
+    /// The codex run's claimed box step, while one stands ([`Self::claim_box`]).
+    pub(crate) fn codex_claim_step(&self) -> Option<Node> {
+        self.codex_run()?;
+        self.agent.as_ref()?.tracker.claim_node()
     }
 
     /// `mark - shown [need= sev=] [held=] [coalesced=]`.
@@ -1314,8 +1380,14 @@ impl SessionLog {
     /// dismissed (`by=human`, `by=ctl`, …) was the answer: the next box's escalation is the
     /// supervisor's to raise at its next look, never carried. While no such step is open (the
     /// stall itself) nothing is written: the stall's own need stands, and the escalation comes
-    /// back with the box.
+    /// back with the box. A codex run carries nothing: its claimed box steps
+    /// ([`Self::claim_box`]) close `out=passed` whenever codex-alab answers inside the program,
+    /// so such a close is no sign the ask went unanswered, and codex-alab raises its attention
+    /// again for its next box itself.
     pub(crate) fn carry_escalation(&mut self, at: Stamp) {
+        if self.codex_run().is_some() {
+            return;
+        }
         let Some(was) = self.observed.esc_step else {
             return;
         };

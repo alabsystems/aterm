@@ -464,11 +464,46 @@ pub fn past_drawn_caret(line: &str, col: usize) -> Option<usize> {
 /// The column a composer's first glyph is drawn at, after its `❯ `.
 pub const COMPOSER_COL: usize = 2;
 
+/// WHETHER A CURSOR AT `cursor` (row and column; `None` where the read has none on its rows, as one
+/// above them) STANDS HOME ON A COMPOSER OF `lines` FROM ROW `caret`: at the column its first glyph is
+/// drawn at, where a program that draws grey text leaves its cursor over it. That is the caret's row,
+/// or, on a lone line, the row under it, where a grid a resize left drawn one row high has it
+/// (`docs/DESIGN-wall-resume-2026-09-28.md`). A later row of the composer is where only text of more
+/// than one row, or a redraw not yet done, leaves it, and any other row, or none, is a frame read
+/// before its program placed the cursor.
+///
+/// With the glyph's cell ([`composer_glyph_cell`]) this is what the loop's `composer_draft` and
+/// Claude Code's and Muse Code's upgrade gates read grey text by: a suggestion only here.
+#[must_use]
+pub fn cursor_home(cursor: Option<(usize, usize)>, caret: usize, lines: &[String]) -> bool {
+    cursor.is_some_and(|(row, col)| {
+        col == COMPOSER_COL && (row == caret || (lines.len() == 1 && row == caret + 1))
+    })
+}
+
+/// WHETHER A COMPOSER OF `lines` FROM ROW `caret` HOLDS NO DRAFT, as Claude Code's and Muse Code's
+/// upgrade gates read it (the loop's `composer_draft` by the same rule): nothing in it, or a first
+/// line that `grey` says is drawn grey with the cursor home ([`cursor_home`]). A blank first line over
+/// text on a later row is text, whatever a blank's cell is drawn in, so `grey` is asked of nothing but
+/// a first glyph with the cursor home on it.
+#[must_use]
+pub fn composer_holds_no_draft(
+    cursor: Option<(usize, usize)>,
+    caret: usize,
+    lines: &[String],
+    grey: impl FnOnce() -> bool,
+) -> bool {
+    if lines.first().is_none_or(String::is_empty) {
+        return lines.iter().all(String::is_empty);
+    }
+    cursor_home(cursor, caret, lines) && grey()
+}
+
 /// THE COMPOSER'S FIRST GLYPH, READ WHERE ITS CELL SAYS WHAT THE TEXT IS: `read(col)` is the
 /// composer row's `cell` reply at `col` (`None` where none came). Column [`COMPOSER_COL`], or, where
 /// the program draws its own caret over that glyph, the glyph after it ([`past_drawn_caret`]).
 /// The one read behind the loop's `composer_draft` and Claude Code's and Muse Code's upgrade
-/// gates, so that a suggestion the loop takes for one each gate takes for one too.
+/// gates ([`cursor_home`]).
 pub fn composer_glyph_cell(mut read: impl FnMut(usize) -> Option<String>) -> Option<String> {
     let first = read(COMPOSER_COL)?;
     match past_drawn_caret(&first, COMPOSER_COL) {

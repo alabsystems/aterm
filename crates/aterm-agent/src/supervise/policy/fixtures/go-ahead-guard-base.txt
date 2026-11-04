@@ -727,6 +727,10 @@ NEEDS YOU: confirmation that the old logs can be purged before I rebuild.		plain
   NEEDS YOU: confirmation that the old logs can be purged before I rebuild.		plain
 Once you say so I'll push my branch and main gets overwritten with it.	\=	plain
   Once you say so I'll push my branch and main gets overwritten with it.	\=	plain
+NEEDS YOU: say "go" so I can drop the table and rebuild.		plain
+  NEEDS YOU: say "go" so I can drop the table and rebuild.		plain
+NEEDS YOU: say "go" so I can rewrite history and rebuild.		plain
+  NEEDS YOU: say "go" so I can rewrite history and rebuild.		plain
 I'll remove the worktree you made once you say so.	\=	plain
   I'll remove the worktree you made once you say so.	\=	plain
 Once you say so I'll merge the other agent's branch into main.	\=	plain

@@ -19,6 +19,7 @@ pub(super) use operation::Operation;
 pub(super) use operation::{cancel_owner, pending, retain_claim};
 
 const WAITING: &str = "OK codex-exec-handoff state=waiting\n";
+const NOT_NEEDED: &str = "OK codex-exec-handoff state=not-needed\n";
 
 #[derive(Debug)]
 pub(super) struct Preparation {
@@ -92,8 +93,14 @@ pub(crate) fn serve(ctx: &Arc<crate::SessionCtx>, master: i32, line: &str) -> St
     let Some(source) = ExecSource::capture(pid) else {
         return DENIED.into();
     };
-    let Ok(env) = Env::from_process() else {
-        return WAITING.into();
+    let env = match Env::from_process() {
+        Ok(env) => env,
+        // This process's working directory and state directory do not come back by themselves:
+        // no handoff is coming, and a wait would only spend the session's turn.
+        Err(why) => {
+            aterm_log::warn!("codex exec handoff: none is coming: {why}");
+            return NOT_NEEDED.into();
+        }
     };
     if ctx.fabric.hold().is_some() || !renewal::human_grace_ready(ctx, &env) {
         return WAITING.into();
@@ -146,7 +153,7 @@ pub(crate) fn serve(ctx: &Arc<crate::SessionCtx>, master: i32, line: &str) -> St
             WAITING.into()
         }
         Progress::NotNeeded(observed) if observed.elapsed() < Duration::from_secs(5) => {
-            "OK codex-exec-handoff state=not-needed\n".into()
+            NOT_NEEDED.into()
         }
         Progress::Selected(proposal, observed) if observed.elapsed() < Duration::from_secs(60) => {
             format!(
@@ -199,7 +206,14 @@ fn start(ctx: &Arc<crate::SessionCtx>, env: Env, job: Arc<Preparation>) {
                 Ok(Some(proposal)) if current => {
                     Progress::Selected(Box::new(proposal), Instant::now())
                 }
-                Err("not-weekly-exhausted") if current => Progress::NotNeeded(Instant::now()),
+                // However often it is asked, no handoff is coming to this session, and a wait
+                // would only spend its turn. The log says which of the two ended it.
+                Err(why) if current && codex_rotation::prepare_refusal_stands(why).is_some() => {
+                    if let Some(end) = codex_rotation::prepare_refusal_stands(why) {
+                        aterm_log::info!("codex exec handoff: none is coming: {}", end.as_str());
+                    }
+                    Progress::NotNeeded(Instant::now())
+                }
                 _ => Progress::Retry(Instant::now() + Duration::from_secs(5)),
             };
         })

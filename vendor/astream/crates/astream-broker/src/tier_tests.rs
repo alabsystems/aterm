@@ -923,3 +923,197 @@ fn compaction_prunes_dropped_dedup_keys_and_skips_damaged_cold_prefix_payloads()
         .unwrap();
     assert_eq!((new_off, new_dup), (Offset(8), false));
 }
+
+/// xorshift64*: a tiny deterministic PRNG for the packed tier's random streams.
+struct Rng(u64);
+
+impl Rng {
+    fn below(&mut self, n: u64) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D) % n.max(1)
+    }
+}
+
+/// Every retained record of `log` against what was published (`model`, by offset): read
+/// back cold through its packed slot's frame start equal to the record, its slot's summary
+/// the record's own (offset, subject, plaintext-frame bytes, hidden), and the slots naming
+/// exactly the retained records' subjects.
+fn check_packed(
+    log: &BrokerLog,
+    model: &std::collections::BTreeMap<u64, BrokerRecord>,
+) -> Result<(), String> {
+    let tier = log.tier_for_test();
+    let base = log.base().0;
+    let want: Vec<&BrokerRecord> = model.range(base..).map(|(_, r)| r).collect();
+    if tier.len() != want.len() || log.head().0 != base + want.len() as u64 {
+        return Err(format!(
+            "retained {} records from {base} to {}, published {}",
+            tier.len(),
+            log.head().0,
+            want.len()
+        ));
+    }
+    for (i, rec) in want.iter().enumerate() {
+        let got = log.record_arc(i);
+        if got.as_deref() != Some(*rec) {
+            return Err(format!("record {} reads back as {got:?}", base + i as u64));
+        }
+        let s = tier.summary(i).ok_or(format!("no summary at {i}"))?;
+        let expect = (
+            base + i as u64,
+            rec.subject.as_str(),
+            crate::brecord::plaintext_frame_bytes(rec),
+            crate::store::is_hidden_record(rec),
+        );
+        if (s.offset(), s.subject(), s.bytes(), s.is_hidden()) != expect {
+            return Err(format!("summary {i}: {s:?}, the record's {expect:?}"));
+        }
+    }
+    let subjects: std::collections::BTreeSet<&str> =
+        want.iter().map(|r| r.subject.as_str()).collect();
+    if tier.live_subjects() != subjects.len() {
+        return Err(format!(
+            "{} subjects named, {} retained",
+            tier.live_subjects(),
+            subjects.len()
+        ));
+    }
+    Ok(())
+}
+
+/// One seeded stream against a log held at a residency budget of 0: single publishes (a
+/// re-sent key answered with its original offset and nothing appended), batches, hidden
+/// commit records, reopens (each one's broker times the same as before it) and, with
+/// `retention`, cuts; `check_packed` after every step.
+fn packed_stream(seed: u64) -> (crate::test_scratch::Scratch, BrokerLog) {
+    use crate::brecord::GroupCommit;
+    use std::collections::BTreeMap;
+
+    let root = crate::test_scratch::Scratch::new(&format!("tier-packed-{seed}"));
+    let path = root.path().join("log");
+    let open = |path: &std::path::Path| {
+        let mut opts = crate::OpenOptions::new(Durability::Relaxed);
+        opts.resident_budget = Some(0);
+        BrokerLog::open_opts(path, opts, || Ok(crate::Prepared::Nothing)).unwrap()
+    };
+    let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+    let mut log = open(&path);
+    let mut model: BTreeMap<u64, BrokerRecord> = BTreeMap::new();
+    let mut keys: BTreeMap<(u64, u64), u64> = BTreeMap::new();
+    let mut next_seq = [0u64; 4];
+    let record = |off: u64, pid: u64, pseq: u64, subject: String, body: Vec<u8>| BrokerRecord {
+        seq: Offset(off),
+        producer_id: pid,
+        producer_seq: pseq,
+        subject,
+        body,
+        commit: None,
+    };
+    for step in 0..240 {
+        let roll = rng.below(100);
+        if roll < 55 {
+            let pid = rng.below(4);
+            let resend = rng.below(6) == 0 && next_seq[pid as usize] > 0;
+            let pseq = if resend {
+                rng.below(next_seq[pid as usize])
+            } else {
+                next_seq[pid as usize] += 1 + rng.below(2);
+                next_seq[pid as usize]
+            };
+            let subject = format!("/f/packed/s{}", rng.below(9));
+            let body = vec![(step % 251) as u8; rng.below(400) as usize];
+            let (off, dup) = log
+                .publish(pid + 1, pseq, subject.clone(), body.clone())
+                .unwrap();
+            match keys.get(&(pid + 1, pseq)) {
+                Some(&orig) => assert_eq!((off.0, dup), (orig, true), "seed {seed} step {step}"),
+                None => {
+                    assert!(!dup, "seed {seed} step {step}: a fresh key dedups");
+                    keys.insert((pid + 1, pseq), off.0);
+                    model.insert(off.0, record(off.0, pid + 1, pseq, subject, body));
+                }
+            }
+        } else if roll < 70 {
+            for _ in 0..1 + rng.below(6) {
+                let pid = rng.below(4);
+                next_seq[pid as usize] += 1;
+                let pseq = next_seq[pid as usize];
+                let subject = format!("/f/packed/b{}", rng.below(5));
+                let body = vec![7u8; rng.below(300) as usize];
+                let (off, dup) = log
+                    .stage_publish(pid + 1, pseq, subject.clone(), body.clone())
+                    .unwrap();
+                assert!(!dup);
+                keys.insert((pid + 1, pseq), off.0);
+                model.insert(off.0, record(off.0, pid + 1, pseq, subject, body));
+            }
+            log.commit_batch().unwrap();
+        } else if roll < 80 {
+            let group = format!("g{}", rng.below(3));
+            let upto = rng.below(log.head().0 + 1);
+            let off = log.commit(group.clone(), upto).unwrap();
+            let mut rec = record(off.0, 0, 0, crate::store::COMMIT_SUBJECT.into(), Vec::new());
+            rec.commit = Some(GroupCommit { group, upto });
+            model.insert(off.0, rec);
+        } else if roll < 90 {
+            let bts: Vec<Option<u64>> = (0..log.tier_for_test().len())
+                .map(|i| log.tier_for_test().bt(i))
+                .collect();
+            drop(log);
+            log = open(&path);
+            let again: Vec<Option<u64>> = (0..log.tier_for_test().len())
+                .map(|i| log.tier_for_test().bt(i))
+                .collect();
+            assert_eq!(
+                again, bts,
+                "seed {seed} step {step}: the reopen's broker times"
+            );
+        } else {
+            #[cfg(feature = "retention")]
+            {
+                let span = log.head().0 - log.base().0;
+                let cut = log.base().0 + rng.below(span / 2 + 1);
+                log.retain_before(Offset(cut)).unwrap();
+                keys.retain(|_, off| *off >= log.base().0);
+            }
+        }
+        if let Err(e) = check_packed(&log, &model) {
+            panic!("seed {seed} step {step}: {e}");
+        }
+    }
+    (root, log)
+}
+
+#[test]
+fn every_retained_record_reads_back_through_the_packed_tier() {
+    for seed in 0..16 {
+        let (_root, log) = packed_stream(seed);
+        drop(log);
+    }
+}
+
+/// The negative control: one slot whose frame start is a byte off is caught.
+#[test]
+fn a_slot_whose_frame_start_is_off_is_caught() {
+    for seed in 0..4 {
+        let (_root, mut log) = packed_stream(seed);
+        let model: std::collections::BTreeMap<u64, BrokerRecord> = (0..log.tier_for_test().len())
+            .filter_map(|i| log.record_arc(i))
+            .map(|r| (r.seq.0, (*r).clone()))
+            .collect();
+        assert_eq!(check_packed(&log, &model), Ok(()));
+        assert!(
+            log.tier_for_test().len() >= 2,
+            "seed {seed}: a cold record to skew"
+        );
+        log.tier_mut_for_test().skew_frame_start(0);
+        assert!(
+            check_packed(&log, &model).is_err(),
+            "seed {seed}: a skewed frame start reads back"
+        );
+    }
+}

@@ -2352,8 +2352,8 @@ impl SettingsPreviewSpec {
                 &self.variation_requests(),
             )
             .filter(|&(w, h)| w > 0 && h > 0)
-            .map_or_else(
-                || (self.font_px * 0.6, self.font_px * self.line_height * 1.25),
+            .map_or(
+                (self.font_px * 0.6, self.font_px * self.line_height * 1.25),
                 |(w, h)| (w as f32 / scale, h as f32 / scale),
             )
     }
@@ -11367,299 +11367,7 @@ mod tests {
         crate::settings::u32_rgb(frame.pixels[y * frame.width + x])
     }
 
-    /// The low 24 bits of a frame pixel: its `0xRRGGBB` colour, as [`frame_rgb`] reads it.
-    const RGB: u32 = 0x00FF_FFFF;
-
-    /// WCAG 2's linear value of each sRGB channel value, the table [`luma`] reads.
-    fn linear_channels() -> [f32; 256] {
-        std::array::from_fn(|v| {
-            let c = f32::from(u8::try_from(v).expect("a channel value")) / 255.0;
-            if c <= 0.039_28 {
-                c / 12.92
-            } else {
-                ((c + 0.055) / 1.055).powf(2.4)
-            }
-        })
-    }
-
-    /// WCAG 2 relative luminance of the `0xRRGGBB` colour `rgb`, its channels read in `lin`
-    /// ([`linear_channels`]).
-    fn luma(lin: &[f32; 256], rgb: u32) -> f32 {
-        let [r, g, b] = crate::settings::u32_rgb(rgb);
-        0.2126 * lin[usize::from(r)] + 0.7152 * lin[usize::from(g)] + 0.0722 * lin[usize::from(b)]
-    }
-
-    /// WCAG 2 contrast of two colours of relative luminance `la` and `lb`.
-    fn wcag(la: f32, lb: f32) -> f32 {
-        (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
-    }
-
-    /// Each channel's median of the `0xRRGGBB` colours `px` (the upper one of an even count:
-    /// each channel's `len / 2`th smallest value).
-    fn median_rgb(px: &[u32]) -> Option<u32> {
-        if px.is_empty() {
-            return None;
-        }
-        let rank = px.len() / 2;
-        let mut median = 0;
-        for shift in [16, 8, 0] {
-            let channel = |i: usize| ((px[i] >> shift) & 0xff) as u8;
-            let value = if px.len() <= 16 {
-                // A ring's few: sorted in place.
-                let mut sorted = [0_u8; 16];
-                for i in 0..px.len() {
-                    let v = channel(i);
-                    let mut j = i;
-                    while j > 0 && sorted[j - 1] > v {
-                        sorted[j] = sorted[j - 1];
-                        j -= 1;
-                    }
-                    sorted[j] = v;
-                }
-                sorted[rank]
-            } else {
-                // Each value's count, then the value the count passes `rank` at.
-                let mut counts = [0_usize; 256];
-                for i in 0..px.len() {
-                    counts[usize::from(channel(i))] += 1;
-                }
-                let (mut value, mut seen) = (0, 0);
-                loop {
-                    seen += counts[usize::from(value)];
-                    if seen > rank {
-                        break value;
-                    }
-                    value += 1;
-                }
-            };
-            median |= u32::from(value) << shift;
-        }
-        Some(median)
-    }
-
-    /// A cell's ground: the most common of its `0xRRGGBB` colours `px` (row by row), the first
-    /// seen of a tie, as the trail lab's `trail-contrast` takes a glyph's ground (its `mode`);
-    /// `None` for no pixels. `counts` is scratch: each colour and its count, in the order first
-    /// seen.
-    fn cell_ground(px: &[u32], counts: &mut Vec<(u32, usize)>) -> Option<u32> {
-        counts.clear();
-        let mut i = 0;
-        while i < px.len() {
-            let mut at = 0;
-            while at < counts.len() && counts[at].0 != px[i] {
-                at += 1;
-            }
-            if at == counts.len() {
-                counts.push((px[i], 1));
-            } else {
-                counts[at].1 += 1;
-            }
-            i += 1;
-        }
-        let &(mut ground, mut most) = counts.first()?;
-        for &(rgb, n) in counts.iter() {
-            if n > most {
-                (ground, most) = (rgb, n);
-            }
-        }
-        Some(ground)
-    }
-
-    /// A cell's ground is its commonest colour, and of two as common the first seen, as
-    /// `trail-contrast` takes one: neither the lower colour nor the one first seen later.
-    #[test]
-    fn a_cells_ground_is_its_commonest_colour_the_first_seen_of_a_tie() {
-        let (dark, light) = (0x10_1010, 0xF0_F0F0);
-        let mut counts = Vec::new();
-        assert_eq!(
-            cell_ground(&[light, dark, dark, light], &mut counts),
-            Some(light)
-        );
-        assert_eq!(
-            cell_ground(&[dark, light, light, dark], &mut counts),
-            Some(dark)
-        );
-        assert_eq!(
-            cell_ground(&[dark, light, light, light, dark], &mut counts),
-            Some(light)
-        );
-        assert_eq!(cell_ground(&[], &mut counts), None);
-    }
-
-    /// What every lettered cell the scene's lights or companion changed reads, as the trail
-    /// lab's `trail-contrast` judges a glyph against its clean twin (`twin`, the card with no
-    /// light and no companion): its local contrast, what a reader sees round each stroke (each
-    /// solid ink pixel against the median of the nearest ring, 1 then 2 px out, of pixels that
-    /// are pure ground in the twin; the worst pixel row's lower median), the one reading the
-    /// letter guard keeps; its whole-cell contrast (the median of its core ink against the median
-    /// of its pure ground, as the frame has them) where no solid pixel has ground that near.
-    /// `(reading, bare, row, col)` for each such letter, `bare` the same glyph read on the twin.
-    /// A cell's ground is its most common colour in the twin, the first seen of a tie
-    /// ([`cell_ground`]).
-    ///
-    /// It runs on every frame of the card's every look, unoptimized: each cell's pixels are
-    /// read into buffers once, each colour's luminance off a table, and the loops index.
-    fn judged_letters(
-        lit: &aterm_render::Frame,
-        twin: &aterm_render::Frame,
-        input: &RenderInput,
-        (cell_w, cell_h): (usize, usize),
-    ) -> Vec<(f32, f32, usize, usize)> {
-        /// A glyph's core: this share of the way from the clean ground to its extreme.
-        const CORE_SHARE: f32 = 0.70;
-        /// A glyph's solid ink: this share of its extreme's ratio against the ground.
-        const SOLID_SHARE: f32 = 0.85;
-
-        let lin = linear_channels();
-        let near = |a: u32, b: u32| {
-            let ([ar, ag, ab], [br, bg, bb]) =
-                (crate::settings::u32_rgb(a), crate::settings::u32_rgb(b));
-            ar.abs_diff(br) <= 12 && ag.abs_diff(bg) <= 12 && ab.abs_diff(bb) <= 12
-        };
-        let n = cell_w * cell_h;
-        // The cell's pixels row by row, in the twin and the lit frame (`0xRRGGBB`), and of
-        // the twin's: each one's luminance and contrast against the ground, and the core's.
-        let (mut clean, mut shown) = (Vec::with_capacity(n), Vec::with_capacity(n));
-        let (mut lum, mut against, mut core) = (vec![0.0; n], vec![0.0; n], vec![false; n]);
-        let mut counts: Vec<(u32, usize)> = Vec::new();
-        let mut out = Vec::new();
-        for (row, cells) in input.cells.iter().enumerate() {
-            for (col, cell) in cells.iter().enumerate() {
-                let (x0, y0) = (col * cell_w, row * cell_h);
-                if matches!(cell.ch, ' ' | '\0')
-                    || (row, col) == (input.cursor_row, input.cursor_col)
-                    || x0 + cell_w > lit.width
-                    || y0 + cell_h > lit.height
-                {
-                    continue;
-                }
-                clean.clear();
-                shown.clear();
-                for y in y0..y0 + cell_h {
-                    clean.extend_from_slice(&twin.pixels[y * twin.width + x0..][..cell_w]);
-                    shown.extend_from_slice(&lit.pixels[y * lit.width + x0..][..cell_w]);
-                }
-                if shown == clean {
-                    continue;
-                }
-                let mut changed = false;
-                let mut i = 0;
-                while i < n {
-                    clean[i] &= RGB;
-                    shown[i] &= RGB;
-                    changed = changed || !near(shown[i], clean[i]);
-                    i += 1;
-                }
-                if !changed {
-                    continue;
-                }
-                let Some(ground) = cell_ground(&clean, &mut counts) else {
-                    continue;
-                };
-                let ground_luma = luma(&lin, ground);
-                // The extreme: the last pixel no other passes in contrast against the ground.
-                let mut extreme = 0;
-                let mut i = 0;
-                while i < n {
-                    lum[i] = luma(&lin, clean[i]);
-                    against[i] = wcag(lum[i], ground_luma);
-                    if against[i].total_cmp(&against[extreme]).is_ge() {
-                        extreme = i;
-                    }
-                    i += 1;
-                }
-                if against[extreme] < 1.5 {
-                    continue;
-                }
-                let reach = CORE_SHARE * (lum[extreme] - ground_luma).abs();
-                let mut i = 0;
-                while i < n {
-                    core[i] = clean[i] != ground && (lum[i] - ground_luma).abs() >= reach;
-                    i += 1;
-                }
-                let solid_bar = SOLID_SHARE * against[extreme];
-                let solid = |i: usize| against[i] >= solid_bar;
-                let cored = |i: usize| core[i];
-                // What the cell reads in `frame` (`px`, its pixels there), by the twin's ground,
-                // core and solid ink.
-                let read = |frame: &aterm_render::Frame, px: &[u32]| {
-                    let (mut ink, mut bed) = (Vec::new(), Vec::new());
-                    for i in 0..n {
-                        if clean[i] == ground {
-                            bed.push(px[i]);
-                        } else if core[i] {
-                            ink.push(px[i]);
-                        }
-                    }
-                    let (ink, bed) = (median_rgb(&ink)?, median_rgb(&bed)?);
-                    let whole = wcag(luma(&lin, ink), luma(&lin, bed));
-                    let (w, h) = (frame.width as i32, frame.height as i32);
-                    let ring_ground = |x: usize, y: usize| {
-                        let mut ring = [0_u32; 16];
-                        for off in 1..=2_i32 {
-                            let mut len = 0;
-                            let mut dy = -off;
-                            while dy <= off {
-                                let mut dx = -off;
-                                while dx <= off {
-                                    let (gx, gy) = (x as i32 + dx, y as i32 + dy);
-                                    if (dx.abs() == off || dy.abs() == off)
-                                        && gx >= 0
-                                        && gy >= 0
-                                        && gx < w
-                                        && gy < h
-                                    {
-                                        let (gx, gy) = (gx as usize, gy as usize);
-                                        if twin.pixels[gy * twin.width + gx] & RGB == ground {
-                                            ring[len] = frame.pixels[gy * frame.width + gx] & RGB;
-                                            len += 1;
-                                        }
-                                    }
-                                    dx += 1;
-                                }
-                                dy += 1;
-                            }
-                            if let Some(median) = median_rgb(&ring[..len]) {
-                                return Some(median);
-                            }
-                        }
-                        None
-                    };
-                    let local_of = |solid: &dyn Fn(usize) -> bool| {
-                        let mut least: Option<f32> = None;
-                        let mut readings = Vec::with_capacity(cell_w);
-                        for dy in 0..cell_h {
-                            readings.clear();
-                            for dx in 0..cell_w {
-                                let i = dy * cell_w + dx;
-                                if solid(i)
-                                    && let Some(g) = ring_ground(x0 + dx, y0 + dy)
-                                {
-                                    readings.push(wcag(luma(&lin, px[i]), luma(&lin, g)));
-                                }
-                            }
-                            if readings.is_empty() {
-                                continue;
-                            }
-                            readings.sort_by(f32::total_cmp);
-                            let reading = readings[(readings.len() - 1) / 2];
-                            least = Some(least.map_or(reading, |least| least.min(reading)));
-                        }
-                        least
-                    };
-                    let local = local_of(&solid).or_else(|| local_of(&cored));
-                    // The ring round the strokes, what a reader sees round each one (the letter
-                    // guard's one model, `letter_guard::ring`): the whole cell where no solid
-                    // pixel has ground that near.
-                    Some(local.unwrap_or(whole))
-                };
-                if let (Some(reading), Some(bare)) = (read(lit, &shown), read(twin, &clean)) {
-                    out.push((reading, bare, row, col));
-                }
-            }
-        }
-        out
-    }
+    use aterm_render::letter_judge::judged_letters;
 
     /// The least a letter reads under a light (WCAG AA).
     const LEGIBLE: f32 = 4.5;
@@ -11922,7 +11630,9 @@ mod tests {
             let (a, b) = (frame_rgb(lit, x, y), frame_rgb(bare, x, y));
             a.iter().zip(&b).any(|(p, q)| p.abs_diff(*q) > 12)
         };
-        let mut cuts = Vec::new();
+        // Each card walks the loop whole, one after the other: its scene plays on from the frame
+        // before, where turning between the two at every lit frame replays its warm cycles.
+        let mut lit_edges = Vec::new();
         for phase in (0..CURSOR_SCENE_CYCLE_MS).step_by(MOTION_STEP_MS as usize) {
             let LitCard {
                 lit, twin: bare, ..
@@ -11939,6 +11649,12 @@ mod tests {
                 .filter(|&(x, y)| lit_at(&lit, &bare, x, y))
                 .count();
             let top: Vec<usize> = (0..w).filter(|&x| lit_at(&lit, &bare, x, 0)).collect();
+            if sides > 0 || !top.is_empty() {
+                lit_edges.push((phase, sides, top));
+            }
+        }
+        let mut cuts = Vec::new();
+        for (phase, sides, top) in lit_edges {
             let risen = if top.is_empty() {
                 0
             } else {
@@ -11980,11 +11696,22 @@ mod tests {
     /// box's clip, the rainbow band's exit in a four-row card (the Return sets the submitted
     /// line on the top row) and Fire's dark cores over the prompt in a three-row card stood
     /// flat against the card's top edge (settings round 2). Fire's paper tongues there were
-    /// cut too, but the taller card holds them under its submitted line's letters, so this
-    /// card's top edge cannot see them rise; the engine's own test holds them
+    /// cut too. A taller card that reads the frame's text holds them under its submitted line's
+    /// letters, where the top edge cannot see them rise, so only the blind three-row card shows
+    /// them here; the engine's own test holds them with the text read
     /// (`a_blaze_under_the_grids_top_keeps_inside_the_box`).
+    ///
+    /// Only the four-row items play as the terminal does: that card and its taller five-row twin
+    /// read the frame's text. The three- and five-row items play blind to it, their taller twins
+    /// too, where the guard cuts nothing and more light reaches the edge: a frame production never
+    /// draws, so a failure seen only blind may be a false positive, and a mark drawn only because of
+    /// the frame's text is judged by the four-row items alone. Each control plays its row count as
+    /// the sweep does.
     #[test]
     fn no_light_stands_cut_at_the_cards_edge() {
+        fn reads_frame_text(rows: usize) -> bool {
+            rows == 4
+        }
         let light = PreviewTerminalTheme::from_scheme(
             &aterm_types::scheme::builtin("GitHub Light").expect("built-in light theme"),
         );
@@ -12015,6 +11742,12 @@ mod tests {
         // Each item plays on its own thread, with that thread's fonts and scene.
         let found: Vec<String> =
             aterm_spec::check::each(&items, |&(raw, ground, rows, scale, host)| {
+                // Set on each item: a worker keeps its thread-local between items.
+                SCENE_CONTROLS.with(|controls| {
+                    let mut sight = controls.get();
+                    sight.frame_text = reads_frame_text(rows);
+                    controls.set(sight);
+                });
                 let _ = compiled(SettingsPreviewSpec::default());
                 #[cfg(target_os = "macos")]
                 if host {
@@ -12035,18 +11768,18 @@ mod tests {
         let prepared = crate::tray_raster::prepared_semantic_font_for_direct_view_test(
             &SemanticFontCandidate::default(),
         );
-        let with_controls = |set: &dyn Fn(&mut SceneControls), run: &dyn Fn() -> Vec<String>| {
+        // A control plays its row count as the sweep does, with one law off.
+        let with_law_off = |rows: usize, off: &dyn Fn(&mut SceneControls), raw, ground| {
             let kept = SCENE_CONTROLS.with(std::cell::Cell::get);
             let mut changed = kept;
-            set(&mut changed);
+            changed.frame_text = reads_frame_text(rows);
+            off(&mut changed);
             SCENE_CONTROLS.with(|controls| controls.set(changed));
-            let cuts = run();
+            let cuts = edge_cuts(raw, ground, rows, (&prepared, 1.0));
             SCENE_CONTROLS.with(|controls| controls.set(kept));
             cuts
         };
-        let drops = with_controls(&|c| c.motes_whole = false, &|| {
-            edge_cuts("water", ("dark", dark), 5, (&prepared, 1.0))
-        });
+        let drops = with_law_off(5, &|c| c.motes_whole = false, "water", ("dark", dark));
         assert!(
             !drops.is_empty(),
             "negative control: Water's drops drawn cut at the edge"
@@ -12055,10 +11788,9 @@ mod tests {
             ("rainbow kitty pet", ("dark", dark), 4),
             ("rainbow kitty pet", ("light", light), 4),
             ("fire", ("dark", dark), 3),
+            ("fire", ("light", light), 3),
         ] {
-            let cut = with_controls(&|c| c.rises_kept = false, &|| {
-                edge_cuts(raw, ground, rows, (&prepared, 1.0))
-            });
+            let cut = with_law_off(rows, &|c| c.rises_kept = false, raw, ground);
             assert!(
                 !cut.is_empty(),
                 "negative control: {raw} on {} in {rows} rows cut by the box's clip",
@@ -12118,6 +11850,19 @@ mod tests {
         ]
     }
 
+    /// The styles, each on its ground, whose cards run the real blur when
+    /// [`the_cards_letters_read_under_every_light`] judges every style: whichever frames light the
+    /// mask [`aterm_render::bloom::LetterMask`] reads the cells and the caret alone, not the style, so
+    /// these hold it for the rest.
+    const REAL_BLUR: [(&str, &str); 6] = [
+        ("comet", "dark"),
+        ("comet", "light"),
+        ("rainbow kitty pet", "dark"),
+        ("rainbow kitty pet", "light"),
+        ("laser", "dark"),
+        ("fire", "light"),
+    ];
+
     /// Every letter a trail or companion lies on in the card keeps 4.5:1, judged as the
     /// trail lab's `trail-contrast` judges one ([`judged_letters`]: by the ring round its
     /// strokes, against the card's clean twin, no light and no companion drawn), in every style
@@ -12144,6 +11889,10 @@ mod tests {
     /// control under the whole cell's median ground had denied. Every look, style and frame is
     /// judged at display scale 1 and 2. The judged letters under the control print with
     /// `--nocapture`.
+    ///
+    /// A frame whose gate holds the bloom or spares its letters lays no blur on a pixel this judge
+    /// reads, so only the styles in [`REAL_BLUR`] run it (each asserted to light a frame through it);
+    /// a card whose gate opens runs it from that frame on, whatever its style.
     #[test]
     fn the_cards_letters_read_under_every_light() {
         let _ = compiled(SettingsPreviewSpec::default());
@@ -12173,20 +11922,35 @@ mod tests {
             let mut glass_frames = 0;
             let mut judged_glass_frames = 0;
             let mut retained_word_frames = 0;
+            let mut blooms = REAL_BLUR.contains(&(raw, side));
+            let mut blurred_frames = 0;
             for phase in (0..CURSOR_SCENE_CYCLE_MS).step_by(MOTION_STEP_MS as usize) {
                 let _ = aterm_render::test_counters::take_glass_slabs();
+                let _ = aterm_render::test_counters::take_bloom_pixels();
+                let mut card = lit_card(
+                    raw,
+                    (theme, blooms, look),
+                    (phase, 7, Twin::Clean),
+                    (prepared, scale),
+                );
+                let gate = card.input.bloom_gate;
+                if !blooms && !(gate.held() || gate.spares_letters()) {
+                    blooms = true;
+                    card = lit_card(
+                        raw,
+                        (theme, true, look),
+                        (phase, 7, Twin::Clean),
+                        (prepared, scale),
+                    );
+                }
                 let LitCard {
                     lit,
                     twin,
                     input: lit_input,
                     cell,
                     without_body,
-                } = lit_card(
-                    raw,
-                    (theme, true, look),
-                    (phase, 7, Twin::Clean),
-                    (prepared, scale),
-                );
+                } = card;
+                blurred_frames += usize::from(aterm_render::test_counters::take_bloom_pixels() > 0);
                 let glass = aterm_render::test_counters::take_glass_slabs() > 0;
                 glass_frames += usize::from(glass);
                 if glass && let Some(without_body) = without_body {
@@ -12263,7 +12027,7 @@ mod tests {
                     );
                 }
             }
-            under
+            (under, blurred_frames)
         };
         let companions = companion_styles();
         assert!(
@@ -12290,28 +12054,46 @@ mod tests {
             }
         }
         // Each item plays on its own thread, with that thread's fonts and scene.
-        let found: Vec<String> =
-            aterm_spec::check::each(&items, |&(face, host, scale, raw, ground, look)| {
-                let _ = compiled(SettingsPreviewSpec::default());
-                #[cfg(target_os = "macos")]
-                if host {
-                    return under(raw, ground, look, (face, &host_card_face(), scale));
-                }
-                assert!(!host, "the host's face is macOS's");
-                let prepared = crate::tray_raster::prepared_semantic_font_for_direct_view_test(
-                    &SemanticFontCandidate::default(),
-                );
-                under(raw, ground, look, (face, &prepared, scale))
-            })
-            .into_iter()
-            .flatten()
-            .collect();
+        let judged = aterm_spec::check::each(&items, |&(face, host, scale, raw, ground, look)| {
+            let _ = compiled(SettingsPreviewSpec::default());
+            #[cfg(target_os = "macos")]
+            if host {
+                return under(raw, ground, look, (face, &host_card_face(), scale));
+            }
+            assert!(!host, "the host's face is macOS's");
+            let prepared = crate::tray_raster::prepared_semantic_font_for_direct_view_test(
+                &SemanticFontCandidate::default(),
+            );
+            under(raw, ground, look, (face, &prepared, scale))
+        });
+        let found: Vec<&String> = judged.iter().flat_map(|(under, _)| under).collect();
         assert!(
             found.is_empty(),
             "{} frames hold a letter under its bar: {:#?}",
             found.len(),
             &found[..found.len().min(24)]
         );
+        // The list above is names: a renamed style would end its blur here in silence.
+        for (raw, side) in REAL_BLUR {
+            assert!(
+                crate::prefs::CURSOR_TRAIL_STYLES.contains(&raw),
+                "{raw} is no style of the card, so its blur holds no mask"
+            );
+            for (face, _) in &faces {
+                let blurred: usize = items
+                    .iter()
+                    .zip(&judged)
+                    .filter(|((f, _, _, r, ground, _), _)| {
+                        *f == *face && *r == raw && ground.0 == side
+                    })
+                    .map(|(_, (_, blurred))| blurred)
+                    .sum();
+                assert!(
+                    blurred > 0,
+                    "{raw} on {side} in {face} blurred no frame, so its blur holds no mask"
+                );
+            }
+        }
         let set = |change: &dyn Fn(&mut SceneControls)| {
             SCENE_CONTROLS.with(|controls| {
                 let mut next = controls.get();
@@ -12321,7 +12103,7 @@ mod tests {
         };
         set(&|c| c.frame_text = false);
         let (face, prepared) = &faces[0];
-        let unread = under("laser", ("dark", dark), None, (face, prepared, 1.0));
+        let (unread, _) = under("laser", ("dark", dark), None, (face, prepared, 1.0));
         set(&|c| c.frame_text = true);
         assert!(
             !unread.is_empty(),
@@ -12351,7 +12133,7 @@ mod tests {
                  reads that card on it ({thin_ink:.4})"
             );
             set(&|c| c.glyph_ink = false);
-            let solid = under("sparkle", ("light", light), None, (face, prepared, 1.0));
+            let (solid, _) = under("sparkle", ("light", light), None, (face, prepared, 1.0));
             set(&|c| c.glyph_ink = true);
             assert!(
                 !solid.is_empty(),

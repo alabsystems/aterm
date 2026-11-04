@@ -109,11 +109,11 @@
 //!
 //! aterm depends on this crate directly (astream's `docs/ROADMAP.md`, "What aterm
 //! uses beyond the fabric"). It reads the boot through [`boot_session`] and
-//! [`parse_boot_id`] in aterm-link, aterm-agent, aterm-acaffiene, aterm-gui, aterm-uds,
+//! [`parse_boot_id`] in aterm-link, aterm-agent, aterm-acaffeine, aterm-gui, aterm-uds,
 //! aterm-release (its publisher fence's `fence-boot`, compared as 16 bytes), aterm-cli
 //! (its setup ledger) and aterm-update (which reads Linux's `boot_id` file itself and
 //! judges it with [`parse_boot_id`]), and writes the boot text it records (aterm-agent's ledger and
-//! tapes, aterm-acaffiene's state file, aterm-release's fence, aterm-link's messages)
+//! tapes, aterm-acaffeine's state file, aterm-release's fence, aterm-link's messages)
 //! with [`boot_id_text`]. Outside tests (whose oracle is the kernel's own text), only
 //! aterm-machines reads `kern.bootsessionuuid` otherwise, with a `sysctl -n`
 //! subprocess, to read what its enrollment root script reads. On
@@ -590,8 +590,10 @@ pub fn barrier_refused(err: &io::Error) -> bool {
 /// rather than that a flush failed: `Unsupported` or `InvalidInput` by kind everywhere,
 /// and on Apple the errnos a volume answers a flush `fcntl` it cannot take with
 /// ([`is_apple_barrier_refused_errno`]: `F_FULLFSYNC` is refused as `F_BARRIERFSYNC`
-/// is). Darwin's `ENOTSUP` is 45 and its `EOPNOTSUPP` 102, and std reads only the second
-/// as `Unsupported`, so the kind alone misses the usual refusal.
+/// is). The kind alone misses some of them: no std names `ENODEV` (what a full flush of
+/// `/dev/null` answers) or `ENOTTY` by kind, and a stock std reads only Darwin's
+/// `EOPNOTSUPP` (102), not its `ENOTSUP` (45), as `Unsupported`, where the Trust std reads
+/// both.
 ///
 /// A refused flush leaves the bytes where they were, in the page cache: a crash of the
 /// process loses none of them, a power loss may. Any other error (`EIO`, `ENOSPC`, ...)
@@ -1304,8 +1306,8 @@ mod tests {
     }
 
     /// A directory that cannot be flushed or opened is unavailable, on every platform by
-    /// its kind and on Apple by Darwin's own refusal errnos too (`ENOTSUP` is 45 there,
-    /// which std leaves uncategorized); a real I/O failure never is.
+    /// its kind and on Apple by Darwin's own refusal errnos too (`ENOTSUP` is 45 there, and
+    /// `ENODEV` and `ENOTTY` have no kind the rule reads); a real I/O failure never is.
     #[test]
     fn a_refused_or_unopenable_directory_flush_is_unavailable_and_eio_is_not() {
         for kind in [

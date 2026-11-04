@@ -405,10 +405,45 @@ fn weekly_exhausted(usage: &IdentifiedUsage) -> bool {
             .any(|(window, _)| *window == "seven_day")
 }
 
-fn usable(usage: &IdentifiedUsage) -> bool {
+/// Whether a fresh read lets a session move to its row, by the rule its writer holds a sample on
+/// record to ([`accounts::Sample::low`]), so a read it just made selects no row it would refuse.
+fn usable(usage: &IdentifiedUsage, now: i64) -> bool {
     usage.usage.sample.week_pct.is_some_and(|used| used < 100)
         && usage.usage.sample.session_pct.is_none_or(|used| used < 100)
         && usage.usage.walls.is_empty()
+        && !usage.usage.sample.low(now)
+}
+
+/// Whether `why`, what [`prepare`] refused a session for, stands however often it is asked: this
+/// session's login is no row of the pool, or a login the pool does not manage. A wait would change
+/// nothing, so its control answers that no handoff is coming rather than to wait.
+#[must_use]
+pub fn prepare_refusal_stands(why: &str) -> Option<NoHandoff> {
+    match why {
+        "not-weekly-exhausted" => Some(NoHandoff::LimitNotReached),
+        "source-unbound" | "source-missing" | "source-unmanaged" => Some(NoHandoff::NoRowOfThePool),
+        _ => None,
+    }
+}
+
+/// Why no handoff is coming to a session, however often it asks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoHandoff {
+    /// The session's login has not reached its weekly limit.
+    LimitNotReached,
+    /// The session's login is no row the pool hands off.
+    NoRowOfThePool,
+}
+
+impl NoHandoff {
+    /// What a log line calls it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LimitNotReached => "its login has not reached its weekly limit",
+            Self::NoRowOfThePool => "its login is no row the pool hands off",
+        }
+    }
 }
 
 /// Resolve only host-observed session paths. The source must still identify
@@ -536,23 +571,33 @@ fn prepare_with<T, R: Clone>(
         at: Some(seat.now),
     };
     let mut selected = None;
+    let mut reads = Vec::new();
     let mut admit = |row: &Row| {
         let left = remaining();
         if left.is_zero() {
             return false;
         }
         let new_auth = row_auth(seat, row);
+        let context = seat.store(Cli::Codex).capture_auth_context(row);
         let Some(usage) = reader.read(&new_auth, row.expected_identity_email(), seat.now, left)
         else {
             return false;
         };
-        if !usable(&usage) || usage.identity.account == expected_source.account {
+        reads.push(accounts_pool::FreshRead {
+            label: row.label.clone(),
+            context,
+            usage: usage.usage.clone(),
+        });
+        if !usable(&usage, seat.now) || usage.identity.account == expected_source.account {
             return false;
         }
         selected = Some((row.clone(), usage.identity, new_auth));
         true
     };
     let plan = select(seat, &session, &mut admit);
+    // The report and later writers judge these rows by what was just read. A selection stands
+    // whether or not this records: its writer judges the row again.
+    let _ = accounts_pool::note_fresh_reads(seat, Cli::Codex, &reads, remaining());
     let Some((destination, destination_identity, new_auth)) = selected else {
         return Ok(None);
     };

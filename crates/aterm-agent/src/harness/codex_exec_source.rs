@@ -109,17 +109,31 @@ impl ExecSource {
         reader: &dyn crate::harness::codex_rotation::UsageReader,
         wait: std::time::Duration,
     ) -> Result<Option<crate::harness::codex_rotation::Proposal<ExecCommand>>, &'static str> {
-        use crate::harness::{accounts, accounts_pool, codex_rotation};
         if !self.current() {
             return Err("exec-source-changed");
         }
-        let env = self.account_env().ok_or("exec-auth-path")?;
         let program = std::str::from_utf8(&self.process.image.path).map_err(|_| "exec-program")?;
+        self.prepare_on(seat, sid, expected_source, reader, wait, Path::new(program))
+    }
+
+    /// [`Self::prepare`], judging the Codex `program` this session execs.
+    pub(crate) fn prepare_on(
+        &self,
+        seat: &crate::harness::accounts_pool::Seat<'_>,
+        sid: &str,
+        expected_source: &crate::harness::codex_renewal::Identity,
+        reader: &dyn crate::harness::codex_rotation::UsageReader,
+        wait: std::time::Duration,
+        program: &Path,
+    ) -> Result<Option<crate::harness::codex_rotation::Proposal<ExecCommand>>, &'static str> {
+        use crate::harness::{accounts, accounts_pool, codex_rotation};
+        let default_home = seat.home.join(accounts::Cli::Codex.accounts().default_home);
+        let env = self.account_env(&default_home).ok_or("exec-auth-path")?;
         let session = accounts_pool::Session {
             cli: accounts::Cli::Codex,
             sid,
             supervisor: accounts::Supervisor::Own,
-            env: &env,
+            env: env.as_slice(),
             sample: None,
             point: accounts::Point::Wall {
                 window: "seven_day".into(),
@@ -131,7 +145,7 @@ impl ExecSource {
         let result = codex_rotation::prepare_exec(
             seat,
             &session,
-            Path::new(program),
+            program,
             expected_source,
             reader,
             wait,
@@ -148,12 +162,17 @@ impl ExecSource {
         result
     }
 
-    fn account_env(&self) -> Option<[(&str, &str); 1]> {
+    fn account_env(&self, default_home: &Path) -> Option<Vec<(&str, &str)>> {
         // Attribute the login through its proven credential pointer, as TUI
         // rotation does. CODEX_HOME belongs to config/history; presenting it as
         // a second login override makes the shared pool refuse a managed row.
         // The provider reader separately retains the kernel-bound config home.
-        Some([("CODEX_AUTH_PATH", self.auth_path.to_str()?)])
+        // This machine's own login is the row with no directory, which a pointer
+        // to it would not name: a session there carries none, as a TUI's does.
+        if self.auth_path == default_home.join("auth.json") {
+            return Some(Vec::new());
+        }
+        Some(vec![("CODEX_AUTH_PATH", self.auth_path.to_str()?)])
     }
 
     /// Recheck after provider I/O and before native admission. A changed image,
@@ -221,6 +240,22 @@ mod tests {
         (process, args)
     }
 
+    /// A session on this machine's own login carries no pointer, as a TUI's does: a pointer to it
+    /// would name no row, so its row would never hand off. A managed login's carries its own.
+    #[test]
+    fn a_session_on_the_default_login_carries_no_pointer() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let (process, args) = facts(root.path());
+        let mut source = ExecSource::from_observations(process, args, root.path().into()).unwrap();
+        let default_home = root.path().join(".codex");
+        source.auth_path = default_home.join("auth.json");
+        assert_eq!(source.account_env(&default_home), Some(Vec::new()));
+        source.auth_path = root.path().join("source/auth.json");
+        let carried = source.account_env(&default_home).unwrap();
+        assert_eq!(carried.len(), 1);
+        assert_eq!(carried[0].0, "CODEX_AUTH_PATH");
+    }
+
     #[test]
     fn native_exec_source_retains_the_whole_invocation_and_only_auth_paths() {
         let root = aterm_tempfile::tempdir().unwrap();
@@ -248,7 +283,7 @@ mod tests {
         let source = ExecSource::from_observations(process, args, root.path().into()).unwrap();
         let login = crate::harness::accounts::ProcessLogin::of_env_for(
             crate::harness::accounts::Cli::Codex,
-            source.account_env().unwrap(),
+            source.account_env(&root.path().join(".codex")).unwrap(),
         );
         assert!(login.default_home && login.stored_login);
         assert_eq!(login.login.as_deref(), root.path().join("source").to_str());

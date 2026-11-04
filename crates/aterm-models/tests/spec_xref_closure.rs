@@ -57,6 +57,9 @@ fn collected_digests(refs: &[&xref::RefinementAnchor], waivers: &[&xref::Waiver]
 #[test]
 fn spec_xref_closure() {
     let _domains = aterm_models::link_all();
+    std::hint::black_box(
+        aterm_agent::harness::accounts::account_workflow_scope_environment as fn(),
+    );
     #[cfg(unix)]
     std::hint::black_box((
         aterm_capacity::cohort::capacity_terminal_environment as fn(),
@@ -269,6 +272,20 @@ fn spec_xref_closure() {
                     &aterm_secrets::server::Options,
                 ) -> aterm_secrets::Result<aterm_secrets::server::Running>,
             aterm_secrets::server::records_file_environment as fn(),
+        ));
+        // `SwarmRecordsCapacity`'s anchors beyond `Log::insert` and the server's: the proof
+        // reserve's read, beside `decide`, and the waivers' host. Its Mac writes in `client`
+        // and its legacy database fence in `aterm_db::control` sit beside items named above.
+        std::hint::black_box((
+            aterm_secrets::client::ProofAdmissionCapacity::observe
+                as fn(&Log) -> aterm_secrets::client::ProofAdmissionCapacity,
+            aterm_secrets::server::records_capacity_environment as fn(),
+        ));
+        // `EpochConvergence`'s anchors on the tender, and the waivers' host.
+        std::hint::black_box((
+            aterm_secrets::client::tend_epochs_at
+                as fn(&aterm_secrets::client::Paths, u64) -> aterm_secrets::Result<Vec<Record>>,
+            aterm_secrets::client::epoch_convergence_environment as fn(),
         ));
     }
     #[expect(

@@ -259,15 +259,26 @@ type Twins = std::collections::BTreeMap<String, Drawn>;
 
 /// What [`draw_frames`] drew: every frame the record describes, in drawing
 /// order; the frames each fixture claims to differ (`(a, b)`: the input
-/// changed between them); and the twin of each frame aterm's CPU side draws
-/// too.
+/// changed between them); the twin of each frame aterm's CPU side draws
+/// too; and the shape of each readback held to the CPU renderer's frame, as
+/// the arm encoded it ([`Self::shape`]).
 struct Drawing {
     frames: Named,
     distinct: Vec<(String, String)>,
     twins: Twins,
+    shapes: std::collections::BTreeMap<String, String>,
 }
 
 impl Drawing {
+    /// The shape of the readback `gpu` just drew as `name` ([`shape_note`]); `epoch` is the
+    /// font epoch before it.
+    fn shape(&mut self, name: &str, gpu: &GpuRenderer, epoch: u64) {
+        self.shapes.insert(
+            name.to_owned(),
+            shape_note(&gpu.frame_shape(), gpu.cpu.font_epoch() != epoch),
+        );
+    }
+
     /// `frame`, drawn as `name`, with its twin when it has one.
     fn push(&mut self, name: String, frame: Drawn, twin: Option<Drawn>) {
         if let Some(twin) = twin {
@@ -290,6 +301,7 @@ fn draw_frames_with(family: Option<&str>) -> Drawing {
         frames: Vec::new(),
         distinct: Vec::new(),
         twins: Twins::new(),
+        shapes: std::collections::BTreeMap::new(),
     };
 
     // Readbacks: the encode plan, three frames each (the second and third
@@ -304,10 +316,13 @@ fn draw_frames_with(family: Option<&str>) -> Drawing {
     for (name, input, drive) in &fixtures {
         let twin = cpu_twin(&mut gpu, input);
         for pass in 0..3 {
+            let epoch = gpu.cpu.font_epoch();
             let f = gpu
                 .try_render_input(&mut win, input, None)
                 .unwrap_or_else(|e| panic!("{name}: the readback: {e}"));
             drew_on(&gpu, name);
+            let frame = format!("{name}/readback/{pass}");
+            d.shape(&frame, &gpu, epoch);
             if pass == 0 {
                 let drawn: Vec<StreamId> = gpu.frame_plan.iter().map(|i| i.stream).collect();
                 for want in drive {
@@ -317,19 +332,17 @@ fn draw_frames_with(family: Option<&str>) -> Drawing {
                     );
                 }
             }
-            d.push(
-                format!("{name}/readback/{pass}"),
-                f.into(),
-                Some(twin.clone()),
-            );
+            d.push(frame, f.into(), Some(twin.clone()));
         }
     }
     gpu.set_cursor_opacity(0.5);
     let cursor = fixtures_base_for_cursor();
+    let epoch = gpu.cpu.font_epoch();
     let f = gpu
         .try_render_input(&mut win, &cursor, None)
         .expect("the cursor-blend readback");
     drew_on(&gpu, "cursor_blend");
+    d.shape("cursor_blend/readback/0", &gpu, epoch);
     assert!(
         gpu.frame_plan
             .iter()
@@ -374,10 +387,12 @@ fn draw_frames_with(family: Option<&str>) -> Drawing {
         .push(("heat/readback".to_owned(), "heat/layered/0".to_owned()));
     gpu.set_bloom(false);
     gpu.set_shimmer(false);
+    let epoch = gpu.cpu.font_epoch();
     let f = gpu
         .try_render_input(&mut win, &heat, None)
         .expect("the plain heat readback");
     drew_on(&gpu, "heat/readback");
+    d.shape("heat/readback", &gpu, epoch);
     let twin = cpu_twin(&mut gpu, &heat);
     d.push("heat/readback".to_owned(), f.into(), Some(twin));
 
@@ -499,12 +514,15 @@ fn draw_frames_with(family: Option<&str>) -> Drawing {
     for (label, opacity) in [("opaque", 1.0f32), ("translucent", 0.55)] {
         gpu.set_background_opacity(opacity);
         let mut win = WindowGpu::new();
+        let epoch = gpu.cpu.font_epoch();
         let f = gpu
             .try_render_input(&mut win, &input, None)
             .unwrap_or_else(|e| panic!("{label}: the readback: {e}"));
         drew_on(&gpu, label);
+        let frame = format!("window/{label}/readback");
+        d.shape(&frame, &gpu, epoch);
         let twin = cpu_twin(&mut gpu, &input);
-        d.push(format!("window/{label}/readback"), f.into(), Some(twin));
+        d.push(frame, f.into(), Some(twin));
     }
     d.distinct.push((
         "window/opaque/readback".to_owned(),
@@ -520,6 +538,43 @@ fn draw_frames_with(family: Option<&str>) -> Drawing {
     #[cfg(target_os = "macos")]
     crown_row_frames(&mut d);
     d
+}
+
+/// What the arm's encode of a readback staged ([`GpuRenderer::frame_shape`]), and whether the
+/// font epoch moved during it (the readback then encoded the frame again): beside a finding seen
+/// once, what that frame's encode held.
+fn shape_note(s: &FrameShape, epoch_moved: bool) -> String {
+    format!(
+        "encoded in {} passes, {} fx instances ({} refused, {} atlas bytes written), route \
+         {:?}, fetch {:?}{}",
+        s.passes,
+        s.fx_instances,
+        s.fx_refused,
+        s.fx_atlas_bytes,
+        s.route,
+        s.fetch_probe,
+        if epoch_moved {
+            ", encoded again after the font epoch moved"
+        } else {
+            ""
+        }
+    )
+}
+
+/// `findings`, each followed by its frame's shape where [`Drawing::shapes`] holds one.
+fn with_shapes(
+    findings: &[String],
+    shapes: &std::collections::BTreeMap<String, String>,
+) -> Vec<String> {
+    findings
+        .iter()
+        .map(|f| {
+            let frame = f.split_once(": ").map_or(f.as_str(), |(n, _)| n);
+            shapes
+                .get(frame)
+                .map_or_else(|| f.clone(), |s| format!("{f} [{s}]"))
+        })
+        .collect()
 }
 
 /// The CPU renderer's frame of `input`: the renderer the arm wraps, under
@@ -1693,6 +1748,7 @@ fn armed_frames_hold_to_their_cpu_twins() {
         frames,
         distinct,
         twins,
+        shapes,
     } = draw_frames();
     let drawn = rows_of(&frames);
     for (name, (geom, sha)) in &drawn {
@@ -1750,7 +1806,7 @@ fn armed_frames_hold_to_their_cpu_twins() {
          for a blit); the law is the parity suites' and is never loosened to pass.",
         verdict.findings.len(),
         verdict.twinned,
-        verdict.findings
+        with_shapes(&verdict.findings, &shapes)
     );
     planted_texel_is_decided(arch, &adapter, &frames, &twins);
     #[cfg(windows)]
@@ -1801,6 +1857,7 @@ fn armed_frames_hold_to_their_cpu_twins_on_bundled_faces() {
             frames,
             distinct,
             twins,
+            shapes,
         } = draw_frames_with(Some(family));
         let drawn = rows_of(&frames);
         let digests: std::collections::BTreeMap<&str, &str> = drawn
@@ -1821,7 +1878,7 @@ fn armed_frames_hold_to_their_cpu_twins_on_bundled_faces() {
              {} of {} twinned frames): {:#?}",
             verdict.findings.len(),
             verdict.twinned,
-            verdict.findings
+            with_shapes(&verdict.findings, &shapes)
         );
     }
     end_unless_the_colour_row_ran();

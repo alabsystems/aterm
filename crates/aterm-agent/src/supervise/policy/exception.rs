@@ -668,7 +668,7 @@ pub const LOGIN_BACKING_OUT: &str = "aterm backs out of the /login it typed (its
 const fn draft_notice_text(text: &NoticeText, composer: &Composer) -> NoticeText {
     NoticeText {
         todo: match composer {
-            Composer::Diverted => "Close the completion menu, then send the draft in the tab.",
+            Composer::Diverted(by) => by.todo(),
             Composer::Own => "Clear aterm's unsent text in the tab.",
             _ => text.todo,
         },
@@ -824,7 +824,7 @@ fn limit_roster_step<'a>(
             (None, None) => draft.map(|composer| {
                 let text = match composer {
                     Composer::Own => &notice::LIMIT_DRAFT_OWN,
-                    Composer::Diverted => &notice::LIMIT_DRAFT_MENU,
+                    Composer::Diverted(_) => &notice::LIMIT_DRAFT_MENU,
                     _ => &notice::LIMIT_DRAFT,
                 };
                 (text, Some(ready.label.as_str()), None)

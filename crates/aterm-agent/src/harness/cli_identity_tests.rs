@@ -14,6 +14,8 @@ struct TerminalCodex {
     driver_reports_identity: bool,
     program: Option<PathBuf>,
     sign_in_program: Option<PathBuf>,
+    snapshot_store: Option<(accounts::Store, i64)>,
+    admitted: RefCell<Option<accounts::Logins>>,
 }
 impl TerminalCodex {
     fn new(reported: Option<&'static str>) -> Self {
@@ -27,6 +29,8 @@ impl TerminalCodex {
             driver_reports_identity: true,
             program: None,
             sign_in_program: None,
+            snapshot_store: None,
+            admitted: RefCell::new(None),
         }
     }
 }
@@ -54,6 +58,9 @@ impl AccountsHost for TerminalCodex {
     }
     fn vendor_login(&self, req: &crate::harness::login_drive::Request<'_>) -> Result<i32, String> {
         assert_eq!(req.cli, Cli::Codex);
+        if let Some((store, now)) = &self.snapshot_store {
+            *self.admitted.borrow_mut() = Some(store.load_logins(*now).unwrap().0);
+        }
         self.homes.borrow_mut().push(req.staging.to_path_buf());
         std::fs::write(req.staging.join("auth.json"), "isolated fixture login").unwrap();
         if let Some((path, text, false)) = &self.mutation {
@@ -172,6 +179,7 @@ fn codex_publication_refuses_credential_identity_changed_after_the_report() {
                         })
                     });
                 let mut host = TerminalCodex::new(Some("owner@example.test"));
+                host.snapshot_store = Some((store.clone(), env.now));
                 let replacement = publication_credential(kind, 1);
                 host.replacement = Some(replacement.clone());
                 host.driver_reports_identity = path != "renew-probe";
@@ -185,7 +193,10 @@ fn codex_publication_refuses_credential_identity_changed_after_the_report() {
                     "{path}, prior={prior}, kind={kind}: {out}{err}"
                 );
                 if refused {
-                    assert_eq!(store.load_logins(env.now).unwrap().0, before);
+                    let admitted = host.admitted.borrow();
+                    let admitted = admitted.as_ref().unwrap();
+                    assert_eq!(admitted.labels, before.labels);
+                    assert_eq!(store.load_logins(env.now).unwrap().0, *admitted);
                 }
                 if let Some(files) = prior_files {
                     for (path, bytes) in files {
@@ -463,12 +474,16 @@ fn a_credential_lost_during_the_identity_probe_cannot_publish() {
                 let store = env.accounts_store_for(Cli::Codex).unwrap();
                 let before = store.load_logins(env.now).unwrap().0;
                 let mut host = TerminalCodex::new(Some("owner@example.test"));
+                host.snapshot_store = Some((store.clone(), env.now));
                 host.credential_fault = Some(replace_with_directory);
                 let (code, out, err) =
                     command(&format!("accounts {verb} account --cli codex"), &env, &host);
                 assert_eq!(host.probes.borrow().len(), 1);
                 assert_eq!(code, exit(1), "{verb}, prior={prior}: {out}{err}");
-                assert_eq!(store.load_logins(env.now).unwrap().0, before);
+                let admitted = host.admitted.borrow();
+                let admitted = admitted.as_ref().unwrap();
+                assert_eq!(admitted.labels, before.labels);
+                assert_eq!(store.load_logins(env.now).unwrap().0, *admitted);
                 let staging = host.homes.borrow()[0].clone();
                 assert_eq!(
                     std::fs::read(staging.join("auth.retained")).unwrap(),
@@ -655,7 +670,7 @@ fn duplicate_canonical_identities_and_unsupported_alias_options_refuse() {
         parsed(
             "accounts adopt-default account --cli kimi --email alias@example.test --identity-email owner@example.test --region global"
         )
-        .is_err()
+        .is_ok()
     );
 }
 
@@ -1006,6 +1021,7 @@ fn publication_case(
         &mut Vec::new(),
     )
     .unwrap();
+    let admitted_logins = store.load_logins(env.now).unwrap().0;
     let credential = plan.staging.join(cli.connector().stores[0]);
     std::fs::create_dir_all(credential.parent().unwrap()).unwrap();
     std::fs::write(&credential, "prepared login").unwrap();
@@ -1082,7 +1098,7 @@ fn publication_case(
         }
     }
     if refused {
-        assert_eq!(store.load_logins(env.now).unwrap().0, records.logins);
+        assert_eq!(store.load_logins(env.now).unwrap().0, admitted_logins);
     } else {
         let logins = store.load_logins(env.now).unwrap().0;
         let binding = logins.get("account").unwrap();

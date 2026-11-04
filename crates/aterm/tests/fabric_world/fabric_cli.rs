@@ -537,7 +537,8 @@ fn the_report_and_its_doctor_say_what_the_broker_says_of_its_log() {
         );
     }
     // What of its log the broker keeps decoded, as the holds row's `resident=` quotes it (D10):
-    // aterm sets no residency budget, so every record the snapshot counts.
+    // a log this small fits whole inside aterm's residency budget
+    // (`aterm_link::durability::RESIDENT_BUDGET`), so every record the snapshot counts.
     let snapshot = &health["snapshot"];
     let records = snapshot["records"]
         .as_u64()
@@ -1086,7 +1087,7 @@ fn a_live_broker_is_read_for_real_and_the_env_overrides_the_file() {
     let broker = Broker::spawn(&s);
     s.write_config(&format!(
         "[fabric]\ncommand = \"{}\"\n",
-        s.command("/tmp/atf-nowhere.sock", false)
+        s.command(&s.path("nowhere.sock"), false)
     ));
     let env_cmd = s.command(&s.sock(), true);
 

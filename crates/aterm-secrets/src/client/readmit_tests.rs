@@ -1139,6 +1139,8 @@ fn reader_0147(mut wire: &[u8]) -> Result<Vec<(u8, Option<u8>)>, String> {
 /// with "membership admission of an unknown evidence 4".
 #[test]
 fn a_mac_whose_vault_key_changed_takes_its_seat_back_by_proof_with_nobody() {
+    // Every server it reads is its own on loopback, which answers.
+    let _answering = ServersAnswering::set();
     let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
     let (m22, m7) = (&macs.m22, &macs.m7);
     let (_, old, _) = member_key(m7);
@@ -1240,6 +1242,8 @@ fn a_mac_whose_vault_key_changed_takes_its_seat_back_by_proof_with_nobody() {
 /// no server reachable moves the seat and the `Refused` match fails.
 #[test]
 fn a_member_that_reads_no_newer_records_lets_no_new_key_in() {
+    // The server answers until it stops below.
+    let answering = ServersAnswering::set();
     let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
     let (m22, m7) = (&macs.m22, &macs.m7);
     let pair = node_pair(9);
@@ -1268,6 +1272,7 @@ fn a_member_that_reads_no_newer_records_lets_no_new_key_in() {
         book: CURRENT,
     };
     let later = aterm_time::unix_millis().unwrap() + DARK_FOR_MS + 1;
+    drop(answering);
     macs.server.stop();
     let refused = admit_by_proof(m22, &proven, later).expect("decided");
     let Readmit::Refused(why) = &refused else {
@@ -1299,6 +1304,8 @@ fn a_stranger_is_refused_before_possession_and_a_refusal_after_it_stays_ambiguou
     use crate::members::desk::{self, Desk, Local};
     use crate::members::join::{self, Stream};
     use crate::members::joiner::Joining;
+    // The server answers the setup's reads; the desk's below keep their own bounds.
+    let answering = ServersAnswering::set();
     let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
     let (m22, m7) = (macs.m22.clone(), macs.m7.clone());
     let pair = node_pair(8);
@@ -1312,6 +1319,7 @@ fn a_stranger_is_refused_before_possession_and_a_refusal_after_it_stays_ambiguou
     .expect("a Node record");
     post_records_to_servers(&m7).expect("m7 posts its records");
     sync_records(&m22, None).expect("m22 pulls m7's Node record");
+    drop(answering);
     let fresh = Paths::for_home(&macs.root.path().join("new-mac"));
     machine_identity(&fresh).expect("identity");
     let device = crate::commons::bootstrap::Device::open(&fresh)
@@ -1572,6 +1580,8 @@ fn a_fresh_vault_key_proves_its_node_key_to_a_members_desk_and_is_in() {
     use crate::members::desk::{self, Desk, Local};
     use crate::members::join::{self, Stream};
     use crate::members::joiner::Joining;
+    // Every server this thread reads is its own on loopback, which answers.
+    let _answering = ServersAnswering::set();
     let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
     let (m22, m7) = (&macs.m22, &macs.m7);
     let pair = node_pair(8);
@@ -1895,5 +1905,318 @@ fn unset_clock_refuses_proof_decisions() {
     );
     assert!(
         matches!(decided(&log, ME, 9, false, 0), Decision::Refuse(why) if why.contains("clock"))
+    );
+}
+
+/// `SwarmRecordsCapacity` in each configuration it declares: the committed one, then the
+/// activation's.
+fn records_capacity_configurations() -> Vec<aterm_spec::derive::Model> {
+    let name = aterm_models_swarm::records_capacity_model().name;
+    aterm_spec::xref::model_configurations()
+        .into_iter()
+        .find(|configurations| configurations[0].name == name)
+        .expect("SwarmRecordsCapacity is registered")
+}
+
+/// `model`'s constant `name`, as a count.
+fn capacity_constant(model: &aterm_spec::derive::Model, name: &str) -> usize {
+    model
+        .consts
+        .iter()
+        .find(|(constant, _)| *constant == name)
+        .map(|&(_, value)| usize::try_from(value).expect("a count"))
+        .expect("the model's constant")
+}
+
+/// The record budgets `model`'s `Budgets` log holds: `W` weighed, `K` keyed, `H` in all.
+fn capacity_budgets(model: &aterm_spec::derive::Model) -> RecordBudgets {
+    RecordBudgets {
+        weighed: capacity_constant(model, "W"),
+        keyed: capacity_constant(model, "K"),
+        held: capacity_constant(model, "H"),
+    }
+}
+
+/// A log of `SwarmRecordsCapacity`'s `Budgets` holding `w` weighed and `k` keyed records:
+/// [`alab`] (`w` 2, `k` 1), then `ME`'s phrase `Admit`s and `Name`s.
+fn capacity_log(w: i64, k: i64) -> Log {
+    let mut log = alab();
+    for n in 0..w - 2 {
+        let tag = 100 + u8::try_from(n).expect("a tag");
+        admit_by_phrase(&mut log, Mac(tag), tag);
+    }
+    fill_names(&mut log, usize::try_from(w + k).expect("a count"));
+    log
+}
+
+/// `log`'s held records by the budget each counts against ([`Kind::weighed`]): weighed, keyed.
+fn by_kind(log: &Log) -> (i64, i64) {
+    let weighed = log.records().filter(|r| r.kind().weighed()).count();
+    let keyed = log.held_count() - weighed;
+    (
+        i64::try_from(weighed).expect("a count"),
+        i64::try_from(keyed).expect("a count"),
+    )
+}
+
+/// One of `SwarmRecordsCapacity`'s budgets actions on `log`, and what it did (the model's
+/// `last`): `AddWeighed` a person's `Admit` of a new Mac, `AddKeyed` a `Name`, each held or
+/// refused by [`Log::insert`] for a budget, and `Prove` a Mac on the home LAN that proves its
+/// node key, judged by [`decide`] with an admission of `wraps` `Wrap`s beside its `Admit` (the
+/// model's `PW`). Where [`decide`] lets it in, its batch is signed: the `Admit`, then a keyed
+/// record for each `Wrap` (a `Name`, which counts as a `Wrap` does), each held where
+/// [`Log::insert`] takes it.
+fn capacity_act(log: &mut Log, action: &str, wraps: usize) -> i64 {
+    let inserted = |log: &mut Log, body: Body, (held, refused): (i64, i64)| {
+        let record = log
+            .draft(&ME.id(), T0, body)
+            .sign(&ME.seed(), ME.incarnation())
+            .unwrap();
+        match log.insert(record) {
+            Ok(Inserted::Held) => held,
+            Err(e) if e.kind() == crate::ErrorKind::MembershipCapacity => refused,
+            other => panic!("{action}: {other:?}"),
+        }
+    };
+    let name = || Body::Name {
+        name: "added".into(),
+    };
+    match action {
+        "AddWeighed" => inserted(
+            log,
+            Body::Admit {
+                entrant: Entrant {
+                    request: Mac(150).request(),
+                    node_key: node(150),
+                    name: "m150".to_owned(),
+                    label: "m150".to_owned(),
+                },
+                evidence: Evidence::Phrase,
+            },
+            (1, 2),
+        ),
+        "AddKeyed" => inserted(log, name(), (3, 4)),
+        "Prove" => match on_lan_with_wraps(log, Mac(90), 90, wraps, T0) {
+            Decision::Lan => {
+                admit(log, ME, Mac(90), 90, "m90", Evidence::Manual, T0);
+                for _ in 0..wraps {
+                    inserted(log, name(), (0, 0));
+                }
+                5
+            }
+            Decision::Refuse(_) => 6,
+            other => panic!("Prove: {other:?}"),
+        },
+        other => panic!("not a budgets action: {other}"),
+    }
+}
+
+/// `SwarmRecordsCapacity`'s variables after a budgets action on a real log: `w` and `k` the
+/// log's held records by kind (not its own counts, which a mutant may count wrong), `last` what
+/// the action did, and `lw` and `lk` the records by kind it judged, `before` it.
+fn records_capacity_transition(
+    before: (i64, i64),
+    last: i64,
+    after: &Log,
+) -> aterm_spec::interp::State {
+    let (w, k) = by_kind(after);
+    aterm_spec::interp::State::from([
+        ("sc", 1),
+        ("w", w),
+        ("k", k),
+        ("last", last),
+        ("lw", before.0),
+        ("lk", before.1),
+        ("nr", 0),
+        ("nx", 0),
+        ("mark", 0),
+        ("gs", 0),
+        ("fenced", 0),
+    ])
+}
+
+/// `action` on a log of `model`'s `Budgets` holding `w` weighed and `k` keyed records, made and
+/// acted on within the model's budgets, a proof's batch of its `PW` `Wrap`s: the state it leaves.
+fn capacity_observed(
+    model: &aterm_spec::derive::Model,
+    (w, k): (i64, i64),
+    action: &str,
+) -> aterm_spec::interp::State {
+    capacity_budgets(model).within(|| {
+        let mut log = capacity_log(w, k);
+        assert_eq!(by_kind(&log), (w, k), "the log realizes ({w}, {k})");
+        let last = capacity_act(&mut log, action, capacity_constant(model, "PW"));
+        records_capacity_transition((w, k), last, &log)
+    })
+}
+
+/// The state `model` reaches by `path` from its first (each of these actions has one
+/// successor).
+fn capacity_state(model: &aterm_spec::derive::Model, path: &[&str]) -> aterm_spec::interp::State {
+    path.iter().fold(model.init_state(), |state, action| {
+        let next = model.successors(action, &state);
+        assert_eq!(next.len(), 1, "{action} from {state:?}");
+        next[0].clone()
+    })
+}
+
+/// S8: `SwarmRecordsCapacity` holds its laws, each of its mutants breaks the law it stands for
+/// (1 `LegacyNeverPartial`, 2 `CrossedBeforeHeld`, 3 `ProofReserve`, 4 `KeyedBound` and
+/// `ProofReserve`, 5 `ProofReserve`, 6 `LegacyNeverPartial`), and a real log refines its
+/// `Budgets` in each configuration the model declares (the committed held total, and the
+/// activation's, the two budgets together): from every count of weighed and keyed records the
+/// model reaches, each of `AddWeighed`, `AddKeyed` and `Prove` on a real log of those counts
+/// (made within the model's budgets, `RecordBudgets::within`) gives exactly the successor the
+/// model allows there. `Prove` is [`decide`] judging an admission of the model's `PW` `Wrap`s,
+/// and its whole batch signed where it lets the Mac in. A successor reads only the counts, so
+/// one log per count and action judges every state with those counts.
+///
+/// NEGATIVE CONTROLS, each the real log down its mutant's path:
+/// - `readmit::RESERVE_OVER_ALL` (the reserve over every kind against three quarters of the held
+///   total, as before the split): the activation's log of three weighed records and one keyed
+///   lets a proof in past the weighed reserve, which is no successor of `Prove` and breaks
+///   `ProofReserve`.
+/// - `budgets::KEYED_AS_WEIGHED` (keyed kinds counted as weighed): the activation's log of two
+///   weighed and two keyed records refuses a `Name`, which is no successor of `AddKeyed` and
+///   breaks `KeyedBound`; and its first log refuses the first proof by the weighed reserve, as
+///   the model's mutant 4 does, which is no successor and breaks `ProofReserve`.
+/// - `readmit::BATCH_WITHOUT_WRAPS` (a proof's fit judged by its `Admit` alone): the committed
+///   first log lets a proof in whose `Wrap` the held total then refuses, which is no successor
+///   of `Prove` and breaks `ProofReserve`.
+#[test]
+fn record_budgets_and_the_proof_reserve_conform() {
+    use crate::membership_log::budgets::KEYED_AS_WEIGHED;
+    use aterm_spec::interp::{fired_actions, violated_invariants, with_buggy};
+
+    let configurations = records_capacity_configurations();
+    assert_eq!(configurations.len(), 2, "the committed and the activation");
+    let faults = aterm_spec::verify::sweep_faults(&configurations);
+    assert!(faults.is_empty(), "{faults:?}");
+    let model = &configurations[0];
+    aterm_spec::interp::prove_and_catch(model);
+    let fired: BTreeSet<&str> = configurations.iter().flat_map(fired_actions).collect();
+    assert_eq!(fired.len(), model.actions.len(), "fired actions: {fired:?}");
+    for (buggy, law) in [
+        (1, "LegacyNeverPartial"),
+        (2, "CrossedBeforeHeld"),
+        (3, "ProofReserve"),
+        (4, "KeyedBound"),
+        (4, "ProofReserve"),
+        (5, "ProofReserve"),
+        (6, "LegacyNeverPartial"),
+    ] {
+        assert!(
+            configurations
+                .iter()
+                .any(|m| violated_invariants(&with_buggy(m, buggy)).contains(law)),
+            "mutant {buggy} breaks {law}"
+        );
+    }
+
+    let actions = ["AddWeighed", "AddKeyed", "Prove"];
+    let mut admitted = 0;
+    for model in &configurations {
+        let start = model.successors("Budgets", &model.init_state());
+        assert_eq!(start.len(), 1);
+        let start = start[0].clone();
+        let mut reached = BTreeSet::from([start.clone()]);
+        let mut queue = std::collections::VecDeque::from([start]);
+        while let Some(state) = queue.pop_front() {
+            for action in &model.actions {
+                let enabled = model.action_enabled(action.name, &state);
+                assert_eq!(enabled, actions.contains(&action.name), "{}", action.name);
+                for next in model.successors(action.name, &state) {
+                    if reached.insert(next.clone()) {
+                        queue.push_back(next);
+                    }
+                }
+            }
+        }
+        let counts: BTreeSet<(i64, i64)> = reached.iter().map(|s| (s["w"], s["k"])).collect();
+        for &(w, k) in &counts {
+            for action in actions {
+                let observed = capacity_observed(model, (w, k), action);
+                admitted += usize::from(observed["last"] == 5);
+                for state in reached.iter().filter(|s| (s["w"], s["k"]) == (w, k)) {
+                    assert_eq!(
+                        model.successors(action, state),
+                        vec![observed.clone()],
+                        "{} {action} from {state:?}",
+                        capacity_constant(model, "H")
+                    );
+                }
+            }
+        }
+        eprintln!(
+            "SwarmRecordsCapacity (held {}): {} states, {} counts judged",
+            capacity_constant(model, "H"),
+            reached.len(),
+            counts.len()
+        );
+    }
+    assert!(admitted > 0, "a proof's whole batch is signed somewhere");
+
+    let committed = &configurations[0];
+    let activation = &configurations[1];
+    let control = |switch: &'static std::thread::LocalKey<std::cell::Cell<bool>>,
+                   model: &aterm_spec::derive::Model,
+                   path: &[&str],
+                   action: &str,
+                   law: &str| {
+        let from = capacity_state(model, path);
+        switch.with(|cell| cell.set(true));
+        let observed = capacity_observed(model, (from["w"], from["k"]), action);
+        switch.with(|cell| cell.set(false));
+        assert!(
+            !model.successors(action, &from).contains(&observed),
+            "{action} from {from:?} gave {observed:?}, a successor"
+        );
+        assert!(!model.check_invariant(law, &observed), "{observed:?}");
+        observed
+    };
+
+    // The reserve over every kind, past the weighed reserve.
+    let over_all = control(
+        &RESERVE_OVER_ALL,
+        activation,
+        &["Budgets", "AddWeighed"],
+        "Prove",
+        "ProofReserve",
+    );
+    assert_eq!(over_all["last"], 5, "the mutant lets the proof in");
+    // Keyed kinds counted as weighed: a `Name`, then the first proof.
+    let name = control(
+        &KEYED_AS_WEIGHED,
+        activation,
+        &["Budgets", "AddKeyed"],
+        "AddKeyed",
+        "KeyedBound",
+    );
+    assert_eq!(name["last"], 4, "the mutant refuses the Name");
+    let proof = control(
+        &KEYED_AS_WEIGHED,
+        activation,
+        &["Budgets"],
+        "Prove",
+        "ProofReserve",
+    );
+    assert_eq!(proof["last"], 6, "the mutant refuses the first proof");
+    assert_eq!(
+        with_buggy(activation, 4).successors("Prove", &capacity_state(activation, &["Budgets"])),
+        vec![proof],
+        "the model's mutant 4 refuses it alike"
+    );
+    // A proof's fit judged by its `Admit` alone.
+    let cut = control(
+        &BATCH_WITHOUT_WRAPS,
+        committed,
+        &["Budgets"],
+        "Prove",
+        "ProofReserve",
+    );
+    assert_eq!(
+        (cut["last"], cut["w"], cut["k"]),
+        (5, 3, 1),
+        "the mutant signs the Admit, and the held total refuses its Wrap"
     );
 }

@@ -246,10 +246,7 @@ mod tests {
             },
         };
         // Nothing is read or written before the refusal, so the scratch root stays empty.
-        let root = aterm_tempfile::Builder::new()
-            .prefix("agh-import-loose-")
-            .tempdir()
-            .expect("a scratch directory");
+        let root = crate::test_fixtures::scratch_dir("import-loose");
         let dirs = Dirs::under(root.path());
         let error = import_from_gh(
             &gh,

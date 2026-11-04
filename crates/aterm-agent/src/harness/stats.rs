@@ -170,6 +170,9 @@ pub struct SelfClaimed {
     /// Every act it recorded in the window, those that count nothing included (a point left to a
     /// person, a mail turn's receipt).
     pub acts: u64,
+    /// The measured facts its acts carried ([`approvals::SelfClaimFactRow`]): aterm's words that
+    /// rode its acts, booked to it, never to aterm's own facts told.
+    pub facts_told: u64,
 }
 
 impl SelfClaimed {
@@ -1135,6 +1138,10 @@ pub fn fold_ledger_row(acc: &mut HarnessStats, v: &Value, ts: i64) {
         fold_self_claim(acc, sid, &row, ts);
         return;
     }
+    if let Some((holder, _)) = approvals::SelfClaimFactRow::of(v) {
+        fold_self_claim_fact(acc, sid, holder, ts);
+        return;
+    }
     let rule = text("rule_id").unwrap_or("-");
     let outcome = text("decision").and_then(Outcome::from_word);
     let fact = approvals::is_fact_rule(rule);
@@ -1204,6 +1211,36 @@ fn fold_self_claim(acc: &mut HarnessStats, sid: &str, row: &approvals::SelfClaim
             .entry(name.to_string())
             .or_default()
             .take(row.act);
+    }
+}
+
+/// A fact a proven self-claim's act carried ([`approvals::SelfClaimFactRow`]), booked to its
+/// `holder` and to the session's share of it: in none of aterm's own rows, sessions or facts
+/// told, and closing no limit, as none of its acts does.
+fn fold_self_claim_fact(acc: &mut HarnessStats, sid: &str, holder: &str, ts: i64) {
+    if holder.is_empty() {
+        bump(&mut acc.bad);
+        return;
+    }
+    if ts < acc.since_ms {
+        return;
+    }
+    let name = acts::claimant_name(holder);
+    bump(
+        &mut acc
+            .self_claimed
+            .entry(name.to_string())
+            .or_default()
+            .facts_told,
+    );
+    if let Some(tally) = acc.tally(sid) {
+        bump(
+            &mut tally
+                .self_claimed
+                .entry(name.to_string())
+                .or_default()
+                .facts_told,
+        );
     }
 }
 

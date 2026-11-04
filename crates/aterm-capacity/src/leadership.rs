@@ -120,6 +120,30 @@ pub struct Fence {
     revoked: Cell<bool>,
 }
 
+/// Captured only from actual, current leadership and original claim custody.
+/// Keeping this separate lets a controller own its fence beside its jobs.
+#[derive(Debug)]
+pub(crate) struct Binding {
+    namespace: Namespace,
+    epoch: Epoch,
+    process: u32,
+}
+
+impl Binding {
+    pub(crate) fn check(&self, fence: &Fence) -> io::Result<()> {
+        fence.check_current()?;
+        if self.namespace != fence.namespace
+            || self.epoch != fence.epoch
+            || self.process != fence.process
+        {
+            return Err(refused(
+                "retained cohort belongs to different host leadership",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl Fence {
     /// Acquire existing leadership, durably advance its incarnation and retain
     /// its exact lock. No old claim is removed, rebound or interpreted as drained.
@@ -247,6 +271,15 @@ impl Fence {
     pub fn check_claim(&self, claim: &Claim) -> io::Result<()> {
         self.check_current()?;
         claim.check_cohort_namespace(&self.namespace)
+    }
+
+    pub(crate) fn capture_binding(&self, claim: &Claim) -> io::Result<Binding> {
+        self.check_claim(claim)?;
+        Ok(Binding {
+            namespace: self.namespace.clone(),
+            epoch: self.epoch,
+            process: self.process,
+        })
     }
 }
 

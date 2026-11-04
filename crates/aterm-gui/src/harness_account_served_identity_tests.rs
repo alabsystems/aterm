@@ -24,12 +24,14 @@ fn auth(value: i64) -> accounts::Auth {
     }
 }
 
+fn with_auth(a: &Accts, state: &mut accounts::State, value: i64) {
+    let row = state.accounts.entry("main".into()).or_default();
+    row.auth = auth(value);
+    row.auth_at = (value > 0).then_some(a.clock());
+}
+
 fn set_auth(a: &Accts, value: i64) {
-    edited(a, |state| {
-        let row = state.accounts.entry("main".into()).or_default();
-        row.auth = auth(value);
-        row.auth_at = (value > 0).then_some(a.clock());
-    });
+    edited(a, |state| with_auth(a, state, value));
 }
 
 fn profile_bytes(evidence: i64) -> Vec<u8> {
@@ -97,8 +99,8 @@ impl Trial {
                 at: a.clock(),
                 took: false,
             });
+            with_auth(&a, state, case.before_auth);
         });
-        set_auth(&a, case.before_auth);
         {
             let mut kept = idle.kept.lock().unwrap();
             let process = kept.snapshot.clone().unwrap();
@@ -349,6 +351,93 @@ pub(crate) fn identity_transition(
     transition(state, action, false, false)
 }
 
+/// How stale a world step's reads before the writer stand, as `(d, e)`: the identity's and the
+/// auth row's distance from what is at the writer, mod 3. The six the conformance test runs:
+/// neither stale, each stale alone at both distances, and both stale at once.
+const STALE_READS: [(i64, i64); 6] = [(0, 0), (1, 0), (2, 0), (0, 1), (0, 2), (1, 1)];
+
+/// The `(d, e)` of [`STALE_READS`] a step's case stands at.
+fn stale_reads(c: &Case) -> (i64, i64) {
+    (
+        (c.before - c.credential).rem_euclid(3),
+        (c.before_auth - c.auth).rem_euclid(3),
+    )
+}
+
+/// The steps the conformance test takes, as `(state, action, legacy, dedicated)`.
+///
+/// A step that builds no world is cheap and runs in all four path forms. A world step costs a whole
+/// accounts world, and its `before` and `before_auth` only multiply states in the correct model, so
+/// each decision (all a step's state but those two) runs at the [`STALE_READS`] of the nine, each
+/// in both `dedicated` forms and one `legacy` form by parity.
+///
+/// Why the steps left out are implied. A writer that uses what it reads at the writer takes the
+/// same decision at all nine, and one that does not is caught where one read is stale and the other
+/// is not: every step with exactly one stale read is kept, and both stale at once stays, so a writer
+/// that re-reads one value only when the other changed, or memoises a decision on one of them,
+/// meets a step it gets wrong. Each decision still runs in all four path forms and at all six, which
+/// this holds. What is not implied, and would be missed: a fault that needs both reads stale at one
+/// of the three pairs left out, or one specific `legacy` form together with one specific stale pair.
+fn identity_steps(
+    model: &aterm_spec::derive::Model,
+) -> Vec<(aterm_spec::interp::State, &'static str, bool, bool)> {
+    let mut steps = Vec::new();
+    let mut decisions: std::collections::BTreeMap<
+        _,
+        (std::collections::BTreeSet<_>, std::collections::BTreeSet<_>),
+    > = std::collections::BTreeMap::new();
+    for state in aterm_spec::interp::reachable_states(model) {
+        for action in &model.actions {
+            if !model.action_enabled(action.name, &state) {
+                continue;
+            }
+            if !matches!(action.name, "Observe" | "Poll" | "Retry" | "Replay") {
+                for (legacy, dedicated) in
+                    [(false, false), (false, true), (true, false), (true, true)]
+                {
+                    steps.push((state.clone(), action.name, legacy, dedicated));
+                }
+                continue;
+            }
+            let c = case(&state, false, false);
+            let stale = stale_reads(&c);
+            if !STALE_READS.contains(&stale) {
+                continue;
+            }
+            let legacy =
+                (i64::from(c.named) + c.before + c.credential + c.before_auth + c.auth + c.method)
+                    % 2
+                    == 1;
+            let decision = decisions
+                .entry((
+                    action.name,
+                    [
+                        "named",
+                        "credential",
+                        "denied",
+                        "auth",
+                        "method",
+                        "phase",
+                        "polls",
+                    ]
+                    .map(|field| state[field]),
+                ))
+                .or_default();
+            decision.0.insert(stale);
+            for dedicated in [false, true] {
+                decision.1.insert((legacy, dedicated));
+                steps.push((state.clone(), action.name, legacy, dedicated));
+            }
+        }
+    }
+    assert!(!decisions.is_empty(), "CONTROL: world steps run");
+    for (decision, (stale, forms)) in &decisions {
+        assert_eq!(stale.len(), STALE_READS.len(), "{decision:?}: {stale:?}");
+        assert_eq!(forms.len(), 4, "{decision:?}: {forms:?}");
+    }
+    steps
+}
+
 #[test]
 fn served_identity_conforms_at_every_writer_and_replay() {
     let model = aterm_models_harness::account_served_identity_model();
@@ -356,18 +445,7 @@ fn served_identity_conforms_at_every_writer_and_replay() {
     assert_eq!(aterm_spec::interp::prove_and_catch(&model), 1188);
     // Each step builds its own accounts world, little but file system work, so the steps run on
     // the file system lane's workers ([`aterm_spec::fs_lane::PLACES`]).
-    let mut steps = Vec::new();
-    for state in aterm_spec::interp::reachable_states(&model) {
-        for action in &model.actions {
-            if model.action_enabled(action.name, &state) {
-                for (legacy, dedicated) in
-                    [(false, false), (false, true), (true, false), (true, true)]
-                {
-                    steps.push((state.clone(), action.name, legacy, dedicated));
-                }
-            }
-        }
-    }
+    let steps = identity_steps(&model);
     aterm_spec::check::each_on(
         aterm_spec::fs_lane::PLACES,
         &steps,

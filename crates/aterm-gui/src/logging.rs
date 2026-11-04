@@ -299,31 +299,41 @@ pub(crate) struct ReportHead {
 }
 
 #[cfg(unix)]
-pub(crate) fn open_regular_nonblock(path: &Path) -> std::io::Result<std::fs::File> {
+pub(crate) fn open_regular_nonblock_with_meta(
+    path: &Path,
+) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
     use std::os::unix::fs::OpenOptionsExt as _;
     let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
         .open(path)?;
-    if !file.metadata()?.is_file() {
+    let meta = file.metadata()?;
+    if !meta.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "not a regular file",
         ));
     }
-    Ok(file)
+    Ok((file, meta))
 }
 
 #[cfg(not(unix))]
-pub(crate) fn open_regular_nonblock(path: &Path) -> std::io::Result<std::fs::File> {
+pub(crate) fn open_regular_nonblock_with_meta(
+    path: &Path,
+) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
     let file = std::fs::File::open(path)?;
-    if !file.metadata()?.is_file() {
+    let meta = file.metadata()?;
+    if !meta.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "not a regular file",
         ));
     }
-    Ok(file)
+    Ok((file, meta))
+}
+
+pub(crate) fn open_regular_nonblock(path: &Path) -> std::io::Result<std::fs::File> {
+    open_regular_nonblock_with_meta(path).map(|(file, _)| file)
 }
 
 /// The [`ReportHead`] of the panic report at `path`.
@@ -391,10 +401,11 @@ pub(crate) const CRASH_HEAD_BYTES: u64 = 1536;
 
 fn crash_head(path: &Path) -> Vec<String> {
     use std::io::Read as _;
-    let Ok(file) = open_regular_nonblock(path) else {
+    let Ok((file, meta)) = open_regular_nonblock_with_meta(path) else {
         return Vec::new();
     };
-    let mut buf = Vec::new();
+    let cap = usize::try_from(meta.len().min(CRASH_HEAD_BYTES).saturating_add(1)).unwrap_or(0);
+    let mut buf = Vec::with_capacity(cap);
     if file.take(CRASH_HEAD_BYTES).read_to_end(&mut buf).is_err() {
         return Vec::new();
     }

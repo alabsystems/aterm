@@ -354,6 +354,7 @@ fn another_writer_cannot_complete_a_peers_attempt() {
     let claim = a.dispatch_once(REQUEST, 1, OPERATION, || None).unwrap();
     b.dispatch_once(REQUEST, 1, OPERATION, || None).unwrap();
     rounds(&lab);
+    assert_eq!(b.snapshot().unwrap().used.values().sum::<u64>(), 2);
     raw_payload(
         &lab,
         &allocation,

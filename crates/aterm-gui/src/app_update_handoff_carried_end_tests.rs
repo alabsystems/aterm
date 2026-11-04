@@ -673,6 +673,7 @@ fn prove_self_claim(ctx: &crate::SessionCtx, home: &std::path::Path, thread: &st
                     draft_empty: None,
                     frame: None,
                     goal: None,
+                    background_terminals: None,
                     initializing: false,
                 },
             ),

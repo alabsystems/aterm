@@ -1,26 +1,43 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tape recovery and prefix salvage ([`recover`], [`salvage`], [`Tail::Torn`], [`Tail::Fault`],
-//! [`Why::OutOfPlace`], [`Why::MagicFormat`], [`Why::TooLarge`], [`Why::Unsearched`],
-//! [`super::frame`], [`super::delta`], [`HELD_MAX`], [`super::frame::RUN_CAP`],
-//! [`SEARCH_PER_BYTE`], [`SEARCH_FLOOR`]).
+//! Tape recovery and prefix salvage ([`recover`], [`salvage`]).
+//!
+//! A tape is its [`MAGIC`], then astream step records from step 0, the header
+//! ([`super::frame`]). astream's scan ([`scan_steps_from`], claim
+//! `wire.steps.torn-vs-fault`) keeps the longest intact, in-order prefix of them
+//! and says what ended it: the bytes' end ([`Tail::Clean`]); a record a crash
+//! cut short or damaged with nothing decodable after it ([`Tail::Torn`]); or
+//! damage with a record after it, a record out of its place, or one this build
+//! cannot read ([`Tail::Fault`], [`Why::Steps`]). Its bounded search after a
+//! break is astream's too: where the search runs out of budget the answer is a
+//! fault, never a torn tail. This module decodes the bodies of the records the
+//! scan kept ([`super::delta`], [`super::codec`]), within [`HELD_MAX`].
+//!
+//! astream's rule reads bytes, not intent, so it brings one exception with it
+//! (`astream_wire::steps`, "A body that holds a frame of its own"): a frame's
+//! bytes are opaque, and a payload stored raw whose items hold a whole encoded
+//! astream frame (an `Emit`, `Exchange` or `File` of such bytes) keeps that
+//! frame intact. A cut in the last frame past the nested frame's last byte is
+//! then a fault at that frame ([`Why::Steps`], `LengthPastEnd`), and damage to
+//! it `CorruptFrame`, never [`Tail::Torn`], because a rotted length looks the
+//! same. The error runs one way, a torn tail read as a fault, never the
+//! reverse: [`recover`] refuses, and [`salvage`] keeps every frame before the
+//! last, the prefix a torn read keeps.
+//!
+//! A magic one byte off this build's, before a record the scan keeps, is a
+//! damaged magic ([`Why::DamagedMagic`]): never a tape of the format a rotted
+//! format byte names, nor no tape at all.
 
 use astream_effects::EffectRecord;
+use astream_wire::frame::HEADER_SIZE;
+use astream_wire::steps::{STEP_HEADER, StepEnd, StepFault, StepScan, scan_steps_from};
 
-use super::codec::{CodecError, Decoder, End, Input, Item, Mark, len64};
-use super::frame::{FRAME_RAW_MAX, Format, HEAD, Kind, MAGIC, checksum, place_named};
+use super::codec::{CodecError, Decoder, End, Input, Item, Mark};
+use super::frame::{FRAME_FORMAT, FRAME_RAW_MAX, Kind, MAGIC};
 
 /// The most a read holds in memory.
 pub const HELD_MAX: usize = 1 << 30;
-
-/// The search for a whole frame after a short or bad one hashes at most this
-/// many times the bytes after it.
-const SEARCH_PER_BYTE: usize = 64;
-
-/// The least the search may hash, however few bytes follow the frame: as much
-/// as one frame can hold.
-const SEARCH_FLOOR: usize = FRAME_RAW_MAX;
 
 /// What a tape's bytes hold.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,7 +57,7 @@ pub struct Recovered {
 pub enum Tail {
     /// The bytes end exactly after a whole frame (or are empty).
     Clean,
-    /// A frame cut short (or damaged) with nothing whole after it.
+    /// A frame cut short (or damaged) with nothing whole after it, at byte `at`.
     Torn { at: usize },
     /// Damage inside the tape, or a frame that is whole and wrong, at byte `at`.
     Fault { at: usize, why: Why },
@@ -51,16 +68,16 @@ pub enum Tail {
 pub enum Why {
     /// The file does not start with a tape's magic.
     NotATape,
-    /// A tape of a frame format this build does not read.
+    /// A tape of a frame format this build does not read: 1 and 2, the frames
+    /// before astream step records, or a later one.
     Format(u8),
-    /// A magic naming frame format `named` before a header valid only under `header`.
-    MagicFormat { named: u8, frames: u8 },
-    /// A frame that fails its checksum or its shape, with a whole frame after it.
-    Damaged,
-    /// A whole frame at place `expected` whose checksum names place `found`.
-    OutOfPlace { expected: u64, found: u64 },
-    /// A frame whose length runs past the end, with a whole frame after it.
-    LengthPastEnd,
+    /// A magic one byte off this build's, at `byte`, before a step record the
+    /// scan keeps from step 0: this build's tape, its magic damaged.
+    DamagedMagic { byte: usize },
+    /// What astream's scan found wrong with the records ([`StepFault`]): damage
+    /// with a whole record after it, a record this build cannot read, or a
+    /// record whose step is not its place (frames repeated, dropped or moved).
+    Steps(StepFault),
     /// The first frame is not the header.
     NoHeader,
     /// A header frame after the first.
@@ -69,8 +86,6 @@ pub enum Why {
     Unreadable(String),
     /// Items that would hold more than `limit` bytes in memory ([`HELD_MAX`]).
     TooLarge { limit: usize },
-    /// A frame that is short or fails its checksum.
-    Unsearched,
 }
 
 impl std::fmt::Display for Why {
@@ -79,36 +94,21 @@ impl std::fmt::Display for Why {
             Self::NotATape => write!(f, "not a harness tape"),
             Self::Format(n) => write!(
                 f,
-                "a tape of frame format {n}: this build reads formats {} and {}",
-                Format::One as u8,
-                Format::Two as u8
+                "a tape of frame format {n}: this build reads only format {FRAME_FORMAT}, astream \
+                 step records"
             ),
-            Self::MagicFormat { named, frames } => write!(
+            Self::DamagedMagic { byte } => write!(
                 f,
-                "a magic naming frame format {named} before a header of format {frames}: a \
-                 damaged magic"
+                "a tape magic damaged at byte {byte}: frame format {FRAME_FORMAT}'s astream step \
+                 records follow it"
             ),
-            Self::Damaged => write!(f, "a damaged frame with whole frames after it"),
-            Self::OutOfPlace { expected, found } => write!(
-                f,
-                "frame {found} where frame {expected} belongs: whole frames repeated, dropped or \
-                 moved"
-            ),
-            Self::LengthPastEnd => write!(
-                f,
-                "a frame whose length runs past the end with whole frames after it"
-            ),
+            Self::Steps(fault) => write!(f, "{fault}"),
             Self::NoHeader => write!(f, "the first frame is not the header"),
             Self::SecondHeader => write!(f, "a header frame after the first"),
             Self::Unreadable(why) => write!(f, "a whole frame this build cannot read: {why}"),
             Self::TooLarge { limit } => write!(
                 f,
                 "items that would hold more than {limit} bytes, more than this reader holds"
-            ),
-            Self::Unsearched => write!(
-                f,
-                "a short or damaged frame followed by more frame-like bytes than this reader \
-                 checks"
             ),
         }
     }
@@ -173,13 +173,18 @@ impl std::fmt::Display for Why {
 )]
 #[must_use]
 pub fn recover(bytes: &[u8]) -> Recovered {
-    read(bytes, Keep::Refuse, Check::Xxh64, Limits::TAPE)
+    read(bytes, Keep::Refuse, HELD_MAX, steps)
 }
 
 /// [`recover`], keeping the prefix before a fault.
 #[must_use]
 pub fn salvage(bytes: &[u8]) -> Recovered {
-    read(bytes, Keep::Prefix, Check::Xxh64, Limits::TAPE)
+    read(bytes, Keep::Prefix, HELD_MAX, steps)
+}
+
+/// astream's scan of a tape's records, from step 0.
+pub(crate) fn steps(records: &[u8]) -> StepScan {
+    scan_steps_from(records, 0)
 }
 
 /// What a read keeps of a faulted tape.
@@ -189,196 +194,18 @@ pub(crate) enum Keep {
     Prefix,
 }
 
-/// Whether a frame's checksum is checked, and its place.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Check {
-    Xxh64,
-    #[cfg(test)]
-    Nothing,
-    #[cfg(test)]
-    Unplaced,
-}
+/// Where a record starts, counted back from its body: the astream frame's head
+/// and the step record's.
+pub(crate) const RECORD_HEAD: usize = HEADER_SIZE + STEP_HEADER;
 
-/// The reader's own bounds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Limits {
-    pub(crate) held: usize,
-    pub(crate) search_floor: usize,
-}
-
-impl Limits {
-    /// The bounds [`recover`] and [`salvage`] enforce.
-    pub(crate) const TAPE: Self = Self {
-        held: HELD_MAX,
-        search_floor: SEARCH_FLOOR,
-    };
-}
-
-/// One frame as it stands at an offset.
-enum Frame {
-    /// Whole: its kind, raw bytes, where the next frame starts, and the place its sum names.
-    Whole {
-        kind: Kind,
-        raw: Vec<u8>,
-        end: usize,
-        place: Option<u64>,
-    },
-    /// Its head or payload runs past the end of the bytes.
-    Short,
-    /// It fails its checksum or its shape.
-    Bad,
-}
-
-/// How a read checks a frame's sum: by the tape's frame format, and (but in a
-/// negative control) in full.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Sums {
-    format: Format,
-    check: Check,
-}
-
-/// A frame's head whose lengths are within the writer's bounds and whose
-/// payload is inside the bytes: what can be known of a frame without hashing
-/// it.
-struct Head<'a> {
-    kind: Kind,
-    raw_len: usize,
-    comp_len: usize,
-    sum: u64,
-    /// The head's two lengths, as stored (the checksum covers them).
-    lengths: &'a [u8],
-    /// The payload, as stored.
-    payload: &'a [u8],
-    /// Where the next frame starts.
-    end: usize,
-}
-
-/// The head of the frame at `at`, or the frame it already is ([`Frame::Short`],
-/// [`Frame::Bad`]).
-fn head_at(bytes: &[u8], at: usize) -> Result<Head<'_>, Frame> {
-    let Some(head) = bytes.get(at..).and_then(|rest| rest.get(..HEAD)) else {
-        return Err(Frame::Short);
-    };
-    let word = |from: usize| {
-        let mut w = [0u8; 4];
-        w.copy_from_slice(&head[from..from + 4]);
-        u32::from_le_bytes(w) as usize
-    };
-    let raw_len = word(1);
-    let comp_len = word(5);
-    let mut sum = [0u8; 8];
-    sum.copy_from_slice(&head[9..HEAD]);
-    let sum = u64::from_le_bytes(sum);
-    let Some(kind) = Kind::of(head[0]) else {
-        return Err(Frame::Bad);
-    };
-    if raw_len > FRAME_RAW_MAX || (comp_len != 0 && comp_len >= raw_len) {
-        return Err(Frame::Bad);
-    }
-    let stored = if comp_len == 0 { raw_len } else { comp_len };
-    let start = at + HEAD;
-    let end = start.checked_add(stored).ok_or(Frame::Short)?;
-    let payload = bytes.get(start..end).ok_or(Frame::Short)?;
-    Ok(Head {
-        kind,
-        raw_len,
-        comp_len,
-        sum,
-        lengths: &head[1..9],
-        payload,
-        end,
-    })
-}
-
-/// The place `head`'s frame names: `Ok(None)` when its tape's sums name none
-/// (format 1, or a negative control), `Err` when it fails its checksum.
-fn place_of(head: &Head<'_>, sums: Sums) -> Result<Option<u64>, ()> {
-    let hashed = || checksum(head.kind, head.lengths, head.payload);
-    match (sums.check, sums.format) {
-        (Check::Xxh64, Format::One) => (hashed() == head.sum).then_some(None).ok_or(()),
-        (Check::Xxh64, Format::Two) => place_named(head.sum, hashed()).map(Some).ok_or(()),
-        #[cfg(test)]
-        (Check::Nothing, _) => Ok(None),
-        #[cfg(test)]
-        (Check::Unplaced, Format::One) => (hashed() == head.sum).then_some(None).ok_or(()),
-        #[cfg(test)]
-        (Check::Unplaced, Format::Two) => place_named(head.sum, hashed()).map(|_| None).ok_or(()),
-    }
-}
-
-/// The frame `head` heads: whole when it passes its checksum — its sum names a
-/// place, in a format-2 tape — and its payload comes back to its raw length.
-fn whole(head: &Head<'_>, sums: Sums) -> Frame {
-    let Ok(place) = place_of(head, sums) else {
-        return Frame::Bad;
-    };
-    let raw = if head.comp_len == 0 {
-        head.payload.to_vec()
-    } else {
-        match aterm_lz4::decompress(head.payload, head.raw_len) {
-            Ok(raw) if raw.len() == head.raw_len => raw,
-            Ok(_) | Err(_) => return Frame::Bad,
-        }
-    };
-    Frame::Whole {
-        kind: head.kind,
-        raw,
-        end: head.end,
-        place,
-    }
-}
-
-/// The frame at `at` ([`Frame`]).
-fn frame_at(bytes: &[u8], at: usize, sums: Sums) -> Frame {
-    match head_at(bytes, at) {
-        Ok(head) => whole(&head, sums),
-        Err(frame) => frame,
-    }
-}
-
-/// What the search after a short or bad frame found.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum After {
-    /// A whole records frame starts after it.
-    Whole,
-    /// None does.
-    Nothing,
-    /// The search met its bound before it could say.
-    Unsearched,
-}
-
-/// Whether a whole records frame starts anywhere after `at` (never at `at`),
-/// hashing at most [`SEARCH_PER_BYTE`] times the bytes after `at`, and at
-/// least `floor`.
-fn whole_frame_after(bytes: &[u8], at: usize, sums: Sums, floor: usize) -> After {
-    let rest = bytes.len().saturating_sub(at);
-    let mut budget = rest.saturating_mul(SEARCH_PER_BYTE).max(floor);
-    for q in at.saturating_add(1)..bytes.len() {
-        if bytes[q] != Kind::Records as u8 {
-            continue;
-        }
-        let Ok(head) = head_at(bytes, q) else {
-            continue;
-        };
-        let Some(left) = budget.checked_sub(head.payload.len()) else {
-            return After::Unsearched;
-        };
-        budget = left;
-        if matches!(
-            whole(&head, sums),
-            Frame::Whole {
-                kind: Kind::Records,
-                ..
-            }
-        ) {
-            return After::Whole;
-        }
-    }
-    After::Nothing
-}
-
-/// The read behind [`recover`] and [`salvage`].
-pub(crate) fn read(bytes: &[u8], keep: Keep, check: Check, limits: Limits) -> Recovered {
+/// The read behind [`recover`] and [`salvage`]: the magic, then the records
+/// `scan` keeps after it, decoded holding at most `held` bytes.
+pub(crate) fn read(
+    bytes: &[u8],
+    keep: Keep,
+    held: usize,
+    scan: fn(&[u8]) -> StepScan,
+) -> Recovered {
     let mut out = Recovered {
         header: None,
         items: Vec::new(),
@@ -388,63 +215,35 @@ pub(crate) fn read(bytes: &[u8], keep: Keep, check: Check, limits: Limits) -> Re
     if bytes.is_empty() {
         return out;
     }
-    let Some(format) = Format::of_magic(bytes) else {
-        out.tail = magic_tail(bytes);
+    let Some(records) = bytes.strip_prefix(MAGIC.as_slice()) else {
+        out.tail = magic_tail(bytes, scan);
         return out;
     };
-    let sums = Sums { format, check };
+    let scanned = scan(records);
     let mut reader = Reader {
         decoder: Decoder::default(),
         held: 0,
-        limit: limits.held,
+        limit: held,
     };
-    let mut at = MAGIC.len();
-    let tail = loop {
-        if at == bytes.len() {
-            break if out.frames == 0 {
-                Tail::Torn { at }
-            } else {
-                Tail::Clean
-            };
-        }
-        let floor = limits.search_floor;
-        match frame_at(bytes, at, sums) {
-            Frame::Whole {
-                kind,
-                raw,
-                end,
-                place,
-            } => {
-                let expected = len64(out.frames);
-                if let Some(found) = place
-                    && found != expected
-                {
-                    break Tail::Fault {
-                        at,
-                        why: Why::OutOfPlace { expected, found },
-                    };
-                }
-                if let Err(why) = reader.take(&mut out, kind, &raw) {
-                    break Tail::Fault { at, why };
-                }
-                at = end;
-            }
-            Frame::Short => break broken(bytes, at, sums, floor, Why::LengthPastEnd),
-            Frame::Bad => {
-                if out.frames == 0
-                    && let Some(frames) = header_reads_as_other(bytes, at, sums)
-                {
-                    break Tail::Fault {
-                        at: 0,
-                        why: Why::MagicFormat {
-                            named: format as u8,
-                            frames: frames as u8,
-                        },
-                    };
-                }
-                break broken(bytes, at, sums, floor, Why::Damaged);
-            }
-        }
+    let taken = scanned.steps.iter().try_for_each(|(_, body)| {
+        let at = MAGIC.len() + body.start.saturating_sub(RECORD_HEAD);
+        records
+            .get(body.clone())
+            .ok_or_else(|| Why::Unreadable("a body outside the bytes".to_string()))
+            .and_then(|body| reader.take(&mut out, body))
+            .map_err(|why| Tail::Fault { at, why })
+    });
+    let tail = match (taken, scanned.end) {
+        (Err(fault), _) => fault,
+        (Ok(()), StepEnd::Clean) if out.frames == 0 => Tail::Torn { at: MAGIC.len() },
+        (Ok(()), StepEnd::Clean) => Tail::Clean,
+        (Ok(()), StepEnd::Torn) => Tail::Torn {
+            at: MAGIC.len() + scanned.valid_len,
+        },
+        (Ok(()), StepEnd::Fault { at, kind }) => Tail::Fault {
+            at: MAGIC.len() + at,
+            why: Why::Steps(kind),
+        },
     };
     if matches!(tail, Tail::Fault { .. }) && keep == Keep::Refuse {
         out.header = None;
@@ -455,48 +254,57 @@ pub(crate) fn read(bytes: &[u8], keep: Keep, check: Check, limits: Limits) -> Re
     out
 }
 
-/// The other format, when the first frame at `at`, bad as the magic's format
-/// reads it, is whole as the other's: then the magic's format byte is what
-/// was damaged.
-fn header_reads_as_other(bytes: &[u8], at: usize, sums: Sums) -> Option<Format> {
-    let other = match sums.format {
-        Format::One => Format::Two,
-        Format::Two => Format::One,
-    };
-    let as_other = Sums {
-        format: other,
-        ..sums
-    };
-    matches!(frame_at(bytes, at, as_other), Frame::Whole { .. }).then_some(other)
-}
-
-/// What ends the prefix at a short or bad frame at `at`: the torn tail when
-/// nothing whole follows it, else the fault `why`, or [`Why::Unsearched`]
-/// when the search met its bound first.
-fn broken(bytes: &[u8], at: usize, sums: Sums, floor: usize, why: Why) -> Tail {
-    match whole_frame_after(bytes, at, sums, floor) {
-        After::Nothing => Tail::Torn { at },
-        After::Whole => Tail::Fault { at, why },
-        After::Unsearched => Tail::Fault {
-            at,
-            why: Why::Unsearched,
-        },
-    }
-}
-
-/// The tail of bytes that do not start with a magic this build reads: the
-/// start of one, cut short, is a first write that tore; a tape of another
-/// frame format is refused by its number; anything else is no tape.
-fn magic_tail(bytes: &[u8]) -> Tail {
-    let magics = [Format::Two.magic(), Format::One.magic()];
-    if bytes.len() < MAGIC.len() && magics.iter().any(|m| m.starts_with(bytes)) {
+/// The tail of bytes that do not start with this build's magic: the start of
+/// one, cut short, is a first write that tore; a magic one byte off before a
+/// record `scan` keeps is damaged; a tape of another frame format is refused
+/// by its number; anything else is no tape.
+fn magic_tail(bytes: &[u8], scan: fn(&[u8]) -> StepScan) -> Tail {
+    if bytes.len() < MAGIC.len() && MAGIC.starts_with(bytes) {
         return Tail::Torn { at: 0 };
     }
-    let why = match bytes.get(..MAGIC.len()) {
-        Some(m) if m[..6] == MAGIC[..6] && m[7] == MAGIC[7] => Why::Format(m[6]),
+    let Some((magic, records)) = bytes.split_at_checked(MAGIC.len()) else {
+        return Tail::Fault {
+            at: 0,
+            why: Why::NotATape,
+        };
+    };
+    let mut off = (0..MAGIC.len()).filter(|&i| magic[i] != MAGIC[i]);
+    let why = match (off.next(), off.next()) {
+        (Some(byte), None) if !scan(records).steps.is_empty() => Why::DamagedMagic { byte },
+        _ if magic[..6] == MAGIC[..6] && magic[7] == MAGIC[7] => Why::Format(magic[6]),
         _ => Why::NotATape,
     };
     Tail::Fault { at: 0, why }
+}
+
+/// A record's body as a frame: its kind and its raw bytes. The scan vouched
+/// for its bytes, so a body that is not what it claims is a writer's fault,
+/// never a crash's.
+fn unframed(body: &[u8]) -> Result<(Kind, Vec<u8>), Why> {
+    let unreadable = |what: &str| Why::Unreadable(what.to_string());
+    let [kind, l0, l1, l2, l3, payload @ ..] = body else {
+        return Err(unreadable("a frame shorter than its head"));
+    };
+    let kind = Kind::of(*kind).ok_or_else(|| unreadable("a frame of a kind this build lacks"))?;
+    let raw_len = u32::from_le_bytes([*l0, *l1, *l2, *l3]) as usize;
+    if raw_len > FRAME_RAW_MAX {
+        return Err(unreadable("a frame longer than a frame may be"));
+    }
+    let raw = match payload.len().cmp(&raw_len) {
+        std::cmp::Ordering::Equal => payload.to_vec(),
+        std::cmp::Ordering::Less => aterm_lz4::decompress(payload, raw_len)
+            .ok()
+            .filter(|raw| raw.len() == raw_len)
+            .ok_or_else(|| {
+                unreadable("a compressed frame that does not come back to its length")
+            })?,
+        std::cmp::Ordering::Greater => {
+            return Err(unreadable(
+                "a frame whose payload is longer than its raw bytes",
+            ));
+        }
+    };
+    Ok((kind, raw))
 }
 
 /// What a read carries from one whole frame to the next: the items' decoder,
@@ -517,12 +325,13 @@ impl Reader {
         Ok(())
     }
 
-    /// A whole frame, taken into `out`: the first must be the header, every
-    /// later one records.
-    fn take(&mut self, out: &mut Recovered, kind: Kind, raw: &[u8]) -> Result<(), Why> {
+    /// A whole record's body, taken into `out`: the first must be the header,
+    /// every later one records.
+    fn take(&mut self, out: &mut Recovered, body: &[u8]) -> Result<(), Why> {
+        let (kind, raw) = unframed(body)?;
         match (out.frames, kind) {
             (0, Kind::Header) => {
-                let text = String::from_utf8(raw.to_vec())
+                let text = String::from_utf8(raw)
                     .map_err(|_| Why::Unreadable("a header that is not UTF-8".to_string()))?;
                 self.hold(text.len())?;
                 out.header = Some(text);
@@ -530,7 +339,7 @@ impl Reader {
             (0, Kind::Records) => return Err(Why::NoHeader),
             (_, Kind::Header) => return Err(Why::SecondHeader),
             (_, Kind::Records) => {
-                let mut input = Input::new(raw);
+                let mut input = Input::new(&raw);
                 let mut items = Vec::new();
                 while !input.is_empty() {
                     let spelled = self.decoder.spelled();

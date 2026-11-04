@@ -67,6 +67,7 @@ fn setup_then_join_produce_an_anchor_and_a_roster_the_client_accepts() {
 
     let tmp = aterm_tempfile::Builder::new()
         .prefix("atpkg-keys-e2e-provisioned-")
+        .suffix(".noindex")
         .tempdir()
         .expect("scratch tree");
     let dir = tmp.path().to_path_buf();

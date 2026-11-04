@@ -1539,6 +1539,30 @@ fn turn_of(
 ///
 /// # Errors
 /// Local state cannot be read or written, or a record fails to open or sign.
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::refines(
+        machine = "EpochConvergence",
+        action = "RotationPasses",
+        project = "aterm_secrets::client::remove::tests::convergence::epoch_convergence_transition"
+    )
+)]
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::refines(
+        machine = "EpochConvergence",
+        action = "PrefixPasses",
+        project = "aterm_secrets::client::remove::tests::convergence::epoch_convergence_transition"
+    )
+)]
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::refines(
+        machine = "EpochConvergence",
+        action = "SettledPasses",
+        project = "aterm_secrets::client::remove::tests::convergence::epoch_convergence_transition"
+    )
+)]
 pub fn tend_epochs_at(paths: &Paths, now_ms: u64) -> crate::Result<Vec<Record>> {
     let Some(store) = trusted_store(paths)? else {
         return Ok(Vec::new());
@@ -1567,6 +1591,14 @@ pub fn tend_epochs_at(paths: &Paths, now_ms: u64) -> crate::Result<Vec<Record>> 
 }
 
 /// Compute ranks and settledness on the same log snapshot that authoring will use.
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::refines(
+        machine = "EpochConvergence",
+        action = "Observe",
+        project = "aterm_secrets::client::remove::tests::convergence::epoch_convergence_transition"
+    )
+)]
 fn ready_rekeys(
     log: &Log,
     me: &MemberId,
@@ -1713,6 +1745,14 @@ fn everyone_wait(
     (waited_to, waits)
 }
 
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::refines(
+        machine = "EpochConvergence",
+        action = "Author",
+        project = "aterm_secrets::client::remove::tests::convergence::epoch_convergence_transition"
+    )
+)]
 fn tend_ready_epochs(
     paths: &Paths,
     now_ms: u64,
@@ -1836,7 +1876,7 @@ const MAX_TEND_MARK: usize = crate::membership_log::MAX_HELD_RECORDS * (90 + 112
 /// while it holds it); the same two for each newest `[everyone]` epoch that held the other
 /// audiences while its batch could still decide a Mac with no seat ([`everyone_wait`]); and
 /// when this Mac first saw each removal a due waits on, by the Mac taken out.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct TendMark {
     due: BTreeMap<[u8; 32], u64>,
     seen: BTreeMap<RecordId, (u64, u64)>,
@@ -2107,6 +2147,84 @@ pub fn member_list(paths: &Paths) -> crate::Result<Option<Vec<ListedMac>>> {
     out.extend(gone);
     Ok(Some(out))
 }
+
+/// Host for `EpochConvergence`'s environment markers, so `spec_xref_closure` accounts for every
+/// model action: which lab shape it is, and when records reach a Mac, are what the exchange and
+/// the Macs around the tender do.
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "EpochConvergence",
+        action = "Rotation",
+        reason = "Environment: a remover's batch reaches every seated Mac but one, which holds its Remove"
+    )
+)]
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "EpochConvergence",
+        action = "Prefix",
+        reason = "Environment: a Mac removes one while it holds a prefix of another's removal batch"
+    )
+)]
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "EpochConvergence",
+        action = "Settled",
+        reason = "Environment: three concurrent re-keys, of which a carrier holds two"
+    )
+)]
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "EpochConvergence",
+        action = "Recheck",
+        reason = "Environment: a Mac removes one while it holds another's Remove alone, past every grace"
+    )
+)]
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "EpochConvergence",
+        action = "Deliver",
+        reason = "Environment: the rest of the remover's batch reaches the Mac within the grace"
+    )
+)]
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "EpochConvergence",
+        action = "Heal",
+        reason = "Environment: every seated Mac takes every other's records"
+    )
+)]
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "EpochConvergence",
+        action = "Rest",
+        reason = "Environment: the rest of the other Mac's batch arrives"
+    )
+)]
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "EpochConvergence",
+        action = "Head",
+        reason = "Environment: the third re-key arrives, settled"
+    )
+)]
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "EpochConvergence",
+        action = "Arrive",
+        reason = "Environment: a prefix of the other Mac's batch arrives between the look and the signing"
+    )
+)]
+#[doc(hidden)]
+pub fn epoch_convergence_environment() {}
 
 #[cfg(test)]
 #[path = "remove_tests.rs"]

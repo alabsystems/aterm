@@ -171,11 +171,12 @@ pub fn apple_devtools_dialogs(dialogs: &[Dialog]) -> Vec<&Dialog> {
         .collect()
 }
 
-/// The `setup=` rows whose press opens a grant macOS lets only a person give: a privacy switch in
-/// System Settings (Full Disk Access, Developer Tools, Accessibility), macOS's own Local Network
-/// alert, and the debugger's administrator password (the SamplingTools authorization). aterm
-/// offers each (`;offered:`) and never answers it; it waits on a press for one only once a person
-/// asked for the batch.
+/// The `setup=` rows only a person can settle: a privacy switch in System Settings (Full Disk
+/// Access, Developer Tools, Accessibility) and macOS's own Local Network alert, which aterm offers
+/// (`;offered:`), never answers, and waits on only once a person asked for the batch; and the
+/// debugger's developer mode on an account that may not turn it on, which needs an administrator.
+/// An admin account's debugger row is neither offered nor waited on: it reads Waiting until setup's
+/// one Mac password (the Mac Setup tab) turns developer mode on.
 pub const MACOS_PERSON_ROWS: [&str; 5] = ["fda", "devtools", "lan", "ax", "debugger"];
 
 /// The rows after `key:` in a `setup=` field (`;needs:<row,...>` or `;offered:<row,...>`,
@@ -1430,7 +1431,7 @@ mod tests {
 
     #[test]
     fn a_typed_line_goes_to_the_first_shell_never_the_tab_listed_first() {
-        // A first launch with the Command Line Tools tab listed ahead of the shell's.
+        // A first launch with the Mac Setup tab listed ahead of the shell's.
         let ls = "763 0 s-aaaaaaaaaaaaaaaaaaaa - alive ~ meta=0 path=live program=aterm agent=-\n\
                   763 1 s-bbbbbbbbbbbbbbbbbbbb - alive ~ meta=0 path=live program=zsh agent=-\n";
         assert_eq!(shell_session(ls), Some("s-bbbbbbbbbbbbbbbbbbbb"));
@@ -1677,6 +1678,12 @@ mod tests {
         assert_eq!(acts(RECORDS), 7);
         assert_eq!(acts(""), 0);
         assert_eq!(acts("click\ntorn\n"), 0);
+        // A running installer is an act at each second it was seen (`setup_reading`), and the
+        // same second read twice is one.
+        assert_eq!(
+            acts("up 100 installer 100\nup 100 installer 100\nup 101 installer 101\n"),
+            2
+        );
         let at = |ms: u64| Reading {
             setup: Some("pending:devtools,debugger,vault".into()),
             record: None,

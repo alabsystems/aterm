@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// The lab's commit stamp `ATERM_LAB_GIT_COMMIT` (12 hex digits, `-dirty` on a dirty tree, `unknown` without git), from which `aos-search` names its evaluator's build; and the toolchain line `ATERM_LAB_TOOLCHAIN` (the first line of `$RUSTC -vV`) and build profile `ATERM_LAB_PROFILE` (cargo's `PROFILE` and `OPT_LEVEL`) its workers' execution identity carries.
+// The lab's commit stamp `ATERM_LAB_GIT_COMMIT` (12 hex digits, `-dirty` when the tree has changes outside the measured ledger `docs/measured` (`crates/aterm/stamp_paths.rs`), `unknown` without git), from which `aos-search` names its evaluator's build; and the toolchain line `ATERM_LAB_TOOLCHAIN` (the first line of `$RUSTC -vV`) and build profile `ATERM_LAB_PROFILE` (cargo's `PROFILE` and `OPT_LEVEL`) its workers' execution identity carries.
 
 #![allow(
     clippy::disallowed_types,
@@ -9,6 +9,13 @@
 )]
 
 use std::path::PathBuf;
+
+/// The paths the stamp is of: every producer that probes a work tree for a stamp's `-dirty`
+/// mounts this one file.
+#[path = "../aterm/stamp_paths.rs"]
+mod stamp_paths;
+
+use stamp_paths::PATHSPEC;
 
 fn main() {
     println!("cargo:rerun-if-env-changed=ATERM_BUILD_GIT_COMMIT");
@@ -24,7 +31,8 @@ fn main() {
             }
             let commit = run("git", &["rev-parse", "--short=12", "HEAD"])
                 .unwrap_or_else(|| "unknown".into());
-            let dirty = run("git", &["status", "--porcelain"]).is_some_and(|s| !s.is_empty());
+            let dirty = run("git", &[&["status", "--porcelain"][..], &PATHSPEC].concat())
+                .is_some_and(|s| !s.is_empty());
             if commit != "unknown" && dirty {
                 format!("{commit}-dirty")
             } else {
@@ -104,7 +112,7 @@ fn git_watch_paths() -> Vec<PathBuf> {
     paths
 }
 
-/// Every existing regular file git tracks in this checkout and its submodules, absolute and with no newline in its name, so an edit to any of them reruns the script.
+/// Every existing regular file git tracks in this checkout and its submodules, absolute and with no newline in its name, so an edit to any of them reruns the script; but the measured ledger's, which the stamp is not of ([`PATHSPEC`]).
 fn tracked_files() -> Vec<PathBuf> {
     let Some(top) = run("git", &["rev-parse", "--show-toplevel"]).map(PathBuf::from) else {
         return Vec::new();
@@ -113,6 +121,7 @@ fn tracked_files() -> Vec<PathBuf> {
         .arg("-C")
         .arg(&top)
         .args(["ls-files", "-z", "--recurse-submodules"])
+        .args(PATHSPEC)
         .output()
     else {
         return Vec::new();

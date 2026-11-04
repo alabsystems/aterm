@@ -1293,6 +1293,107 @@ fn derived_claimed_turn_edges_proves_and_catches_each_law() {
 }
 
 #[test]
+fn derived_claimed_box_steps_proves_and_catches_each_law() {
+    let model = aterm_models_session::claimed_box_steps_model();
+    assert_proves_and_catches(&model);
+    assert_every_invariant_breaks_first(&model);
+    assert_committed_dead_actions(
+        &model,
+        &[
+            "PreActCloses",
+            "SweepWordsOnly",
+            "StallShared",
+            "SweepPersonAsCtl",
+        ],
+    );
+    let fired = |path: &[&str]| {
+        let mut s = model.init_state();
+        for action in path {
+            assert!(model.fire(action, &mut s), "{action}: {s:?}");
+        }
+        s
+    };
+
+    let stacked = fired(&[
+        "Show1",
+        "Refresh",
+        "Sweep",
+        "AlabAnswer1",
+        "Show2",
+        "AlabAnswer2",
+        "Refresh",
+        "Sweep",
+    ]);
+    assert_eq!(
+        (
+            stacked["gap"],
+            stacked["s1"],
+            stacked["s2"],
+            stacked["saw2"]
+        ),
+        (0, 2, 0, 0),
+        "two stacked boxes share one began: one step (R9)"
+    );
+    let apart = fired(&[
+        "Show1",
+        "Refresh",
+        "Sweep",
+        "PersonKey",
+        "PersonAnswer1",
+        "Refresh",
+        "Show2",
+        "Refresh",
+        "Sweep",
+    ]);
+    assert_eq!(
+        (apart["gap"], apart["s1"], apart["o1"], apart["by1"]),
+        (1, 2, 2, 1),
+        "a new began leaves box 1's step, by the person's key it bound"
+    );
+    assert_eq!((apart["s2"], apart["held"]), (1, 2), "and opens box 2's");
+    let rested = fired(&[
+        "Show1",
+        "Refresh",
+        "Sweep",
+        "AlabAnswer1",
+        "Refresh",
+        "TurnEnd",
+    ]);
+    assert_eq!(
+        (rested["turn"], rested["s1"], rested["o1"], rested["by1"]),
+        (2, 2, 2, 0),
+        "the turn's close is its standing box's leave: passed, by nobody"
+    );
+    let approved = fired(&[
+        "Show1",
+        "Refresh",
+        "Sweep",
+        "HarnessKey",
+        "AlabAnswer1",
+        "Refresh",
+        "Sweep",
+    ]);
+    assert_eq!(
+        (approved["s1"], approved["o1"], approved["by1"]),
+        (2, 1, 3),
+        "a bound proven approve is the leave's outcome: approved, by the harness"
+    );
+    let stalled = fired(&[
+        "Show1",
+        "Refresh",
+        "Sweep",
+        "Stall",
+        "StallEnd",
+        "AlabAnswer1",
+    ]);
+    assert_eq!(
+        (stalled["held"], stalled["s1"]),
+        (1, 1),
+        "a stall leaves the claim's slot alone"
+    );
+}
+
+#[test]
 fn derived_turn_tracker_proves_and_catches_each_law() {
     let model = aterm_models_session::turn_tracker_model();
     assert_proves_and_catches(&model);

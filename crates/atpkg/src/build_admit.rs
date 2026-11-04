@@ -2222,10 +2222,27 @@ fn front_exec_bounded(
 #[cfg(target_os = "macos")]
 pub const HOLDER_ARMS_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// TEST SEAM ([`aterm_types::dev_seam!`]): a count of milliseconds, [`hand_over`] waits that long
+/// for its holder to arm where it is longer than [`HOLDER_ARMS_WITHIN`], so a test whose holder
+/// must arm waits out only its hang detector on a loaded machine.
+#[cfg(target_os = "macos")]
+pub const HOLDER_ARMS_WITHIN_ENV: &str = "ATERM_BUILD_HOLDER_ARMS_WITHIN_MS";
+
+/// [`hand_over`]'s wait for its holder to arm: [`HOLDER_ARMS_WITHIN`], or the longer
+/// [`HOLDER_ARMS_WITHIN_ENV`] a debug build was given.
+#[cfg(target_os = "macos")]
+fn holder_arms_within() -> std::time::Duration {
+    aterm_types::dev_seam!(HOLDER_ARMS_WITHIN_ENV)
+        .and_then(|ms| ms.to_str()?.parse::<u64>().ok())
+        .map_or(HOLDER_ARMS_WITHIN, |ms| {
+            HOLDER_ARMS_WITHIN.max(std::time::Duration::from_millis(ms))
+        })
+}
+
 /// HAND `held`'s CLAIM TO A HOLDER ([`hold`]): this executable, as recorded at its `main`'s first
 /// call and unchanged at its path ([`aterm_uds::tether::executable`]), spawned detached with a copy
 /// of the claim's descriptor and the arming pipe, and armed: its pid and then its arming byte
-/// read within [`HOLDER_ARMS_WITHIN`]. Its child, which forks the holder away, is reaped. A
+/// read within [`holder_arms_within`]. Its child, which forks the holder away, is reaped. A
 /// holder that did not arm is let go: the pipe closed under it (so a late arming fails and it
 /// leaves, handing the claim off), and once its pid was read it is ended by proof of its
 /// identity. The claim is this process's either way until it hands it off. Why it did not arm,
@@ -2262,7 +2279,7 @@ fn hand_over(held: &Held) -> Result<(), String> {
         .stderr(aterm_uds::spawnfd::ChildStdio::Null);
     let mut child = aterm_uds::spawnfd::detached_with_two_fds(command, descriptor, arming.into())
         .map_err(|e| format!("its spawn: {e}"))?;
-    let (holder, said) = read_arming(&armed, HOLDER_ARMS_WITHIN);
+    let (holder, said) = read_arming(&armed, holder_arms_within());
     if said.is_ok() {
         drop(armed);
         let _ = child.wait();

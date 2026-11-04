@@ -181,6 +181,21 @@ pub fn set_env_reread(run: &Run, key: &str, value: Option<&str>) -> Result<Rerea
     set_env_reread_with_wait(run, key, value, &WallWait::new())
 }
 
+fn reread_counter(log: std::path::PathBuf, settings: String) -> impl Fn() -> usize {
+    let state = std::cell::RefCell::new((crate::util::LineTailCursor::default(), 0usize));
+    move || {
+        let mut st = state.borrow_mut();
+        let (reset, delta) = st.0.poll_scratch_text(&log).unwrap_or_default();
+        if reset {
+            st.1 = 0;
+        }
+        if !delta.is_empty() {
+            st.1 += rereads(&delta, &settings);
+        }
+        st.1
+    }
+}
+
 /// Deep-merge `patch` into the scratch settings ([`crate::verbs::settings_merge`]) and wait until
 /// Claude Code re-reads the file.
 ///
@@ -191,7 +206,7 @@ pub fn merge_reread(run: &Run, patch: &J) -> Result<Reread, Fail> {
     let log = run.w.join(LOG);
     until_reread(
         || crate::verbs::settings_merge(run, patch).map(drop),
-        || rereads(&crate::util::scratch_text(&log), &settings),
+        reread_counter(log, settings),
         REWRITE_EVERY,
         HANG,
         &WallWait::new(),
@@ -208,7 +223,7 @@ pub(crate) fn set_env_reread_with_wait(
     let log = run.w.join(LOG);
     until_reread(
         || crate::verbs::set_env(run, key, value).map(drop),
-        || rereads(&crate::util::scratch_text(&log), &settings),
+        reread_counter(log, settings),
         REWRITE_EVERY,
         HANG,
         wait,

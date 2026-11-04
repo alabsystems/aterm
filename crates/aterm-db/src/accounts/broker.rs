@@ -778,6 +778,27 @@ impl Broker {
             .expires = self.lease_now();
     }
 
+    /// A lease for each of `grants`, cloned from `token`'s, that no token can present: a table
+    /// filled with no issue's fixture work, and no count of issues made either.
+    #[cfg(test)]
+    pub(crate) fn test_fill(&self, token: &[u8], grants: &[Grant]) {
+        let mut state = self
+            .lock_until(Instant::now() + Duration::from_secs(60))
+            .unwrap();
+        let lease = held_lease(&state, self.token_digest(token).unwrap()).unwrap();
+        for (n, grant) in grants.iter().enumerate() {
+            let key = aterm_digest::hmac_sha256_parts(
+                self.key.expose(),
+                &[b"aterm/broker/test-fill\0", &n.to_le_bytes()],
+            );
+            let filled = Lease {
+                grant: grant.clone(),
+                ..lease.clone()
+            };
+            state.leases.insert(key, filled);
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn test_revoke_after_contention(&self, token: &[u8]) -> bool {
         std::thread::scope(|scope| {

@@ -14,10 +14,10 @@ use aterm_spec::derive::Model;
 /// key was logged that was not shown echoed), `gap` (the recording's glow took keys its log does
 /// not hold) and `dirty` (a recording started from a glow that took an unlogged key).
 ///
-/// `Key` is a key logged at its press (the tty or an open prompt of aterm's shell echoes it) or,
-/// unattached, drawn unrecorded; `Private` a key the recording may not hold, which stops it
-/// before the glow sees the key; `Refute` a held run whose echo was not proven, which stops the
-/// recording the same way and hands the held keys to the glow unrecorded.
+/// `Key` is a key logged at its press (the tty or an open prompt of aterm's shell echoes it, or it
+/// carries no text) or, unattached, drawn unrecorded; `Private` a key the recording may not hold,
+/// which stops it before the glow sees the key; `Refute` a held run whose echo was not proven,
+/// which stops the recording the same way and hands the held keys to the glow unrecorded.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn aos_key_hold_model() -> Model {
@@ -46,7 +46,7 @@ pub fn aos_key_hold_model() -> Model {
                 echoed = 0;
             }
             action Key when (held == 0) {
-                att = att;
+                unproven = if Buggy == 5 && att == 1 { 1 } else { unproven };
             }
             action Private when (att <= 1) {
                 att = 0;

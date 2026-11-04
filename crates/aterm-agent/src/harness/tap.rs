@@ -196,10 +196,12 @@ pub fn read_owner_command(home: &Path) -> Option<String> {
         open.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     let file = open.open(path).ok()?;
-    if !file.metadata().ok()?.is_file() {
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.len() > OWNER_SETTINGS_MAX {
         return None;
     }
-    let mut text = String::new();
+    let mut text =
+        String::with_capacity(usize::try_from(meta.len()).unwrap_or(0).saturating_add(1));
     file.take(OWNER_SETTINGS_MAX + 1)
         .read_to_string(&mut text)
         .ok()?;
@@ -623,10 +625,12 @@ fn read_regular(path: &Path) -> Option<String> {
         open.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     let file = open.open(path).ok()?;
-    if !file.metadata().ok()?.is_file() {
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.len() > FILE_MAX {
         return None;
     }
-    let mut text = String::new();
+    let mut text =
+        String::with_capacity(usize::try_from(meta.len()).unwrap_or(0).saturating_add(1));
     file.take(FILE_MAX + 1).read_to_string(&mut text).ok()?;
     (text.len() as u64 <= FILE_MAX).then_some(text)
 }

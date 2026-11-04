@@ -38,9 +38,17 @@ pub const ALPN_DATABASE_REPAIR: &[u8] = b"atdb/2";
 /// endpoints offer none of the database protocols.
 pub const ALPN_DATABASE_CREDENTIALS: &[u8] = b"atdb/3";
 
-/// Database repair with fixed metadata, bounded authority evidence and causal frontiers.
+/// Database repair with fixed metadata, bounded authority evidence and causal frontiers, each
+/// side sending the whole seat witness its bootstrap selected, as 0.153 released it. Newer
+/// endpoints prefer [`ALPN_DATABASE_DELTA`] and keep this one, frame for frame, for 0.153 peers.
 /// This remains a database-only protocol with exporter-bound node proofs.
 pub const ALPN_DATABASE_FRONTIER: &[u8] = b"atdb/4";
+
+/// Database repair over causal frontiers where each side states what it holds before any
+/// authority evidence, so each pushes only the seat evidence the other lacks, and membership
+/// rounds move bounded batches. Older database peers still select [`ALPN_DATABASE_FRONTIER`] or an
+/// earlier protocol. This remains a database-only protocol with exporter-bound node proofs.
+pub const ALPN_DATABASE_DELTA: &[u8] = b"atdb/5";
 
 const PROTOCOLS: [&[u8]; 2] = [ALPN_NODES, ALPN];
 
@@ -843,6 +851,9 @@ fn database_server_config() -> Arc<ServerConfig> {
         config
             .alpn_protocols
             .insert(0, ALPN_DATABASE_FRONTIER.to_vec());
+        config
+            .alpn_protocols
+            .insert(0, ALPN_DATABASE_DELTA.to_vec());
         Arc::new(config)
     }))
 }
@@ -861,6 +872,9 @@ fn database_client_config() -> Arc<ClientConfig> {
         config
             .alpn_protocols
             .insert(0, ALPN_DATABASE_FRONTIER.to_vec());
+        config
+            .alpn_protocols
+            .insert(0, ALPN_DATABASE_DELTA.to_vec());
         Arc::new(config)
     }))
 }
@@ -1005,8 +1019,8 @@ pub fn server_handshake_with_denied(
     )
 }
 
-/// Authenticate a database-only listener, preferring [`ALPN_DATABASE_FRONTIER`]
-/// and retaining the existing fleet protocols for older dialers. This serves
+/// Authenticate a database-only listener, preferring [`ALPN_DATABASE_DELTA`]
+/// and retaining the earlier database and fleet protocols for older dialers. This serves
 /// only [`FleetOp::Database`], with no terminal survey or drive capability.
 ///
 /// # Errors
@@ -1059,6 +1073,40 @@ pub fn test_server_handshake_database_v3_as(
     test_server_handshake_database_version_as(tcp, secret, me, within, 3)
 }
 
+/// A released `atdb/4` listener (0.153's) for cross-version protocol tests.
+///
+/// # Errors
+/// As [`server_handshake_database_as`].
+#[cfg(any(test, debug_assertions))]
+pub fn test_server_handshake_database_v4_as(
+    tcp: TcpStream,
+    secret: &FleetSecret,
+    me: Option<&NodeIdentity>,
+    within: Duration,
+) -> Result<Accepted, FleetError> {
+    test_server_handshake_database_version_as(tcp, secret, me, within, 4)
+}
+
+/// The `atdb` version `alpn` names, or `None` for a protocol that is not a database one.
+#[cfg(any(test, debug_assertions))]
+fn database_version(alpn: &[u8]) -> Option<u8> {
+    [
+        ALPN_DATABASE_REPAIR,
+        ALPN_DATABASE_CREDENTIALS,
+        ALPN_DATABASE_FRONTIER,
+        ALPN_DATABASE_DELTA,
+    ]
+    .iter()
+    .zip(2..)
+    .find_map(|(known, version)| (*known == alpn).then_some(version))
+}
+
+/// Whether a build that speaks database protocols up to `atdb/<version>` offers `alpn`.
+#[cfg(any(test, debug_assertions))]
+fn offered_up_to(version: u8, alpn: &[u8]) -> bool {
+    database_version(alpn).is_none_or(|own| own <= version)
+}
+
 #[cfg(any(test, debug_assertions))]
 fn test_server_handshake_database_version_as(
     tcp: TcpStream,
@@ -1068,9 +1116,9 @@ fn test_server_handshake_database_version_as(
     version: u8,
 ) -> Result<Accepted, FleetError> {
     let mut config = (*database_server_config()).clone();
-    config.alpn_protocols.retain(|alpn| {
-        alpn != ALPN_DATABASE_FRONTIER && (version >= 3 || alpn != ALPN_DATABASE_CREDENTIALS)
-    });
+    config
+        .alpn_protocols
+        .retain(|alpn| offered_up_to(version, alpn));
     let watchdog = arm(&tcp, within)?;
     server_handshake_armed(
         tcp,
@@ -1233,8 +1281,8 @@ pub fn client_handshake_as(
     client_handshake_by(tcp, secret, me, op, within).map_err(|undialed| undialed.error)
 }
 
-/// Authenticate a database dialer, preferring [`ALPN_DATABASE_FRONTIER`] and
-/// negotiating an existing fleet protocol with an older listener. TLS pins,
+/// Authenticate a database dialer, preferring [`ALPN_DATABASE_DELTA`] and
+/// negotiating an earlier database or fleet protocol with an older listener. TLS pins,
 /// secret proofs and exporter-bound node proofs are unchanged.
 ///
 /// # Errors
@@ -1284,6 +1332,20 @@ pub fn test_client_handshake_database_v3_as(
     test_client_handshake_database_version_as(tcp, secret, me, within, 3)
 }
 
+/// A released `atdb/4` dialer (0.153's) for cross-version protocol tests.
+///
+/// # Errors
+/// As [`client_handshake_database_as`].
+#[cfg(any(test, debug_assertions))]
+pub fn test_client_handshake_database_v4_as(
+    tcp: TcpStream,
+    secret: &FleetSecret,
+    me: Option<&NodeIdentity>,
+    within: Duration,
+) -> Result<Dialed, FleetError> {
+    test_client_handshake_database_version_as(tcp, secret, me, within, 4)
+}
+
 #[cfg(any(test, debug_assertions))]
 fn test_client_handshake_database_version_as(
     tcp: TcpStream,
@@ -1293,9 +1355,9 @@ fn test_client_handshake_database_version_as(
     version: u8,
 ) -> Result<Dialed, FleetError> {
     let mut config = (*database_client_config()).clone();
-    config.alpn_protocols.retain(|alpn| {
-        alpn != ALPN_DATABASE_FRONTIER && (version >= 3 || alpn != ALPN_DATABASE_CREDENTIALS)
-    });
+    config
+        .alpn_protocols
+        .retain(|alpn| offered_up_to(version, alpn));
     client_handshake_by_on(tcp, secret, me, FleetOp::Database, within, Arc::new(config))
         .map_err(|undialed| undialed.error)
 }
@@ -2431,7 +2493,11 @@ enum Spoken {
 const fn spoken(alpn: Option<&[u8]>) -> Option<Spoken> {
     match alpn {
         Some(
-            ALPN_NODES | ALPN_DATABASE_REPAIR | ALPN_DATABASE_CREDENTIALS | ALPN_DATABASE_FRONTIER,
+            ALPN_NODES
+            | ALPN_DATABASE_REPAIR
+            | ALPN_DATABASE_CREDENTIALS
+            | ALPN_DATABASE_FRONTIER
+            | ALPN_DATABASE_DELTA,
         ) => Some(Spoken::Fleet { nodes: true }),
         Some(ALPN) => Some(Spoken::Fleet { nodes: false }),
         Some(ALPN_ASK) => Some(Spoken::Ask),
@@ -2925,9 +2991,21 @@ mod tests {
         NodeIdentity::from_seed(&format!("{byte:02x}").repeat(16), &[byte; 32]).unwrap()
     }
 
+    /// Two database endpoints meet on the newest database protocol both offer: version 5 is this
+    /// build (`atdb/5`), 4 is 0.153 (`atdb/4`), 3 and 2 the builds before it, and 1 a fleet
+    /// endpoint that offers no database protocol.
     #[test]
     fn database_repair_negotiates_its_order_and_falls_back_with_legacy_node_peers() {
         for (listener_version, dialer_version, expected) in [
+            (5, 5, ALPN_DATABASE_DELTA),
+            (5, 4, ALPN_DATABASE_FRONTIER),
+            (4, 5, ALPN_DATABASE_FRONTIER),
+            (5, 3, ALPN_DATABASE_CREDENTIALS),
+            (3, 5, ALPN_DATABASE_CREDENTIALS),
+            (5, 2, ALPN_DATABASE_REPAIR),
+            (2, 5, ALPN_DATABASE_REPAIR),
+            (5, 1, ALPN_NODES),
+            (1, 5, ALPN_NODES),
             (4, 4, ALPN_DATABASE_FRONTIER),
             (4, 3, ALPN_DATABASE_CREDENTIALS),
             (3, 4, ALPN_DATABASE_CREDENTIALS),
@@ -2948,14 +3026,13 @@ mod tests {
             let (listened, dialed) = over_loopback(
                 move |tcp| {
                     let me = node(1);
-                    let mut accepted = if listener_version == 4 {
+                    let mut accepted = if listener_version == 5 {
                         server_handshake_database_as(tcp, &secret(7), Some(&me), HANG)
                     } else if listener_version >= 2 {
                         let mut config = (*database_server_config()).clone();
-                        config.alpn_protocols.retain(|alpn| {
-                            alpn != ALPN_DATABASE_FRONTIER
-                                && (listener_version >= 3 || alpn != ALPN_DATABASE_CREDENTIALS)
-                        });
+                        config
+                            .alpn_protocols
+                            .retain(|alpn| offered_up_to(listener_version, alpn));
                         let watchdog = arm(&tcp, HANG).unwrap();
                         server_handshake_armed(
                             tcp,
@@ -2994,14 +3071,13 @@ mod tests {
                 },
                 move |tcp| {
                     let me = node(2);
-                    let mut dialed = if dialer_version == 4 {
+                    let mut dialed = if dialer_version == 5 {
                         client_handshake_database_as(tcp, &secret(7), Some(&me), HANG)
                     } else if dialer_version >= 2 {
                         let mut config = (*database_client_config()).clone();
-                        config.alpn_protocols.retain(|alpn| {
-                            alpn != ALPN_DATABASE_FRONTIER
-                                && (dialer_version >= 3 || alpn != ALPN_DATABASE_CREDENTIALS)
-                        });
+                        config
+                            .alpn_protocols
+                            .retain(|alpn| offered_up_to(dialer_version, alpn));
                         client_handshake_by_on(
                             tcp,
                             &secret(7),

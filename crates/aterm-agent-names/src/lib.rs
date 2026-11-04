@@ -54,7 +54,7 @@ pub fn agent_of(program: &str) -> Option<Agent> {
         // vendor's grok as its child on the same terminal: the screen is Grok's
         // (`docs/DESIGN-harness-repos-2026-10-24.md` §8.1 item 5).
         Some(Agent::Grok)
-    } else if is("kimi") || is("kimi-code") {
+    } else if is("kimi") || is("kimi-code") || is("kimi-alab") {
         Some(Agent::Kimi)
     } else {
         None
@@ -138,7 +138,14 @@ mod tests {
             ("Grok-Alab", Some(Agent::Grok)),
             ("grok-alabs", None),
             ("grok-", None),
-            ("kimi-alab", None),
+            ("kimi", Some(Agent::Kimi)),
+            ("kimi-code", Some(Agent::Kimi)),
+            ("kimi-alab", Some(Agent::Kimi)),
+            (
+                "/opt/pkg/bin/kimi-alab run -- --session x",
+                Some(Agent::Kimi),
+            ),
+            ("kimi-alabs", None),
             ("claude-codes", None),
             ("claude-alabs", None),
             ("claude-code-alabs", None),

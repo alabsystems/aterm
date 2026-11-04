@@ -179,6 +179,21 @@ pub struct RateLimiterSet {
 }
 
 impl RateLimiterSet {
+    /// The heap bytes the set holds past its own size: its buckets and its id table.
+    #[must_use]
+    pub(crate) fn heap_bytes(&self) -> usize {
+        let Self { buckets, slots } = self;
+        slots.keys().fold(
+            buckets
+                .capacity()
+                .saturating_mul(std::mem::size_of::<TokenBucket>())
+                .saturating_add(aterm_alloc::heap::table_bytes::<(String, usize)>(
+                    slots.capacity(),
+                )),
+            |sum, id| sum.saturating_add(id.capacity()),
+        )
+    }
+
     /// Build the set from a [`Policy`]'s `rate_limits` table.
     #[must_use]
     pub fn from_policy(policy: &Policy) -> Self {

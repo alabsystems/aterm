@@ -92,7 +92,8 @@ src/tests.rs	test_powershell_speaks_utf8_only_inside_an_aterm_tab	sh-pwsh-utf8
 src/tests.rs	test_powershell_unsets_shell_nonce_env_after_source	sh-nonce-capture	
 src/tests.rs	test_powershell_prompt_emits_osc7_and_prompt_marks	sh-pwsh-prompt	
 src/tests.rs	test_powershell_osc7_path_percent_encodes_windows_paths	sh-osc7-encoder	
-src/tests.rs	test_cache_dir_windows_uses_localappdata	cache-dir	
+src/tests.rs	test_per_user_cache_dir_on_windows_is_localappdata	cache-dir	
+src/tests.rs	test_per_user_cache_dir_takes_each_platforms_sources_in_order	cache-dir	
 src/tests.rs	test_cache_dir_is_the_per_user_cache_outside_the_containment_write_roots	cache-dir	
 src/tests.rs	test_merge_wslenv_is_append_safe_and_idempotent	merge-wslenv	
 src/tests.rs	test_wsl_cwd_env_only_crosses_a_posix_path	wsl-cwd-env	

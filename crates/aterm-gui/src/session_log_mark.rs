@@ -671,6 +671,11 @@ impl SessionLog {
     /// approval or question step while one is open (even with a tool open
     /// beside it), else on the deepest open node (`-` only when nothing is),
     /// as the loop's own act marks land ([`aterm_slog::Log::mark`], fix E3).
+    /// It never lands on a codex run's claimed box step (GAP 26,
+    /// [`Self::codex_claim_step`]), nor closes it: until an act names the box
+    /// it answered, an act (a pre-approval among them) cannot say it answered
+    /// that box, so the mark lands where it would with no such step standing
+    /// ([`Self::act_place_beside`]).
     pub(crate) fn self_claim_act(
         &mut self,
         act: &str,
@@ -688,17 +693,30 @@ impl SessionLog {
         };
         let f = f.clone().id(Key::Holder, holder).unwrap_or(f);
         let f = f.clone().text(Key::HarnessAct, act).unwrap_or(f);
-        let seq = self
-            .log
-            .mark(
-                Mark::new(Kind::Act, Src::Mark, aterm_slog::Conf::Claim)
-                    .by(by)
-                    .fields(f),
-                at,
-            )
-            .ok()?;
+        let mut mark = Mark::new(Kind::Act, Src::Mark, aterm_slog::Conf::Claim)
+            .by(by)
+            .fields(f);
+        if let Some(node) = self
+            .codex_claim_step()
+            .and_then(|c| self.act_place_beside(c))
+        {
+            mark = mark.at(node);
+        }
+        let seq = self.log.mark(mark, at).ok()?;
         self.consumers.limiter.spend(&by, at.mono_ms);
         Some(seq)
+    }
+
+    /// Where [`aterm_slog::Log::mark`] places a node-less act with the open
+    /// node `beside` set aside: the newest other open approval or question
+    /// step, else the newest other open node.
+    fn act_place_beside(&self, beside: Node) -> Option<Node> {
+        let open = self.log.open_nodes();
+        let others = || open.iter().rev().filter(|e| e.node != beside);
+        others()
+            .find(|e| aterm_slog::is_decision_step(e.kind))
+            .or_else(|| others().next())
+            .map(|e| e.node)
     }
 }
 

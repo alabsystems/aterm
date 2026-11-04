@@ -279,6 +279,46 @@ fn private_parents(overlay: &Path, name: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// Why an overlay home cannot be made where aterm makes no symbolic links ([`make_link`]).
+pub(crate) const NO_LINKS: &str =
+    "an overlay home needs symbolic links, which aterm makes only on Unix";
+
+/// Why `row`'s login home of `cli` cannot be made here, judged from the records alone: a row of
+/// its own (a non-empty `dir`) whose seam is an overlay home ([`Seam::Overlay`], Kimi Code's)
+/// where aterm makes no symbolic links ([`NO_LINKS`]). `None` on Unix and for every other row.
+/// A launch meets the same refusal when it prepares such a row ([`make_link`]), so a judge that
+/// says what a launch takes without preparing one (`accounts_pool::launch_now`) meets it too.
+pub(crate) fn unmade_here(
+    cli: super::accounts::Cli,
+    row: &super::accounts::Row,
+) -> Option<&'static str> {
+    let own = row.dir.as_deref().is_some_and(|dir| !dir.is_empty());
+    (cfg!(not(unix)) && own && matches!(cli.accounts().seam, Seam::Overlay { .. }))
+        .then_some(NO_LINKS)
+}
+
+/// Whether aterm makes `cli`'s login homes here: every CLI's on Unix, and off Unix each but an
+/// overlay home's ([`unmade_here`]), whose refusal off Unix
+/// `a_sign_in_that_needs_an_overlay_runs_nothing_where_aterm_makes_no_links` and
+/// `an_overlay_row_is_never_started_on_where_aterm_makes_no_links` hold.
+#[cfg(test)]
+pub(crate) fn links_here(cli: super::accounts::Cli) -> bool {
+    cfg!(unix) || !matches!(cli.accounts().seam, Seam::Overlay { .. })
+}
+
+/// The pooled CLI a harness model's `provider` names (1 Codex, 2 Grok Build, 3 Kimi Code CLI), as
+/// the launch policy, pool recovery and sign-in policy walks read it beside [`links_here`].
+#[cfg(test)]
+pub(crate) fn model_provider(index: i64) -> super::accounts::Cli {
+    use super::accounts::Cli;
+    match index {
+        1 => Cli::Codex,
+        2 => Cli::Grok,
+        3 => Cli::Kimi,
+        _ => unreachable!("a model's provider is 1..=3: {index}"),
+    }
+}
+
 #[cfg(unix)]
 fn make_link(target: &Path, at: &Path) -> io::Result<()> {
     std::os::unix::fs::symlink(target, at)
@@ -286,10 +326,7 @@ fn make_link(target: &Path, at: &Path) -> io::Result<()> {
 
 #[cfg(not(unix))]
 fn make_link(_target: &Path, _at: &Path) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "an overlay home needs symbolic links, which aterm makes only on Unix",
-    ))
+    Err(io::Error::new(io::ErrorKind::Unsupported, NO_LINKS))
 }
 
 #[cfg(all(test, unix))]

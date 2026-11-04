@@ -9540,13 +9540,25 @@ fn a_press_moves_what_it_pressed_by_no_fraction_of_a_point() {
 }
 
 /// A PRESS IN THE LEAST VIEW NEITHER COVERS NOR MOVES WHAT IT PRESSED, AT EVERY TEXT SCALE: in
-/// the least view ([`least_view`]) at 0.85×, 1×, 1.25×, 1.5×, 1.75× and 2× text, in a dark and a
-/// light theme, every switch and segment drawn whole and live on a screen a Page Down shows,
-/// pressed, stays where it was, whole, while its status comes up and once its write lands, and
-/// the status's bar covers none of it. Where it was is to a hundredth of a point: the same place
-/// reached by two sums of fractions differs by a hundred-thousandth (Cursor & Motion's Reduce at
-/// 0.85×, 114.4 and 114.40001). In the views the window's fixed least gave Settings, a press's
-/// bar covered or moved the control in 84 of 356 presses.
+/// the least view ([`least_view`]) at 0.85×, 1×, 1.25×, 1.5×, 1.75× and 2× text, every switch and
+/// segment drawn whole and live on a screen a Page Down shows, pressed, stays where it was, whole,
+/// while its status comes up and once its write lands, and the status's bar covers none of it.
+/// Where it was is to a hundredth of a point: the same place reached by two sums of fractions
+/// differs by a hundred-thousandth (Cursor & Motion's Reduce at 0.85×, 114.4 and 114.40001). In the
+/// views the window's fixed least gave Settings, a press's bar covered or moved the control in 84
+/// of 356 presses.
+///
+/// Every route is walked in a dark and a light theme. A press is judged in the default theme, and
+/// in the light one where the two walks differ (Home, Modified and Appearance today) or where
+/// the status reads the theme: on Cursor Styles, pressing Bloom in a light theme adds that bloom
+/// shows only on dark themes, which is the one long status a dock bar holds. A press is seated at
+/// the screen the walk found it on, which gave the frames of the quadratic replay of Page Downs at
+/// every press compared (all 1,068 of both themes, by a hash of each frame's keys, rects and clips,
+/// not its words). A key drawn elsewhere at that seat (10 of those presses) takes the replay, so
+/// no press is skipped. What is not implied, and would be missed: a press whose outcome depends on
+/// state Page Down leaves behind other than the scroll while drawing the key at the same place,
+/// and a fault only a light theme's press shows, on a route whose walks agree and whose status does
+/// not read the theme.
 #[test]
 fn a_press_in_the_least_view_neither_covers_nor_moves_what_it_pressed() {
     at_each_text_scale(
@@ -9559,11 +9571,13 @@ fn a_press_in_the_least_view_neither_covers_nor_moves_what_it_pressed() {
                 .filter(|route| !matches!(route, SettingsRoute::Themes | SettingsRoute::Messages))
                 .collect();
             let mut presses = Vec::new();
-            for source in ["", "theme = \"GitHub Light\"\n"] {
-                for &route in &routes {
+            for &route in &routes {
+                let mut dark_walk = Vec::new();
+                for source in ["", "theme = \"GitHub Light\"\n"] {
+                    let at_start = presses.len();
                     let mut lab = Lab::new(source);
                     lab.state_mut().navigate(route);
-                    let mut before: Option<Vec<(UiKey, LogicalRect)>> = None;
+                    let mut walk: Vec<Vec<(UiKey, LogicalRect)>> = Vec::new();
                     for page in 0..300 {
                         let screen = lab.compile(width, height);
                         let place: Vec<(UiKey, LogicalRect)> = screen
@@ -9571,7 +9585,7 @@ fn a_press_in_the_least_view_neither_covers_nor_moves_what_it_pressed() {
                             .iter()
                             .map(|node| (node.key.clone(), node.rect))
                             .collect();
-                        if before.as_ref() == Some(&place) {
+                        if walk.last() == Some(&place) {
                             break;
                         }
                         for node in &screen.paint {
@@ -9591,11 +9605,17 @@ fn a_press_in_the_least_view_neither_covers_nor_moves_what_it_pressed() {
                                     node.key.clone(),
                                     node.rect,
                                     segment,
+                                    lab.state().page_scroll,
                                 ));
                             }
                         }
-                        before = Some(place);
+                        walk.push(place);
                         lab.dispatch(AppEvent::ScrollPage(1));
+                    }
+                    if source.is_empty() {
+                        dark_walk = walk;
+                    } else if walk == dark_walk && route != SettingsRoute::CursorStyles {
+                        presses.truncate(at_start);
                     }
                 }
             }
@@ -9604,22 +9624,30 @@ fn a_press_in_the_least_view_neither_covers_nor_moves_what_it_pressed() {
             on_workers(
                 &presses,
                 "least view presses",
-                |(source, route, page, key, was, segment)| {
+                |(source, route, page, key, was, segment, top)| {
                     let was = *was;
+                    let drawn_at = |screen: &crate::native_ui::CompiledUi| {
+                        screen
+                            .paint
+                            .iter()
+                            .find(|node| node.key == *key)
+                            .map(|node| node.rect)
+                    };
                     let mut lab = Lab::new(source);
                     lab.state_mut().navigate(*route);
-                    for _ in 0..*page {
-                        let _ = lab.compile(width, height);
-                        lab.dispatch(AppEvent::ScrollPage(1));
+                    let _ = lab.compile(width, height);
+                    lab.state_mut().page_scroll = *top;
+                    let mut before = lab.compile(width, height);
+                    if drawn_at(&before) != Some(was) {
+                        lab = Lab::new(source);
+                        lab.state_mut().navigate(*route);
+                        for _ in 0..*page {
+                            let _ = lab.compile(width, height);
+                            lab.dispatch(AppEvent::ScrollPage(1));
+                        }
+                        before = lab.compile(width, height);
                     }
-                    let before = lab.compile(width, height);
-                    if before
-                        .paint
-                        .iter()
-                        .find(|node| node.key == *key)
-                        .map(|node| node.rect)
-                        != Some(was)
-                    {
+                    if drawn_at(&before) != Some(was) {
                         return;
                     }
                     let (action, value) = if *segment {
@@ -9698,8 +9726,10 @@ fn a_press_in_the_least_view_neither_covers_nor_moves_what_it_pressed() {
                 .into_inner()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             faults.sort();
+            // Each scale presses 103 or more, and its dark walks alone 87 to 91: a floor of 90 fails
+            // on the light presses gone, or on more than a route's worth of controls gone.
             assert!(
-                pressed.into_inner() > 100,
+                pressed.into_inner() > 90,
                 "{scale}x: the sweep presses the pages' switches and segments"
             );
             assert!(

@@ -1540,9 +1540,56 @@ fn spawn_session_leader_on_fresh_pty(
     }
 }
 
+/// The foreground group of the pty whose master is `master`, as [`end_session_on_pty`] reads
+/// it: `tcgetpgrp`, or a test's stand-in ([`front_read`]) where it set one.
+#[cfg(any(test, debug_assertions))]
+fn foreground_of(master: libc::c_int) -> libc::pid_t {
+    #[cfg(test)]
+    if let Some(group) = front_read::stand_in() {
+        return group;
+    }
+    // SAFETY: `tcgetpgrp` is a read-only ioctl on a master the caller owns.
+    unsafe { libc::tcgetpgrp(master) }
+}
+
+/// Whether the process whose pid is `group` leads that group and is in the session `session`
+/// leads: then `group` names a group of that session, not one an id read stale, or reused since,
+/// gave another session (a group keeps its id while its leader lives, so the two reads and the
+/// signal after them all name it, short of a pid wrap within that span).
+#[cfg(any(test, debug_assertions))]
+fn leads_in_session(group: libc::pid_t, session: libc::pid_t) -> bool {
+    // SAFETY: plain syscalls taking no pointer.
+    unsafe { libc::getpgid(group) == group && libc::getsid(group) == session }
+}
+
+/// The foreground read [`end_session_on_pty`] makes, stood in for by a test, as an id read
+/// stale, or reused since, would read: a group of another session.
+#[cfg(test)]
+pub(crate) mod front_read {
+    use std::cell::Cell;
+
+    thread_local! {
+        static STAND_IN: Cell<Option<libc::pid_t>> = const { Cell::new(None) };
+    }
+
+    /// This thread's next [`super::end_session_on_pty`] of a running leader reads its pty's
+    /// foreground group as `group`.
+    pub(crate) fn reads_as(group: libc::pid_t) {
+        STAND_IN.with(|stand_in| stand_in.set(Some(group)));
+    }
+
+    /// The stand-in [`reads_as`] set, taken.
+    pub(super) fn stand_in() -> Option<libc::pid_t> {
+        STAND_IN.with(Cell::take)
+    }
+}
+
 /// Ends the session that `leader`, spawned by [`spawn_session_leader_on_pty`] onto the pty of
 /// `master`, leads, and closes that pty, `master` last: one `SIGKILL` to the pty's foreground
-/// group (a shell's job); a `SIGKILL` to the leader's own group (on Apple again, paced, until
+/// group (a shell's job) where that group's own leader runs in this session ([`leads_in_session`]:
+/// an id read stale, or reused since, may name another session's group; a job whose group
+/// leader has exited is the caller's to end, as background jobs are); a `SIGKILL` to the
+/// leader's own group (on Apple again, paced, until
 /// the kernel finds no member of it left to signal or [`END_KILL_CAP`] has passed); the leader
 /// reaped; all while `said` takes what the master gives (on Apple a session leader's exit first
 /// waits for its terminal's output to drain, which reading the master lets it finish); then the
@@ -1584,15 +1631,10 @@ pub fn end_session_on_pty(
     let pid = libc::pid_t::try_from(leader.id()).map_err(io::Error::other)?;
     // `None`: reaped (by the caller), so its pid and group may name others; nothing is signalled.
     if let Some(exited) = child_exit_unreaped(pid) {
-        // SAFETY: `tcgetpgrp` is a read-only ioctl on the master this call owns.
-        let front = if exited {
-            0
-        } else {
-            unsafe { libc::tcgetpgrp(fd) }
-        };
-        if front > 1 && front != pid {
+        let front = if exited { 0 } else { foreground_of(fd) };
+        if front > 1 && front != pid && leads_in_session(front, pid) {
             // SAFETY: a plain syscall taking no pointer; `front` > 1 names one group, the one the
-            // pty named its foreground just now, while the session's leader is unreaped.
+            // pty named its foreground just now, whose own leader runs in this session.
             unsafe {
                 libc::kill(-front, libc::SIGKILL);
             }

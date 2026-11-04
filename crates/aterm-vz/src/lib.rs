@@ -157,7 +157,9 @@ pub(crate) fn is_regular_file(path: &std::path::Path) -> bool {
 }
 
 /// Open a regular file for reading without following a terminal symlink or blocking on a FIFO.
-pub(crate) fn open_regular_nonblock(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+pub(crate) fn open_regular_nonblock_with_meta(
+    path: &std::path::Path,
+) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
     #[cfg(unix)]
     let file = {
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -177,13 +179,19 @@ pub(crate) fn open_regular_nonblock(path: &std::path::Path) -> std::io::Result<s
         }
         std::fs::File::open(path)?
     };
-    if !file.metadata()?.is_file() {
+    let meta = file.metadata()?;
+    if !meta.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "not a regular file",
         ));
     }
-    Ok(file)
+    Ok((file, meta))
+}
+
+/// Open a regular file for reading without following a terminal symlink or blocking on a FIFO.
+pub(crate) fn open_regular_nonblock(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    open_regular_nonblock_with_meta(path).map(|(file, _)| file)
 }
 
 /// Read at most `max_bytes` from a regular file without following a terminal symlink or blocking on a FIFO.
@@ -192,8 +200,15 @@ pub(crate) fn read_regular_bounded(
     max_bytes: u64,
 ) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
-    let file = open_regular_nonblock(path)?;
-    let mut bytes = Vec::new();
+    let (file, meta) = open_regular_nonblock_with_meta(path)?;
+    if meta.len() > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("file exceeds {max_bytes}-byte limit"),
+        ));
+    }
+    let cap = usize::try_from(meta.len().min(max_bytes).saturating_add(1)).unwrap_or(0);
+    let mut bytes = Vec::with_capacity(cap);
     let read = file
         .take(max_bytes.saturating_add(1))
         .read_to_end(&mut bytes)?;

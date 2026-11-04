@@ -51,7 +51,8 @@ pub fn read_regular(path: &Path, max_bytes: u64) -> io::Result<(Vec<u8>, std::fs
             format!("file exceeds {max_bytes} bytes"),
         ));
     }
-    let mut buf = Vec::new();
+    let cap = usize::try_from(meta.len().min(max_bytes).saturating_add(1)).unwrap_or(0);
+    let mut buf = Vec::with_capacity(cap);
     file.take(max_bytes.saturating_add(1))
         .read_to_end(&mut buf)?;
     if u64::try_from(buf.len()).unwrap_or(u64::MAX) > max_bytes {

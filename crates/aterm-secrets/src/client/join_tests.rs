@@ -330,6 +330,8 @@ fn a_forged_verdict_only_asks_for_the_password_again() {
 
 #[test]
 fn an_admin_mac_records_each_mac_left_to_a_person_and_approves_exactly_the_one_named() {
+    // Every server it reads is its own on loopback, which answers.
+    let _answering = ServersAnswering::set();
     let root = aterm_tempfile::tempdir().expect("tempdir");
     let server = serve_holding(&root.path().join("store"), Duration::from_millis(200));
     let (admin, source, password) = team(root.path(), &server);
@@ -420,6 +422,8 @@ fn an_admin_mac_records_each_mac_left_to_a_person_and_approves_exactly_the_one_n
 
 #[test]
 fn failed_approval_refresh_withdraws_actions_until_a_fresh_judgment() {
+    // Every server it reads is its own on loopback, which answers.
+    let _answering = ServersAnswering::set();
     let root = aterm_tempfile::tempdir().unwrap();
     let server = serve_holding(&root.path().join("store"), Duration::from_millis(1));
     let (admin, source, _) = team(root.path(), &server);
@@ -455,6 +459,8 @@ fn failed_approval_refresh_withdraws_actions_until_a_fresh_judgment() {
 
 #[test]
 fn a_vault_approved_only_by_code_records_every_asking_mac_until_it_is_in() {
+    // Every server it reads is its own on loopback, which answers.
+    let _answering = ServersAnswering::set();
     let root = aterm_tempfile::tempdir().expect("tempdir");
     let server = serve_holding(&root.path().join("store"), Duration::from_millis(200));
     let (admin, source, _) = team(root.path(), &server);
@@ -582,6 +588,8 @@ fn a_mac_let_go_is_no_mac_asking_to_join_until_it_asks_again() {
     fn clock() -> u64 {
         aterm_time::unix_secs().unwrap_or(0) + AHEAD.load(std::sync::atomic::Ordering::SeqCst)
     }
+    // Every server it reads is its own on loopback, which answers.
+    let _answering = ServersAnswering::set();
     for mode in [Mode::Password, Mode::Open, Mode::Code] {
         AHEAD.store(0, std::sync::atomic::Ordering::SeqCst);
         let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -1157,6 +1165,8 @@ fn a_mac_let_in_by_code_while_the_approver_was_away_is_no_ghost_once_let_go() {
     fn clock() -> u64 {
         aterm_time::unix_secs().unwrap_or(0) + AHEAD.load(std::sync::atomic::Ordering::SeqCst)
     }
+    // Every server it reads is its own on loopback, which answers.
+    let _answering = ServersAnswering::set();
     let root = aterm_tempfile::tempdir().expect("tempdir");
     let server = crate::server::start_with_clock(
         std::net::TcpListener::bind("127.0.0.1:0").expect("bind"),
@@ -3284,6 +3294,8 @@ fn the_standing_browse_ends_while_sharing_is_off_and_starts_afresh() {
 
 /// `mb`, let into `admin`'s vault at `source` and holding its version.
 fn member_in(root: &Path, admin: &Paths, source: &str) -> Paths {
+    // The server it reads is its own on loopback, which answers.
+    let _answering = ServersAnswering::set();
     let mb = Paths::for_home(&root.join("mb"));
     let asked = join(
         &mb,
@@ -3331,6 +3343,8 @@ fn the_subscriber_starts_the_converge_pass_as_it_starts_per_applied_version_and_
         [Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7))), None, None];
     const AWAY: crate::converge::Routes =
         [Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 9))), None, None];
+    // Every server this thread reads is its own on loopback, which answers.
+    let _answering = ServersAnswering::set();
     let root = aterm_tempfile::tempdir().expect("tempdir");
     // A long-poll held past HELD ends a round that changed nothing, and the next begins at once.
     let server = serve_holding(

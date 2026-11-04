@@ -13,7 +13,7 @@ default-members = [
     "crates/agh", "crates/agh-fake", "crates/amacs", "crates/amacs-files", "crates/amacs-protocol", "crates/amacs-term",
     "crates/aterm", "crates/aterm-a11y", "crates/aterm-agent", "crates/aterm-agent-names", "crates/aterm-alloc", "crates/aterm-aos", "crates/aterm-aos-pane",
     "crates/aterm-bidi", "crates/aterm-bits", "crates/aterm-bootstrap-verify", "crates/aterm-brotli", "crates/aterm-buffer",
-    "crates/aterm-acaffiene", "crates/aterm-cap", "crates/aterm-capacity",
+    "crates/aterm-acaffeine", "crates/aterm-cap", "crates/aterm-capacity",
     "crates/aterm-cfg-if", "crates/aterm-cg", "crates/aterm-cli", "crates/aterm-codec",
     "crates/aterm-conformance", "crates/aterm-containment", "crates/aterm-control",
     "crates/aterm-converge",
@@ -79,7 +79,7 @@ bundle = []
 update_channel = "alabsystems/aterm"
 
 [workspace.package]
-version = "0.153.0"
+version = "0.154.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -184,8 +184,8 @@ aterm-jpeg = { path = "crates/aterm-jpeg" }
 # First-party JSON serde Deserializer/Serializer, `Value`, and `json!`.
 aterm-json = { path = "crates/aterm-json" }
 aterm-keeper = { path = "crates/aterm-keeper" }
-# `aterm acaffiene` menu-bar keep-awake mug (macOS at run time).
-aterm-acaffiene = { path = "crates/aterm-acaffiene" }
+# `aterm acaffeine` menu-bar keep-awake mug (macOS at run time).
+aterm-acaffeine = { path = "crates/aterm-acaffeine" }
 aterm-lexicon = { path = "crates/aterm-lexicon" }
 aterm-log = { path = "crates/aterm-log" }
 aterm-lz4 = { path = "crates/aterm-lz4" }
@@ -421,11 +421,12 @@ opt-level = 2
 
 # The vault in dev: X25519 is TweetNaCl's sixteen-limb ladder, first-party
 # (`aterm-secrets/src/x25519.rs`), and RFC 7748 §5.2's thousand-iteration
-# vector, the lib's longest test, ran 5.22 -> 0.42 s alone. Interleaved, two
-# per side at a load of 3.6-4.5: `-p aterm-secrets`'s tests 16.4, 15.6 ->
-# 9.9, 8.3 s wall (--lib 8.3 -> 4.2-4.8, flows 5.7 -> 3.5-3.9). A whole-crate
-# recompile of the lib test takes 3.7 s instead of 1.5. Only opt-level moves;
-# debug assertions and overflow checks stay on.
+# vector ran 5.22 -> 0.42 s alone (0.23 s since `mul` and `car25519` wrap, which
+# the ladder's proof allows). Interleaved, two per side at a load of 3.6-4.5:
+# `-p aterm-secrets`'s tests 16.4, 15.6 -> 9.9, 8.3 s wall (--lib 8.3 -> 4.2-4.8,
+# flows 5.7 -> 3.5-3.9). A whole-crate recompile of the lib test takes 3.7 s
+# instead of 1.5. Only opt-level moves; debug assertions and overflow checks
+# stay on.
 [profile.dev.package.aterm-secrets]
 opt-level = 2
 

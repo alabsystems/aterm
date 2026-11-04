@@ -78,21 +78,29 @@ pub struct Table {
     /// `true` installs the newest `Command Line Tools for Xcode` label when none is installed, and
     /// selects them when nothing is selected.
     pub command_line_tools: Option<bool>,
+    /// `true` turns developer mode on and adds the console account to `_developer`
+    /// ([`crate::root_steps::DeveloperMode`]).
+    pub debugger: Option<bool>,
 }
 
-/// The items `table` asks for.
+/// The items `table` asks for: developer mode before the tools, as it takes a moment and their
+/// install takes minutes and can end short (round 9: the elevation's root half ran at 4 s and
+/// developer mode was still off at 86 s, behind the tools' download).
 /// # Errors
 /// Never today; the signature is the family contract.
 pub fn expand(table: &Table, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
     let _ = ctx;
-    Ok(if table.command_line_tools == Some(true) {
-        vec![Box::new(CommandLineTools {
+    let mut items: Vec<Box<dyn Item>> = Vec::new();
+    if table.debugger == Some(true) {
+        items.push(Box::new(crate::root_steps::DeveloperMode));
+    }
+    if table.command_line_tools == Some(true) {
+        items.push(Box::new(CommandLineTools {
             planned: Mutex::new(None),
             unfinished: Mutex::new(None),
-        })]
-    } else {
-        Vec::new()
-    })
+        }));
+    }
+    Ok(items)
 }
 
 /// One `Command Line Tools` entry of `softwareupdate -l`.
@@ -180,7 +188,7 @@ struct CommandLineTools {
 }
 
 /// A failure of the install, in its words for a person's own terminal and its class for the
-/// Command Line Tools tab ([`Unfinished`]).
+/// Mac Setup tab ([`Unfinished`]).
 #[derive(Debug)]
 struct Failure {
     class: Unfinished,
@@ -1078,6 +1086,22 @@ Software Update found the following new or updated software:\n\
         );
     }
 
+    /// Developer mode, a moment's step, comes before the tools' minutes-long install, so the
+    /// elevation applies it at once whatever becomes of the download.
+    #[test]
+    fn developer_mode_is_applied_before_the_tools_install() {
+        let items = expand(
+            &Table {
+                command_line_tools: Some(true),
+                debugger: Some(true),
+            },
+            &ctx(),
+        )
+        .unwrap();
+        let ids: Vec<String> = items.iter().map(|item| item.id()).collect();
+        assert_eq!(ids, ["developer.debugger", crate::items::github::CLT_ITEM]);
+    }
+
     #[test]
     fn installed_and_selected_tools_are_ok_with_their_receipt_version() {
         let sys = Fake::root();
@@ -1090,6 +1114,7 @@ Software Update found the following new or updated software:\n\
         let items = expand(
             &Table {
                 command_line_tools: Some(true),
+                debugger: None,
             },
             &ctx(),
         )
@@ -1126,6 +1151,7 @@ Software Update found the following new or updated software:\n\
         let items = expand(
             &Table {
                 command_line_tools: Some(true),
+                debugger: None,
             },
             &ctx(),
         )
@@ -1219,6 +1245,7 @@ Software Update found the following new or updated software:\n\
         let items = expand(
             &Table {
                 command_line_tools: Some(true),
+                debugger: None,
             },
             &ctx(),
         )
@@ -1564,6 +1591,7 @@ Software Update found the following new or updated software:\n\
         let items = expand(
             &Table {
                 command_line_tools: Some(true),
+                debugger: None,
             },
             &ctx(),
         )
@@ -1598,6 +1626,7 @@ Software Update found the following new or updated software:\n\
         let items = expand(
             &Table {
                 command_line_tools: Some(true),
+                debugger: None,
             },
             &ctx(),
         )
@@ -1641,6 +1670,7 @@ Software Update found the following new or updated software:\n\
         let items = expand(
             &Table {
                 command_line_tools: Some(true),
+                debugger: None,
             },
             &ctx(),
         )
@@ -1682,6 +1712,7 @@ Software Update found the following new or updated software:\n\
         let items = expand(
             &Table {
                 command_line_tools: Some(true),
+                debugger: None,
             },
             &ctx(),
         )
@@ -1711,6 +1742,7 @@ Software Update found the following new or updated software:\n\
         let items = expand(
             &Table {
                 command_line_tools: Some(true),
+                debugger: None,
             },
             &ctx(),
         )
@@ -1724,7 +1756,8 @@ Software Update found the following new or updated software:\n\
         assert!(
             expand(
                 &Table {
-                    command_line_tools: Some(false)
+                    command_line_tools: Some(false),
+                    debugger: None,
                 },
                 &ctx()
             )
@@ -2342,6 +2375,7 @@ Software Update found the following new or updated software:\n\
             let items = expand(
                 &Table {
                     command_line_tools: Some(true),
+                    debugger: None,
                 },
                 &ctx(),
             )

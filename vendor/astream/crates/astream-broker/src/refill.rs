@@ -38,8 +38,10 @@ pub use refill_island::{refill_debt_clamp, refill_join_cursor_max};
 pub const REFILL_ROW_COST: u64 = 192;
 
 /// Default scan-equivalent slack before a shared refill hands remaining lanes back to
-/// individual per-lane `Fetch`es (`FETCH_SCAN_MAX = 65,536`, ~341 carried rows).
-pub const DEFAULT_REFILL_SPLIT_SLACK: u64 = 65_536;
+/// individual per-lane `Fetch`es: one page's scan, the broker's
+/// [`FETCH_SCAN_MAX`](crate::broker::FETCH_SCAN_MAX), or `FETCH_SCAN_MAX / REFILL_ROW_COST`
+/// rows carried for no lane. It is defined from that bound, so the slack moves with the page.
+pub const DEFAULT_REFILL_SPLIT_SLACK: u64 = crate::broker::FETCH_SCAN_MAX as u64;
 
 /// Maximum number of lanes planned in a single [`SharedRefillPlan`].
 pub const MAX_REFILL_LANES: usize = 1024;

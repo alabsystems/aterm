@@ -88,7 +88,7 @@ pub(crate) fn binding_transition(
             let before = every_file(tmp.path());
             let result = store.transact_logins(env.now, &mut None, |_, bindings| {
                 edited = true;
-                *bindings = saved;
+                bindings.labels = saved.labels;
                 accounts::note_login_notice(bindings, "main", 3, env.now);
                 Ok(Vec::new())
             });

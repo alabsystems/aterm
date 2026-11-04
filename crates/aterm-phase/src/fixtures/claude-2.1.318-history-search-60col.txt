@@ -1,0 +1,51 @@
+# claude-code 2.1.318 · MEASURED 2026-11-04, `aterm ctl text` of a private headless aterm (60x50, aterm 0.154.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · Claude Code's prompt-history search (ctrl+r) open at a turn end in a 60-column window, query readme, its match please read the readme in the composer row in typed ink; the search's label wraps in its own column, `search` on the footer's first row beside the query and `prompts:` under it · cursor=14,23
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.lab0/proj
+
+
+❯ please read the readme
+
+⏺ Hi! I am the local lab stub, not a model. (reply 1)
+
+✻ Worked for 0s · done 9:17 AM
+
+────────────────────────────────────────────────────────────
+❯ please read the readme
+────────────────────────────────────────────────────────────
+  search         readm… ⏵⏵ auto mode on (shift+tab to
+  prompts:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

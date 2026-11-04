@@ -36,6 +36,9 @@ pub struct Table {
     pub local_host_name: Option<String>,
     /// `HostName`, a fully qualified name.
     pub host_name: Option<String>,
+    /// `true` puts the rule in place that lets the console account set the three names to a
+    /// swarm label later, with no password ([`crate::root_steps::NameRule`]).
+    pub admitted_name_rule: Option<bool>,
 }
 
 /// The items `table` asks for, `{hardware}` filled from `ctx.facts`.
@@ -45,6 +48,9 @@ pub struct Table {
 pub fn expand(table: &Table, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
     let hardware = hardware::describe(&ctx.facts);
     let mut items: Vec<Box<dyn Item>> = Vec::new();
+    if table.admitted_name_rule == Some(true) {
+        items.push(Box::new(crate::root_steps::NameRule));
+    }
     if let Some(template) = &table.computer_name {
         let template = &said_once(template, &hardware);
         match with_hardware(template, &hardware, |d| {
@@ -693,6 +699,7 @@ mod tests {
             computer_name: computer.map(Into::into),
             local_host_name: local.map(Into::into),
             host_name: host.map(Into::into),
+            admitted_name_rule: None,
         }
     }
 

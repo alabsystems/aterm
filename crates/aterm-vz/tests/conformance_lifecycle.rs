@@ -8,10 +8,13 @@
 //!   ([`helper::take`] and the end `helper::run` makes), the real disk layers over a scratch
 //!   state directory ([`Layers::prepare`], [`PartialBake::seal`]) and the real command client
 //!   ([`aterm_vz::agent::run`]), walked over every state the model reaches without the
-//!   world's steps. Each edge is replayed from the start and projected ([`project`]) onto
-//!   exactly the model's successor; `Detect` is replayed for each detector that fits the
-//!   state ([`VARIANTS`]); and at each state the inputs [`PROBES`] names, which the model
-//!   has no step for, change nothing.
+//!   world's steps. Each edge that moves the state is replayed from the start on a rig of its
+//!   own and projected ([`project`]) onto exactly the model's successor; `Detect` is replayed
+//!   for each detector that fits the state ([`VARIANTS`]); and the inputs that must leave a
+//!   state as it is (the [`PROBES`], which the model has no step for, and any edge that stutters
+//!   there) run in line on one rig replayed to it, each projected at once before the next. So
+//!   each such input follows the earlier ones at its state, and a refused input that would mask
+//!   the next one's defect there would hide it; a move is never behind one.
 //! - The lab's side: [`Lab`] and [`Session`](aterm_vz::client::Session) over the Fake
 //!   `Helper` ([`Threaded`]: the real core and serve loop on a thread), and the escalation and
 //!   the leftovers over a stand-in, this binary holding the run files as the helper does (as
@@ -1071,21 +1074,6 @@ fn step(rig: &mut Rig, action: &'static str, win: &mut Win<'_>) {
     rig.check_pulled();
 }
 
-/// The real system after `path`, then `last` in its evidence window, its layers over `base`.
-fn replay(
-    path: &[&'static str],
-    last: &'static str,
-    base: &Path,
-    ev: Option<&mut StepEvidence>,
-) -> Rig {
-    let mut rig = Rig::new(boots(path.iter().copied().chain([last])), base);
-    for action in path {
-        step(&mut rig, action, &mut Win(None));
-    }
-    step(&mut rig, last, &mut Win(ev));
-    rig
-}
-
 /// How many replays run at once across this binary's walks. Each makes and removes its own
 /// state directory, and the kernel's file system path stops gaining past four at once
 /// (measured 2026-10-28: one process's threads churning such trees ran 1.35 times one
@@ -1203,44 +1191,82 @@ fn checks_at(
     checks
 }
 
-/// One check's replay on a thread of its own, `fault` armed on it: what it projects to and
-/// its step's evidence window (none for a probe, or where the walk keeps none), or the panic
-/// it raised, which the walk raises again where it reads this check. Nothing once it has its
-/// slot and `unread` says the walk will not read it.
-fn replayed(
-    path: &[&'static str],
+/// One check of a depth, by its place in the order the walk reads them.
+#[derive(Clone, Copy)]
+struct Placed<'a> {
+    place: usize,
     action: &'static str,
     check: Check,
+    next: &'a State,
+}
+
+/// What one rig runs: a move, or every check that must leave the state as it is.
+struct Replay<'a> {
+    path: &'a [&'static str],
+    checks: Vec<Placed<'a>>,
+}
+
+/// What one check's replay shows: what it projects to and its step's evidence window (none for
+/// a probe, or where the walk keeps none), or the panic it raised.
+type Shown = std::thread::Result<(State, Option<StepEvidence>)>;
+
+/// One rig's replay on a thread of its own, `fault` armed on it: `path`, with no window open,
+/// then each of `checks` in order, its own step alone in its window, up to the first that
+/// disagrees or panics, which the walk raises again where it reads that check. Nothing once it
+/// has its slot and `unread` says the walk will read none of them.
+fn replayed(
+    Replay { path, checks }: &Replay<'_>,
     base: &Path,
     fault: Option<Fault>,
     witness: bool,
     unread: impl FnOnce() -> bool,
-) -> Option<std::thread::Result<(State, Option<StepEvidence>)>> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+) -> Option<Vec<Shown>> {
+    let mut shown = Vec::with_capacity(checks.len());
+    let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         in_slot(|| {
             if unread() {
-                return None;
+                return false;
             }
-            Some(armed(fault, || {
-                let mut window =
-                    (witness && check != Check::Probe).then(|| StepEvidence::new(MACHINE));
-                let rig = replay(path, action, base, window.as_mut());
-                let observed = project(&rig);
-                drop(rig);
-                (observed, window)
-            }))
+            armed(fault, || {
+                let actions = path.iter().copied().chain(checks.iter().map(|c| c.action));
+                let mut rig = Rig::new(boots(actions), base);
+                for action in *path {
+                    step(&mut rig, action, &mut Win(None));
+                }
+                for c in checks {
+                    let mut window =
+                        (witness && c.check != Check::Probe).then(|| StepEvidence::new(MACHINE));
+                    step(&mut rig, c.action, &mut Win(window.as_mut()));
+                    let observed = project(&rig);
+                    let agrees = observed == *c.next;
+                    shown.push(Ok((observed, window)));
+                    if !agrees {
+                        break;
+                    }
+                }
+            });
+            true
         })
-    }))
-    .transpose()
+    }));
+    match ran {
+        Ok(false) => None,
+        Ok(true) => Some(shown),
+        Err(panic) => {
+            shown.push(Err(panic));
+            Some(shown)
+        }
+    }
 }
 
 /// Walk `m` breadth first, with `fault` armed: every edge from every reachable state replayed
 /// on the real system and projected onto exactly the model's successor, each of its
 /// [`VARIANTS`] onto the same successor, and every probe at every state where it applies a
-/// stutter. Each depth's replays run at once ([`REPLAYERS`]), and are read back in the order
-/// one replay at a time would make them; a check past the first that disagrees or panics is
-/// not replayed, since the walk never reads it. `strict` panics at a disagreement; otherwise
-/// the walk stops at its first.
+/// stutter. Each check that moves the state has a rig of its own; a state's stutters, whatever
+/// they are, share one, since none of them should change what the next one meets. Each depth's
+/// rigs run at once ([`REPLAYERS`]), and their checks are read back in the order one replay at
+/// a time would make them; a check past the first that disagrees or panics is not replayed,
+/// since the walk never reads it. `strict` panics at a disagreement; otherwise the walk stops at
+/// its first.
 fn walk(
     m: &Model,
     probes: &[(&'static str, Guard)],
@@ -1265,35 +1291,64 @@ fn walk(
             .iter()
             .map(|(st, _)| checks_at(m, probes, st))
             .collect();
-        let items: Vec<(usize, &[&'static str], &'static str, Check, &State)> = depth
-            .iter()
-            .zip(&checks)
-            .flat_map(|((_, path), here)| {
-                here.iter()
-                    .map(move |(action, check, next)| (path.as_slice(), *action, *check, next))
-            })
-            .enumerate()
-            .map(|(at, (path, action, check, next))| (at, path, action, check, next))
-            .collect();
+        let mut replays: Vec<Replay<'_>> = Vec::new();
+        let mut places = 0;
+        for ((st, path), here) in depth.iter().zip(&checks) {
+            let mut stutters = Vec::new();
+            for (action, check, next) in here {
+                let c = Placed {
+                    place: places,
+                    action,
+                    check: *check,
+                    next,
+                };
+                places += 1;
+                if next == st {
+                    stutters.push(c);
+                } else {
+                    replays.push(Replay {
+                        path,
+                        checks: vec![c],
+                    });
+                }
+            }
+            if !stutters.is_empty() {
+                replays.push(Replay {
+                    path,
+                    checks: stutters,
+                });
+            }
+        }
         // The depth's first check that disagrees or panics, of those seen so far. It only
         // falls, so every check before the one the walk stops at is replayed, and since the
-        // workers take checks in order, only those already started run past it.
+        // workers take rigs in order, only those already started run past it.
         let first_off = AtomicUsize::new(usize::MAX);
-        let mut replays = aterm_spec::check::each(&items, |&(at, path, action, check, next)| {
-            let replay = replayed(path, action, check, &base, fault, witness, || {
-                first_off.load(Ordering::Relaxed) < at
+        let ran = aterm_spec::check::each(&replays, |replay| {
+            let shown = replayed(replay, &base, fault, witness, || {
+                first_off.load(Ordering::Relaxed) < replay.checks[0].place
             })?;
-            if !replay.as_ref().is_ok_and(|(observed, _)| observed == next) {
-                first_off.fetch_min(at, Ordering::Relaxed);
+            let off = shown
+                .iter()
+                .zip(&replay.checks)
+                .find(|(shown, c)| !shown.as_ref().is_ok_and(|(observed, _)| observed == c.next));
+            if let Some((_, c)) = off {
+                first_off.fetch_min(c.place, Ordering::Relaxed);
             }
-            Some(replay)
-        })
-        .into_iter();
+            Some(shown)
+        });
+        let mut reads: Vec<Option<Shown>> = Vec::new();
+        reads.resize_with(places, || None);
+        for (replay, shown) in replays.iter().zip(ran) {
+            for (c, shown) in replay.checks.iter().zip(shown.into_iter().flatten()) {
+                reads[c.place] = Some(shown);
+            }
+        }
+        let mut reads = reads.into_iter();
         let mut deeper = Vec::new();
-        for ((st, path), here) in depth.iter().zip(checks) {
+        for ((st, path), here) in depth.iter().zip(&checks) {
             w.states += 1;
             for (action, check, next) in here {
-                let (observed, window) = replays
+                let (observed, window) = reads
                     .next()
                     .expect("a result for every check")
                     .expect("every check the walk reads is replayed")
@@ -1309,11 +1364,11 @@ fn walk(
                     Check::Variant => w.variants += 1,
                     Check::Probe => w.probes += 1,
                 }
-                if observed == next {
-                    if check == Check::Edge && seen.insert(key(&next)) {
+                if observed == *next {
+                    if *check == Check::Edge && seen.insert(key(next)) {
                         let mut to = path.clone();
                         to.push(action);
-                        deeper.push((next, to));
+                        deeper.push((next.clone(), to));
                     }
                     continue;
                 }

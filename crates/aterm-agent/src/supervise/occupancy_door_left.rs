@@ -10,7 +10,8 @@
 //! `FactsState::look`): told, its `typed … settled=<how>` row booked and its wake told; released,
 //! its `skipped … why=<why>` row booked and its wake's claim given back, so `await wake` answers.
 //! Until then no door tells its episode and no door claims its wake. A look is a read the loop
-//! made anyway: nothing is read for it, under any mode, and with no line left it reads not even
+//! made anyway: nothing is read for it, under any mode, but the glyph's cell where the rows and
+//! the cursor do not say typed (`Session::left_seen`), and with no line left it reads not even
 //! the clock. Where the owner's `prompt` is no longer in force, the policy's draft step sends
 //! nothing `prompt` left ([`Session::left_composer`]). A replay of a recording without slice 2's
 //! doors (`Fx::slice2_recorded`) keeps nothing left: its doors book the line skipped, as the build
@@ -94,17 +95,21 @@ impl<C: Ctl> Session<'_, C> {
     /// The look a read of `screen` is (`live`: a turn runs on it): whether its composer holds a
     /// draft (unread under a prompt, or where none is drawn, or while a line this loop gave up on
     /// undrawn is held: an empty composer then says nothing of a line that may still come, so no
-    /// line it left is released while its copy may arrive) and its submit count.
-    pub(in crate::supervise::run) fn left_seen(&self, screen: &Screen, live: bool) -> LeftLook {
+    /// line it left is released while its copy may arrive) and its submit count. Unless the rows
+    /// and the cursor alone say typed ([`draft_read`]), the glyph's cell is asked, as at the door's own
+    /// write ([`Self::door_draft`]): a line left stands, whole or edited, while that says typed or
+    /// cannot say, and a suggestion at home is no line left, on any number of rows.
+    pub(in crate::supervise::run) fn left_seen(&mut self, screen: &Screen, live: bool) -> LeftLook {
         let reader = self.reader(&screen.rows);
         let draft = if (reader.prompt(&screen.rows).is_some() && !armed(Fault::BoxedComposerRead))
             || self.custody.is_some()
         {
             None
         } else {
-            reader
-                .composer(&screen.rows)
-                .map(|c| typed_draft_in(Some(&c), reader.placeholder(), screen))
+            reader.composer(&screen.rows).map(|c| {
+                draft_read(Some(&c), reader.placeholder(), screen) == Some(true)
+                    || self.door_draft(screen) != Some(false)
+            })
         };
         LeftLook::Read {
             draft,

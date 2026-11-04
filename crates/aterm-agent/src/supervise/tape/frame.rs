@@ -1,45 +1,32 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tape frame encoding, position-bound checksums, and [`TapeWriter`].
+//! Tape frames and [`TapeWriter`]: after the tape's magic, each frame is one
+//! `astream_wire::steps` record whose step is its place, the header's step 0
+//! (astream claim `wire.steps.torn-vs-fault`; [`super::recover`] reads them back
+//! with astream's scan).
 
 use std::io::Write;
+
+use astream_wire::frame::{FrameError, HEADER_SIZE, MAX_PAYLOAD_LEN};
+use astream_wire::steps::{STEP_HEADER, encode_step};
 
 use super::codec::{Encoder, Item, Mark, len64};
 
 /// Eight-byte tape file magic (`ATAPE\0`, [`FRAME_FORMAT`], `'\n'`).
 pub const MAGIC: [u8; 8] = [b'A', b'T', b'A', b'P', b'E', 0, FRAME_FORMAT, b'\n'];
 
-/// Frame format byte written by this build.
-pub const FRAME_FORMAT: u8 = Format::Two as u8;
+/// The one frame format this build writes and reads: 3, astream step records.
+/// Formats 1 and 2 framed each frame in aterm's own head and xxh64; a tape of
+/// either is refused by its number ([`super::recover::Why::Format`]).
+pub const FRAME_FORMAT: u8 = 3;
 
-/// A frame format this build reads: the magic's seventh byte.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Format {
-    /// T3's: each frame's sum is its xxh64 alone, so it names no place.
-    One = 1,
-    /// Each frame's sum also names its place.
-    Two = 2,
-}
+/// A frame's body before its payload: its kind, and its raw length.
+pub(crate) const BODY_HEAD: usize = 1 + 4;
 
-impl Format {
-    /// The format whose magic `bytes` start with.
-    pub(crate) fn of_magic(bytes: &[u8]) -> Option<Self> {
-        [Self::Two, Self::One]
-            .into_iter()
-            .find(|f| bytes.starts_with(&f.magic()))
-    }
-
-    /// The magic of a tape of this format.
-    pub(crate) const fn magic(self) -> [u8; 8] {
-        let mut magic = MAGIC;
-        magic[6] = self as u8;
-        magic
-    }
-}
-
-/// A frame's head: kind, raw length, payload length, checksum.
-pub(crate) const HEAD: usize = 1 + 4 + 4 + 8;
+/// The bytes a frame takes beyond its stored payload: the astream frame's head,
+/// the step record's head, and the body's.
+pub(crate) const OVERHEAD: usize = HEADER_SIZE + STEP_HEADER + BODY_HEAD;
 
 /// A frame closes once its raw items reach this.
 pub const FRAME_RAW: usize = 64 * 1024;
@@ -47,11 +34,18 @@ pub const FRAME_RAW: usize = 64 * 1024;
 /// A run's tape is at most this many bytes, its header's included.
 pub const RUN_CAP: u64 = 64 * 1024 * 1024;
 
-/// Maximum raw byte length of a single frame.
-pub(crate) const FRAME_RAW_MAX: usize = 64 * 1024 * 1024;
+/// Maximum raw byte length of a single frame: the largest body an astream step
+/// record carries ([`MAX_PAYLOAD_LEN`] less the step's head) less the body's
+/// head. A frame stores its raw bytes compressed only when that is shorter, so
+/// its stored payload is never longer than its raw bytes and every frame of at
+/// most this many raw bytes is a step record astream encodes. An item longer
+/// than this ends the tape at a truncation mark ([`TapeWriter::append`]).
+pub(crate) const FRAME_RAW_MAX: usize = MAX_PAYLOAD_LEN - STEP_HEADER - BODY_HEAD;
 
-/// Room kept below the cap for the truncation mark's own frame.
-const MARK_ROOM: u64 = 64;
+/// Room kept below the cap for the truncation mark's own frame: a frame's
+/// overhead, and the mark's two bytes and its door, a varint of at most ten
+/// (stored raw: twelve bytes compress by none).
+const MARK_ROOM: u64 = (OVERHEAD + 2 + 10) as u64;
 
 /// What a frame holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,90 +66,26 @@ impl Kind {
     }
 }
 
-/// Compute a frame's xxh64 checksum over its kind, lengths, and stored payload.
-pub(crate) fn checksum(kind: Kind, lengths: &[u8], payload: &[u8]) -> u64 {
-    let mut sum = aterm_zstd::xxh64::Xxh64::new(kind as u64);
-    sum.update(lengths);
-    sum.update(payload);
-    sum.digest()
-}
-
-/// Upper bound on frame count in a writer's tape (`RUN_CAP / HEAD`).
-pub(crate) const PLACES: u64 = RUN_CAP / HEAD as u64;
-
-/// What every place is mixed with before it is folded into a sum: the
-/// format-2 magic's own word, so no place's word is 0 (the word a format-1
-/// sum would carry).
-const PLACE_SALT: u64 = u64::from_le_bytes(Format::Two.magic());
-
-/// MurmurHash3's 64-bit finalizer's two multipliers, and their inverses
-/// modulo 2^64.
-const FMIX_1: u64 = 0xff51_afd7_ed55_8ccd;
-const FMIX_2: u64 = 0xc4ce_b9fe_1a85_ec53;
-const FMIX_1_INV: u64 = inverse(FMIX_1);
-const FMIX_2_INV: u64 = inverse(FMIX_2);
-
-/// The inverse of an odd `k` modulo 2^64, by Newton's iteration: each step
-/// doubles the low bits that are right, from the three `k` itself gets right
-/// (an odd square is 1 modulo 8), so five steps make 96 of them.
-const fn inverse(k: u64) -> u64 {
-    let mut x = k;
-    let mut step = 0;
-    while step < 5 {
-        x = x.wrapping_mul(2u64.wrapping_sub(k.wrapping_mul(x)));
-        step += 1;
-    }
-    x
-}
-
-/// MurmurHash3-mixed word encoding frame position `n` in format-2 checksums.
-pub(crate) const fn place_word(n: u64) -> u64 {
-    let mut z = n ^ PLACE_SALT;
-    z = (z ^ (z >> 33)).wrapping_mul(FMIX_1);
-    z = (z ^ (z >> 33)).wrapping_mul(FMIX_2);
-    z ^ (z >> 33)
-}
-
-/// Recover the frame position encoded in format-2 `sum` given payload hash `hashed`.
-pub(crate) fn place_named(sum: u64, hashed: u64) -> Option<u64> {
-    let mut z = sum ^ hashed;
-    z = (z ^ (z >> 33)).wrapping_mul(FMIX_2_INV);
-    z = (z ^ (z >> 33)).wrapping_mul(FMIX_1_INV);
-    let n = (z ^ (z >> 33)) ^ PLACE_SALT;
-    (n < PLACES).then_some(n)
-}
-
-/// Encode one format-2 frame at `place` (LZ4-compressed when that saves at least 1/8).
-pub(crate) fn frame_bytes(kind: Kind, place: u64, raw: &[u8]) -> Vec<u8> {
-    framed(Format::Two, kind, place, raw)
-}
-
-/// Encode one frame in `format` at `place`.
-pub(crate) fn framed(format: Format, kind: Kind, place: u64, raw: &[u8]) -> Vec<u8> {
+/// One frame of `kind` holding `raw`, as the step record at `step`: the body is
+/// the kind, the raw length and the payload, LZ4-compressed when that saves at
+/// least an eighth.
+///
+/// # Errors
+/// `raw` is longer than [`FRAME_RAW_MAX`], so its body is past what a step
+/// record carries ([`FrameError::TooLarge`]).
+pub(crate) fn frame_bytes(kind: Kind, step: u64, raw: &[u8]) -> Result<Vec<u8>, FrameError> {
+    let raw_len = u32::try_from(raw.len())
+        .ok()
+        .filter(|_| raw.len() <= FRAME_RAW_MAX)
+        .ok_or(FrameError::TooLarge)?;
     let packed = aterm_lz4::compress(raw);
     let saves = packed.len() <= raw.len() - raw.len() / 8 && packed.len() < raw.len();
     let payload: &[u8] = if saves { &packed } else { raw };
-    let comp_len = if saves { payload.len() } else { 0 };
-    let mut lengths = [0u8; 8];
-    lengths[..4].copy_from_slice(&u32_of(raw.len()).to_le_bytes());
-    lengths[4..].copy_from_slice(&u32_of(comp_len).to_le_bytes());
-    let sum = checksum(kind, &lengths, payload);
-    let sum = match format {
-        Format::One => sum,
-        Format::Two => sum ^ place_word(place),
-    };
-    let mut out = Vec::with_capacity(HEAD + payload.len());
-    out.push(kind as u8);
-    out.extend_from_slice(&lengths);
-    out.extend_from_slice(&sum.to_le_bytes());
-    out.extend_from_slice(payload);
-    out
-}
-
-/// A length as a frame's head holds it. Every frame's raw is at most
-/// [`FRAME_RAW_MAX`], which a `u32` holds.
-fn u32_of(n: usize) -> u32 {
-    u32::try_from(n).unwrap_or(u32::MAX)
+    let mut body = Vec::with_capacity(BODY_HEAD + payload.len());
+    body.push(kind as u8);
+    body.extend_from_slice(&raw_len.to_le_bytes());
+    body.extend_from_slice(payload);
+    encode_step(step, &body)
 }
 
 /// Where a tape's frames go: a file, or (a test's) memory.
@@ -221,8 +151,8 @@ pub struct TapeWriter {
     effects: u64,
     /// Bytes handed to the sink so far.
     written: u64,
-    /// Frames handed to the sink so far: the next frame's place.
-    places: u64,
+    /// Frames handed to the sink so far: the next frame's step.
+    steps: u64,
     cap: u64,
     stopped: Option<Stopped>,
 }
@@ -234,7 +164,7 @@ impl std::fmt::Debug for TapeWriter {
             .field("open", &self.open.len())
             .field("effects", &self.effects)
             .field("written", &self.written)
-            .field("places", &self.places)
+            .field("steps", &self.steps)
             .field("stopped", &self.stopped)
             .finish_non_exhaustive()
     }
@@ -257,13 +187,13 @@ impl TapeWriter {
             open_from: 0,
             effects: 0,
             written: 0,
-            places: 0,
+            steps: 0,
             cap: RUN_CAP,
             stopped: None,
         };
-        let mut first = MAGIC.to_vec();
-        first.extend(frame_bytes(Kind::Header, 0, header.as_bytes()));
-        w.put(&first);
+        if let Some(frame) = w.frame(Kind::Header, header.as_bytes()) {
+            w.put(&[MAGIC.as_slice(), &frame].concat());
+        }
         w
     }
 
@@ -344,7 +274,9 @@ impl TapeWriter {
         }
         let raw = std::mem::take(&mut self.open);
         let from = std::mem::replace(&mut self.open_from, self.effects);
-        let bytes = frame_bytes(Kind::Records, self.places, &raw);
+        let Some(bytes) = self.frame(Kind::Records, &raw) else {
+            return;
+        };
         if self.written + len64(bytes.len()) + MARK_ROOM > self.cap {
             self.truncate(from);
             return;
@@ -358,9 +290,24 @@ impl TapeWriter {
         self.open.clear();
         let mut raw = Vec::new();
         Encoder::default().item(&Item::Mark(Mark::Truncated { door }), &mut raw);
-        self.put(&frame_bytes(Kind::Records, self.places, &raw));
+        if let Some(bytes) = self.frame(Kind::Records, &raw) {
+            self.put(&bytes);
+        }
         if self.stopped.is_none() {
             self.stopped = Some(Stopped::Capped);
+        }
+    }
+
+    /// The frame of `kind` holding `raw` at the next step ([`frame_bytes`]); one
+    /// astream refuses is a failure, said once.
+    fn frame(&mut self, kind: Kind, raw: &[u8]) -> Option<Vec<u8>> {
+        match frame_bytes(kind, self.steps, raw) {
+            Ok(bytes) => Some(bytes),
+            Err(e) => {
+                let e = std::io::Error::new(std::io::ErrorKind::InvalidInput, e);
+                self.fail(&e, "cannot frame it");
+                None
+            }
         }
     }
 
@@ -377,7 +324,7 @@ impl TapeWriter {
         match self.sink.write_frame(bytes) {
             Ok(()) => {
                 self.written += len64(bytes.len());
-                self.places += 1;
+                self.steps += 1;
             }
             Err(e) => self.fail(&e, "cannot write to it"),
         }

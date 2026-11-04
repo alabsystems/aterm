@@ -664,6 +664,30 @@ fn key_from_config<T: Copy>(
     key_from_config_or(in_toml, default, default, fallback)
 }
 
+fn read_toml_file(path: &Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+    const MAX_TOML_BYTES: u64 = 1024 * 1024;
+    let (file, meta) = aterm_uds::regular_file::open(path)?;
+    if meta.len() > MAX_TOML_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "config file exceeds size limit",
+        ));
+    }
+    let cap = usize::try_from(meta.len().min(MAX_TOML_BYTES))
+        .unwrap_or(0)
+        .saturating_add(1);
+    let mut text = String::with_capacity(cap);
+    file.take(MAX_TOML_BYTES + 1).read_to_string(&mut text)?;
+    if text.len() as u64 > MAX_TOML_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "config file exceeds size limit",
+        ));
+    }
+    Ok(text)
+}
+
 fn key_from_config_or<T>(
     in_toml: fn(&str) -> Result<Option<T>, String>,
     absent: T,
@@ -673,7 +697,7 @@ fn key_from_config_or<T>(
     let Some(path) = config_path() else {
         return absent;
     };
-    let text = match std::fs::read_to_string(&path) {
+    let text = match read_toml_file(&path) {
         Ok(t) => t,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return absent,
         Err(e) => {
@@ -745,7 +769,7 @@ pub fn resolve_command(
     let Some(path) = path else {
         return Ok(None);
     };
-    let text = match std::fs::read_to_string(path) {
+    let text = match read_toml_file(path) {
         Ok(t) => t,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("{}: {e}", path.display())),

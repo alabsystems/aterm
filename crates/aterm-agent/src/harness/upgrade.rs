@@ -4118,35 +4118,32 @@ pub fn hold_since(prior: (u64, u64), f: &Facts, now_s: u64) -> (u64, u64) {
     }
 }
 
-/// Returns whether the composer prompt is present and holds no user-typed text.
+/// Returns whether the composer prompt is present and holds no user-typed text: nothing in it, or a
+/// grey first glyph (`dim_at_caret`) with the cursor home ([`crate::supervise::screen::cursor_home`]),
+/// which is how the loop tells a suggestion too (`Session::composer_draft`). Grey with the cursor
+/// anywhere else says neither there, so it holds here, and so does the prompt-history search open
+/// over the composer ([`aterm_phase::phase::history_search`]), whose query keys would type into.
 #[must_use]
 pub fn composer_is_empty(
     rows: &[String],
     cursor: Option<(usize, usize)>,
     dim_at_caret: bool,
 ) -> bool {
+    if aterm_phase::phase::history_search(rows) {
+        return false;
+    }
     let Some((caret, lines)) = aterm_phase::phase::composer_draft(rows) else {
         return false;
     };
-    if lines.iter().skip(1).any(|l| !l.is_empty()) {
-        return false;
-    }
-    if lines.first().is_none_or(|l| l.is_empty()) {
-        return true;
-    }
-    dim_at_caret && !aterm_phase::phase::cursor_inside_text(cursor, caret)
+    crate::supervise::screen::composer_holds_no_draft(cursor, caret, &lines, || dim_at_caret)
 }
 
-/// Returns the screen row whose cell style distinguishes a dim placeholder from typed text.
+/// Returns the screen row whose cell style distinguishes a dim placeholder from typed text: none with
+/// the cursor anywhere but home, where [`composer_is_empty`] asks no cell.
 #[must_use]
 pub fn composer_dim_row(rows: &[String], cursor: Option<(usize, usize)>) -> Option<usize> {
     let (caret, lines) = aterm_phase::phase::composer_draft(rows)?;
-    if lines.iter().skip(1).any(|l| !l.is_empty())
-        || aterm_phase::phase::cursor_inside_text(cursor, caret)
-    {
-        return None;
-    }
-    Some(caret)
+    crate::supervise::screen::cursor_home(cursor, caret, &lines).then_some(caret)
 }
 
 /// Persisted per-session state machine phase for an upgrade.

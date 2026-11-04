@@ -29,9 +29,13 @@ use crate::age::{self, AgeError, Identity, Recipient};
 use crate::text::{self, Audience, Entry};
 use crate::{Error, Result, SecretBytes};
 use aterm_digest::Sha256;
+use register::Register;
 use ring::{aead, hkdf};
 use std::collections::{BTreeMap, BTreeSet};
 use zeroize::{Zeroize, Zeroizing};
+
+mod keyed;
+mod register;
 
 /// Maximum binary age capsule size carried by [`Body::Wrap`].
 pub const MAX_WRAP_CAPSULE: usize = 1024;
@@ -959,101 +963,6 @@ fn drop_dangling_anchors(
     }
 }
 
-/// One register's ops (in causal order, as `CandidateOp`s) and which of them are carries: a `Put`
-/// of the value the register already held in that `Put`'s own causal past, as an epoch's reseal
-/// writes when a Mac departs (the writer re-puts every entry under a fresh epoch, changing no
-/// value), or a `Delete` where every live op of the register in its own causal past is a
-/// `Delete`, as a reseal re-issues one (F21 rule 6). A `Delete` that settles a `Put`/`Delete`
-/// conflict is no carry: it writes. A carry stands for the op whose value it carries (`reps`);
-/// every other op for itself.
-struct Register<'a> {
-    cands: &'a [CandidateOp],
-    carries: Vec<bool>,
-    reps: Vec<usize>,
-}
-
-impl<'a> Register<'a> {
-    fn classify(cands: &'a [CandidateOp], effective: &eval::Effective) -> Self {
-        let mut register = Register {
-            cands,
-            carries: vec![false; cands.len()],
-            reps: (0..cands.len()).collect(),
-        };
-        for k in 0..cands.len() {
-            // What the writer held: the register over `k`'s causal past (`before` is the whole
-            // past, so scanning from the newest, an op is maximal unless it lies before one
-            // already found maximal).
-            let mut maximal: Vec<usize> = Vec::new();
-            for b in (0..k).rev() {
-                if effective.before(cands[b].index, cands[k].index)
-                    && !maximal
-                        .iter()
-                        .any(|&m| effective.before(cands[b].index, cands[m].index))
-                {
-                    maximal.push(b);
-                }
-            }
-            let held = register.live(maximal, effective);
-            let carried = match cands[k].op {
-                DecodedOp::Put(_) => register
-                    .winner(&held)
-                    .filter(|&w| same_op(&cands[w].op, &cands[k].op)),
-                DecodedOp::Delete => register.winner(&held).filter(|_| {
-                    held.iter()
-                        .all(|&h| matches!(cands[h].op, DecodedOp::Delete))
-                }),
-            };
-            if let Some(w) = carried {
-                register.carries[k] = true;
-                register.reps[k] = register.reps[w];
-            }
-        }
-        register
-    }
-
-    /// `maximal` less each carry whose value another of them, writing something else, already
-    /// replaced: a reseal on one side of a split loses to an edit or `Delete` on the other.
-    fn live(&self, maximal: Vec<usize>, effective: &eval::Effective) -> Vec<usize> {
-        let cands = self.cands;
-        maximal
-            .iter()
-            .copied()
-            .filter(|&c| {
-                !self.carries[c]
-                    || !maximal.iter().any(|&s| {
-                        s != c
-                            && !same_op(&cands[s].op, &cands[c].op)
-                            && effective.before(cands[self.reps[c]].index, cands[s].index)
-                    })
-            })
-            .collect()
-    }
-
-    /// The op every Mac writes among `siblings`: the lowest id of what each stands for.
-    fn winner(&self, siblings: &[usize]) -> Option<usize> {
-        siblings
-            .iter()
-            .copied()
-            .min_by_key(|&i| (self.cands[self.reps[i]].record_id, self.cands[i].record_id))
-    }
-
-    /// The register's siblings. An op replaces what lies in its causal past, except that a carry
-    /// replaces only ops writing the value it carries: a reseal after two concurrent edits keeps
-    /// both as candidates instead of settling on one.
-    fn siblings(&self, effective: &eval::Effective) -> Vec<usize> {
-        let cands = self.cands;
-        let replaced = |a: usize, b: usize| {
-            a != b
-                && effective.before(cands[a].index, cands[b].index)
-                && (!self.carries[b] || same_op(&cands[a].op, &cands[b].op))
-        };
-        let maximal = (0..cands.len())
-            .filter(|&a| !(0..cands.len()).any(|b| replaced(a, b)))
-            .collect();
-        self.live(maximal, effective)
-    }
-}
-
 struct CommonsControlOp {
     index: usize,
     record_id: RecordId,
@@ -1342,7 +1251,7 @@ impl Log {
     /// Age recipients belonging to Macs that were removed and not restored in this log.
     #[must_use]
     pub fn removed_recipients(&self) -> BTreeSet<Recipient> {
-        let membership = self.membership();
+        let membership = self.membership_ref();
         let mut out = membership.removed_recipients().clone();
         for m in membership.members().values() {
             let r = m.binding.recipient();
@@ -1362,7 +1271,7 @@ impl Log {
     /// Whether `recipient` belongs to a Mac that was removed and not restored in this log.
     #[must_use]
     pub fn recipient_is_removed(&self, recipient: &Recipient) -> bool {
-        let membership = self.membership();
+        let membership = self.membership_ref();
         if membership.removed_recipients().contains(recipient) {
             return true;
         }
@@ -1408,37 +1317,14 @@ impl Log {
         target_audience: &EpochAudience,
         recipient: &Recipient,
     ) -> bool {
-        let effective = self.effective();
-        let mut epochs: Vec<(usize, RecordId)> = Vec::new();
-        let mut wrapped_epochs: BTreeSet<RecordId> = BTreeSet::new();
-        for (i, record) in self.order.iter().enumerate().skip(1) {
-            if !effective.counts(i) {
-                continue;
-            }
-            match record.body() {
-                Body::Epoch { audience, .. } if audience == target_audience => {
-                    epochs.push((i, *record.id()));
-                }
-                Body::Wrap {
-                    epoch,
-                    recipient: to,
-                    ..
-                } if to == recipient => {
-                    wrapped_epochs.insert(*epoch);
-                }
-                _ => {}
-            }
-        }
-        let maximal: Vec<RecordId> = epochs
-            .iter()
-            .filter(|&&(a, _)| {
-                !epochs
-                    .iter()
-                    .any(|&(b, _)| a != b && effective.before(a, b))
-            })
-            .map(|&(_, id)| id)
-            .collect();
-        !maximal.is_empty() && maximal.iter().all(|id| wrapped_epochs.contains(id))
+        let verdict = self
+            .epochs()
+            .wraps_newest_to(self, target_audience, recipient);
+        #[cfg(test)]
+        super::epochs::oracle::check("wraps_maximal_audience_to", verdict, || {
+            super::epochs::oracle::wraps_maximal_audience_to(self, target_audience, recipient)
+        });
+        verdict
     }
 
     /// Whether this log removed the Mac whose age recipient is `recipient`: no member holds that
@@ -1633,31 +1519,18 @@ impl Log {
             return Ok(None);
         }
         let effective = self.effective();
-        let mut list: Vec<(usize, RecordId, u64, [u8; 32])> = Vec::new();
-        for (i, record) in self.order.iter().enumerate().skip(1) {
-            if !effective.counts(i) {
-                continue;
-            }
-            if let Body::Epoch {
-                audience: EpochAudience::Commons,
-                generation,
-                commitment,
-            } = record.body()
-            {
-                list.push((i, *record.id(), *generation, *commitment));
-            }
-        }
-        if list.is_empty() {
-            return Ok(None);
-        }
-        let maximal: Vec<(u64, RecordId, [u8; 32])> = list
+        let maximal: Vec<(u64, RecordId, [u8; 32])> = self
+            .epochs()
+            .newest(&EpochAudience::Commons)
             .iter()
-            .filter(|&&(a, _, _, _)| {
-                !list
-                    .iter()
-                    .any(|&(b, _, _, _)| a != b && effective.before(a, b))
+            .filter_map(|&at| match self.order[at].body() {
+                Body::Epoch {
+                    generation,
+                    commitment,
+                    ..
+                } => Some((*generation, *self.order[at].id(), *commitment)),
+                _ => None,
             })
-            .map(|&(_, id, generation, commitment)| (generation, id, commitment))
             .collect();
         let Some(&(generation, basis, commitment)) = maximal
             .iter()
@@ -1806,154 +1679,6 @@ impl Log {
         self.keyed_epochs_in(self.effective())
     }
 
-    fn keyed_epochs_in(&self, effective: &eval::Effective) -> Vec<Keyed> {
-        let keyed: Vec<usize> = (1..self.order.len())
-            .filter(|&i| effective.keyed(i))
-            .collect();
-        if keyed.is_empty() {
-            return Vec::new();
-        }
-        let membership = self.membership();
-        let member_of: BTreeMap<Recipient, MemberId> = membership
-            .members()
-            .iter()
-            .map(|(actor, m)| (m.binding.recipient(), *actor))
-            .collect();
-        // Every recipient a seat binds to each actor: an attestation is a `Wrap` its signer
-        // addressed to itself.
-        let mut recipients: BTreeMap<MemberId, BTreeSet<Recipient>> = BTreeMap::new();
-        let mut epochs: BTreeMap<&EpochAudience, Vec<usize>> = BTreeMap::new();
-        let mut wraps: BTreeMap<RecordId, Vec<(usize, Recipient)>> = BTreeMap::new();
-        for (i, record) in self.order.iter().enumerate() {
-            match record.body() {
-                Body::Genesis { founders, .. } => {
-                    for founder in founders {
-                        if let Some(actor) = founder.member() {
-                            recipients
-                                .entry(actor)
-                                .or_default()
-                                .insert(founder.recipient);
-                        }
-                    }
-                }
-                Body::Admit { entrant, .. } => {
-                    recipients
-                        .entry(entrant.member())
-                        .or_default()
-                        .insert(entrant.request.binding().recipient());
-                }
-                Body::Epoch { audience, .. } if effective.counts(i) => {
-                    epochs.entry(audience).or_default().push(i);
-                }
-                Body::Wrap {
-                    epoch, recipient, ..
-                } => wraps.entry(*epoch).or_default().push((i, *recipient)),
-                _ => {}
-            }
-        }
-        let audience_of = |e: usize| match self.order[e].body() {
-            Body::Epoch { audience, .. } => Some(audience),
-            _ => None,
-        };
-        let wraps_of = |e: usize| wraps.get(self.order[e].id()).map_or(&[][..], Vec::as_slice);
-        let own = |actor: &MemberId, recipient: &Recipient| {
-            recipients
-                .get(actor)
-                .is_some_and(|set| set.contains(recipient))
-        };
-        // At record `at`, `actor` has the key of the counting epoch `h` when it minted `h` or a
-        // counting `Wrap` of `h` to it lies in `at`'s past.
-        let has_counting_key = |actor: &MemberId, h: usize, at: usize| {
-            self.order[h].actor() == actor
-                || wraps_of(h).iter().any(|&(w, recipient)| {
-                    effective.counts(w) && own(actor, &recipient) && effective.before(w, at)
-                })
-        };
-        // ...and of the keyed epoch `k` only when its attestation of `k` (a counting `Wrap` of
-        // `k` it signed to itself) lies in `at`'s past: only a reseal signs one.
-        let attests = |actor: &MemberId, k: usize, at: usize| {
-            wraps_of(k).iter().any(|&(w, recipient)| {
-                effective.counts(w)
-                    && self.order[w].actor() == actor
-                    && own(actor, &recipient)
-                    && effective.before(w, at)
-            })
-        };
-        // Each keyed epoch's dependents and holders: the dependents' signers, and the members
-        // rule 2's usable Wraps of it are addressed to.
-        let held: Vec<(usize, &EpochAudience, &[usize], BTreeSet<MemberId>)> = keyed
-            .iter()
-            .filter_map(|&e| {
-                let audience = audience_of(e)?;
-                let dependents = effective.dependents(e);
-                let mut holders: BTreeSet<MemberId> =
-                    dependents.iter().map(|&d| *self.order[d].actor()).collect();
-                for &(w, recipient) in wraps_of(e) {
-                    if effective.opens_wrap(w)
-                        && let Some(member) = member_of.get(&recipient)
-                    {
-                        holders.insert(*member);
-                    }
-                }
-                Some((e, audience, dependents, holders))
-            })
-            .collect();
-        // A full reseal: a counting epoch of the audience whose signer, there, has the key of
-        // every newest counting epoch of the audience in its past and of every keyed epoch of the
-        // audience that a current member holds, with a dependent in its past, that no earlier
-        // full reseal in its past covers already. A covered epoch's key goes to no newcomer and
-        // nobody attests it again, so a later keyed epoch of the audience is covered by whoever
-        // reseals it; one no current member holds nobody can attest, and rule 7 ignores it too.
-        // Decided in record order, where an epoch's past comes before it, and kept per epoch.
-        let mut full: BTreeMap<usize, bool> = BTreeMap::new();
-        for (audience, list) in &epochs {
-            for &e2 in list {
-                let signer = self.order[e2].actor();
-                let past: Vec<usize> = list
-                    .iter()
-                    .copied()
-                    .filter(|&h| effective.before(h, e2))
-                    .collect();
-                let newest_held = past
-                    .iter()
-                    .filter(|&&h| !past.iter().any(|&h2| effective.before(h, h2)))
-                    .all(|&h| has_counting_key(signer, h, e2));
-                let is_full = newest_held
-                    && held
-                        .iter()
-                        .filter(|(_, aud, _, holders)| {
-                            aud == audience && holders.iter().any(|h| membership.contains(h))
-                        })
-                        .filter(|(_, _, dependents, _)| {
-                            dependents.iter().any(|&d| effective.before(d, e2))
-                        })
-                        .filter(|(_, _, dependents, _)| {
-                            !past.iter().any(|&e1| {
-                                full.get(&e1).copied().unwrap_or(false)
-                                    && dependents.iter().all(|&d| effective.before(d, e1))
-                            })
-                        })
-                        .all(|&(k, _, _, _)| attests(signer, k, e2));
-                full.insert(e2, is_full);
-            }
-        }
-        held.into_iter()
-            .map(|(e, audience, dependents, holders)| {
-                let covered = epochs.get(audience).into_iter().flatten().any(|&e2| {
-                    full.get(&e2).copied().unwrap_or(false)
-                        && dependents.iter().all(|&d| effective.before(d, e2))
-                });
-                Keyed {
-                    epoch: *self.order[e].id(),
-                    audience: audience.clone(),
-                    dependents: dependents.iter().map(|&d| *self.order[d].id()).collect(),
-                    holders,
-                    covered,
-                }
-            })
-            .collect()
-    }
-
     /// Decrypt only the winning [`EpochAudience::Commons`] control descriptor for `identity`,
     /// skipping [`EpochAudience::Everyone`] and [`EpochAudience::Hosts`] X25519 unwraps (`F18`).
     /// A winner sealed under a keyed Commons epoch (F21) opens as well.
@@ -2078,15 +1803,8 @@ impl Log {
                 });
             }
         }
-        let siblings: Vec<&CommonsControlOp> = candidates
-            .iter()
-            .filter(|a| {
-                !candidates
-                    .iter()
-                    .any(|b| a.index != b.index && effective.before(a.index, b.index))
-            })
-            .collect();
-        Ok(siblings
+        Ok(effective
+            .newest(&candidates, |op| op.index)
             .into_iter()
             .min_by_key(|op| op.record_id)
             .map(|winner| winner.value.clone()))
@@ -2208,38 +1926,17 @@ impl Log {
         let effective = self.effective();
         let keyed_keys = self.unwrap_keyed_epochs(identity, effective, |_| true)?;
 
-        let mut epochs_by_aud: BTreeMap<EpochAudience, Vec<(usize, RecordId)>> = BTreeMap::new();
-        let mut max_generation: BTreeMap<EpochAudience, u64> = BTreeMap::new();
-        let mut wrapped_recipients: BTreeMap<RecordId, BTreeSet<Recipient>> = BTreeMap::new();
-
-        for (i, record) in self.order.iter().enumerate().skip(1) {
-            if !effective.counts(i) {
-                continue;
-            }
-            match record.body() {
-                Body::Epoch {
-                    audience,
-                    generation,
-                    ..
-                } => {
-                    epochs_by_aud
-                        .entry(audience.clone())
-                        .or_default()
-                        .push((i, *record.id()));
-                    let entry = max_generation.entry(audience.clone()).or_insert(0);
-                    *entry = (*entry).max(*generation);
-                }
-                Body::Wrap {
-                    epoch, recipient, ..
-                } => {
-                    wrapped_recipients
-                        .entry(*epoch)
-                        .or_default()
-                        .insert(*recipient);
-                }
-                _ => {}
-            }
-        }
+        let epochs = self.epochs();
+        let max_generation: BTreeMap<EpochAudience, u64> = epochs
+            .audiences()
+            .iter()
+            .map(|(audience, sealed)| (audience.clone(), sealed.generation))
+            .collect();
+        let wrapped_recipients: BTreeMap<RecordId, BTreeSet<Recipient>> = epochs
+            .wraps()
+            .iter()
+            .map(|(epoch, to)| (*epoch, to.keys().copied().collect()))
+            .collect();
 
         let mut maximal_epochs: BTreeMap<EpochAudience, Vec<RecordId>> = BTreeMap::new();
         let mut fully_unwrapped_audiences = BTreeSet::new();
@@ -2247,11 +1944,11 @@ impl Log {
         let mut hidden_epochs = false;
         let left_out_everyone =
             self.audience_left_out_recipient(&EpochAudience::Everyone, &my_recipient);
-        for (aud, list) in &epochs_by_aud {
-            let max_ids: Vec<RecordId> = list
+        for (aud, sealed) in epochs.audiences() {
+            let max_ids: Vec<RecordId> = sealed
+                .newest
                 .iter()
-                .filter(|&&(a, _)| !list.iter().any(|&(b, _)| a != b && effective.before(a, b)))
-                .map(|&(_, id)| id)
+                .map(|&at| *self.order[at].id())
                 .collect();
             let is_excluded =
                 left_out_everyone || self.audience_left_out_recipient(aud, &my_recipient);
@@ -2398,12 +2095,20 @@ impl Log {
         let mut winning_ops: BTreeMap<(Audience, String), RecordId> = BTreeMap::new();
         let mut host_winners: BTreeMap<String, Vec<(Audience, usize, RecordId)>> = BTreeMap::new();
 
-        for ((audience, name), candidates) in registers {
+        let registers: Vec<((Audience, String), Vec<CandidateOp>)> =
+            registers.into_iter().collect();
+        let ops: Vec<&[CandidateOp]> = registers.iter().map(|(_, ops)| ops.as_slice()).collect();
+        let (order, held) = (&self.order, &self.held);
+        let classified = Register::classify_all(&ops, effective.reach(), |x| {
+            order[x].parents().iter().map(move |parent| held[parent])
+        });
+        for (((audience, name), candidates), register) in registers.iter().zip(&classified) {
             // A carry changes nothing, so it loses to a concurrent sibling that changes the
             // register, a `Delete` included: a reseal on one side of a split never undoes an edit
             // made on the other. Siblings that write the same thing are no conflict.
-            let register = Register::classify(&candidates, effective);
-            let siblings = register.siblings(effective);
+            let siblings = register.siblings(effective.reach());
+            #[cfg(test)]
+            register::oracle::check(candidates, effective, register, &siblings);
             let Some(w) = register.winner(&siblings) else {
                 continue;
             };
@@ -2429,7 +2134,7 @@ impl Log {
                 by_audience
                     .entry(audience.clone())
                     .or_default()
-                    .insert(name, entry.clone());
+                    .insert(name.clone(), entry.clone());
                 // A keyed epoch carries no authority (F21 rule 3): its winners are kept apart.
                 let winners = if keyed_keys.contains_key(&winner.epoch) {
                     &mut keyed_winning
@@ -2441,20 +2146,16 @@ impl Log {
                     .or_default()
                     .insert(winner.epoch);
             } else if keyed_keys.contains_key(&winner.epoch) {
-                keyed_deletes.entry(audience).or_default().insert(name);
+                keyed_deletes
+                    .entry(audience.clone())
+                    .or_default()
+                    .insert(name.clone());
             }
         }
 
         let mut commons_control = None;
         if !commons_candidates.is_empty() {
-            let siblings: Vec<&ControlRef> = commons_candidates
-                .iter()
-                .filter(|a| {
-                    !commons_candidates
-                        .iter()
-                        .any(|b| a.index != b.index && effective.before(a.index, b.index))
-                })
-                .collect();
+            let siblings = effective.newest(&commons_candidates, |c| c.index);
             if let Some(winner) = siblings.into_iter().min_by_key(|c| c.record_id) {
                 commons_control = Some(winner.index);
                 let winners = if keyed_keys.contains_key(&winner.epoch) {
@@ -2471,14 +2172,7 @@ impl Log {
 
         let mut winning_host_audience: BTreeMap<String, Audience> = BTreeMap::new();
         for (name, candidates) in host_winners {
-            let maximal: Vec<&(Audience, usize, RecordId)> = candidates
-                .iter()
-                .filter(|a| {
-                    !candidates
-                        .iter()
-                        .any(|b| a.1 != b.1 && effective.before(a.1, b.1))
-                })
-                .collect();
+            let maximal = effective.newest(&candidates, |c| c.1);
             if maximal.len() > 1 {
                 for (aud, _, _) in &maximal {
                     conflicts.insert((aud.clone(), name.clone()));
@@ -2682,6 +2376,7 @@ mod selective_tests;
 mod tests {
     use super::*;
     use crate::commons::binding::Request;
+    use crate::membership_log::tests::signed::generated;
     use crate::membership_log::{Entrant, Evidence, Inserted};
 
     const NETWORK: [u8; 16] = [0x31; 16];
@@ -3041,8 +2736,8 @@ mod tests {
     /// Two concurrent edits are a conflict. A reseal after it carries the winning value and leaves
     /// the other a candidate; a `Delete` then a `Put` (a person's save) settles it.
     ///
-    /// NEGATIVE CONTROL: let a carry replace every op in its past (drop the `same_op` clause in
-    /// `Register::siblings`): the reseal settles the conflict, and nobody is told.
+    /// NEGATIVE CONTROL: let a carry replace every op in its past (in `Register::siblings`, OR
+    /// the carries' rows into `writers` too): the reseal settles the conflict, and nobody is told.
     #[test]
     fn a_reseal_keeps_a_conflict_and_a_save_settles_it() {
         let t = three();
@@ -4520,6 +4215,90 @@ mod tests {
         assert_eq!(read(&side_a, &t.id1, "S"), Some(b"v3".to_vec()));
     }
 
+    /// F21's coverage (rule 4) needs every newest dependent of a keyed epoch in a full reseal's
+    /// past. On m9's side of test 1's split, m2 lets W in and wraps `E` to it; then that copy
+    /// forks, and m2 edits `S` under `E` on one copy while W edits `T` under it on the other: two
+    /// concurrent newest dependents. m1 heals with W's copy alone, attests `E` and reseals for
+    /// m1, m2 and W, which covers `E` there, its one dependent in the reseal's past. Once m2's
+    /// copy merges in, `E` has a dependent the reseal never saw: it stands uncovered, and m1 is
+    /// due to reseal again.
+    ///
+    /// NEGATIVE CONTROL: with a reseal covering a keyed epoch once any of its newest dependents
+    /// lies in its past ([`keyed::Mutant::AnyNewestDependent`]), this fails "a dependent past
+    /// the reseal leaves E uncovered".
+    #[test]
+    fn a_full_reseal_that_saw_one_of_two_concurrent_dependents_covers_nothing() {
+        let t = three();
+        let split = keyed_split(&t, false);
+        let (ww, incw, idw, mw, ew) = make_entrant(75, "m15");
+        let mut side_2 = split.side_2.clone();
+        let admit = side_2.draft(
+            &t.m2,
+            1_710,
+            Body::Admit {
+                entrant: ew,
+                evidence: Evidence::Phrase,
+            },
+        );
+        hold(&mut side_2, admit, &t.w2, t.inc2);
+        let wrap = side_2
+            .draft_wrap(&t.m2, 1_711, split.epoch, &split.key, idw.recipient())
+            .unwrap();
+        hold(&mut side_2, wrap, &t.w2, t.inc2);
+        let mut m2_copy = side_2.clone();
+        let draft = m2_copy
+            .draft_put(&t.m2, 1_720, split.epoch, &split.key, &put("S", b"v1"))
+            .unwrap();
+        hold(&mut m2_copy, draft, &t.w2, t.inc2);
+        let mut w_copy = side_2;
+        let draft = w_copy
+            .draft_put(&mw, 1_720, split.epoch, &split.key, &put("T", b"t"))
+            .unwrap();
+        hold(&mut w_copy, draft, &ww, incw);
+
+        // m1 heals with W's copy, attests `E`, then mints an `[everyone]` epoch for m1, m2 and W.
+        let mut healed = split.side_1.clone();
+        healed.merge(&w_copy).unwrap();
+        let wrap = healed
+            .draft_wrap(&t.m1, 2_900, split.epoch, &split.key, t.id1.recipient())
+            .unwrap();
+        hold(&mut healed, wrap, &t.w1, t.inc1);
+        let (draft, key) = healed
+            .draft_epoch(&t.m1, 3_000, Audience::Everyone, 3)
+            .unwrap();
+        let epoch = hold(&mut healed, draft, &t.w1, t.inc1);
+        for id in [&t.id1, &t.id2, &idw] {
+            let wrap = healed
+                .draft_wrap(&t.m1, 3_001, epoch, &key, id.recipient())
+                .unwrap();
+            hold(&mut healed, wrap, &t.w1, t.inc1);
+        }
+        let keyed = healed.keyed_epochs();
+        assert_eq!(keyed.len(), 1, "CONTROL: E is keyed");
+        assert_eq!(keyed[0].dependents.len(), 1, "CONTROL: W's write");
+        assert!(
+            keyed[0].covered,
+            "CONTROL: m1's reseal covers E where it saw every dependent"
+        );
+        assert!(
+            reseal_due_on(&healed, &t.m1).is_empty(),
+            "CONTROL: no reseal is due once E is covered"
+        );
+
+        healed.merge(&m2_copy).unwrap();
+        let keyed = healed.keyed_epochs();
+        assert_eq!(keyed.len(), 1);
+        assert_eq!(keyed[0].dependents.len(), 2, "m2's write and W's");
+        assert!(
+            !keyed[0].covered,
+            "a dependent past the reseal leaves E uncovered"
+        );
+        assert!(
+            reseal_due_on(&healed, &t.m1).contains(&EpochAudience::Everyone),
+            "m1 is due to reseal E again"
+        );
+    }
+
     /// F21's rule 6 carries a `Delete` only when every live op in its past is a `Delete`: one
     /// that settles a `Put`/`Delete` conflict writes. m1 puts `U=a` while m2 deletes `U`, and m2's
     /// `Delete` wins that conflict: the pair is redrafted, fresh salts in both each time, until
@@ -4794,5 +4573,60 @@ mod tests {
             b"concurrent-trio"
         };
         assert_eq!(opened_conc.entries[0].value.as_slice(), expected);
+    }
+
+    /// On 200 signed logs where Macs remove each other while the removed reseal on their own
+    /// copies and others write under those epochs, and reseals attest and cover the keyed epochs
+    /// ([`generated`]), every keyed-epoch reading of every opening is what the replaced reading
+    /// gives: the generated logs read keyed epochs, covered ones among them.
+    #[test]
+    fn two_hundred_signed_logs_read_keyed_epochs_as_the_replaced_reading_did() {
+        keyed::oracle::CHECKED.set((0, 0));
+        keyed::oracle::FOUND.set((0, 0));
+        for seed in 1..=200 {
+            let _ = generated(seed);
+        }
+        let (checked, wrong) = keyed::oracle::CHECKED.get();
+        let (found, covered) = keyed::oracle::FOUND.get();
+        assert_eq!(wrong, 0, "of {checked} readings");
+        assert!(found > 0, "no reading of {checked} found a keyed epoch");
+        assert!(
+            covered > 0,
+            "no reading of {found} found a covered keyed epoch"
+        );
+    }
+
+    /// Every keyed-epoch reading the tests take checks itself against the one it replaced
+    /// ([`keyed::oracle`]), so the F21 scenarios above are the differential's cases.
+    /// NEGATIVE CONTROLS: on the three coverage scenarios, a reading whose reseal signer holds
+    /// the key of every newest epoch, that forgets the full reseals already found, or whose
+    /// reseal covers a keyed epoch once any newest dependent lies in its past, disagrees with the
+    /// replaced one (each scenario's own assertions may fail under the mutant as well). The last
+    /// also fails the scenario of two concurrent dependents.
+    #[test]
+    fn the_keyed_epoch_reading_disagrees_under_each_mutant() {
+        for mutant in [
+            keyed::Mutant::HoldEveryNewest,
+            keyed::Mutant::ForgetCovering,
+            keyed::Mutant::AnyNewestDependent,
+        ] {
+            keyed::oracle::CHECKED.set((0, 0));
+            keyed::oracle::COUNT_ONLY.set(true);
+            keyed::MUTANT.set(Some(mutant));
+            let _ = std::panic::catch_unwind(a_keyed_epoch_is_covered_only_by_a_full_reseal);
+            let _ = std::panic::catch_unwind(
+                a_later_keyed_epoch_is_covered_by_another_macs_full_reseal,
+            );
+            let concurrent = std::panic::catch_unwind(
+                a_full_reseal_that_saw_one_of_two_concurrent_dependents_covers_nothing,
+            );
+            keyed::MUTANT.set(None);
+            keyed::oracle::COUNT_ONLY.set(false);
+            let (checked, wrong) = keyed::oracle::CHECKED.get();
+            assert!(checked > 0 && wrong > 0, "{mutant:?} goes unnoticed");
+            if mutant == keyed::Mutant::AnyNewestDependent {
+                assert!(concurrent.is_err(), "{mutant:?} covers E");
+            }
+        }
     }
 }

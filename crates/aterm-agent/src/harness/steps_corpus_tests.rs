@@ -112,6 +112,7 @@ fn said_of_event(e: &StepEvent) -> Option<Said> {
     let (kind, id, mut words): (&str, Option<String>, Vec<String>) = match e {
         StepEvent::Bind { .. } => return None,
         StepEvent::Prompt { vref } => ("prompt", Some(vref.as_str().to_string()), vec![]),
+        StepEvent::HarnessTurn { vref } => ("harness", Some(vref.as_str().to_string()), vec![]),
         StepEvent::Interrupt => ("interrupt", None, vec![]),
         StepEvent::ToolUse {
             id,

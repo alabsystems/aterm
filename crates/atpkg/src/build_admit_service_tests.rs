@@ -349,7 +349,10 @@ fn real_builds(world: &Path, seat: &Seat<'_>, d: &mut Driver) {
         .pair(Instant::now() + aterm_spec::wait::MUST_HAPPEN)
         .unwrap();
     drop(gone);
-    assert!(disconnected.step().is_err());
+    assert_eq!(
+        disconnected.step().unwrap(),
+        super::service::monitor::Progress::Complete
+    );
     assert!(d.done.is_empty());
     for path in &release.0 {
         std::fs::write(path.join("release"), b"host accepts progress").unwrap();
@@ -419,8 +422,7 @@ fn monitor_builds(world: &Path, d: &mut Driver) {
         // never receives a client callback or network error.
         let io = scope.spawn(move || {
             while server.step().unwrap() == Progress::Pending {
-                let (fd, interest) = server.readiness().unwrap();
-                aterm_uds::ready::until(fd, interest, server.deadline()).unwrap();
+                server.wait(server.deadline()).unwrap();
             }
         });
         aterm_spec::wait::until_within(

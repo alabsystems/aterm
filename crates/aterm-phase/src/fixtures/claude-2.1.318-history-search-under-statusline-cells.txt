@@ -1,0 +1,3 @@
+# claude-code 2.1.318 · MEASURED 2026-11-04 · `aterm ctl cell <row> <col>` of the composer row's first glyphs on claude-2.1.318-history-search-under-statusline.txt (the search's match, typed ink), one per line: the row, the column, the reply
+14 2 OK S d0d0d0 111318 none
+14 3 OK C d0d0d0 111318 none

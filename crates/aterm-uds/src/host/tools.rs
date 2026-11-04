@@ -587,7 +587,7 @@ pub const TOOLS: &[Tool] = &[
     os(
         "launchctl",
         &["/bin/launchctl"],
-        "the keeper's, the machines agent's and acaffiene's launchd jobs",
+        "the keeper's, the machines agent's and acaffeine's launchd jobs",
     ),
     os(
         "defaults",

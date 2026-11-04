@@ -1815,9 +1815,11 @@ impl LogWake {
         LogWake { clause }
     }
 
-    /// Rings `session`'s watchers if `applied` transcript steps changed footer-visible facts.
+    /// Wakes the loop for `session` ([`Wake::SessionLogMoved`]) if `applied` transcript steps
+    /// changed footer-visible facts, moved the log's wake, or moved its harness pairing's read
+    /// wait.
     pub(crate) fn after(&self, session: u64, applied: &crate::session_log::transcript::Applied) {
-        if (applied.owed && self.clause) || applied.settle.is_some() {
+        if (applied.owed && self.clause) || applied.settle.is_some() || applied.waits {
             post_log_moved(session);
         }
     }
@@ -11839,21 +11841,29 @@ mod tests {
     fn the_rule_carries_the_owners_footer() {
         let blank = cell(' ', [200, 200, 200]);
         let rule = cell('\u{2500}', [60, 60, 60]);
-        let fit = footer::fit_rule(&facts(), 76, None);
-        let (cells, lights) = compose_rule(&fit, None, rule, blank, [0, 128, 255], 76);
+        let fit_plain = footer::fit_rule(&facts(), 76, None);
+        let (plain_cells, lights) = compose_rule(&fit_plain, None, rule, blank, [0, 128, 255], 76);
         assert_eq!(lights, None);
         assert_eq!(
-            text_of(&cells),
-            " \u{25C6} Opus 5.5 xhigh   \u{2302} ~/aterm   \u{2387} main "
+            plain_cells.len(),
+            footer::segments_width(&fit_plain.segments) + 2
         );
-        let o = cells.iter().position(|c| c.ch == 'O').expect("the model");
-        assert!(
-            [1, o].iter().all(|&c| cells[c].bold
-                && matches!(cells[c].script, aterm_core::terminal::Script::Sub { .. })),
-            "the facts are drawn small, low and bold"
-        );
-        assert_eq!(cells[0].script, aterm_core::terminal::Script::Normal);
-        assert_eq!(cells.len(), footer::segments_width(&fit.segments) + 2);
+        assert_eq!(plain_cells[0], blank);
+        assert_eq!(plain_cells[plain_cells.len() - 1], blank);
+        let set = footer::set_facts(&fit_plain.segments);
+        assert!(!set.glyphs.is_empty());
+        for glyph in &set.glyphs {
+            let painted = plain_cells[1 + glyph.cell];
+            assert_eq!(
+                painted.bold,
+                glyph.mark || !glyph.quiet || !crate::claude_card::dark_ground(blank),
+                "{glyph:?}"
+            );
+            assert!(
+                matches!(painted.script, aterm_core::terminal::Script::Sub { .. }),
+                "{glyph:?}"
+            );
+        }
         let none = footer::fit_rule(&FooterFacts::default(), 76, None);
         assert!(
             compose_rule(&none, None, rule, blank, [1, 1, 1], 76)
@@ -11873,15 +11883,23 @@ mod tests {
             reason: harness.reason,
         };
         let fit = footer::fit_rule(&facts(), 76, Some(widths));
+        assert_eq!(fit.segments, fit_plain.segments);
         let (cells, lights) = compose_rule(&fit, Some(&harness), rule, blank, [0, 128, 255], 76);
         assert_eq!(lights, Some(1));
         assert_eq!(cells.len(), 76, "the rule's glyphs run on to the facts");
-        let text = text_of(&cells);
-        assert!(text.starts_with(" \u{221e} \u{2500}"), "{text:?}");
-        assert!(
-            text.ends_with(" \u{25C6} Opus 5.5 xhigh   \u{2302} ~/aterm   \u{2387} main "),
-            "{text:?}"
+        assert_eq!(cells[0], blank);
+        assert_eq!(
+            &cells[1..1 + harness.lights.len()],
+            harness.lights.as_slice()
         );
+        assert_eq!(cells[1 + harness.lights.len()], blank);
+        assert!(
+            cells[2 + harness.lights.len()..76 - plain_cells.len()]
+                .iter()
+                .all(|&c| c == rule),
+            "the rule's glyphs bridge the lights and the facts"
+        );
+        assert_eq!(&cells[76 - plain_cells.len()..], plain_cells.as_slice());
         assert_eq!(cells[1].fg, [0, 128, 255], "cruise in the accent");
         assert_eq!(cells[1].script, aterm_core::terminal::Script::Normal);
     }

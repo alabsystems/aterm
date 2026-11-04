@@ -685,8 +685,15 @@ fn sign_back_receipts_reject_corruption_and_retain_their_clock_after_removal() {
 fn sign_back_clears_persisted_bot_hold_only_after_a_committed_success() {
     let root = aterm_tempfile::TempDir::new().unwrap();
     let store = accounts::Store::at(root.path());
+    let path = root.path().join("accounts.toml");
+    let raw = accounts::Row {
+        label: "account".into(),
+        ..accounts::Row::default()
+    };
+    fs::write(&path, accounts::row_text(&raw).unwrap()).unwrap();
     store
-        .transact_logins(NOW, &mut None, |state, _| {
+        .transact_pool_logins_within(&[], &path, NOW, &mut None, |_, state, logins| {
+            accounts::admit_workflow(logins, "account")?;
             let mut events = accounts::note_auth(state, "account", accounts::Auth::SignedOut, NOW);
             events.push(
                 accounts::Event::new(NOW, accounts::Kind::SignIn, "account")
@@ -695,7 +702,8 @@ fn sign_back_clears_persisted_bot_hold_only_after_a_committed_success() {
             Ok(events)
         })
         .unwrap();
-    assert_eq!(bot_check_on_record_at(&store, "account"), Some(NOW));
+    let logins = store.load_logins(NOW).unwrap().0;
+    assert_eq!(bot_check_on_record_at(&store, &raw, &logins), Some(NOW));
     fs::rename(store.ledger_path(), root.path().join("retained-ledger")).unwrap();
     fs::create_dir(store.ledger_path()).unwrap();
     assert!(
@@ -720,7 +728,8 @@ fn sign_back_clears_persisted_bot_hold_only_after_a_committed_success() {
     );
     fs::rename(store.ledger_path(), root.path().join("obstruction")).unwrap();
     fs::rename(root.path().join("retained-ledger"), store.ledger_path()).unwrap();
-    assert_eq!(bot_check_on_record_at(&store, "account"), Some(NOW));
+    let logins = store.load_logins(NOW + 1).unwrap().0;
+    assert_eq!(bot_check_on_record_at(&store, &raw, &logins), Some(NOW));
     store
         .transact_logins(NOW + 1, &mut None, |state, logins| {
             Ok(accounts::note_signed_back(
@@ -731,7 +740,8 @@ fn sign_back_clears_persisted_bot_hold_only_after_a_committed_success() {
             ))
         })
         .unwrap();
-    assert_eq!(bot_check_on_record_at(&store, "account"), None);
+    let logins = store.load_logins(NOW + 1).unwrap().0;
+    assert_eq!(bot_check_on_record_at(&store, &raw, &logins), None);
     assert_eq!(
         store
             .load_logins(NOW + 1)

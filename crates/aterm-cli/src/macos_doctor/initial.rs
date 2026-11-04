@@ -4032,8 +4032,9 @@ fn init_grant(
     match standing {
         Standing::InPlace => Grant::On,
         Standing::NeedsYou | Standing::Differs => Grant::NeedsYou(match access {
-            Access::Debugger => "aterm.app's Permissions turns it on with one administrator \
-                                 password (`aterm help permissions`)"
+            Access::Debugger => "setup's one Mac password, which aterm asks for by itself as \
+                                 setup begins, turns it on (`aterm init --only base.clt` asks \
+                                 for it now)"
                 .to_owned(),
             Access::FullDiskAccess | Access::Accessibility => format!(
                 "System Settings \u{25b8} Privacy & Security \u{25b8} {}: switch on {app}",
@@ -4673,7 +4674,8 @@ pub enum PermissionSteps {
     NotYet,
     /// Held until a person chooses again: their Cancel or Stop holds them (a Restore's record a
     /// Cancel holds among them), the admitted run's plan leaves Permissions out, or no person
-    /// pressed for them: an automatic setup decision authorizes no OS permission prompt.
+    /// pressed for them: the grants only a person can give are offered, and an automatic setup
+    /// decision opens none of their pages (setup's one early elevation is its own lane).
     Off,
 }
 

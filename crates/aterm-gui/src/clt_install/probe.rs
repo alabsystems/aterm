@@ -74,10 +74,15 @@ fn stamp_of(path: &Path, owner: u32) -> Option<Vec<u8>> {
         .open(path)
         .ok()?;
     let meta = file.metadata().ok()?;
-    if !meta.is_file() || meta.uid() != owner || meta.mode() & 0o6022 != 0 {
+    if !meta.is_file()
+        || meta.uid() != owner
+        || meta.mode() & 0o6022 != 0
+        || meta.len() == 0
+        || meta.len() > max as u64
+    {
         return None;
     }
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
     file.take(max as u64 + 1).read_to_end(&mut bytes).ok()?;
     (!bytes.is_empty() && bytes.len() <= max).then_some(bytes)
 }

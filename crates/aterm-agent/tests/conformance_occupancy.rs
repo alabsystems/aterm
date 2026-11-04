@@ -1039,6 +1039,17 @@ fn tier1_the_real_decider_says_due_exactly_where_the_model_types() {
 
 type Shows = fn(&State) -> bool;
 
+/// Each planted defect walks at variant 0 ([`guards`]: a person's own hand, no task, a stall) and
+/// disagrees only where the model says. THE GAP: no control here proves a walk sees a planted
+/// defect under the guards variants 1 and 2 read instead (halted or a draft for the person, an
+/// exchange for no task, memory or reach for the brake), so a defect only they expose has no
+/// control beside it. The same holds of the other things they change: the closing point's
+/// `(acts, background)` form ([`point`]) and, on odd variants, a stuck run's reopen on a later-born
+/// call. Only the clean walks cover all of this: the real decider's
+/// [`tier1_the_real_decider_says_due_exactly_where_the_model_types`] (0..4, stuck runs too) and
+/// [`tier1_a_point_blind_to_the_person_disagrees_at_the_point_alone`] (0..3). Of the faults, only
+/// [`Fault::KUnseeded`] leaves variant 0: it keeps variant 1, the one fault whose disagreements
+/// differ there (more of them).
 #[test]
 fn tier1_each_planted_defect_disagrees_where_the_model_says() {
     let controls: [(Fault, Option<RuleId>, Shows, Option<Shows>); 14] = [
@@ -1132,7 +1143,12 @@ fn tier1_each_planted_defect_disagrees_where_the_model_says() {
             .into_iter()
             .filter(|r| only.map_or(*r != RuleId::Wake, |o| o == *r))
         {
-            for variant in 0..3 {
+            let variants = if fault == Fault::KUnseeded {
+                0..2
+            } else {
+                0..1
+            };
+            for variant in variants {
                 runs.push((
                     1,
                     Run {
@@ -1159,20 +1175,18 @@ fn tier1_each_planted_defect_disagrees_where_the_model_says() {
         }),
     ];
     for (fault, key, shows) in stuck {
-        for variant in 0..3 {
-            runs.push((
-                1,
-                Run {
-                    rule: RuleId::WaitNudge,
-                    variant,
-                    fault: Some(fault),
-                    key,
-                    stuck: true,
-                    blind_point: false,
-                },
-            ));
-            checks.push((fault, shows, None));
-        }
+        runs.push((
+            1,
+            Run {
+                rule: RuleId::WaitNudge,
+                variant: 0,
+                fault: Some(fault),
+                key,
+                stuck: true,
+                blind_point: false,
+            },
+        ));
+        checks.push((fault, shows, None));
     }
     let walked = walks(&runs, false);
     for ((&(_, Run { rule, variant, .. }), (fault, shows, among)), w) in

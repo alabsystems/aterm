@@ -9845,17 +9845,22 @@ impl Restart {
 /// every ask of one restart, its first and each asked again after a deferral, and another at any
 /// other restart's. A lost line's is its line's ([`Restart::InputLost`]'s `line`), the same while
 /// the line is held, whatever other restart is asked meanwhile; any other restart's is its run's
-/// (`Session::restart_run`): its kind and the Unix second the loop first asked it, kept while the
-/// loop asks that kind again on its back-off and restored by a later loop for a model's move its
-/// ledger shows still waiting, so a re-ask there is the same. The relaunch's record keeps the ask
-/// that claimed it (`St::ask`), and a restart asked again meets its own record by it alone, never
-/// by its cause, so a restart asked of the process an earlier restart of its cause started is
-/// made of it (`relaunch::its_own`).
+/// (`Session::restart_run`): its kind and its run's Unix second, the second the loop first asked
+/// it, or one past the last run's where that run's was this second or later
+/// (`Session::restart_floor`), so no two runs of one loop share one; a loop's first run is past
+/// the newest run's second its journal's restart notes name (each names its run's ask). It is
+/// kept while the loop asks that kind again, on its back-off or, for a move put off to a quiet
+/// moment (a model's way back, an account move ahead), at a later turn end, until the restart is
+/// made or refused or the loop decides another act; and it is restored by a later loop for a
+/// model's move its ledger or journal shows still waiting, so a re-ask there is the same. The
+/// relaunch's record keeps the ask that claimed it (`St::ask`), and a restart asked again meets
+/// its own record by it alone, never by its cause, so a restart asked of the process an earlier
+/// restart of its cause started is made of it (`relaunch::its_own`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestartAsk(String);
 
 impl RestartAsk {
-    /// The ask of `why` in the loop's restart run first asked at Unix second `run_at`.
+    /// The ask of `why` in the loop's restart run of Unix second `run_at`.
     #[must_use]
     pub fn of(why: &Restart, run_at: i64) -> Self {
         match why {
@@ -10966,14 +10971,52 @@ pub enum Composer {
     Placeholder(String),
     Typed,
     Own,
-    Diverted,
+    Diverted(Diversion),
 }
 
 impl Composer {
-    /// Whether text stands in the composer: a draft, or aterm's own words.
+    /// Whether the composer is no empty one to type into: a draft, aterm's own words, or something
+    /// standing over it (whose row may hold no text at all, as the prompt-history search's over an
+    /// empty composer).
     #[must_use]
     pub const fn drafted(&self) -> bool {
-        matches!(self, Composer::Typed | Composer::Own | Composer::Diverted)
+        matches!(
+            self,
+            Composer::Typed | Composer::Own | Composer::Diverted(_)
+        )
+    }
+}
+
+/// WHAT STANDS OVER THE COMPOSER so that its Enter sends no draft it shows ([`Composer::Diverted`]):
+/// the point is asked about ([`Self::reason`]) once a person's grace is out, and decided again when
+/// it goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Diversion {
+    /// Claude Code's completion menu, open under a draft: Enter may run or complete its entry.
+    Menu,
+    /// The program's prompt-history search, open over the composer
+    /// (`aterm_phase::ScreenReader::history_search`): keys type into its query and Enter sends the
+    /// old prompt it matched, whatever the composer's row shows.
+    Search,
+}
+
+impl Diversion {
+    /// The escalation's reason.
+    #[must_use]
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::Menu => MENU_DIVERTS,
+            Self::Search => SEARCH_DIVERTS,
+        }
+    }
+
+    /// What the person does in the tab, for a notice about the draft.
+    #[must_use]
+    pub const fn todo(self) -> &'static str {
+        match self {
+            Self::Menu => "Close the completion menu, then send the draft in the tab.",
+            Self::Search => "Leave the prompt-history search in the tab with Esc.",
+        }
     }
 }
 
@@ -10981,10 +11024,15 @@ impl Composer {
 pub const OWN_WORDS_STAND: &str =
     "aterm's own words stand unsent in the prompt; clear them and the session goes on";
 
-/// Escalation reason while a draft stands over Claude Code's open completion menu ([`Composer::Diverted`]).
+/// Escalation reason while a draft stands over Claude Code's open completion menu ([`Diversion::Menu`]).
 pub const MENU_DIVERTS: &str = "a draft stands with Claude Code's completion menu open: Enter \
      may run or complete the menu's highlighted entry, not send the draft; send or clear it \
      and the session goes on";
+
+/// Escalation reason while the prompt-history search stands over the composer ([`Diversion::Search`]).
+pub const SEARCH_DIVERTS: &str = "the prompt-history search (ctrl+r) is open over the composer: \
+     Enter would send the old prompt it found and typing would go into its query; leave the \
+     search and the session goes on";
 
 /// Suffix of an escalated question's reason when `answer_questions` holds it (`<why>; answer_questions is off`).
 pub const ANSWERS_OFF: &str = "answer_questions is off";
@@ -11204,7 +11252,6 @@ pub struct TurnEndReading {
     /// under the owner's `prompt` alone ([`RideFact::new`]); `None` everywhere else.
     pub wake: Option<RideFact>,
     pub pending_input: bool,
-    pub background: bool,
     pub interrupted: bool,
     pub restartable: bool,
     pub relaunch_off: bool,
@@ -11276,6 +11323,10 @@ pub struct TurnEndReading {
 pub struct ScreenAnswer {
     pub prompt: u64,
     pub work: Option<Duration>,
+    /// The prompt opens with [`crate::harness::upgrade::HARNESS_MARK`], as every turn the harness
+    /// types does (a restart prompt, an upgrade's notice): read where the words of a turn the host
+    /// typed are not this policy's to compare ([`TurnEndState::host_typed`]).
+    pub harness: bool,
 }
 
 impl ScreenAnswer {
@@ -11285,6 +11336,7 @@ impl ScreenAnswer {
         aterm_phase::answered_prompt(rows).map(|said| Self {
             prompt: crate::supervise::approvals::words_hash(&said),
             work: done_row_work(rows),
+            harness: said.starts_with(crate::harness::upgrade::HARNESS_MARK),
         })
     }
 }
@@ -11526,13 +11578,17 @@ impl TurnEndReading {
             if runs.iter().all(sends) {
                 None
             } else if selection_read || !runs.iter().any(sends) {
-                Some(Composer::Diverted)
+                Some(Composer::Diverted(Diversion::Menu))
             } else {
                 Some(Composer::Unknown)
             }
         });
+        // A HISTORY SEARCH OVER THE COMPOSER: what its row shows (a match drawn as typed, nothing, a
+        // suggestion) is no draft Enter would send, whatever its cell says.
+        let searching = reading.program.reader().history_search(rows);
         let composer = match (reading.composer.as_ref(), read.typed) {
             (None, _) => Composer::Absent,
+            (Some(_), _) if searching => Composer::Diverted(Diversion::Search),
             (Some(_), None) => Composer::Unknown,
             (Some(_), Some(true)) if own => Composer::Own,
             (Some(_), Some(true)) => over_menu.unwrap_or(Composer::Typed),
@@ -11611,12 +11667,6 @@ impl TurnEndReading {
             wake: None,
             pending_input: claude
                 && last_said_row(rows).is_some_and(|r| r.trim_start().starts_with('❯')),
-            background: reading.phase == Phase::Busy
-                && if claude {
-                    aterm_phase::turn_over_background(rows)
-                } else {
-                    reading.program.reader().background_wait(rows).is_some()
-                },
             interrupted: reading.interrupted,
             restartable: false,
             relaunch_off: false,
@@ -11892,6 +11942,15 @@ const fn class_of(kind: WallKind) -> WallClass {
 
 const fn named_class(class: WallClass) -> bool {
     matches!(class, WallClass::Usage | WallClass::Model)
+}
+
+/// THE ACTS OF A LIMIT'S PLACE, the rule half of [`TurnEndState::in_limits_place`]: the done
+/// check, the go-ahead, an answer and a land act, each of which a usage window's or a model
+/// bucket's standing track turns into the limit's own try. The one list aterm's loop and a proven
+/// self-claim's fact read (`harness fact`'s `why=limit`) both judge by.
+#[must_use]
+pub fn limits_place_rule(rule: &str) -> bool {
+    rule == RULE_DONE_CHECK || rule == RULE_GO_AHEAD || is_answer_rule(rule) || is_land_rule(rule)
 }
 
 /// Whether `t` is a limit a usage tap's window times (a Claude Code session or weekly limit) whose
@@ -12732,6 +12791,10 @@ pub struct TurnEndState {
     point_inputs: Option<u64>,
     point_clean: bool,
     last_prompt: Option<u64>,
+    /// The prompt the last screen read showed answered ([`TurnEndReading::answered`]), judged
+    /// as a point or not: what a turn the host types next is answered past
+    /// ([`Self::host_typed`]).
+    screen_prompt: Option<u64>,
     cut_check: bool,
     cut_land: bool,
     cut_text: Option<String>,
@@ -12958,6 +13021,7 @@ impl TurnEndState {
             point_inputs: None,
             point_clean: false,
             last_prompt: None,
+            screen_prompt: None,
             cut_check: false,
             cut_land: false,
             cut_text: None,
@@ -15589,14 +15653,11 @@ impl TurnEndState {
     }
 
     /// Whether an act under `rule` typed now would be typed IN A LIMIT'S PLACE ([`Self::acted`]
-    /// records it so): the done check, an answer or a land act while the track of a usage window
-    /// or a model bucket stands that no loop before this one only seeded.
+    /// records it so): an act of a limit's place ([`limits_place_rule`]) while the track of a
+    /// usage window or a model bucket stands that no loop before this one only seeded.
     #[must_use]
     pub fn in_limits_place(&self, rule: &str) -> bool {
-        (rule == RULE_DONE_CHECK
-            || rule == RULE_GO_AHEAD
-            || is_answer_rule(rule)
-            || is_land_rule(rule))
+        limits_place_rule(rule)
             && self
                 .wall
                 .as_ref()
@@ -16940,6 +17001,7 @@ impl TurnEndState {
         let arrived = self.points > 0 || reading.worked.is_some();
         let ran_turn = self.ran_turn_reading(reading, now);
         let reading = ran_turn.as_ref().unwrap_or(reading);
+        self.screen_prompt = reading.answered.map(|a| a.prompt);
         // The seat this screen names, kept for a limit met later
         // ([`Self::note_seat`]).
         self.note_seat(reading);
@@ -17102,7 +17164,10 @@ impl TurnEndState {
             reading
         };
         let unseen;
-        let reading = match self.answered_unseen(reading, now) {
+        let reading = match self
+            .answered_unseen(reading, now)
+            .or_else(|| self.host_answered_unseen(reading, now))
+        {
             Some(work) => {
                 unseen = TurnEndReading {
                     worked: Some(work),
@@ -17336,6 +17401,8 @@ impl TurnEndState {
         // slept through ([`Self::woken_esc`]) ended it, not the agent. Whether a read caught the
         // turn running before the stop must not decide the next prompt's back-off (2026-11-03
         // real-Claude flows f1 and f2: 2 min and 4 min after the same restart prompt's reply).
+        // `SupervisorTurnEnd`'s `HarnessStopsTurn` and `HarnessStopsTurnLong` are this stop, held to
+        // `NoPassedCutPersonsTurnOrHarnessStopCounts` and `NeverBackOffAfterRealWork`.
         let harness_cut = reading.interrupted && self.woken_esc.is_some();
         let wall_cut = reading.wall.is_some();
         let pass = wall_cut && !self.cut_pass_spent;
@@ -18347,6 +18414,41 @@ impl TurnEndState {
             .map(|work| work.min(since))
     }
 
+    /// A TURN THE HOST TYPED, ANSWERED BEFORE ANY READ SAW IT RUN ([`Self::host_typed`]): its words
+    /// are the host's, never this policy's to compare as [`Self::answered_unseen`] compares its own
+    /// act's, so its answer is the turn the screen closes on a prompt the harness typed
+    /// ([`ScreenAnswer::harness`]) other than the one the screen showed answered when the host
+    /// typed ([`Awaited::over`]). A restart prompt Claude Code answers within a second is judged at
+    /// that read, its work the screen's; [`TurnEndTiming::take_within`] stays the hang detector for
+    /// a turn no screen shows answered. A host turn in the same words as that prompt (a second
+    /// restart for the same cause on the same version) is one no screen tells from it: a resume
+    /// redraws the screen and the host's typing moves the submit count before any answer, so
+    /// neither marks the new turn as [`Awaited::submitted_since`] marks this policy's own, and it
+    /// waits [`TurnEndTiming::take_within`]. `None` where a read saw work, no host turn awaits, the
+    /// screen is no answered point or shows no such answer, or a limit's conversation is not the
+    /// one read.
+    fn host_answered_unseen(&self, reading: &TurnEndReading, now: Instant) -> Option<Duration> {
+        if self
+            .wall
+            .as_ref()
+            .is_some_and(|t| named_class(t.class) && !limit_conversation_ours(t, reading))
+        {
+            return None;
+        }
+        let a = self
+            .awaiting
+            .as_ref()
+            .filter(|a| a.host.is_some() && !a.command && !a.taken && !a.met && !a.off_stood)?;
+        if reading.worked.is_some() || !reading.answered_point() {
+            return None;
+        }
+        let since = now.saturating_duration_since(a.at);
+        reading
+            .answered
+            .filter(|s| s.harness && Some(s.prompt) != a.over)
+            .map(|s| s.work.unwrap_or(since).min(since))
+    }
+
     const fn submitted_since(&self, reading: &TurnEndReading) -> Option<bool> {
         match (reading.submits, self.point_submits) {
             (Some(now), Some(then)) if now >= then => Some(now > then),
@@ -19053,6 +19155,9 @@ impl TurnEndState {
     }
 
     /// Records a turn the host typed (upgrade notice, carry-on; [`RULE_HOST_TURN`]), awaited like this policy's acts; once the agent takes it, a person's exchange left to them ([`Self::left_to_person`]) is over.
+    ///
+    /// Its words are the host's: a screen answers it with a prompt the harness typed
+    /// ([`ScreenAnswer::harness`]) other than the one the last screen read showed answered.
     pub fn host_typed(&mut self, now: Instant, kind: HostTurn) {
         self.keyed_by_harness();
         self.land.check_pending = false;
@@ -19088,7 +19193,7 @@ impl TurnEndState {
             wall_retry: false,
             own: false,
             said: None,
-            over: None,
+            over: self.screen_prompt,
             lead: None,
             opened: None,
             submitted: false,
@@ -19161,6 +19266,10 @@ impl TurnEndState {
     /// Record a restart the loop asked its host for ([`TurnEndAction::Restart`]).
     pub fn restarted(&mut self, why: &Restart, made: bool, reading: &TurnEndReading, now: Instant) {
         self.keyed_by_harness();
+        // `reading` is the decided point's screen, re-read for the restart: the screen as it stood
+        // before the agent was ended, not one read after it. A turn the host types with the restart
+        // is answered past the prompt that screen showed answered ([`Self::host_typed`]).
+        self.screen_prompt = reading.answered.map(|a| a.prompt);
         if made {
             self.replies = Replies::default();
             self.settling = None;
@@ -20248,7 +20357,7 @@ pub(super) const RULES_OPEN: &str = " (standing rules: ";
 pub const FACT_RIDES: [&str; 4] = [RULE_CONTINUE, RULE_DONE_CHECK, RULE_LAND, RULE_LAND_NUDGE];
 
 /// How a fact opens after the text it rides and its standing rules.
-const FACT_OPEN: &str = " (aterm: ";
+pub const FACT_OPEN: &str = " (aterm: ";
 
 /// The words a fact adds to the act it rides: ` (aterm: {text})`.
 #[must_use]
@@ -20681,10 +20790,13 @@ fn decide_unridden(
         Some(_) if reading.composer == Composer::Own => TurnEndAction::Escalate {
             reason: OWN_WORDS_STAND.to_string(),
         },
-        Some(_) if reading.composer == Composer::Diverted => TurnEndAction::Escalate {
-            reason: MENU_DIVERTS.to_string(),
+        Some(_) => match &reading.composer {
+            Composer::Diverted(by) => TurnEndAction::Escalate {
+                reason: by.reason().to_string(),
+            },
+            _ => return act,
         },
-        _ => return act,
+        None => return act,
     };
     ended_at(trace, "draft", drafted)
 }
@@ -22068,9 +22180,12 @@ pub(super) const fn relaunch_on(reading: &TurnEndReading, cfg: &SupervisorConfig
 fn renewed_draft_reason(composer: &Composer) -> String {
     let what = match composer {
         Composer::Own => "aterm's own words stand unsent in the prompt: clear them",
-        Composer::Diverted => {
+        Composer::Diverted(Diversion::Menu) => {
             "a draft stands with Claude Code's completion menu open: close the menu, then send \
              or clear the draft"
+        }
+        Composer::Diverted(Diversion::Search) => {
+            "the prompt-history search is open over the composer: leave it with Esc"
         }
         _ => "a draft stands in the composer: send or clear it",
     };
@@ -22079,7 +22194,7 @@ fn renewed_draft_reason(composer: &Composer) -> String {
 
 /// WHETHER ONLY A DRAFT HOLDS A RENEWED ROSTER LOGIN'S MOVE: the session's row was signed in again
 /// (`login_superseded`), the relaunch onto it reaches the tab, and the composer holds words a
-/// relaunch would lose. With the composer empty the relaunch follows by itself where the host
+/// relaunch would lose, or something stands over it ([`Composer::drafted`]). With the composer empty the relaunch follows by itself where the host
 /// advises it, and advising nothing, the renewed login ended too; where no relaunch reaches the
 /// tab, the tab waits on the row's own sign-in, naming what holds the move ([`login_wall_waits`]).
 pub(super) fn renewed_draft_holds(reading: &TurnEndReading, cfg: &SupervisorConfig) -> bool {

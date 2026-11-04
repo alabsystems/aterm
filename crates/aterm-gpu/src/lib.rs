@@ -65,6 +65,10 @@ mod gl;
 mod gl_shaders;
 #[cfg(target_os = "macos")]
 mod metal;
+/// The quiet-commit probe's entry point and types (`benches/quiet_commit.rs`).
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+pub use metal::quiet_probe::{QuietCommit, QuietTake, quiet_commit_probe};
 /// Launch Metal warm types (`metal/warm.rs`).
 #[cfg(target_os = "macos")]
 pub use metal::warm::{FirstFrameKnobs, FirstFrameWarm};

@@ -257,6 +257,28 @@ fn compile_shell(
     })
 }
 
+impl super::checkpoint_heap::Heap for PolicyState {
+    fn heap(&self) -> usize {
+        let Self {
+            engine,
+            gates: _,
+            xtwinops: _,
+            shell: _,
+            response_limit: _,
+        } = self;
+        const _: () = assert!(
+            !std::mem::needs_drop::<(
+                PolicyGates,
+                [BridgeDecision; XTWINOPS_GATES],
+                [[BridgeDecision; SHELL_SUBCOMMANDS]; SHELL_MAJORS.len()],
+                RateLimitSlot,
+            )>(),
+            "a policy gate with drop glue holds heap: count it"
+        );
+        engine.heap()
+    }
+}
+
 impl Default for PolicyState {
     #[inline]
     fn default() -> Self {

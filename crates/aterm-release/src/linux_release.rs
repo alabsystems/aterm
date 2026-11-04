@@ -152,7 +152,11 @@ pub fn static_verifier_file(
             path.display()
         ));
     }
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(size.min(pin::MAX_ASSET + 1))
+            .unwrap_or(0)
+            .saturating_add(1),
+    );
     open_regular_nonblock(path)
         .and_then(|file| file.take(pin::MAX_ASSET + 1).read_to_end(&mut bytes))
         .map_err(|e| format!("read {}: {e}", path.display()))?;

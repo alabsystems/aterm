@@ -697,7 +697,7 @@ fn a_mark_across_a_read_boundary_is_found_and_a_near_miss_is_not() {
 }
 
 /// UNDER THE OWNER'S PIN ON A ROW OF ITS OWN, THE ROW ON THIS MACHINE'S OWN LOGIN SERVES ONLY ONCE
-/// THAT PIN ENDS: walled, the refusal names its wall's end, the pin's end ([`UNPIN_FIX`]) and
+/// THAT PIN ENDS: walled, the refusal names its wall's end, the pin's end ([`unpin_fix`]) and
 /// its own pin, made once that wall ends; signed out, its sign-in and then its pin. CONTROL: with
 /// no pin (the pool's pick, or the review's serving row), a walled row serves by itself once its
 /// wall ends and is offered no pin (the next usage read would undo one) and no pin's end, and a
@@ -720,23 +720,23 @@ fn under_a_pin_the_default_row_serves_only_once_that_pin_ends() {
     let ends = crate::harness::usage::rfc3339_utc(until);
     let words = only_default_pinned(&why, "work", &walled);
     assert!(
-        words.contains(&pin) && words.contains(&ends) && words.contains(UNPIN_FIX),
+        words.contains(&pin) && words.contains(&ends) && words.contains(&unpin_fix()),
         "{words}"
     );
     let words = only_default_pinned(&why, "work", &signed_out);
     assert!(
-        words.contains(&pin) && words.contains(DEFAULT_SIGN_IN),
+        words.contains(&pin) && words.contains(&default_sign_in()),
         "{words}"
     );
     for row in [None, Some("work")] {
         let words = only_default(&why, row, &walled);
         assert!(
-            words.contains(&ends) && !words.contains(&pin) && !words.contains(UNPIN_FIX),
+            words.contains(&ends) && !words.contains(&pin) && !words.contains(&unpin_fix()),
             "CONTROL {row:?}: {words}"
         );
         let words = only_default(&why, row, &signed_out);
         assert!(
-            words.contains(DEFAULT_SIGN_IN) && !words.contains(&pin),
+            words.contains(&default_sign_in()) && !words.contains(&pin),
             "CONTROL {row:?}: {words}"
         );
     }

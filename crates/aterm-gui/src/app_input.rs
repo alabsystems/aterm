@@ -2964,12 +2964,44 @@ fn committed_char_cells(ch: char, ambiguous_width_double: bool) -> u16 {
     u16::try_from(width).unwrap_or(u16::MAX)
 }
 
+/// The text a key sequence's `bytes` type when they type nothing else (a `[key_sequences]` chord
+/// that sends `#`): UTF-8 with no ESC or other C0 byte, and at least one printable char one or two
+/// cells wide.
+fn sequence_text(bytes: &[u8]) -> Option<&str> {
+    if bytes.iter().any(|&b| b < 0x20) {
+        return None;
+    }
+    let text = std::str::from_utf8(bytes).ok()?;
+    text.chars()
+        .any(|ch| !ch.is_control() && (1..=2).contains(&aterm_grapheme::char_width(ch)))
+        .then_some(text)
+}
+
+/// [`classify_press`] of a press as the session gets it: a person's key sequence that types only
+/// text ([`sequence_text`]) is classified exactly as the [`InputEvent::Text`] of that string, so a
+/// recording holds it for its echo or stops as it does for a typed key (ATERM-KI-1025-1); a
+/// controller's `send` bytes stay bytes, not typed characters.
+fn classify_sent(ev: &InputEvent, person: bool) -> PressClass<'_> {
+    match ev {
+        InputEvent::KeySequence(bytes) if person => match sequence_text(bytes) {
+            Some(text) => classify(&InputEvent::Text(text.to_owned()), Some(text)),
+            None => classify_press(ev),
+        },
+        _ => classify_press(ev),
+    }
+}
+
 fn classify_press(ev: &InputEvent) -> PressClass<'_> {
-    use aterm_types::keyboard::{Key as TKey, Modifiers as TMods, NamedKey as TNamed};
-    let ime: Option<&str> = match ev {
-        InputEvent::Text(t) if !t.is_empty() => Some(t),
+    let ime = match ev {
+        InputEvent::Text(t) if !t.is_empty() => Some(t.as_str()),
         _ => None,
     };
+    classify(ev, ime)
+}
+
+/// The classification of `ev`, whose committed text is `ime`.
+fn classify<'t>(ev: &InputEvent, ime: Option<&'t str>) -> PressClass<'t> {
+    use aterm_types::keyboard::{Key as TKey, Modifiers as TMods, NamedKey as TNamed};
     let bare = |mods: &TMods| {
         mods.difference(TMods::CAPS_LOCK | TMods::NUM_LOCK)
             .is_empty()
@@ -3299,8 +3331,9 @@ impl PressClass<'_> {
     }
 }
 
-/// The licence fence one input event draws before its dispatch ([`App::input`]).
-pub(crate) fn press_fence(ev: &InputEvent) -> Option<bool> {
+/// The licence fence one input event draws before its dispatch ([`App::input`]), classified as
+/// [`classify_sent`] classifies it for a person's press (`person`) or a controller's.
+pub(crate) fn press_fence(ev: &InputEvent, person: bool) -> Option<bool> {
     match ev {
         InputEvent::Key {
             event_type: aterm_types::keyboard::KeyEventType::Release,
@@ -3315,7 +3348,7 @@ pub(crate) fn press_fence(ev: &InputEvent) -> Option<bool> {
         | InputEvent::MouseMove { .. }
         | InputEvent::Wheel { .. } => Some(true),
         _ => {
-            let class = classify_press(ev);
+            let class = classify_sent(ev, person);
             let arms_own_license = (class.typed_forward == Some(true) && !class.enter_like)
                 || is_plain_enter(ev)
                 || class.tab_key
@@ -4420,7 +4453,7 @@ impl App {
         {
             return InputOutcome::Ok;
         }
-        if let Some(keep_hand) = press_fence(&ev) {
+        if let Some(keep_hand) = press_fence(&ev, matches!(src, Source::Human)) {
             self.fence_move_license(wid, keep_hand);
         }
         if target_session.is_none()
@@ -4663,7 +4696,7 @@ impl App {
                 );
                 debug_assert_eq!(input_now.is_some(), !is_release);
                 let folded_gate = ev.keypad_folded();
-                let press_class = classify_press(&ev);
+                let press_class = classify_sent(&ev, matches!(src, Source::Human));
                 let line_edit_key = press_class.edits_the_line();
                 let PressClass {
                     console_input,
@@ -4966,10 +4999,13 @@ impl App {
                                 .max(1);
                             let at_prompt =
                                 front_prompt.is_some_and(|p| ws.aos.prompt_open(session, p));
+                            // Within this gate an Enter-like press is an alternate-screen
+                            // Shift-Enter, the one typed press that sends no text.
                             let verdict = crate::aos_host::key_privacy(
                                 tty_swallows,
                                 self.config.secure_keyboard_entry_or_default(),
                                 at_prompt,
+                                enter_like,
                                 || sink.tty_echo(),
                             );
                             let (
@@ -7560,7 +7596,7 @@ impl App {
         let inert = keymap::press_is_inert(&ev);
         let mut base_key: Option<Key> = None;
         let fence = match &press {
-            Some(press) => press_fence(press),
+            Some(press) => press_fence(press, true),
             None if inert => None,
             None => Some(false),
         };
@@ -10803,10 +10839,13 @@ mod ledger_key_tests {
 #[path = "app_input_terminal_emacs_search_input_tests.rs"]
 mod terminal_emacs_search_input_tests;
 
-/// The seam classifies a keypad press as its main-block twin.
+/// The seam classifies a keypad press as its main-block twin, and a person's key sequence that
+/// types only text as that text.
 #[cfg(test)]
 mod keypad_press_class_tests {
-    use super::{OutputEchoInput, PetInputKind, PredictKey, classify_press, is_plain_enter};
+    use super::{
+        OutputEchoInput, PetInputKind, PredictKey, classify_press, classify_sent, is_plain_enter,
+    };
     use crate::input::InputEvent;
     use crate::predict::EditKey;
     use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
@@ -10836,6 +10875,61 @@ mod keypad_press_class_tests {
         let shifted = press(NamedKey::NumpadEnter, Modifiers::SHIFT);
         assert!(!is_plain_enter(&shifted));
         assert!(classify_press(&shifted).enter_like);
+    }
+
+    #[test]
+    fn a_key_sequence_that_types_only_text_is_classified_as_that_text() {
+        let seq = |bytes: &[u8]| InputEvent::KeySequence(bytes.to_vec());
+        for text in ["#", "ab", "日", "e\u{301}"] {
+            let ev = seq(text.as_bytes());
+            let sent = classify_sent(&ev, true);
+            let typed_ev = InputEvent::Text(text.to_owned());
+            let typed = classify_press(&typed_ev);
+            assert_eq!(sent.typed_forward, Some(true), "{text:?}");
+            assert_eq!(sent.ime, Some(text), "{text:?}");
+            assert_eq!(
+                (
+                    sent.predict_candidate,
+                    sent.brk,
+                    sent.keyed_enter,
+                    sent.line_terminator,
+                    sent.typed
+                ),
+                (
+                    typed.predict_candidate,
+                    typed.brk,
+                    typed.keyed_enter,
+                    typed.line_terminator,
+                    typed.typed
+                ),
+                "{text:?}: exactly the Text of that string"
+            );
+            assert!(matches!(sent.console_input, Some(PetInputKind::Text)));
+            let bytes = classify_sent(&ev, false);
+            assert_eq!(
+                (bytes.typed_forward, bytes.ime, bytes.brk),
+                (None, None, true),
+                "{text:?}: a controller's `send` stays bytes"
+            );
+        }
+        for bytes in [
+            &b"\x1b#"[..],
+            b"#\r",
+            b"\t",
+            b"",
+            b"\xff#",
+            "\u{301}".as_bytes(),
+            b"\x7f",
+            b"\x03",
+        ] {
+            let ev = seq(bytes);
+            let class = classify_sent(&ev, true);
+            assert_eq!(
+                (class.typed_forward, class.ime, class.brk),
+                (None, None, true),
+                "{bytes:?}: not text alone"
+            );
+        }
     }
 
     #[test]

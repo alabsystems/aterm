@@ -1842,7 +1842,7 @@ impl StateDir {
     }
 
     fn read(&self, name: &str) -> Option<String> {
-        std::fs::read_to_string(self.path(name))
+        crate::enable::read_bounded_string(&self.path(name), 64 << 20)
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
@@ -1850,7 +1850,7 @@ impl StateDir {
 
     fn read_reservation(&self, name: &str) -> io::Result<Option<String>> {
         self.count(|ops| ops.reads += 1);
-        match std::fs::read_to_string(self.path(name)) {
+        match crate::enable::read_bounded_string(&self.path(name), 64 << 20) {
             Ok(text) => Ok(Some(text)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 match std::fs::symlink_metadata(self.path(name)) {
@@ -1955,15 +1955,21 @@ impl StateDir {
 
     fn logpin_head(&self) -> Option<Vec<u8>> {
         use std::io::Read as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
         let path = self.path(LOGPIN);
-        if !std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file()) {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(crate::enable::LOCK_OPEN_FLAGS)
+            .open(&path)
+            .ok()?;
+        let meta = file.metadata().ok()?;
+        if !meta.is_file() {
             return None;
         }
-        let file = std::fs::File::open(&path).ok()?;
-        let mut head = Vec::new();
-        file.take(crate::mirror::PIN_HEADER.len() as u64 + 1)
-            .read_to_end(&mut head)
-            .ok()?;
+        let max = crate::mirror::PIN_HEADER.len() as u64 + 1;
+        let mut head =
+            Vec::with_capacity(usize::try_from(meta.len().min(max).saturating_add(1)).unwrap_or(0));
+        file.take(max).read_to_end(&mut head).ok()?;
         Some(head)
     }
 
@@ -2110,7 +2116,7 @@ impl StateDir {
             Ok(meta) if !meta.is_file() => return Ok(Reconciled::Kept),
             Ok(_) => {}
         }
-        let bytes = std::fs::read(&path)?;
+        let bytes = crate::enable::read_bounded_bytes(&path, 64 << 20)?;
         match std::str::from_utf8(&bytes)
             .ok()
             .map(crate::mirror::Pin::parse)
@@ -2361,14 +2367,33 @@ impl StateDir {
             .open(path)
         {
             Ok(file) => {
-                if !file.metadata()?.is_file() {
+                let meta = file.metadata()?;
+                if !meta.is_file() {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!("{} is not a regular file", path.display()),
                     ));
                 }
-                let mut bytes = Vec::new();
-                (&file).read_to_end(&mut bytes)?;
+                const MAX_REGULAR_BYTES: u64 = 64 << 20;
+                if meta.len() > MAX_REGULAR_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("{} exceeds size limit", path.display()),
+                    ));
+                }
+                let mut bytes = Vec::with_capacity(
+                    usize::try_from(meta.len().min(MAX_REGULAR_BYTES).saturating_add(1))
+                        .unwrap_or(0),
+                );
+                (&file)
+                    .take(MAX_REGULAR_BYTES + 1)
+                    .read_to_end(&mut bytes)?;
+                if bytes.len() as u64 > MAX_REGULAR_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("{} exceeds size limit", path.display()),
+                    ));
+                }
                 Ok(Some(bytes))
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -2815,7 +2840,8 @@ impl StateDir {
                 lost = true;
             }
         }
-        let table = |name: &str| std::fs::read_to_string(self.path(name)).ok();
+        let table =
+            |name: &str| crate::enable::read_bounded_string(&self.path(name), 64 << 20).ok();
         let (asked, deadlines) = (table(asks::ASKED), table(asks::DEADLINES));
         read.dirty |= read
             .index
@@ -3185,7 +3211,7 @@ impl StateDir {
                     "publication reservation is not a regular file",
                 ));
             }
-            let text = std::fs::read_to_string(entry.path())?;
+            let text = crate::enable::read_bounded_string(&entry.path(), 64 << 20)?;
             let mut changed = false;
             let mut lines = Vec::new();
             for line in text.lines() {
@@ -3658,7 +3684,7 @@ impl StateDir {
 
     /// The `acked` file as it stands.
     pub(crate) fn self_acked_log(&self) -> AckedLog {
-        match std::fs::read_to_string(self.path("acked")) {
+        match crate::enable::read_bounded_string(&self.path("acked"), 64 << 20) {
             Ok(text) => AckedLog::parse(&text),
             Err(e) if e.kind() == io::ErrorKind::NotFound => AckedLog {
                 appendable: true,
@@ -3957,10 +3983,13 @@ impl StateDir {
             Err(e) => return Err(e),
         };
         let bad = || io::Error::new(io::ErrorKind::InvalidData, "invalid bridge run record");
-        if !file.metadata()?.is_file() {
+        let meta = file.metadata()?;
+        if !meta.is_file() {
             return Err(bad());
         }
-        let mut text = String::new();
+        let mut text = String::with_capacity(
+            usize::try_from(meta.len().min(128).saturating_add(1)).unwrap_or(0),
+        );
         (&file).take(128).read_to_string(&mut text)?;
         if text.len() >= 128 {
             return Err(bad());
@@ -4111,7 +4140,7 @@ impl StateDir {
     ) -> io::Result<bool> {
         let path = self.path(rel);
         if let Some(kind) = kind {
-            match std::fs::read(&path) {
+            match crate::enable::read_bounded_bytes(&path, 64 << 20) {
                 Ok(bytes) => {
                     if !std::str::from_utf8(&bytes).is_ok_and(|text| kind.whole(&path, name, text))
                     {
@@ -4273,7 +4302,7 @@ impl StateDir {
                 continue;
             }
             let path = self.path(&rel);
-            let bytes = match std::fs::read(&path) {
+            let bytes = match crate::enable::read_bounded_bytes(&path, 64 << 20) {
                 Ok(bytes) => bytes,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(e),
@@ -4378,7 +4407,7 @@ impl StateDir {
         let mut whole: Vec<(String, Vec<u8>)> = Vec::new();
         for (name, rel) in self.kind_files(TornKind::InFlight)? {
             let path = self.path(&rel);
-            let bytes = match std::fs::read(&path) {
+            let bytes = match crate::enable::read_bounded_bytes(&path, 64 << 20) {
                 Ok(bytes) => bytes,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(e),
@@ -5053,7 +5082,7 @@ impl StateDir {
             let Some(sid) = name.to_str().filter(|n| !n.contains('.')) else {
                 continue;
             };
-            let body = std::fs::read_to_string(entry.path())?;
+            let body = crate::enable::read_bounded_string(&entry.path(), 64 << 20)?;
             let rebased: BTreeMap<String, TopicCursor> = self
                 .parse_topics(sid, &body)
                 .into_iter()
@@ -5164,7 +5193,16 @@ impl StateDir {
             .read(true)
             .custom_flags(crate::enable::LOCK_OPEN_FLAGS)
             .open(path)?;
-        let mut text = String::new();
+        let meta = file.metadata()?;
+        if !meta.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the rewound log fact is not a regular file",
+            ));
+        }
+        let mut text = String::with_capacity(
+            usize::try_from(meta.len().min(128).saturating_add(1)).unwrap_or(0),
+        );
         file.take(128).read_to_string(&mut text)?;
         if text.len() < 128 {
             if let Some(log) = astream_broker::LogIdentity::parse(text.trim()) {
@@ -5245,7 +5283,7 @@ impl StateDir {
         if self.on_the_media("pins") {
             return Ok(());
         }
-        let text = match std::fs::read_to_string(self.path("pins")) {
+        let text = match crate::enable::read_bounded_string(&self.path("pins"), 64 << 20) {
             Ok(text) => text,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(e),
@@ -5367,7 +5405,7 @@ impl StateDir {
             }
             Ok(_) => {}
         }
-        parse_topic_floors(&path, &std::fs::read_to_string(&path)?)
+        parse_topic_floors(&path, &crate::enable::read_bounded_string(&path, 64 << 20)?)
     }
 
     /// Replace one session's broadcast refill floors ([`Self::topic_floors`]).
@@ -5682,16 +5720,30 @@ mod tests {
     }
 
     /// A tolerated flush goes on exactly where astream's rule says the entries cannot be
-    /// flushed: the volume's `ENOTSUP` (Darwin's 45, which std leaves uncategorized, so a
-    /// list of kinds alone missed it) is tolerated, and `EIO` is returned.
+    /// flushed: the volume's `ENOTSUP` (Darwin's 45, Linux's 95) and on Apple `ENODEV` (19,
+    /// what a full flush of `/dev/null` answers) are tolerated, and `EIO` is returned.
+    /// `ENODEV` keeps the errno half under test: the Trust std reads Darwin's 45 as
+    /// `Unsupported` (a stock std leaves it uncategorized), but no std names 19 by a kind the
+    /// rule reads, so a list of kinds alone misses it. CONTROL: 19's kind alone is not
+    /// tolerated.
     #[test]
     fn a_tolerated_flush_goes_on_past_enotsup_and_returns_eio() {
-        let enotsup = if cfg!(target_vendor = "apple") {
-            45
+        let refused: &[i32] = if cfg!(target_vendor = "apple") {
+            let enodev = io::Error::from_raw_os_error(libc::ENODEV);
+            assert!(
+                tolerate_dir_flush(Err(io::Error::from(enodev.kind()))).is_err(),
+                "CONTROL: std names ENODEV by kind ({enodev:?}); the errno half is untested"
+            );
+            &[libc::ENOTSUP, libc::ENODEV]
         } else {
-            95
+            &[libc::ENOTSUP]
         };
-        assert!(tolerate_dir_flush(Err(io::Error::from_raw_os_error(enotsup))).is_ok());
+        for &errno in refused {
+            assert!(
+                tolerate_dir_flush(Err(io::Error::from_raw_os_error(errno))).is_ok(),
+                "errno {errno}"
+            );
+        }
         assert_eq!(
             tolerate_dir_flush(Err(io::Error::from_raw_os_error(libc::EIO)))
                 .map_err(|e| e.raw_os_error()),

@@ -27,7 +27,7 @@ mod claims;
 const HANG: Duration = Duration::from_secs(60);
 const CAPSULE_LIMIT: usize = 32 * 1024;
 const APPLICATION: &str = "lan-startup-data";
-const USAGE: &str = "commons-lan prepare-recipient <new-world> | prepare-source <new-world> <recipient-key> | join <world> <capsule-file> | run <aterm> <world> <seconds> | follow <aterm> <world> <seconds> <owner-pid> | stop <run-directory> | declare <world> | write <world> <key> | read <world> | claim <world> <counter> <since> <until> | release <world> <counter> <until> | claims <world>";
+const USAGE: &str = "commons-lan prepare-recipient <new-world> | prepare-source <new-world> <recipient-key> | join <world> <capsule-file> | run <aterm> <world> <seconds> | follow <aterm> <world> <seconds> <owner-pid> | stop <run-directory> | db <aterm> <world> <db-command> [args...] | declare <world> | write <world> <key> | read <world> | claim <world> <counter> <since> <until> | release <world> <counter> <until> | claims <world>";
 
 /// The flag that lets a `commons-lan` verb drive a world the live default ALab vault admitted: it
 /// names the vault and what stays in it, a member no run takes out.
@@ -355,6 +355,44 @@ fn table_snapshot(world: &World) -> Result<Value, Fail> {
     )
 }
 
+/// Run the shipped database CLI against a prepared profile, including while its
+/// app is stopped. Only inert proposal/data commands are admitted; no credential
+/// activation, membership or service command can pass through this entry point.
+fn database(aterm: &Path, root: &Path, args: &[String], live: bool) -> Res {
+    if !matches!(
+        args.first().map(String::as_str),
+        Some(
+            "nonce"
+                | "commons-status"
+                | "commons-tables"
+                | "commons-inventory"
+                | "accounts-init"
+                | "accounts-write"
+                | "accounts-get"
+                | "accounts-scan"
+                | "accounts-history"
+        )
+    ) {
+        return Err(Fail::usage(
+            "commons-lan db accepts proposal/data commands only",
+        ));
+    }
+    let (world, _) = open(root, live)?;
+    let mut env = world.env();
+    env.retain(|(key, _)| key != "ATERM_STATE_HOME" && key != "CI");
+    let mut command = aterm_uds::spawnfd::command(std::fs::canonicalize(aterm).map_err(fail)?);
+    command
+        .env_clear()
+        .envs(env)
+        .current_dir(&world.home)
+        .arg("db")
+        .args(args);
+    let output = aterm_uds::deadline::output_within(&mut command, HANG).map_err(fail)?;
+    std::io::stdout().write_all(&output.stdout).map_err(fail)?;
+    std::io::stderr().write_all(&output.stderr).map_err(fail)?;
+    Ok(output.status.code().unwrap_or(1))
+}
+
 /// Prepare and drive preserved private profiles without changing installed state.
 pub fn cmd(args: &[String]) -> Res {
     stop::install();
@@ -370,6 +408,9 @@ pub fn cmd(args: &[String]) -> Res {
                 .map_err(fail)?
                 .ok_or_else(|| Fail::die("synthetic vault capsule file is missing"))?;
             join_recipient(Path::new(root), bytes.as_slice())?
+        }
+        [verb, aterm, root, rest @ ..] if verb == "db" => {
+            return database(Path::new(aterm), Path::new(root), rest, live);
         }
         [verb, aterm, root, seconds] if verb == "run" => {
             if !seconds.bytes().all(|b| b.is_ascii_digit()) {
@@ -460,6 +501,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn database_cli_refuses_authority_and_arbitrary_commands_before_launch() {
+        for verb in [
+            "accounts-authorize",
+            "accounts-intent",
+            "accounts-request",
+            "resources-reserve",
+            "table",
+            "init",
+            "anything",
+        ] {
+            let error = database(
+                Path::new("missing-executable"),
+                Path::new("missing-world"),
+                &[verb.into()],
+                false,
+            )
+            .unwrap_err();
+            assert_eq!(error.code, 2, "{verb} must be a usage refusal before I/O");
+        }
+    }
+
+    #[test]
     fn successive_launches_share_the_profile_without_reusing_app_logs() {
         let parent = crate::instance::world_parent();
         let root = parent.path().join("recipient");
@@ -529,6 +592,18 @@ mod tests {
             panic!("a live world needs the flag");
         };
         assert_eq!(refused.code, 1);
+        assert!(refused.msg.as_deref().is_some_and(|msg| msg.contains(LIVE)));
+        let refused = database(
+            Path::new("missing-executable"),
+            &live,
+            &[
+                "accounts-scan".into(),
+                "--collection".into(),
+                "accounts".into(),
+            ],
+            false,
+        )
+        .unwrap_err();
         assert!(refused.msg.as_deref().is_some_and(|msg| msg.contains(LIVE)));
         assert!(open(&live, true).is_ok());
     }

@@ -1485,7 +1485,9 @@ fn ai_accounts_claude_probe(env: &aterm_agent::harness::cli::Env) -> aterm_conve
 /// there (the tools', else Xcode's); its root half runs from this executable, and names the Mac
 /// by the swarm label its vault's roster gave it where that is known by the time the root half
 /// runs ([`crate::converge::mac_name_label`]), so the one password also aligns the Mac's
-/// own names.
+/// own names. On a Mac that has the tools it still asks for that password where the
+/// elevation's other root steps are owed ([`aterm_machines::root_steps::owed_here`]: developer
+/// mode, the rule that names the Mac after admission).
 /// `None` when this executable cannot name itself.
 #[cfg(target_os = "macos")]
 fn command_line_tools() -> Option<aterm_machines::init_clt::CommandLineTools> {
@@ -1502,7 +1504,8 @@ fn command_line_tools() -> Option<aterm_machines::init_clt::CommandLineTools> {
             }),
             aterm,
         )
-        .with_name(Box::new(crate::converge::mac_name_label)),
+        .with_name(Box::new(crate::converge::mac_name_label))
+        .with_owed(Box::new(aterm_machines::root_steps::owed_here)),
     )
 }
 

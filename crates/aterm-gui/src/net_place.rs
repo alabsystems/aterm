@@ -67,17 +67,17 @@ pub(crate) fn reads_asked() -> usize {
 }
 
 /// Restore a test thread's prior place, including when its fixture unwinds.
-#[cfg(all(test, unix))]
+#[cfg(test)]
 pub(crate) struct HeldPlace(Option<Place>);
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 impl Drop for HeldPlace {
     fn drop(&mut self) {
         hold(self.0.take());
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 pub(crate) fn hold_scoped(place: Option<Place>) -> HeldPlace {
     HeldPlace(HELD.with(|held| held.replace(place)))
 }

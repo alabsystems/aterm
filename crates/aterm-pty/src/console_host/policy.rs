@@ -367,7 +367,7 @@ fn read_openconsole_bounded(path: &Path) -> io::Result<Vec<u8>> {
             "OpenConsole.exe exceeds size limit",
         ));
     }
-    let mut buf = Vec::new();
+    let mut buf = Vec::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
     file.take(MAX_OPENCONSOLE_BYTES + 1).read_to_end(&mut buf)?;
     if buf.len() as u64 > MAX_OPENCONSOLE_BYTES {
         return Err(io::Error::new(

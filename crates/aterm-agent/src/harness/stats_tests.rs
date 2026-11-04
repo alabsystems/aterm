@@ -727,6 +727,7 @@ fn a_self_claims_acts_count_as_its_holders_and_never_as_aterms() {
         landed: 6,
         upgraded: 7,
         acts: 29,
+        facts_told: 0,
     };
     assert_eq!(
         both.self_claimed,
@@ -755,6 +756,105 @@ fn a_self_claims_acts_count_as_its_holders_and_never_as_aterms() {
         "NEGATIVE CONTROL: aterm's own rows of the rules count as aterm's"
     );
     assert!(typed_by_aterm.self_claimed.is_empty());
+}
+
+/// A FACT A PROVEN SELF-CLAIM'S ACT CARRIED IS ITS HOLDER'S, NEVER ATERM'S: the row
+/// [`approvals::SelfClaimFactRow`] writes seeds a successor's account told (`seed_rows_in` reads
+/// it as the episode's typed row), is a fact line no reader of acts walks (no typed act of the
+/// session), counts once in `self_claimed["codex-alab"].facts_told` and the session's share, in
+/// none of aterm's own facts told, rows or sessions, and is listed with its holder. NEGATIVE
+/// CONTROL: aterm's own row of the same fact counts as aterm's.
+#[test]
+fn a_self_claims_fact_row_is_its_holders() {
+    use crate::supervise::facts::{EpisodeKey, Fact, FactKind, SeedOutcome};
+    use crate::supervise::occupancy::door::seed_rows_in;
+    let t = 10_000;
+    let fact = Fact {
+        key: EpisodeKey {
+            kind: FactKind::NoProgress,
+            id: 0x00ab_cdef_0123_4567,
+        },
+        text: "python3 (pid 700) has made no progress for 9 min".to_string(),
+        as_of_ms: t - 1_000,
+    };
+    let line = approvals::SelfClaimFactRow {
+        holder: "codex-alab@4242",
+        fact: &fact,
+    }
+    .to_json(t, Some("@s-9"));
+    let body = format!("{line}\n");
+    assert_eq!(
+        seed_rows_in(&body, Some("@s-9")),
+        vec![(fact.key, t, SeedOutcome::Typed)],
+        "{line}"
+    );
+    assert!(approvals::is_fact_line(&line), "{line}");
+    assert!(
+        approvals::typed_at_in(&body, Some("@s-9")).is_empty(),
+        "no act of the session: {line}"
+    );
+    let old = vec![
+        typed(t, RULE_CONTINUE, "keep going"),
+        said(t, RULE_READ_ONLY, Outcome::Approved, ""),
+    ];
+    let fold = |lines: &[String]| {
+        let mut acc = HarnessStats::per_session(t);
+        for line in lines {
+            fold_ledger_line(&mut acc, line);
+        }
+        acc.end_reading();
+        acc
+    };
+    let mut lines = old.clone();
+    lines.push(line.clone());
+    let (both, alone) = (fold(&lines), fold(&old));
+    assert_eq!(both.self_claimed["codex-alab"].facts_told, 1, "{both:#?}");
+    assert_eq!(
+        both.self_claimed["codex-alab"],
+        SelfClaimed {
+            facts_told: 1,
+            ..SelfClaimed::default()
+        },
+        "a fact is no act of its holder's"
+    );
+    let shares = both.by_session.as_ref().expect("shares");
+    assert_eq!(shares["s-9"].self_claimed["codex-alab"].facts_told, 1);
+    assert_eq!(
+        (&both.facts_told, both.rows, both.sessions, both.bad),
+        (&alone.facts_told, alone.rows, alone.sessions, alone.bad),
+        "none of aterm's own"
+    );
+    assert!(both.facts_told.is_empty());
+    assert_eq!(
+        super::super::cli::approval_line(&line),
+        format!(
+            "{} typed {} {} — {} (by codex-alab@4242)",
+            crate::harness::usage::rfc3339_utc(t / 1000),
+            FactKind::NoProgress.rule(),
+            fact.text,
+            crate::supervise::occupancy::door::fact_outcome_reason(
+                fact.key,
+                crate::supervise::occupancy::door::FactDoor::TurnEnd,
+                crate::supervise::occupancy::door::Told::Typed,
+            )
+        )
+    );
+    let by_aterm = row(
+        t,
+        "s-9",
+        FactKind::NoProgress.rule(),
+        Outcome::Typed,
+        &fact.text,
+        "kind=no-progress episode=00abcdef01234567 door=turn-end",
+    );
+    let acc = fold(std::slice::from_ref(&by_aterm));
+    assert_eq!(
+        acc.facts_told,
+        BTreeMap::from([("no-progress".to_string(), 1)]),
+        "NEGATIVE CONTROL: aterm's own row of the fact is aterm's"
+    );
+    assert!(acc.self_claimed.is_empty());
+    assert!(!super::super::cli::approval_line(&by_aterm).contains("(by "));
 }
 
 fn counts_of(t: &Tally) -> [u64; 8] {

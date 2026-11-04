@@ -202,7 +202,8 @@ fn write_pid(file: &mut File) -> std::io::Result<()> {
 }
 
 fn read_pid(file: &mut File) -> Option<u32> {
-    let mut text = String::new();
+    let mut text =
+        String::with_capacity(usize::try_from(MAX_SEAT_BYTES.saturating_add(1)).unwrap_or(0));
     file.take(MAX_SEAT_BYTES).read_to_string(&mut text).ok()?;
     let s = text.trim();
     (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))

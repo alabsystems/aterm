@@ -542,7 +542,8 @@ impl Fixture {
             keep_awake: false,
         };
         let peer = Peer::new();
-        let running = server::start(listener, &options).unwrap();
+        // The peer is this test's own, which answers: its pull waits the hang detector.
+        let running = server::start_with_peer_pull(listener, &options, HANG).unwrap();
         let fixture = Self {
             running: Some(running),
             peer,

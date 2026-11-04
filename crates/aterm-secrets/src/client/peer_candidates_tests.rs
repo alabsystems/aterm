@@ -52,13 +52,17 @@ fn direct_peer_selection_survives_process_restarts() {
     let mut reached: [BTreeSet<String>; 5] = std::array::from_fn(|_| BTreeSet::new());
     for _ in 0..policy.servers.len().div_ceil(MAX_CANDIDATES) {
         // Each invocation has fresh process statics, as the account sign-in
-        // ladder's separate `aterm secrets sync` command does.
+        // ladder's separate `aterm secrets sync` command does. A libtest that runs
+        // one test at a time writes `test <name> ... ` to stdout before the test
+        // runs, with no newline, so the child's line starts after it. The child
+        // runs that way whatever `RUST_TEST_THREADS` this run inherited.
         let mut child = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
         child
             .args([
                 "--exact",
                 "client::peer_candidates_tests::direct_peer_selection_survives_process_restarts",
                 "--nocapture",
+                "--test-threads=1",
             ])
             .env(CHILD_HOME, &paths.home);
         let output = aterm_uds::deadline::output_until_complete_stdout(
@@ -70,8 +74,8 @@ fn direct_peer_selection_survives_process_restarts() {
         let text = String::from_utf8(output.stdout).unwrap();
         let selected = text
             .lines()
-            .find_map(|line| line.strip_prefix(PREFIX))
-            .unwrap();
+            .find_map(|line| line.split_once(PREFIX).map(|(_, json)| json))
+            .unwrap_or_else(|| panic!("the child selected no peers:\n{text}"));
         let batches: [Vec<String>; 5] = aterm_json::from_str(selected).unwrap();
         for (seen, batch) in reached.iter_mut().zip(batches) {
             assert!(batch.len() <= MAX_CANDIDATES);

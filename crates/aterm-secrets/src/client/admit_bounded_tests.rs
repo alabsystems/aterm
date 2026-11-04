@@ -166,15 +166,29 @@ fn log_bundle_inherits_source_mark_only_when_it_learns_complete_records() {
     }
 }
 
+/// A new Mac refuses a member's log it cannot take, before custody, saying which Mac's aterm to
+/// update: its own where the member may hold more than it takes, the member's where this Mac
+/// crossed and the member's `alab-join-bundle/2` states no bound.
+///
+/// NEGATIVE CONTROL: the same bundle from a member within this Mac's bound is taken
+/// (`log_bundle_inherits_source_mark_only_when_it_learns_complete_records`).
 #[test]
 fn log_bundle_refuses_incompatible_or_unbounded_source_before_custody() {
-    for source in [Some(RecordsBound::of(8192, true)), None] {
+    for (source, update) in [
+        (
+            Some(RecordsBound::of(2 * RecordBudgets::PRODUCTION.held, true)),
+            "update aterm on this Mac",
+        ),
+        (None, "update aterm on the allowing Mac"),
+    ] {
         let fixture = Fixture::new(source);
         if source.is_none() {
             super::super::crossing_mark(&fixture.paths).store().unwrap();
         }
-        assert!(accepts_bundle(&fixture.paths, &fixture.bundle).is_err());
-        assert!(write_from_log_bundle(&fixture.paths, &fixture.bundle).is_err());
+        let refused = accepts_bundle(&fixture.paths, &fixture.bundle).unwrap_err();
+        assert!(refused.to_string().contains(update), "{refused}");
+        let refused = write_from_log_bundle(&fixture.paths, &fixture.bundle).unwrap_err();
+        assert!(refused.to_string().contains(update), "{refused}");
         fixture.unchanged();
     }
 }
@@ -247,7 +261,13 @@ fn log_bundle_keeps_a_complete_history_larger_than_the_legacy_wire_bound() {
             fixture.log.insert(record).unwrap();
         }
         let wire = encode_records(fixture.log.records());
-        assert!(crate::membership_log::decode_records(&wire).is_err());
+        assert!(
+            crate::membership_log::store::decode_records_bounded(
+                &wire,
+                crate::membership_log::LEGACY_RECORDS
+            )
+            .is_err()
+        );
         if let Handed::Log { records, .. } = &mut fixture.bundle.handed {
             *records = wire;
         }

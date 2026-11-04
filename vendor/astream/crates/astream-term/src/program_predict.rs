@@ -134,6 +134,9 @@ fn hash_row_cells(screen: &Screen, row: u16, cols: u16) -> u64 {
             h = hash_opt_rgb(h, cell.fg_rgb);
             h = hash_opt_rgb(h, cell.bg_rgb);
             h = fnv1a_step(h, cell.attrs);
+            h = fnv1a_step(h, cell.underline.code());
+            h = hash_color(h, cell.ul);
+            h = hash_opt_rgb(h, cell.ul_rgb);
             h = fnv1a_step(h, cell.width);
             h = fnv1a_step(h, cell.combining_len);
             for &m in cell.combining_marks() {
@@ -182,6 +185,7 @@ const fn is_cursor_relative_op(op: &ScreenOp) -> bool {
         | ScreenOp::ReverseIndex
         | ScreenOp::SetSgr { .. }
         | ScreenOp::SetSgrRgb { .. }
+        | ScreenOp::SetUnderline { .. }
         | ScreenOp::ScrollUp(_)
         | ScreenOp::ScrollDown(_) => true,
         ScreenOp::MoveTo(_, _)
@@ -637,15 +641,8 @@ impl ProgramPredictor {
                     if let (Some(ac), Some(sc)) = (auth.cell(r, c), out.cell(r, c)) {
                         if ac != sc {
                             let faint_cell = Cell {
-                                ch: sc.ch,
-                                fg: sc.fg,
-                                bg: sc.bg,
-                                fg_rgb: sc.fg_rgb,
-                                bg_rgb: sc.bg_rgb,
                                 attrs: sc.attrs | attr::FAINT,
-                                combining: sc.combining,
-                                combining_len: sc.combining_len,
-                                width: sc.width,
+                                ..*sc
                             };
                             out.set_cell(r, c, faint_cell);
                         }

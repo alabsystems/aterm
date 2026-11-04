@@ -162,74 +162,99 @@ pub const fn encode_converse_scalars(mono0: u64, clock: u64, rand: u64, mono1: u
     ]
 }
 
-/// Decode the four scalar `u64` words `(mono0, clock, rand, mono1)` from a 32-byte
-/// little-endian array.
-#[must_use]
-pub const fn decode_converse_scalars(raw: &[u8; 32]) -> (u64, u64, u64, u64) {
-    let mono0 = (raw[0] as u64)
+const fn decode_converse_mono0(raw: &[u8; 32]) -> u64 {
+    (raw[0] as u64)
         | ((raw[1] as u64) << 8)
         | ((raw[2] as u64) << 16)
         | ((raw[3] as u64) << 24)
         | ((raw[4] as u64) << 32)
         | ((raw[5] as u64) << 40)
         | ((raw[6] as u64) << 48)
-        | ((raw[7] as u64) << 56);
-    let clock = (raw[8] as u64)
+        | ((raw[7] as u64) << 56)
+}
+
+const fn decode_converse_clock(raw: &[u8; 32]) -> u64 {
+    (raw[8] as u64)
         | ((raw[9] as u64) << 8)
         | ((raw[10] as u64) << 16)
         | ((raw[11] as u64) << 24)
         | ((raw[12] as u64) << 32)
         | ((raw[13] as u64) << 40)
         | ((raw[14] as u64) << 48)
-        | ((raw[15] as u64) << 56);
-    let rand = (raw[16] as u64)
+        | ((raw[15] as u64) << 56)
+}
+
+const fn decode_converse_rand(raw: &[u8; 32]) -> u64 {
+    (raw[16] as u64)
         | ((raw[17] as u64) << 8)
         | ((raw[18] as u64) << 16)
         | ((raw[19] as u64) << 24)
         | ((raw[20] as u64) << 32)
         | ((raw[21] as u64) << 40)
         | ((raw[22] as u64) << 48)
-        | ((raw[23] as u64) << 56);
-    let mono1 = (raw[24] as u64)
+        | ((raw[23] as u64) << 56)
+}
+
+const fn decode_converse_mono1(raw: &[u8; 32]) -> u64 {
+    (raw[24] as u64)
         | ((raw[25] as u64) << 8)
         | ((raw[26] as u64) << 16)
         | ((raw[27] as u64) << 24)
         | ((raw[28] as u64) << 32)
         | ((raw[29] as u64) << 40)
         | ((raw[30] as u64) << 48)
-        | ((raw[31] as u64) << 56);
-    (mono0, clock, rand, mono1)
+        | ((raw[31] as u64) << 56)
 }
 
-/// The question [`converse`] asks: built from the random word and the file it
-/// read, so a replay fed a wrong value asks a DIFFERENT question — which the
-/// reply door refuses as a diverged request — instead of silently receiving
-/// the recorded answer to a question it did not ask.
-pub fn ask(rand: u64, file: &[u8]) -> Vec<u8> {
-    const HEX: [u8; 16] = *b"0123456789abcdef";
-    let mut out = Vec::with_capacity(50);
-    out.extend_from_slice(b"ask rand=");
-    let hex_bytes = [
-        HEX[((rand >> 60) & 0xF) as usize],
-        HEX[((rand >> 56) & 0xF) as usize],
-        HEX[((rand >> 52) & 0xF) as usize],
-        HEX[((rand >> 48) & 0xF) as usize],
-        HEX[((rand >> 44) & 0xF) as usize],
-        HEX[((rand >> 40) & 0xF) as usize],
-        HEX[((rand >> 36) & 0xF) as usize],
-        HEX[((rand >> 32) & 0xF) as usize],
-        HEX[((rand >> 28) & 0xF) as usize],
-        HEX[((rand >> 24) & 0xF) as usize],
-        HEX[((rand >> 20) & 0xF) as usize],
-        HEX[((rand >> 16) & 0xF) as usize],
-        HEX[((rand >> 12) & 0xF) as usize],
-        HEX[((rand >> 8) & 0xF) as usize],
-        HEX[((rand >> 4) & 0xF) as usize],
-        HEX[(rand & 0xF) as usize],
-    ];
-    out.extend_from_slice(&hex_bytes);
-    out.extend_from_slice(b" len=");
-    let mut n = file.len();
+/// Decode the four scalar `u64` words `(mono0, clock, rand, mono1)` from a 32-byte
+/// little-endian array.
+#[must_use]
+pub const fn decode_converse_scalars(raw: &[u8; 32]) -> (u64, u64, u64, u64) {
+    (
+        decode_converse_mono0(raw),
+        decode_converse_clock(raw),
+        decode_converse_rand(raw),
+        decode_converse_mono1(raw),
+    )
+}
+
+const ASK_HEX: [u8; 16] = *b"0123456789abcdef";
+
+const fn ask_hex_hi(rand: u64) -> [u8; 8] {
+    [
+        ASK_HEX[((rand >> 60) & 0xF) as usize],
+        ASK_HEX[((rand >> 56) & 0xF) as usize],
+        ASK_HEX[((rand >> 52) & 0xF) as usize],
+        ASK_HEX[((rand >> 48) & 0xF) as usize],
+        ASK_HEX[((rand >> 44) & 0xF) as usize],
+        ASK_HEX[((rand >> 40) & 0xF) as usize],
+        ASK_HEX[((rand >> 36) & 0xF) as usize],
+        ASK_HEX[((rand >> 32) & 0xF) as usize],
+    ]
+}
+
+const fn ask_hex_lo(rand: u64) -> [u8; 8] {
+    [
+        ASK_HEX[((rand >> 28) & 0xF) as usize],
+        ASK_HEX[((rand >> 24) & 0xF) as usize],
+        ASK_HEX[((rand >> 20) & 0xF) as usize],
+        ASK_HEX[((rand >> 16) & 0xF) as usize],
+        ASK_HEX[((rand >> 12) & 0xF) as usize],
+        ASK_HEX[((rand >> 8) & 0xF) as usize],
+        ASK_HEX[((rand >> 4) & 0xF) as usize],
+        ASK_HEX[(rand & 0xF) as usize],
+    ]
+}
+
+const fn ask_hex_bytes(rand: u64) -> [u8; 16] {
+    let [h0, h1, h2, h3, h4, h5, h6, h7] = ask_hex_hi(rand);
+    let [l0, l1, l2, l3, l4, l5, l6, l7] = ask_hex_lo(rand);
+    [
+        h0, h1, h2, h3, h4, h5, h6, h7, l0, l1, l2, l3, l4, l5, l6, l7,
+    ]
+}
+
+const fn encode_dec_len(mut n: usize) -> ([u8; 32], usize) {
     let mut dec = [0u8; 32];
     let mut idx = 19usize;
     dec[19] = b'0' | ((n % 10) as u8);
@@ -239,6 +264,20 @@ pub fn ask(rand: u64, file: &[u8]) -> Vec<u8> {
         dec[idx & 31] = b'0' | ((n % 10) as u8);
         n /= 10;
     }
+    (dec, idx)
+}
+
+/// The question [`converse`] asks: built from the random word and the file it
+/// read, so a replay fed a wrong value asks a DIFFERENT question — which the
+/// reply door refuses as a diverged request — instead of silently receiving
+/// the recorded answer to a question it did not ask.
+pub fn ask(rand: u64, file: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(50);
+    out.extend_from_slice(b"ask rand=");
+    let hex_bytes = ask_hex_bytes(rand);
+    out.extend_from_slice(&hex_bytes);
+    out.extend_from_slice(b" len=");
+    let (dec, mut idx) = encode_dec_len(file.len());
     while idx < 20 {
         out.push(dec[idx & 31]);
         idx += 1;
@@ -295,13 +334,17 @@ pub fn converse<S: EffectSeam>(
     let clock = seam.now_nanos()?;
     let rand = seam.next_rand()?;
     let file = seam.read_file(path)?;
-    let request = ask(rand, &file);
-    let reply = seam.exchange(PEER, &request, peer)?;
-    let said = say(&reply);
+    let ask_op: fn(u64, &[u8]) -> Vec<u8> = ask;
+    let request = ask_op(rand, &file);
+    let exchange_op: fn(_, _, _, _) -> _ = EffectSeam::exchange;
+    let reply = exchange_op(seam, PEER, &request, peer)?;
+    let say_op: fn(&[u8]) -> Vec<u8> = say;
+    let said = say_op(&reply);
     seam.emit(OUT, &said)?;
     let mut stops = [false; STOP_READS];
     for read in &mut stops {
-        *read = seam.raised(STOP, stop)?;
+        let raised_op: fn(_, _, _) -> _ = EffectSeam::raised;
+        *read = raised_op(seam, STOP, stop)?;
     }
     let mono1 = seam.mono_nanos()?;
 

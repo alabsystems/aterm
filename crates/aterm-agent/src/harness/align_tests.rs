@@ -17,6 +17,7 @@ const HANG_DETECTOR: Duration = Duration::from_secs(60);
 fn temp_dir(tag: &str) -> aterm_tempfile::TempDir {
     aterm_tempfile::Builder::new()
         .prefix(&format!("aterm-align-{tag}-"))
+        .suffix(".noindex")
         .tempdir()
         .expect("the temp directory is created")
 }

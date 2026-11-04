@@ -24,10 +24,7 @@ const HANG: Duration = Duration::from_secs(60);
 
 /// A scratch root.
 fn scratch() -> aterm_tempfile::TempDir {
-    aterm_tempfile::Builder::new()
-        .prefix("agh-journal-")
-        .tempdir()
-        .expect("a scratch directory")
+    crate::test_fixtures::scratch_dir("journal")
 }
 
 /// `fixture-dev/app`.

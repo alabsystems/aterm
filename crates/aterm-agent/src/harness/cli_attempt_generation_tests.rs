@@ -131,7 +131,7 @@ impl AttemptHost<'_> {
 #[test]
 fn completed_cli_signins_recover_all_records_without_another_provider_login() {
     for cli in [Cli::Claude, Cli::Codex, Cli::Grok, Cli::Kimi] {
-        if !signs_in_here(cli) {
+        if !links_here(cli) {
             continue;
         }
         let tmp = tmp_dir("signin-commit-recovery");
@@ -528,7 +528,7 @@ fn queued_vendor_renewal_rechecks_its_original_parent_before_running_authenticat
 #[test]
 fn a_vendor_sign_in_a_person_waited_for_goes_by_what_the_wait_left() {
     for cli in [Cli::Codex, Cli::Kimi] {
-        if !signs_in_here(cli) {
+        if !links_here(cli) {
             continue;
         }
         for (renewed, runs) in [("main", false), ("other", true)] {
@@ -617,7 +617,7 @@ fn login_and_renewal_generation_admission_conform_for_every_provider() {
     for state in aterm_spec::interp::reachable_states(&model) {
         for action in &model.actions {
             if model.action_enabled(action.name, &state) {
-                if action.name == "Commit" && !signs_in_here(provider_of(&state)) {
+                if action.name == "Commit" && !links_here(provider_of(&state)) {
                     continue;
                 }
                 let next = attempt_transition(&state, action.name);

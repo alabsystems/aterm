@@ -2,12 +2,12 @@
 // Copyright 2026 Andrew Yates
 
 //! The crossed mark: the one-way line a membership log passes once it holds more records than a
-//! 0.146-0.151 build takes ([`LEGACY_RECORDS`]), and the records bound every build since states
+//! 0.146-0.152 build takes ([`LEGACY_RECORDS`]), and the records bound every build since states
 //! on the records wire ([`RecordsBound`], [`crate::transport::RECORDS_BOUND_HEADER`]).
 //!
-//! A build of 0.146-0.151 refuses a whole records stream past [`LEGACY_RECORDS`], and one whose
+//! A build of 0.146-0.152 refuses a whole records stream past [`LEGACY_RECORDS`], and one whose
 //! store is near that bound takes only the part of a stream that fits it: past a rotation's
-//! `Remove` and `Epoch`, the first of its `Wrap`s. A 0.148-0.151 member that holds such a cut
+//! `Remove` and `Epoch`, the first of its `Wrap`s. A 0.148-0.152 member that holds such a cut
 //! batch reads every member whose `Wrap` lies past the cut as left out of the newest
 //! `[everyone]` key on purpose: itself as revoked, the others as out of the fleet. So no build
 //! may hand an old one any record of a log that ever held more than [`LEGACY_RECORDS`], whole or
@@ -166,7 +166,7 @@ impl RecordsBound {
 }
 
 /// Whether a log holding `held` records has crossed by its count alone: it holds more than a
-/// 0.146-0.151 build takes.
+/// 0.146-0.152 build takes.
 #[must_use]
 pub const fn past_legacy(held: usize) -> bool {
     held > LEGACY_RECORDS
@@ -264,6 +264,11 @@ mod mark {
         /// on a parent, storing the mark first, so one record any seat ever held (a removed
         /// Mac's) signs, naming a parent that never comes, crosses it.
         pub(crate) mark_on_waiting: bool,
+        /// MUTANT: the node, crossed, serves a records GET that states no bound the first
+        /// [`LEGACY_RECORDS`](crate::membership_log::LEGACY_RECORDS) records it would serve (the
+        /// raised-bound design's capped reply) rather than the fence's `409`, so a build before
+        /// the fence takes a crossed log's prefix whole.
+        pub(crate) capped_prefix: bool,
     }
 
     #[cfg(test)]

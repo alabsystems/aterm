@@ -138,7 +138,8 @@ impl Sentinel {
         if !meta.is_file() || meta.len() > MAX_SENTINEL_BYTES {
             return None;
         }
-        let mut text = String::new();
+        let mut text =
+            String::with_capacity(usize::try_from(meta.len()).unwrap_or(0).saturating_add(1));
         file.take(MAX_SENTINEL_BYTES + 1)
             .read_to_string(&mut text)
             .ok()?;
@@ -374,12 +375,10 @@ impl Sentinel {
 mod tests {
     use super::*;
 
-    fn sentinel(label: &str) -> (Sentinel, PathBuf) {
-        let dir =
-            std::env::temp_dir().join(format!("aterm-sentinel-{label}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        (Sentinel::new(dir.join("boot.sentinel")), dir)
+    fn sentinel(label: &str) -> (Sentinel, aterm_tempfile::TempDir) {
+        let dir = crate::test_scratch_dir(&format!("sentinel-{label}"));
+        let path = dir.path().join("boot.sentinel");
+        (Sentinel::new(path), dir)
     }
 
     /// Which flush each sentinel write takes (aterm-durable's counting seam): the boot
@@ -409,27 +408,25 @@ mod tests {
         assert_eq!(recording.take(), writes(D, 1), "a launch count");
         assert_eq!(s.forgive_launch_of(9, 7, Some((1, 2))).unwrap(), Some(0));
         assert_eq!(recording.take(), writes(O, 1), "a named give-back");
-        let counter = Sentinel::ordered(dir.join("foreign-trial"));
+        let counter = Sentinel::ordered(dir.path().join("foreign-trial"));
         counter.restart_count(9).unwrap();
         assert_eq!(counter.observe_launch(9).unwrap(), 1);
         assert_eq!(recording.take(), writes(O, 2), "an ordered counter");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn healthy_boot_never_reverts() {
-        let (s, dir) = sentinel("healthy");
+        let (s, _dir) = sentinel("healthy");
         s.arm(1235).unwrap();
         assert_eq!(s.observe_launch(1235).unwrap(), 1);
         s.confirm().unwrap();
         assert!(!s.should_revert(1235, 2), "a confirmed boot never reverts");
         assert_eq!(s.read_state(), None);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn crash_loop_triggers_revert_at_max_attempts() {
-        let (s, dir) = sentinel("crash");
+        let (s, _dir) = sentinel("crash");
         s.arm(1235).unwrap();
         assert_eq!(s.observe_launch(1235).unwrap(), 1);
         assert!(
@@ -438,12 +435,11 @@ mod tests {
         );
         assert_eq!(s.observe_launch(1235).unwrap(), 2);
         assert!(s.should_revert(1235, 2), "two unconfirmed boots ⇒ revert");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_launch_the_killer_forgives_is_not_a_crash() {
-        let (s, dir) = sentinel("forgive");
+        let (s, _dir) = sentinel("forgive");
         s.arm(1235).unwrap();
         assert_eq!(s.observe_launch(1235).unwrap(), 1);
         assert_eq!(s.forgive_launch(1235).unwrap(), 0);
@@ -467,17 +463,15 @@ mod tests {
         assert_eq!(s.forgive_launch(1235).unwrap(), 0, "floored at zero");
         assert_eq!(s.forgive_launch(9999).unwrap(), 0);
         assert_eq!(s.read_state(), Some((1235, 0)));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn sentinel_for_another_build_is_preserved_and_not_counted() {
-        let (s, dir) = sentinel("stale");
+        let (s, _dir) = sentinel("stale");
         s.arm(1000).unwrap();
         assert_eq!(s.observe_launch(2000).unwrap(), 0);
         assert_eq!(s.read_state(), Some((1000, 0)));
         assert!(!s.should_revert(2000, 2));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A failed flush of the sentinel's folder fails the arm (the swap it precedes does not
@@ -519,7 +513,7 @@ mod tests {
                 Some(0)
             );
             assert!(s.named_launches(9).is_empty());
-            let counter = Sentinel::ordered(dir.join("foreign-trial"));
+            let counter = Sentinel::ordered(dir.path().join("foreign-trial"));
             counter
                 .restart_count(9)
                 .expect("a restarted count is in place too");
@@ -531,40 +525,39 @@ mod tests {
                 .expect("a folder the volume cannot flush is no failure");
         }
         assert_eq!(s.read_state(), Some((10, 0)));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_prelanding_arm_failure_preserves_the_previous_record() {
         let (s, dir) = sentinel("arm-temp-obstructed");
         s.arm(8).unwrap();
-        let tmp = dir.join(format!(".boot-sentinel.tmp-{}", std::process::id()));
+        let tmp = dir
+            .path()
+            .join(format!(".boot-sentinel.tmp-{}", std::process::id()));
         std::fs::create_dir(&tmp).unwrap();
         assert!(s.arm(9).is_err());
         assert_eq!(s.read_state(), Some((8, 0)));
         assert!(tmp.is_dir());
         std::fs::remove_dir(&tmp).unwrap();
 
-        let dir_target = Sentinel::new(dir.join("obstructed-target"));
+        let dir_target = Sentinel::new(dir.path().join("obstructed-target"));
         std::fs::create_dir(&dir_target.path).unwrap();
         assert!(dir_target.arm(9).is_err());
         assert!(
             !tmp.exists(),
             "a failed rename removes the temporary sentinel file"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn corrupt_sentinel_does_not_force_a_revert() {
-        let (s, dir) = sentinel("corrupt");
+        let (s, _dir) = sentinel("corrupt");
         std::fs::write(&s.path, "not a sentinel").unwrap();
         assert_eq!(s.read_state(), None);
         assert!(
             !s.should_revert(1235, 1),
             "garbage never forces the disruptive revert"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -588,10 +581,12 @@ mod tests {
             !s.unreadable(),
             "a directory at the path is no marker that does not read"
         );
+        #[cfg(not(unix))]
+        let _ = &dir;
         #[cfg(unix)]
         {
             std::fs::remove_dir(&s.path).unwrap();
-            let decoy = dir.join("decoy.sentinel");
+            let decoy = dir.path().join("decoy.sentinel");
             std::fs::write(&decoy, "1235 5").unwrap();
             std::os::unix::fs::symlink(&decoy, &s.path).unwrap();
             assert_eq!(
@@ -601,12 +596,11 @@ mod tests {
             );
             assert!(!s.unreadable(), "a symlink is not an unreadable marker");
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn named_launches_and_forgive_launch_of_match_pid_start_time_and_cap_at_32() {
-        let (s, dir) = sentinel("named-launches");
+        let (s, _dir) = sentinel("named-launches");
         assert!(s.named_launches(42).is_empty());
         assert_eq!(s.forgive_launch_of(42, 10, None).unwrap(), None);
 
@@ -681,7 +675,6 @@ mod tests {
         assert_eq!(kept.len(), MAX_NAMED_LAUNCHES);
         assert_eq!(kept.first().map(|n| n.pid), Some(1003));
         assert_eq!(kept.last().map(|n| n.pid), Some(1034));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// NEGATIVE CONTROL: `arm` and `confirm` refuse symlinked parent directories and symlinked
@@ -690,7 +683,7 @@ mod tests {
     #[test]
     fn arm_and_confirm_refuse_symlinked_parent_and_non_regular_target() {
         let (s, dir) = sentinel("symlink-guards");
-        let victim = dir.join("victim.txt");
+        let victim = dir.path().join("victim.txt");
         std::fs::write(&victim, "keep").unwrap();
         std::os::unix::fs::symlink(&victim, &s.path).unwrap();
 
@@ -716,10 +709,10 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
         std::fs::remove_file(&s.path).unwrap();
 
-        let outside = dir.join("outside");
+        let outside = dir.path().join("outside");
         std::fs::create_dir(&outside).unwrap();
         std::fs::write(outside.join("boot.sentinel"), "99 1").unwrap();
-        let linked_dir = dir.join("linked-parent");
+        let linked_dir = dir.path().join("linked-parent");
         std::os::unix::fs::symlink(&outside, &linked_dir).unwrap();
         let via_link = Sentinel::new(linked_dir.join("boot.sentinel"));
         assert!(
@@ -734,6 +727,5 @@ mod tests {
             std::fs::read_to_string(outside.join("boot.sentinel")).unwrap(),
             "99 1"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

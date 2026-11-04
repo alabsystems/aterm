@@ -49,8 +49,6 @@ struct Startup {
     offered: Vec<Plan>,
     /// A real local read failure that starts after the startup captured readable state.
     after_bind: Option<AfterBind>,
-    /// The admitted runs whose plan the startup offered back for the window's own answer.
-    resumed: Vec<SetupAdmission>,
 }
 
 impl Startup {
@@ -143,10 +141,6 @@ impl SetupStartup for Startup {
         }))
     }
 
-    fn offer_resume(&mut self, admission: &SetupAdmission) {
-        self.resumed.push(admission.clone());
-    }
-
     fn initial(&mut self) -> Result<Plan, String> {
         assert!(
             self.fresh,
@@ -232,7 +226,6 @@ fn startup(home: &Path) -> Startup {
         fresh: false,
         offered: Vec::new(),
         after_bind: None,
-        resumed: Vec::new(),
     }
 }
 
@@ -240,8 +233,7 @@ fn startup(home: &Path) -> Startup {
 /// window takes the launch's start, and the startup has no successor's path of its own, so on
 /// records nobody admitted a run of (a plan still pending, a rev-3 review closed unanswered, a
 /// first offer an automatic handoff let go) it admits the in-scope plan at once, and a run
-/// already admitted resumes, its plan offered back for the window's own answer (design §3.3,
-/// §6).
+/// already admitted resumes with nothing offered again (design §3.3).
 #[test]
 fn an_update_successor_admits_a_pending_plan() {
     let scratch = aterm_tempfile::tempdir().unwrap();
@@ -286,15 +278,6 @@ fn an_update_successor_admits_a_pending_plan() {
     );
     let saved = host.snapshot().unwrap().plan;
     assert!(saved.selection.contains(Setting::Permissions));
-    assert_eq!(
-        host.resumed,
-        [SetupAdmission {
-            plan: saved,
-            revision,
-            completed: false,
-        }],
-        "its plan is offered back for the window's own answer"
-    );
 }
 
 /// The window gate's scope input is the doctor's lasting refusal, through the one composition

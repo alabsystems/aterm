@@ -612,9 +612,10 @@ fn unavailable_browser_stops_the_device_driver_without_requesting_a_person() {
     }
     let tmp = aterm_tempfile::tempdir().unwrap();
     let drove = stand_in_drive_in(tmp.path(), "hold 0", &mut Unavailable);
+    assert_eq!(drove.outcome.word(), "not-run");
     assert_eq!(
         drove.outcome,
-        Outcome::Unverified("pinned browser fetch is unavailable".into())
+        Outcome::PageNotOpened("pinned browser fetch is unavailable".into())
     );
 }
 

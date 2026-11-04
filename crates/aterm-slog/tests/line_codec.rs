@@ -7,7 +7,7 @@ use aterm_slog::vocab::{
     ACT_WORDS, ASK_WORDS, BOX_WORDS, CAUSE_WORDS, CHANGE_WORDS, CLASS_WORDS, CLS_WORDS, DIR_WORDS,
     END_WORDS, FACT_RULE_WORDS, HEALED_BY_WORDS, HELD_WORDS, MAIL_KIND_WORDS, NEED_WORDS,
     NET_WORDS, ORIGIN_WORDS, OUT_WORDS, PHASE_WORDS, POOL_WORDS, SEV_WORDS, SOURCE_WORDS,
-    STATE_WORDS, VERB_WORDS, WALL_WORDS, WHY_WORDS, WORD_WORDS,
+    STATE_WORDS, TURN_BY_WORDS, VERB_WORDS, WALL_WORDS, WHY_WORDS, WORD_WORDS,
 };
 use aterm_slog::{
     Actor, Cap, Conf, DecodeError, EncodeError, FIELDS, Fields, Key, Kind, Lvl, MAX_RECORD_BYTES,
@@ -115,6 +115,7 @@ fn every_vocabulary_word_is_one_wire_token_named_once() {
         SEV_WORDS,
         HELD_WORDS,
         FACT_RULE_WORDS,
+        TURN_BY_WORDS,
     ] {
         for (i, w) in list.iter().enumerate() {
             assert!(
@@ -1432,6 +1433,72 @@ fn occupancy_fact_keys_are_appended_wire_and_an_older_reader_skips_them() {
     for key in [Key::FactRev, Key::FactRule, Key::FactN] {
         assert_eq!(read.f.get(key), None, "{key:?} skipped: {older}");
     }
+}
+
+#[test]
+fn turn_by_is_appended_wire_and_an_older_reader_skips_it() {
+    assert_eq!(
+        (Key::TurnBy.word(), Key::TurnBy.tier(), Key::TurnBy.cap()),
+        ("turn_by", Tier::Wire, Cap::Word(TURN_BY_WORDS))
+    );
+    assert_eq!(TURN_BY_WORDS, ["harness"]);
+    assert_eq!(
+        FIELDS.last().map(|(k, ..)| *k),
+        Some(Key::TurnBy),
+        "appended: every earlier key keeps its index"
+    );
+    for actor in ["human", "ctl", "vendor", "-"] {
+        assert!(
+            Fields::new().word(Key::TurnBy, actor).is_err(),
+            "{actor}: turn_by is a role a vendor's row names, never an actor"
+        );
+    }
+    let amend = |f: Fields| {
+        let mut r = rec(Op::Amend, Node::new(Lvl::Turn, 1), Kind::Turn, f);
+        (r.src, r.conf, r.by) = (Src::Transcript, Conf::Exact, Actor::Vendor);
+        r
+    };
+    let role = amend(
+        Fields::new()
+            .word(Key::TurnBy, "harness")
+            .expect("a harness turn's amend fields"),
+    );
+    let host = encode(&role, Tier::Host).expect("fits");
+    assert!(
+        host.contains(" amend t1 turn turn_by=harness by=vendor "),
+        "{host}"
+    );
+    assert_eq!(decode(&host), Ok(role.clone()), "{host}");
+    let caused = amend(Fields::new().cause("412").expect("a harness turn's cause"));
+    let host = encode(&caused, Tier::Host).expect("fits");
+    assert!(
+        host.contains(" amend t1 turn cause=412 cause_k=rec by=vendor "),
+        "{host}"
+    );
+    assert_eq!(decode(&host), Ok(caused.clone()), "{host}");
+    let wire = encode(&caused, Tier::Wire).expect("fits");
+    assert!(
+        wire.contains(" amend t1 turn cause_k=rec ") && !wire.contains(" cause="),
+        "the act's seq stays a host fact: {wire}"
+    );
+    assert!(
+        encode(&role, Tier::Wire)
+            .expect("fits")
+            .contains(" turn_by=harness "),
+        "the role goes on the bus"
+    );
+    let r = amend(
+        Fields::new()
+            .word(Key::TurnBy, "harness")
+            .and_then(|f| f.u(Key::Steps, 2))
+            .expect("a harness turn's amend fields"),
+    );
+    let wire = encode(&r, Tier::Wire).expect("fits");
+    assert_eq!(decode(&wire), Ok(r.clone()), "{wire}");
+    let older = wire.replace(" turn_by=", " zz_turn_by=");
+    let read = decode(&older).expect("an older reader still reads it");
+    assert_eq!(read.f.get(Key::TurnBy), None, "skipped: {older}");
+    assert_eq!(read.f.get(Key::Steps), Some(&Val::U(2)), "{older}");
 }
 
 #[test]

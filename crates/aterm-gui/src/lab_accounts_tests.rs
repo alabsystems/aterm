@@ -3,16 +3,69 @@
 
 use super::*;
 
+const JOURNAL_ACCOUNT: &str = "ac-0123456789abcdef";
+
+fn journal_keyer(realm: &str, email: &str) -> Option<String> {
+    match (realm, email) {
+        ("claude", "owner-a@example.test") => Some(JOURNAL_ACCOUNT.into()),
+        ("claude", "owner-b@example.test") => Some("ac-fedcba9876543210".into()),
+        _ => None,
+    }
+}
+
 fn records() -> AccountRecords {
+    let roster = accounts::Roster {
+        rows: vec![accounts::Row {
+            label: "one".into(),
+            ..Default::default()
+        }],
+    };
     AccountRecords {
-        roster: accounts::Roster {
-            rows: vec![accounts::Row {
-                label: "one".into(),
-                ..Default::default()
-            }],
-        },
+        raw_roster: roster.clone(),
+        roster,
         ..Default::default()
     }
+}
+
+fn admitted_observation(
+    records: &mut AccountRecords,
+    observe: impl FnOnce(&mut accounts::Logins) -> Vec<accounts::Event>,
+) {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let store = accounts::Store::at(root.path());
+    let path = root.path().join(accounts::ACCOUNTS_FILE);
+    std::fs::write(
+        &path,
+        accounts::append_rows_for(Cli::Claude, "", &records.raw_roster.rows).unwrap(),
+    )
+    .unwrap();
+    store
+        .observe_admitted_workflow_for_test(&path, "one", 200, |raw, state, logins| {
+            assert_eq!(raw, &records.raw_roster);
+            state.accounts.clone_from(&records.state.accounts);
+            observe(logins)
+        })
+        .unwrap();
+    *records = store.read_account_records(Some(&path), 200).unwrap();
+    assert!(
+        accounts::current_workflow(records.raw_roster.row("one").unwrap(), &records.logins)
+            .is_some()
+    );
+}
+
+fn journal_records() -> AccountRecords {
+    let mut records = records();
+    let row = &mut records.roster.rows[0];
+    row.email = Some("alias@example.test".into());
+    row.identity_email = Some("owner-a@example.test".into());
+    records.raw_roster = records.roster.clone();
+    records
+}
+
+fn project_journal(records: &AccountRecords, seen: &alab_seen::Seen, now_ms: u64) -> LabAccounts {
+    aterm_agent::harness::journal::with_keyer(journal_keyer, || {
+        project_with(records, Some(seen), now_ms)
+    })
 }
 
 fn fact<'a>(view: &'a LabAccounts, key: &str) -> &'a str {
@@ -82,18 +135,18 @@ fn recorded_human_steps_take_precedence_without_exposing_raw_routes() {
                         ..Default::default()
                     },
                 );
-                records.logins.labels.insert(
-                    "one".into(),
-                    accounts::Binding {
-                        sign_in_task: Some(accounts::SignInTask { action, at: 110 }),
-                        sign_in_attempt: outcome.map(|outcome| accounts::SignInAttempt {
+                admitted_observation(&mut records, |logins| {
+                    accounts::note_sign_in_task(logins, "one", action, 110);
+                    outcome.map_or_else(Vec::new, |outcome| {
+                        accounts::note_sign_in_attempt(
+                            logins,
+                            "one",
                             outcome,
-                            routes: "credential-marker https://private.invalid/code secret@example.invalid".into(),
-                            since: 120,
-                        }),
-                        ..Default::default()
-                    },
-                );
+                            "credential-marker https://private.invalid/code secret@example.invalid",
+                            120,
+                        )
+                    })
+                });
                 let before = records.clone();
                 let view = project(&records, 200_000);
                 assert_eq!(
@@ -120,6 +173,61 @@ fn recorded_human_steps_take_precedence_without_exposing_raw_routes() {
                 }
                 assert_eq!(records, before);
             }
+        }
+    }
+}
+
+#[test]
+fn historical_workflow_records_do_not_drive_current_next_steps() {
+    for task_retired in [false, true] {
+        for attempt_retired in [false, true] {
+            let mut records = records();
+            records.logins = accounts::Logins::from_json(
+                &aterm_json::json!({
+                    "schema": accounts::LOGINS_SCHEMA,
+                    "generation_clock": 0,
+                    "workflow_clock": 1,
+                    "workflows": {
+                        "one": {
+                            "token": 1,
+                            "policy": null,
+                            "own_dir": null,
+                            "dir": null,
+                            "legacy_origin": "one",
+                            "task_retired": task_retired,
+                            "attempt_retired": attempt_retired
+                        }
+                    },
+                    "labels": {
+                        "one": {
+                            "dir": null,
+                            "was": [],
+                            "renewal_generation": 0,
+                            "sign_in_task": { "action": "browser", "at": 110 },
+                            "sign_in_attempt": {
+                                "outcome": "failed",
+                                "routes": "private-workflow-route",
+                                "since": 120
+                            }
+                        }
+                    }
+                })
+                .to_string(),
+                200,
+            )
+            .unwrap();
+            let before = records.clone();
+            let view = project(&records, 200_000);
+            assert_eq!(
+                fact(&view, "Sign-in task observed"),
+                recorded_time(Some(110))
+            );
+            assert_eq!(fact(&view, "Attempt observed"), recorded_time(Some(120)));
+            assert!(fact(&view, "Sign-in task applicability").starts_with("Historical only"));
+            assert!(fact(&view, "Attempt applicability").starts_with("Historical only"));
+            assert!(view.rows[0].facts.iter().all(|(key, _)| key != "Next step"));
+            assert!(!format!("{view:?}").contains("private-workflow-route"));
+            assert_eq!(records, before);
         }
     }
 }
@@ -338,19 +446,15 @@ fn automatic_failure_guidance_does_not_invent_a_human_step_or_expose_routes() {
                     ..Default::default()
                 },
             );
-            records.logins.labels.insert(
-                "one".into(),
-                accounts::Binding {
-                    sign_in_attempt: Some(accounts::SignInAttempt {
-                        outcome,
-                        routes:
-                            "credential-marker https://private.invalid/code secret@example.invalid"
-                                .into(),
-                        since: 120,
-                    }),
-                    ..Default::default()
-                },
-            );
+            admitted_observation(&mut records, |logins| {
+                accounts::note_sign_in_attempt(
+                    logins,
+                    "one",
+                    outcome,
+                    "credential-marker https://private.invalid/code secret@example.invalid",
+                    120,
+                )
+            });
             let before = records.clone();
             let view = project(&records, 200_000);
             assert_recovery_inspection(&view);
@@ -638,17 +742,18 @@ fn invalid_times_are_unknown_and_future_quota_does_not_claim_current_capacity() 
     assert!(fact(&view, "Last observed sign-in").contains("not checked now"));
 }
 
-/// A row whose account the lab journal knows shows who last used it, where it is signed in and
-/// each window, by its learned account key; a row of another key shows none of it.
-/// NEGATIVE CONTROL: with `project_with` skipping `journal_facts`, the first `fact` lookup panics
-/// (`fact`).
+/// A row whose account the lab journal knows shows who last used it, retained sign-in records
+/// with their ages, and each window, by its current identity. A row edited to another identity
+/// shows none of the old account's journal facts, even while its stored key names the old one.
+/// NEGATIVE CONTROL: using the stored account key keeps the old journal facts after the
+/// identity edit, failing the assertion that none remain.
 #[test]
 fn a_row_shows_what_the_lab_journal_says_of_its_account() {
-    let mut records = records();
+    let mut records = journal_records();
     records.state.accounts.insert(
         "one".into(),
         accounts::Account {
-            pk: Some("ac-0123456789abcdef".into()),
+            pk: Some(JOURNAL_ACCOUNT.into()),
             ..Default::default()
         },
     );
@@ -657,17 +762,24 @@ fn a_row_shows_what_the_lab_journal_says_of_its_account() {
         ..Default::default()
     };
     seen.accounts.insert(
-        "ac-0123456789abcdef".into(),
+        JOURNAL_ACCOUNT.into(),
         alab_seen::AccountSeen {
             last_use: Some(alab_seen::LastUse {
                 by: "m17".into(),
                 t: 200 - 7_200,
             }),
-            signed_in: vec![alab_seen::SignedIn {
-                on: "m17".into(),
-                state: "in".into(),
-                t: 100,
-            }],
+            signed_in: vec![
+                alab_seen::SignedIn {
+                    on: "m17".into(),
+                    state: "in".into(),
+                    t: 100,
+                },
+                alab_seen::SignedIn {
+                    on: "m3".into(),
+                    state: "out".into(),
+                    t: 500,
+                },
+            ],
             windows: vec![alab_seen::WindowSeen {
                 window: "5h".into(),
                 sub: None,
@@ -681,24 +793,43 @@ fn a_row_shows_what_the_lab_journal_says_of_its_account() {
             history: Vec::new(),
         },
     );
-    let view = project_with(&records, Some(&seen), 200_000);
+    let original = seen.clone();
+    let view = project_journal(&records, &seen, 200_000);
     assert_eq!(
         fact(&view, "Last used by (lab journal)"),
         "m17, about 2 h ago (its clock)"
     );
-    assert_eq!(fact(&view, "Signed in on (lab journal)"), "m17 (in)");
+    assert_eq!(
+        fact(&view, "Sign-in records (lab journal)"),
+        "m17 (in), about 1 min ago (its clock); m3 (out), 5 min ahead (its clock)"
+    );
     assert_eq!(
         fact(&view, "Lab 5h quota"),
-        "5h 42% used, reset unknown, read 1 min ago on m17 (statusline)"
+        "5h 42% used, reset unknown, read on m17, about 1 min ago (its clock) (statusline)"
     );
-    records.state.accounts.get_mut("one").unwrap().pk = Some("ac-ffffffffffffffff".into());
-    let other = project_with(&records, Some(&seen), 200_000);
+    let later = project_journal(&records, &seen, 3_800_000);
+    assert_eq!(
+        fact(&later, "Sign-in records (lab journal)"),
+        "m17 (in), about 1 h ago (its clock); m3 (out), about 55 min ago (its clock)"
+    );
+    assert_eq!(
+        fact(&later, "Lab 5h quota"),
+        "5h 42% used, reset unknown, read on m17, about 1 h ago (its clock) (statusline)"
+    );
+    records.roster.rows[0].identity_email = Some("owner-b@example.test".into());
+    records.raw_roster = records.roster.clone();
+    let other = project_journal(&records, &seen, 200_000);
     assert!(
         !other.rows[0]
             .facts
             .iter()
             .any(|(key, _)| key.contains("lab journal"))
     );
+    assert_eq!(
+        records.state.accounts["one"].pk.as_deref(),
+        Some(JOURNAL_ACCOUNT)
+    );
+    assert_eq!(seen, original);
 }
 
 /// A fresh Lab metadata projection must not repeat a cached journal wall or positive quota
@@ -707,12 +838,11 @@ fn a_row_shows_what_the_lab_journal_says_of_its_account() {
 /// beside the local quota's already withdrawn reading.
 #[test]
 fn lab_account_refresh_ages_cached_journal_windows_without_reading_again() {
-    const KEY: &str = "ac-0123456789abcdef";
-    let mut records = records();
+    let mut records = journal_records();
     records.state.accounts.insert(
         "one".into(),
         accounts::Account {
-            pk: Some(KEY.into()),
+            pk: Some(JOURNAL_ACCOUNT.into()),
             windows: [(
                 accounts::SESSION_LIMIT.into(),
                 accounts::WindowFig {
@@ -738,15 +868,17 @@ fn lab_account_refresh_ages_cached_journal_windows_without_reading_again() {
         read: Some((200, "m17".into(), "statusline".into())),
         wall_until,
     };
+    let mut future_read = window("credits", None, Some(None));
+    future_read.read = Some((350, "m17".into(), "statusline".into()));
     let seen = alab_seen::Seen {
         at: 200,
         accounts: [(
-            KEY.into(),
+            JOURNAL_ACCOUNT.into(),
             alab_seen::AccountSeen {
                 windows: vec![
                     window("5h", Some(300), Some(Some(300))),
                     window("7d", Some(400), Some(Some(400))),
-                    window("credits", None, Some(None)),
+                    future_read,
                     window("day", None, None),
                 ],
                 ..Default::default()
@@ -755,18 +887,22 @@ fn lab_account_refresh_ages_cached_journal_windows_without_reading_again() {
         .into(),
     };
     let original = seen.clone();
-    let before = project_with(&records, Some(&seen), 299_000);
+    let before = project_journal(&records, &seen, 299_000);
     assert!(fact(&before, "5-hour quota").contains("100%"));
     assert!(fact(&before, "Lab 5h quota").contains("100% used"));
     assert!(fact(&before, "Lab 5h quota").contains("at its limit"));
+    assert!(
+        fact(&before, "Lab credits quota")
+            .contains("read on m17, 51 s ahead (its clock) (statusline)")
+    );
     for now_ms in [300_000, 301_000] {
-        let view = project_with(&records, Some(&seen), now_ms);
+        let view = project_journal(&records, &seen, now_ms);
         assert_eq!(view.observed_at_ms, Some(now_ms));
         assert!(fact(&view, "5-hour quota").starts_with("Unknown"));
         let expired = fact(&view, "Lab 5h quota");
         assert!(expired.contains("not read since"), "{expired}");
         assert!(!expired.contains('%') && !expired.contains("at its limit"));
-        assert!(expired.contains("m17 (statusline)"));
+        assert!(expired.contains("read on m17, about 1 min ago (its clock) (statusline)"));
         let future = fact(&view, "Lab 7d quota");
         assert!(future.contains("100% used") && future.contains("at its limit until"));
         let unknown_wall = fact(&view, "Lab credits quota");
@@ -776,5 +912,11 @@ fn lab_account_refresh_ages_cached_journal_windows_without_reading_again() {
         assert!(unknown_reset.contains("100% used, reset unknown"));
         assert!(!unknown_reset.contains("at its limit"));
     }
+    let later = project_journal(&records, &seen, 360_000);
+    assert!(fact(&later, "Lab 5h quota").contains("not read since"));
+    assert!(
+        fact(&later, "Lab credits quota")
+            .contains("read on m17, about 10 s ago (its clock) (statusline)")
+    );
     assert_eq!(seen, original);
 }

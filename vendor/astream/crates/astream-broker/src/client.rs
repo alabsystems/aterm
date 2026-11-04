@@ -864,6 +864,20 @@ impl<S: Read + Write> Client<S> {
         self.ext.supports_stats()
     }
 
+    /// Whether the latest `Hello` answer announced that this broker GAP-FENCES each
+    /// producer's writes on a connection that asks ([`fence_gaps`](Self::fence_gaps),
+    /// [`REQUEST_GAP_FENCES`](crate::REQUEST_GAP_FENCES)): once one is refused, every later
+    /// one of that producer sent on this connection above the refused sequence is refused
+    /// `gap-fenced=<seq>` in send order, until a write at or under it commits, the connection
+    /// closes, or [`clear_gap_fences`](Self::clear_gap_fences) lifts them. So a producer that
+    /// asked may keep several writes in flight whose order must hold on the log: a refused
+    /// one lets nothing sent after it land. `false` before any `Hello`, against a broker
+    /// opened without `OpenOptions::sticky_batch_refusal` (where a refused batch is rolled
+    /// back and the next write lands), and against one that predates it.
+    pub const fn supports_gap_fences(&self) -> bool {
+        self.ext.supports_gap_fences()
+    }
+
     /// The log's health as the latest `Hello` answer told it
     /// ([`HelloHealth`](crate::HelloHealth)): whether it is POISONED — it refuses every
     /// write until it is reopened — and why, and the flushes it has issued since it
@@ -1811,6 +1825,48 @@ impl<S: Read + Write> Client<S> {
         };
         self.broker_times = Some(took);
         Ok(took)
+    }
+
+    /// LIFT THIS CONNECTION'S GAP FENCES ([`Request::ClearGapFences`]): the broker answers
+    /// once every write sent before it is answered, then drops every fence this
+    /// connection's refused writes set ([`supports_gap_fences`](Self::supports_gap_fences)),
+    /// so the next write is judged afresh. Send it only once the answer to every write
+    /// sent before it has been READ, and each refused one is known: a write sent after it
+    /// lands though one sent before it was refused. A broker that holds no fence answers
+    /// the same, `Ok(true)`; one that predates the verb (`ERR_REFUSED`) returns `Ok(false)`
+    /// and leaves the stream framed.
+    ///
+    /// As for `fetch`, no pipelined publish may be awaiting its acknowledgement: while one
+    /// is, the request is refused with [`AcksOwed`] and nothing is sent.
+    pub fn clear_gap_fences(&mut self) -> io::Result<bool> {
+        self.send(&Request::ClearGapFences)?;
+        match self.read_mark() {
+            Ok(_) => Ok(true),
+            Err(e) if is_refused_error(&e) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// ASK THE BROKER TO GAP-FENCE THIS CONNECTION'S WRITES ([`Request::FenceGaps`]) for
+    /// the rest of its life: the broker answers once every write sent before it is
+    /// answered (each judged unfenced), and from then a refused write fences every later
+    /// one of its producer above its sequence, until a write at or under it commits,
+    /// [`clear_gap_fences`](Self::clear_gap_fences) lifts it, or the connection closes.
+    /// `Ok(true)`: the connection is fenced. `Ok(false)`: a broker opened without
+    /// `OpenOptions::sticky_batch_refusal`, or one that predates the verb (`ERR_REFUSED`),
+    /// keeps none; the stream stays framed and the connection unfenced, so a producer keeps
+    /// one write in flight whose order must hold. Ask where
+    /// [`supports_gap_fences`](Self::supports_gap_fences) says the broker keeps them.
+    ///
+    /// As for `fetch`, no pipelined publish may be awaiting its acknowledgement: while one
+    /// is, the request is refused with [`AcksOwed`] and nothing is sent.
+    pub fn fence_gaps(&mut self) -> io::Result<bool> {
+        self.send(&Request::FenceGaps)?;
+        match self.read_mark() {
+            Ok(_) => Ok(true),
+            Err(e) if is_refused_error(&e) => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     fn ensure_broker_times(&mut self) -> io::Result<bool> {

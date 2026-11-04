@@ -9,7 +9,7 @@ use super::*;
 use crate::{
     alab::registry::{ADDRESS, COLLECTIONS, MACHINE_FACTS, PROVIDER, REGISTRY},
     catalog::release::Kept,
-    table::tests::{Lab, repair_commons, repair_commons_among},
+    table::tests::{Lab, repair_commons, repair_commons_among_first, repair_commons_first},
     typed::{cell::Field, owned},
 };
 use aterm_secrets::commons::roster::Role;
@@ -355,9 +355,13 @@ fn a_roll_restates_everything_and_releases_the_sealed_generation() {
 /// heard the seal, edit the first generation; m1's owner edits the same cell in the second.
 /// After the heal neither m2 nor m3 releases the first generation, since m1's cover does not
 /// carry m2's late record; m3's roll carries it, merged beside m1's edit as a conflict; then
-/// every Mac releases it and all three read alike. NEGATIVE CONTROLS: with `within` always
-/// true, m2 releases right after the heal and its `NotCarried` assertion fails; with `restate`
-/// writing the late candidates alone, m1's edit is lost and the conflict assertion fails.
+/// every Mac releases it and all three read alike. Each repair names the table that moved, as a
+/// push does, in as many rounds as that record needs to reach all three (two where a peer wrote
+/// it: m1 in the first, the other peer in the second);
+/// `a_roll_restates_everything_and_releases_the_sealed_generation` holds the regular scan across
+/// generations. NEGATIVE CONTROLS: with `within` always true, m2 releases right after the heal and
+/// its `NotCarried` assertion fails; with `restate` writing the late candidates alone, m1's edit is
+/// lost and the conflict assertion fails.
 #[test]
 fn a_late_edit_is_carried_before_its_mac_releases() {
     let lab = Lab::new(&[Role::Writer, Role::Writer, Role::Writer]);
@@ -365,18 +369,24 @@ fn a_late_edit_is_carried_before_its_mac_releases() {
     macs[0].open().unwrap();
     macs[0].seed().unwrap();
     macs[0].write(vec![facts(&lab, 0, "m1")]).unwrap();
-    repair_commons(&lab, 6);
+    let trust = lab.bootstrap(0).trust();
+    let catalog = crate::catalog::scope(trust).digest();
+    let g1 = att::REGISTRY.descriptor(trust).unwrap().scope.digest();
+    let g2 = att::REGISTRY_2.descriptor(trust).unwrap().scope.digest();
+    repair_commons_first(&lab, 1, catalog);
+    repair_commons_first(&lab, 1, g1);
     macs[2].write(vec![facts(&lab, 2, "m3")]).unwrap();
-    repair_commons(&lab, 6);
+    repair_commons_first(&lab, 2, g1);
     let now = [aterm_time::unix_secs().unwrap(); 3];
 
     // m1 restates; m2 and m3 hear the second generation and declare it on their release pass,
     // as every Mac running this build does on a claims write.
     assert_eq!(macs[0].roll(true, now_ms()).unwrap().waiting.len(), 2);
-    repair_commons(&lab, 6);
+    repair_commons_first(&lab, 1, catalog);
+    repair_commons_first(&lab, 1, g2);
     release(&lab, 1);
     release(&lab, 2);
-    repair_commons(&lab, 6);
+    repair_commons_first(&lab, 2, catalog);
 
     // The cut: m1 alone seals, then edits the second generation.
     let rolled = macs[0].roll(true, now_ms()).unwrap();
@@ -397,10 +407,11 @@ fn a_late_edit_is_carried_before_its_mac_releases() {
             json!("https://two.example.test"),
         )]])
         .unwrap();
-    repair_commons_among(&lab, 6, &[1, 2], &now);
+    repair_commons_among_first(&lab, 1, &[1, 2], &now, g1);
 
     // The heal.
-    repair_commons(&lab, 6);
+    repair_commons_first(&lab, 1, catalog);
+    repair_commons_first(&lab, 1, g2);
     for (n, registry) in macs.iter().enumerate() {
         assert_eq!(registry.generation().generation, 2, "m{}", n + 1);
     }
@@ -420,7 +431,7 @@ fn a_late_edit_is_carried_before_its_mac_releases() {
     assert_eq!((late.from, late.to, late.sealed), (1, 2, false));
     assert!(late.registers >= 1 && late.cover, "{late:?}");
     assert_eq!(late.released.released, vec![first]);
-    repair_commons(&lab, 6);
+    repair_commons_first(&lab, 2, g2);
     assert_eq!(release(&lab, 1).released, vec![first]);
     let views: Vec<View> = macs.iter().map(|r| r.view().unwrap()).collect();
     let site = &views[0].project(&PROVIDER).rows["anthropic"].fields["site"];

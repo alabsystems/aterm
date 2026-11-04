@@ -237,7 +237,11 @@ impl ZshDir {
 pub(crate) const SYSTEM_ZSHENV: [&str; 2] = ["/etc/zshenv", "/etc/zsh/zshenv"];
 
 /// How long zsh's zshenv files get to answer: the login-PATH probe's budget.
+#[cfg(not(test))]
 const ASK_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+/// Unit tests: the hang detector, since every zsh these tests ask answers.
+#[cfg(test)]
+const ASK_BUDGET: std::time::Duration = aterm_spec::wait::MUST_HAPPEN;
 
 /// The answer marker's prefix; each query adds a fresh nonce to distinguish startup output.
 const MARK: &str = "atpkg-zdotdir:";

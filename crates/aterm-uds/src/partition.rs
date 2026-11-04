@@ -71,8 +71,25 @@ fn cut_text() -> Option<String> {
     }
     #[cfg(all(debug_assertions, not(test)))]
     {
+        use std::io::Read as _;
+        const MAX_SEAM_BYTES: u64 = 64 * 1024;
         let file = std::env::var_os(SEAM)?;
-        Some(std::fs::read_to_string(file).unwrap_or_default())
+        let text = crate::regular_file::open(std::path::Path::new(&file))
+            .ok()
+            .filter(|(_, meta)| meta.len() <= MAX_SEAM_BYTES)
+            .and_then(|(opened, meta)| {
+                let cap = usize::try_from(meta.len().min(MAX_SEAM_BYTES))
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                let mut buf = String::with_capacity(cap);
+                opened
+                    .take(MAX_SEAM_BYTES + 1)
+                    .read_to_string(&mut buf)
+                    .ok()?;
+                (buf.len() as u64 <= MAX_SEAM_BYTES).then_some(buf)
+            })
+            .unwrap_or_default();
+        Some(text)
     }
     #[cfg(not(all(debug_assertions, not(test))))]
     {

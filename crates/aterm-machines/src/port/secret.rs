@@ -161,7 +161,7 @@ pub(super) enum Read {
     /// ahead of it are no answer to it).
     Hidden,
     /// With echo off, keeping what was typed before the read (a line another program typed
-    /// ahead, as System State types the Command Line Tools tab's go line once it landed).
+    /// ahead, as System State types the Mac Setup tab's go line once it landed).
     HiddenKept,
 }
 
@@ -388,7 +388,7 @@ mod tests {
         while typing.read(&mut echo).is_ok_and(|n| n > 0) {}
     }
 
-    /// System State types the Command Line Tools tab's go line as soon as the tab lands, often
+    /// System State types the Mac Setup tab's go line as soon as the tab lands, often
     /// before the tab's program reaches its read: the reader with echo off that keeps what was
     /// typed ahead (the go line's) reads that line, where one that discarded it would wait for a
     /// line the window never types again.

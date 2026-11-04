@@ -219,7 +219,8 @@ fn session_log_tail(lock: &Path, cap: u64) -> Option<String> {
     let len = meta.len();
     let from = len.saturating_sub(cap);
     f.seek(SeekFrom::Start(from)).ok()?;
-    let mut bytes = Vec::new();
+    let init = usize::try_from(len.saturating_sub(from).min(cap).saturating_add(1)).unwrap_or(0);
+    let mut bytes = Vec::with_capacity(init);
     f.take(cap).read_to_end(&mut bytes).ok()?;
     let text = String::from_utf8_lossy(&bytes).into_owned();
     Some(if from > 0 {
@@ -1131,24 +1132,26 @@ fn carry_in_flight_with(
 }
 
 /// Whether Muse Code's composer on `scr` is empty ([`aterm_phase::ScreenReader::placeholder_fg`]),
-/// its first glyph read as the loop reads it ([`crate::supervise::screen::composer_glyph_cell`]).
+/// its first glyph read as the loop reads it ([`crate::supervise::screen::composer_glyph_cell`]),
+/// and no prompt-history search stands over it ([`aterm_phase::muse::history_search`]): keys would
+/// type into its query.
 fn composer_empty(c: &mut Client, tab: &str, scr: &super::Screen) -> bool {
+    if aterm_phase::muse::history_search(&scr.rows) {
+        return false;
+    }
     let Some((caret, lines)) = aterm_phase::muse::composer_draft(&scr.rows) else {
         return false;
     };
-    if lines.iter().all(|l| l.trim().is_empty()) {
-        return true;
-    }
     let hint = aterm_phase::Program::Muse.reader().placeholder_fg();
-    lines.iter().skip(1).all(|l| l.trim().is_empty())
-        && scr.cursor == Some((caret, 2))
-        && scr.first.checked_add(caret).is_some_and(|at| {
+    crate::supervise::screen::composer_holds_no_draft(scr.cursor, caret, &lines, || {
+        scr.first.checked_add(caret).is_some_and(|at| {
             crate::supervise::screen::composer_glyph_cell(|col| {
                 c.request_line(&format!("@{tab} cell {at} {col}")).ok()
             })
             .and_then(|line| crate::supervise::screen::cell_is_placeholder(&line, hint))
                 == Some(true)
         })
+    })
 }
 
 /// The last look before typing into Muse Code's composer, returning the screen's generation.

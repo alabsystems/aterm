@@ -794,7 +794,7 @@ fn a_verified_fda_grant_recovers_a_waiting_restore_with_permissions_held() {
     assert!(!RECOVERY.with(|state| state.borrow().0));
     assert_eq!(records().len(), before, "a completed fact is no admission");
     assert!(held.access_revision().is_none());
-    assert!(held.admitted_access().is_none());
+    assert!(!held.person_permission_admission_stands());
 }
 
 /// The Local Network step: nothing before an approved revision; then once per revision, first,
@@ -1106,114 +1106,6 @@ fn a_local_network_step_recovers_its_record_without_triggering_again() {
     WRITES.with(|writes| *writes.borrow_mut() = None);
 }
 
-/// A completed debugger change is not repeated while its outcome waits for
-/// writable history, including after its page closes and Permissions is held.
-#[test]
-fn a_completed_debugger_step_recovers_its_record_after_the_page_closes() {
-    use crate::debugger_access::{DebuggerStepQueue, Outcome};
-    use aterm_containment::consent::DebuggerChange;
-    use aterm_types::macos_setup::access_record;
-
-    access_record::code_subject_from(|| Some([0x54; 32]));
-
-    let root = aterm_tempfile::tempdir().unwrap();
-    let revision = 8_220;
-    access_record::append(
-        root.path(),
-        revision - 1,
-        Access::Debugger,
-        AccessOutcome::Granted,
-    )
-    .unwrap();
-    access_record::append(
-        root.path(),
-        revision,
-        Access::LocalNetwork,
-        AccessOutcome::Triggered,
-    )
-    .unwrap();
-    access_record::append(
-        root.path(),
-        revision,
-        Access::Debugger,
-        AccessOutcome::Handed,
-    )
-    .unwrap();
-    let earlier = access_record::read(root.path(), revision - 1);
-    let record = root.path().join(access_record::FILE);
-    let retained = root.path().join("retained-access-record");
-    std::fs::rename(&record, &retained).unwrap();
-    std::fs::create_dir(&record).unwrap();
-
-    let mut app = App::headless_for_test();
-    app.access_steps.set_reach(StepsReach::INERT);
-    app.debugger_launch = DebuggerStepQueue::queued_for_test(|| Some("MAC-RECORD-RETRY"))
-        .recording_in(Some(root.path().to_owned()));
-    approve(&mut app, revision);
-    assert!(app.open_system_state_tab());
-    let wid = app.frontmost_window.unwrap();
-    let (_, view) = app.active_native_view(wid).unwrap();
-    app.debugger_launch.note_started(revision);
-    app.debugger_launch.end();
-    app.debugger_launch.record(revision, AccessOutcome::Handed);
-    app.debugger_launch.record_written_for_test();
-    app.note_system_state_debugger_outcome(Outcome::NotChanged(DebuggerChange::On));
-    app.debugger_launch.record_written_for_test();
-    assert_eq!(app.debugger_launch.started(), None);
-    assert!(!app.debugger_launch.queued());
-    assert_eq!(
-        access_record::latest(root.path(), revision, Access::Debugger),
-        None,
-        "the completed outcome could not be saved"
-    );
-
-    std::fs::remove_dir(&record).unwrap();
-    std::fs::rename(&retained, &record).unwrap();
-    assert_eq!(
-        access_record::latest(root.path(), revision, Access::Debugger),
-        Some(AccessOutcome::Handed)
-    );
-    app.close_active_native_tab(wid).unwrap();
-    assert!(app.native_runtime.view_state(view).is_none());
-    app.hold_initial_setup_permissions();
-    app.config.privacy = Some(crate::app_config::PrivacyConfig {
-        enabled: Some(false),
-        ..Default::default()
-    });
-    assert_eq!(app.access_revision(), None);
-    let mut now = Instant::now();
-    assert!(
-        app.next_access_step_deadline(now).is_some(),
-        "the completed outcome keeps its save deadline without a page or permission effects"
-    );
-    for _ in 0..3 {
-        let Some(deadline) = app.next_access_step_deadline(now) else {
-            break;
-        };
-        now = deadline;
-        app.settle_access_steps(now);
-        app.debugger_launch.record_written_for_test();
-    }
-    assert_eq!(
-        access_record::latest(root.path(), revision, Access::Debugger),
-        Some(AccessOutcome::Declined),
-        "normal settlement saves the completed change without another macOS step"
-    );
-    assert_eq!(
-        access_record::latest(root.path(), revision, Access::LocalNetwork),
-        Some(AccessOutcome::Triggered)
-    );
-    assert_eq!(access_record::read(root.path(), revision - 1), earlier);
-    assert!(!app.debugger_launch.queued());
-    assert_eq!(app.debugger_launch.started(), None);
-    let saved = access_record::read(root.path(), revision);
-    app.note_system_state_debugger_outcome(Outcome::NotChanged(DebuggerChange::On));
-    app.settle_access_steps(now + super::ACCESS_RECORD_RETRY);
-    app.debugger_launch.record_written_for_test();
-    assert_eq!(access_record::read(root.path(), revision), saved);
-    assert_eq!(app.next_access_step_deadline(now), None);
-}
-
 /// The worker cannot acquire the shared dialog slot in either the trigger or
 /// its record's wake. The slot stays owned for the alert hold, a failed trigger
 /// releases it for the next step, and an inert headless lane never takes it.
@@ -1472,6 +1364,61 @@ fn the_local_network_step_reads_a_door_ask_as_its_question() {
     assert_eq!(app.access_steps.local_network_done, Some(61));
     app.tick_local_network_step(now + LOCAL_NETWORK_ALERT_HOLD);
     assert_eq!(records().len(), recorded + 1, "once");
+}
+
+/// A first LAN use asked macOS through the door, and the step, reading that ask as its question,
+/// started the LAN re-probe: once the re-probe hears the answer (a LAN server answered, or macOS
+/// refused a `.local` lookup), the door's hold of the question ends, so a walk waiting on the
+/// dialog slot goes on. A re-probe that heard nothing in its 30 s, or another revision's, ends
+/// nothing: the hold is left to the person's time or the door's watch. NEGATIVE CONTROLS: with
+/// the `end_door_hold` call taken out of `on_local_network_probe_ready` no answer ends the
+/// door's hold; with it moved out of the `probe_heard_an_answer` branch an unanswered re-probe
+/// ends it.
+#[test]
+fn the_re_probe_hearing_the_answer_ends_the_doors_hold() {
+    use super::LocalNetworkProbe;
+    use std::cell::Cell;
+
+    type Heard = Option<(u64, LocalNetworkProbe)>;
+    thread_local! {
+        static OUTCOME: Cell<Heard> = const { Cell::new(None) };
+        static PROBES: Cell<u32> = const { Cell::new(0) };
+        static ENDED: Cell<u32> = const { Cell::new(0) };
+    }
+    let reach = StepsReach {
+        door_asked: || true,
+        start_local_network_probe: |_| PROBES.with(|probes| probes.set(probes.get() + 1)),
+        take_local_network_probe: || OUTCOME.with(Cell::take),
+        end_door_hold: || {
+            ENDED.with(|ended| ended.set(ended.get() + 1));
+            true
+        },
+        ..stepping()
+    };
+    let now = Instant::now();
+    for (probe, ends) in [
+        (LocalNetworkProbe::Granted, 1),
+        (LocalNetworkProbe::Refused, 1),
+        (LocalNetworkProbe::Unanswered, 0),
+    ] {
+        let mut app = App::headless_for_test();
+        app.access_steps.set_reach(reach);
+        approve(&mut app, 71);
+        PROBES.with(|probes| probes.set(0));
+        ENDED.with(|ended| ended.set(0));
+        app.tick_local_network_step(now);
+        assert_eq!(
+            PROBES.with(Cell::get),
+            1,
+            "{probe:?}: the step read the door's ask and started the re-probe"
+        );
+        OUTCOME.with(|outcome| outcome.set(Some((70, probe))));
+        app.on_local_network_probe_ready(now + Duration::from_secs(1));
+        assert_eq!(ENDED.with(Cell::get), 0, "{probe:?}: another revision's");
+        OUTCOME.with(|outcome| outcome.set(Some((71, probe))));
+        app.on_local_network_probe_ready(now + Duration::from_secs(31));
+        assert_eq!(ENDED.with(Cell::get), ends, "{probe:?}");
+    }
 }
 
 /// The `[privacy]` switches that hold System State's steps, and the Local Network step's reason
@@ -3503,7 +3450,10 @@ fn a_debugger_turned_off_on_record_is_the_rows_opt_out_at_launch() {
     ];
     for (name, observed, want) in cases {
         let app = launched(observed);
-        assert!(app.admitted_access().is_none(), "{name}: no admission");
+        assert!(
+            !app.person_permission_admission_stands(),
+            "{name}: no admission"
+        );
         assert_eq!(
             app.access_opt_outs(),
             [None, None, want, None],
@@ -6698,7 +6648,7 @@ fn a_switch_off_at_launch_holds_the_access_check_until_it_is_on() {
 
 /// Once every switch is on, a re-run access check that can give no verdict (no worker starts
 /// here; one that never answers runs out of attempts the same way) leaves the Full Disk Access
-/// hand-over unasked, so the debugger step and the folders that wait on it go on.
+/// hand-over unasked, so the folders that wait on it go on.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_check_run_again_that_gives_no_verdict_holds_nothing_back() {
@@ -7782,7 +7732,7 @@ fn every_end_of_an_alert_watch_makes_one_record_of_its_kind() {
         finish_alert_watch(
             end,
             looks,
-            9,
+            super::Watched::Step(9),
             baseline,
             |answered| {
                 left.set(answered && live);
@@ -7795,7 +7745,7 @@ fn every_end_of_an_alert_watch_makes_one_record_of_its_kind() {
         assert_eq!(
             records,
             [super::AlertWatchReport {
-                revision: 9,
+                watched: super::Watched::Step(9),
                 ended,
                 baseline,
             }],
@@ -7848,6 +7798,8 @@ enum WatchEvent {
     Woke,
     /// It ended, with this record.
     Logged(super::AlertWatchReport),
+    /// A door's watch told the door's hold that this pass's question was answered.
+    Answered(u64),
 }
 
 /// A live alert watch's worker ([`super::run_alert_watch`]) driven through a scripted window
@@ -7860,6 +7812,30 @@ struct ScriptedWatch {
 impl ScriptedWatch {
     /// The worker's reach, wired to a new script, with `pace`.
     fn new(pace: super::AlertWatchPace) -> (super::AlertWatchIo, Self) {
+        let (io, watch, _) = Self::wired(pace);
+        (io, watch)
+    }
+
+    /// [`Self::new`], and what a door's watch tells the door's hold
+    /// ([`super::start_door_alert_watch`]'s `answered`), which the script hears as
+    /// [`WatchEvent::Answered`].
+    fn for_door(
+        pace: super::AlertWatchPace,
+    ) -> (super::AlertWatchIo, Self, impl Fn(u64) + Send + 'static) {
+        let (io, watch, sent) = Self::wired(pace);
+        (io, watch, move |pass| {
+            let _ = sent.send(WatchEvent::Answered(pass));
+        })
+    }
+
+    /// [`Self::new`], and a sender of the script's events.
+    fn wired(
+        pace: super::AlertWatchPace,
+    ) -> (
+        super::AlertWatchIo,
+        Self,
+        std::sync::mpsc::Sender<WatchEvent>,
+    ) {
         use std::sync::atomic::{AtomicBool, Ordering};
         let (sent, events) = std::sync::mpsc::channel();
         let (lists, listed) = std::sync::mpsc::channel();
@@ -7867,6 +7843,7 @@ impl ScriptedWatch {
         let read_here = Arc::clone(&here);
         let read_sent = sent.clone();
         let wake_sent = sent.clone();
+        let door_sent = sent.clone();
         let io = super::AlertWatchIo {
             read: Box::new(move || {
                 let _ = read_sent.send(WatchEvent::Read);
@@ -7883,7 +7860,7 @@ impl ScriptedWatch {
             }),
             pace,
         };
-        (io, Self { events, lists })
+        (io, Self { events, lists }, door_sent)
     }
 
     /// The worker's next act, within the hang detector.
@@ -7931,7 +7908,12 @@ fn await_worker_asleep(slot: &super::AlertWatchSlot, nth: usize) {
 fn a_live_alert_watchs_first_read_lets_its_trigger_go_and_wakes_the_window() {
     static SLOT: super::AlertWatchSlot = super::AlertWatchSlot::new();
     let (io, watch) = ScriptedWatch::new(AT_ONCE);
-    assert!(super::start_alert_watch(&SLOT, 4, Some("27.0.1"), io));
+    assert!(super::start_alert_watch(
+        &SLOT,
+        super::Watched::Step(4),
+        Some("27.0.1"),
+        io
+    ));
     assert_eq!(
         watch.next(),
         WatchEvent::Read,
@@ -7944,8 +7926,11 @@ fn a_live_alert_watchs_first_read_lets_its_trigger_go_and_wakes_the_window() {
     SLOT.cancel();
     let report = watch.ended();
     assert_eq!(
-        (report.revision, report.ended),
-        (4, super::AlertWatchEnded::StoppedUnarmed)
+        (report.watched, report.ended),
+        (
+            super::Watched::Step(4),
+            super::AlertWatchEnded::StoppedUnarmed
+        )
     );
     assert!(!SLOT.baseline_in(), "a stop takes the baseline back");
 }
@@ -7957,7 +7942,12 @@ fn a_live_alert_watchs_first_read_lets_its_trigger_go_and_wakes_the_window() {
 fn arming_a_live_alert_watch_wakes_its_worker_at_once() {
     static SLOT: super::AlertWatchSlot = super::AlertWatchSlot::new();
     let (io, watch) = ScriptedWatch::new(AT_ONCE);
-    assert!(super::start_alert_watch(&SLOT, 5, Some("26.6.2"), io));
+    assert!(super::start_alert_watch(
+        &SLOT,
+        super::Watched::Step(5),
+        Some("26.6.2"),
+        io
+    ));
     assert_eq!(watch.next(), WatchEvent::Read);
     watch.answer(Some(Vec::new()), true);
     assert_eq!(watch.next(), WatchEvent::Woke);
@@ -7984,7 +7974,12 @@ fn stopping_a_live_alert_watch_wakes_its_worker_and_drops_its_answer() {
     };
     static FOR_ARM: super::AlertWatchSlot = super::AlertWatchSlot::new();
     let (io, watch) = ScriptedWatch::new(slow);
-    assert!(super::start_alert_watch(&FOR_ARM, 6, Some("27.0"), io));
+    assert!(super::start_alert_watch(
+        &FOR_ARM,
+        super::Watched::Step(6),
+        Some("27.0"),
+        io
+    ));
     assert_eq!(watch.next(), WatchEvent::Read);
     watch.answer(Some(Vec::new()), true);
     assert_eq!(watch.next(), WatchEvent::Woke);
@@ -7998,7 +7993,12 @@ fn stopping_a_live_alert_watch_wakes_its_worker_and_drops_its_answer() {
 
     static FOR_LOOK: super::AlertWatchSlot = super::AlertWatchSlot::new();
     let (io, watch) = ScriptedWatch::new(slow);
-    assert!(super::start_alert_watch(&FOR_LOOK, 7, Some("27.0"), io));
+    assert!(super::start_alert_watch(
+        &FOR_LOOK,
+        super::Watched::Step(7),
+        Some("27.0"),
+        io
+    ));
     assert_eq!(watch.next(), WatchEvent::Read);
     watch.answer(Some(Vec::new()), true);
     assert_eq!(watch.next(), WatchEvent::Woke);
@@ -8007,14 +8007,19 @@ fn stopping_a_live_alert_watch_wakes_its_worker_and_drops_its_answer() {
     await_worker_asleep(&FOR_LOOK, 2);
     FOR_LOOK.cancel();
     assert_eq!(
-        watch.ended().revision,
-        7,
+        watch.ended().watched,
+        super::Watched::Step(7),
         "a stop wakes a worker waiting out its look"
     );
 
     static ANSWERED: super::AlertWatchSlot = super::AlertWatchSlot::new();
     let (io, watch) = ScriptedWatch::new(AT_ONCE);
-    assert!(super::start_alert_watch(&ANSWERED, 8, Some("27.0"), io));
+    assert!(super::start_alert_watch(
+        &ANSWERED,
+        super::Watched::Step(8),
+        Some("27.0"),
+        io
+    ));
     assert_eq!(watch.next(), WatchEvent::Read);
     watch.answer(Some(Vec::new()), true);
     assert_eq!(watch.next(), WatchEvent::Woke);
@@ -8029,7 +8034,11 @@ fn stopping_a_live_alert_watch_wakes_its_worker_and_drops_its_answer() {
         "its answer wakes the window"
     );
     assert_eq!(watch.ended().ended, super::AlertWatchEnded::Answered);
-    assert_eq!(ANSWERED.state().answer, Some(8), "the answer is left");
+    assert_eq!(
+        ANSWERED.state().answer,
+        Some(super::Watched::Step(8)),
+        "the answer is left"
+    );
     ANSWERED.cancel();
     assert_eq!(ANSWERED.take_answer(), None, "a stop drops it");
 }
@@ -8042,7 +8051,12 @@ fn stopping_a_live_alert_watch_wakes_its_worker_and_drops_its_answer() {
 fn a_later_start_of_the_live_alert_watch_resets_what_the_last_one_left() {
     static SLOT: super::AlertWatchSlot = super::AlertWatchSlot::new();
     let (io, first) = ScriptedWatch::new(AT_ONCE);
-    assert!(super::start_alert_watch(&SLOT, 1, Some("27.0"), io));
+    assert!(super::start_alert_watch(
+        &SLOT,
+        super::Watched::Step(1),
+        Some("27.0"),
+        io
+    ));
     assert_eq!(first.next(), WatchEvent::Read);
     first.answer(Some(Vec::new()), true);
     assert_eq!(first.next(), WatchEvent::Woke);
@@ -8055,14 +8069,21 @@ fn a_later_start_of_the_live_alert_watch_resets_what_the_last_one_left() {
     assert_eq!(first.ended().ended, super::AlertWatchEnded::Answered);
 
     let (io, second) = ScriptedWatch::new(AT_ONCE);
-    assert!(super::start_alert_watch(&SLOT, 2, Some("27.0"), io));
+    assert!(super::start_alert_watch(
+        &SLOT,
+        super::Watched::Step(2),
+        Some("27.0"),
+        io
+    ));
     assert_eq!(second.next(), WatchEvent::Read);
     assert_eq!(
         SLOT.state(),
         super::AlertWatchState {
             id: 2,
             last_id: 2,
+            watched: Some(super::Watched::Step(2)),
             baseline_in: false,
+            blind: false,
             armed: None,
             answer: None,
         },
@@ -8089,17 +8110,30 @@ fn a_later_start_wakes_the_worker_of_the_watch_it_replaces() {
         arm_wait: Duration::from_secs(600),
     };
     let (io, first) = ScriptedWatch::new(slow);
-    assert!(super::start_alert_watch(&SLOT, 1, Some("27.0"), io));
+    assert!(super::start_alert_watch(
+        &SLOT,
+        super::Watched::Step(1),
+        Some("27.0"),
+        io
+    ));
     assert_eq!(first.next(), WatchEvent::Read);
     first.answer(Some(Vec::new()), true);
     assert_eq!(first.next(), WatchEvent::Woke);
     await_worker_asleep(&SLOT, 1);
     let (io, second) = ScriptedWatch::new(slow);
-    assert!(super::start_alert_watch(&SLOT, 2, Some("27.0"), io));
+    assert!(super::start_alert_watch(
+        &SLOT,
+        super::Watched::Step(2),
+        Some("27.0"),
+        io
+    ));
     let report = first.ended();
     assert_eq!(
-        (report.revision, report.ended),
-        (1, super::AlertWatchEnded::StoppedUnarmed),
+        (report.watched, report.ended),
+        (
+            super::Watched::Step(1),
+            super::AlertWatchEnded::StoppedUnarmed
+        ),
         "the replaced worker stops at the start"
     );
     assert_eq!(second.next(), WatchEvent::Read);
@@ -8118,7 +8152,12 @@ fn a_later_start_wakes_the_worker_of_the_watch_it_replaces() {
 fn an_answer_a_replaced_live_alert_watch_saw_is_never_left_for_the_next() {
     static SLOT: super::AlertWatchSlot = super::AlertWatchSlot::new();
     let (io, first) = ScriptedWatch::new(AT_ONCE);
-    assert!(super::start_alert_watch(&SLOT, 1, Some("27.0"), io));
+    assert!(super::start_alert_watch(
+        &SLOT,
+        super::Watched::Step(1),
+        Some("27.0"),
+        io
+    ));
     assert_eq!(first.next(), WatchEvent::Read);
     first.answer(Some(Vec::new()), true);
     assert_eq!(first.next(), WatchEvent::Woke);
@@ -8128,7 +8167,12 @@ fn an_answer_a_replaced_live_alert_watch_saw_is_never_left_for_the_next() {
     assert_eq!(first.next(), WatchEvent::Read, "the first worker reads on");
 
     let (io, second) = ScriptedWatch::new(AT_ONCE);
-    assert!(super::start_alert_watch(&SLOT, 2, Some("27.0"), io));
+    assert!(super::start_alert_watch(
+        &SLOT,
+        super::Watched::Step(2),
+        Some("27.0"),
+        io
+    ));
     assert_eq!(second.next(), WatchEvent::Read);
     first.answer(Some(Vec::new()), true);
     assert_eq!(
@@ -8152,7 +8196,7 @@ fn no_live_alert_watch_starts_where_its_alerts_host_was_not_measured() {
     for version in [Some("28.0"), Some("15.7.1"), None] {
         let (io, watch) = ScriptedWatch::new(AT_ONCE);
         assert!(
-            !super::start_alert_watch(&SLOT, 3, version, io),
+            !super::start_alert_watch(&SLOT, super::Watched::Step(3), version, io),
             "{version:?}"
         );
         assert!(
@@ -8188,7 +8232,12 @@ fn a_live_alert_watch_paces_and_ends_by_the_persons_presence() {
         first: Duration::ZERO,
         arm_wait: Duration::from_secs(600),
     });
-    assert!(super::start_alert_watch(&AWAY, 1, Some("27.0"), io));
+    assert!(super::start_alert_watch(
+        &AWAY,
+        super::Watched::Step(1),
+        Some("27.0"),
+        io
+    ));
     assert_eq!(watch.next(), WatchEvent::Read);
     watch.answer(Some(Vec::new()), false);
     assert_eq!(watch.next(), WatchEvent::Woke);
@@ -8213,7 +8262,7 @@ fn a_live_alert_watch_paces_and_ends_by_the_persons_presence() {
         "the person back: it answers"
     );
     assert_eq!(watch.ended().ended, super::AlertWatchEnded::Answered);
-    assert_eq!(AWAY.take_answer(), Some(1));
+    assert_eq!(AWAY.take_answer(), Some(super::Watched::Step(1)));
     AWAY.cancel();
 
     static HERE: super::AlertWatchSlot = super::AlertWatchSlot::new();
@@ -8223,7 +8272,12 @@ fn a_live_alert_watch_paces_and_ends_by_the_persons_presence() {
         first: Duration::ZERO,
         arm_wait: Duration::from_secs(600),
     });
-    assert!(super::start_alert_watch(&HERE, 2, Some("27.0"), io));
+    assert!(super::start_alert_watch(
+        &HERE,
+        super::Watched::Step(2),
+        Some("27.0"),
+        io
+    ));
     assert_eq!(watch.next(), WatchEvent::Read);
     watch.answer(Some(Vec::new()), true);
     assert_eq!(watch.next(), WatchEvent::Woke);
@@ -8257,7 +8311,12 @@ fn a_live_alert_watch_reads_at_the_present_pace_for_its_first_looks_whatever_the
         first: Duration::from_secs(600),
         arm_wait: Duration::from_secs(600),
     });
-    assert!(super::start_alert_watch(&SLOT, 3, Some("27.0.1"), io));
+    assert!(super::start_alert_watch(
+        &SLOT,
+        super::Watched::Step(3),
+        Some("27.0.1"),
+        io
+    ));
     assert_eq!(watch.next(), WatchEvent::Read);
     watch.answer(Some(Vec::new()), false);
     assert_eq!(watch.next(), WatchEvent::Woke);
@@ -8286,6 +8345,175 @@ fn a_live_alert_watch_reads_at_the_present_pace_for_its_first_looks_whatever_the
         "the person there: it answers"
     );
     assert_eq!(watch.ended().ended, super::AlertWatchEnded::Answered);
-    assert_eq!(SLOT.take_answer(), Some(3));
+    assert_eq!(
+        SLOT.take_answer().and_then(super::Watched::revision),
+        Some(3),
+        "the step's drain reads its revision"
+    );
     SLOT.cancel();
+}
+
+/// The door's alert watch ([`super::start_door_alert_watch`]): its first read, which the door's
+/// use waits for before it asks, is in when the start returns, and the watch, armed then, reads
+/// on with no wake of the window for that read. Once it saw a new window of the alert's owner
+/// come and then, with the person at the Mac, no window of that owner left, it tells the door's
+/// hold of its own pass, which ends it, and only then wakes the window, so the window's turn
+/// finds the dialog slot free; nothing is left for the step's drain, and its record is the
+/// door's. NEGATIVE CONTROLS: a start that does not arm the watch (`slot.arm_of(watched)` taken
+/// out of `start_door_alert_watch`) leaves its worker waiting for an arm past the hang detector;
+/// a wake that does not tell the hold (`answered(pass)` taken out) wakes the window with the
+/// hold still standing.
+#[test]
+fn the_doors_alert_watch_ends_its_hold_once_the_question_is_answered() {
+    use super::{AlertWatchEnded, Watched};
+    static SLOT: super::AlertWatchSlot = super::AlertWatchSlot::new();
+    let (io, watch, answered) = ScriptedWatch::for_door(AT_ONCE);
+    // The first read's list is there before the use's thread waits for it.
+    watch.answer(Some(on(&[17])), true);
+    assert!(super::start_door_alert_watch(
+        &SLOT,
+        3,
+        Some("27.0.1"),
+        io,
+        answered,
+        WATCH_HANG
+    ));
+    assert_eq!(watch.next(), WatchEvent::Read, "its first read");
+    assert!(SLOT.baseline_in(), "in when the start returned");
+    assert!(
+        SLOT.state().armed.is_some(),
+        "and armed, so the use asks into a watch that reads on"
+    );
+    assert_eq!(
+        watch.next(),
+        WatchEvent::Read,
+        "it reads on, with no wake for its first read"
+    );
+    watch.answer(Some(on(&[17, 48])), true);
+    assert_eq!(watch.next(), WatchEvent::Read);
+    watch.answer(Some(Vec::new()), true);
+    assert_eq!(
+        watch.next(),
+        WatchEvent::Answered(3),
+        "the door's hold of its pass is told"
+    );
+    assert_eq!(watch.next(), WatchEvent::Woke, "then the window wakes");
+    let report = watch.ended();
+    assert_eq!(
+        (report.watched, report.ended),
+        (Watched::Door(3), AlertWatchEnded::Answered)
+    );
+    assert!(report.to_string().contains("door pass 3"), "{report}");
+    assert_eq!(
+        SLOT.take_answer(),
+        None,
+        "nothing left for the window's drain"
+    );
+    SLOT.cancel_of(Watched::Door(3));
+}
+
+/// A door's watch whose first read is not back within its wait is stopped and gives `false`, so
+/// its use asks unwatched and the door's hold runs its bound; its worker, once that read comes
+/// back, finds itself stopped, reads nothing more and records that it was stopped before it read
+/// again, as the door's. One whose first read could not read the window list gives `false` too:
+/// its worker ended at that read, recording it blind, so nothing reads on and the watch is not
+/// left armed. On a macOS whose alert host was not measured no worker starts at all.
+/// NEGATIVE CONTROLS: a start that keeps a late watch (`slot.cancel_of(watched)` taken out of
+/// `start_door_alert_watch`) leaves its worker waiting for an arm past the hang detector; one
+/// that gives `true` whatever came back reads the late watch as watching; a worker that marks
+/// every first read as read (`listed.is_some()` replaced by `true` in `run_alert_watch`) reads
+/// the blind watch as watching.
+#[test]
+fn a_doors_alert_watch_whose_first_read_is_late_lets_its_use_ask_unwatched() {
+    use super::{AlertWatchEnded, Watched};
+    static SLOT: super::AlertWatchSlot = super::AlertWatchSlot::new();
+    let (io, watch, answered) = ScriptedWatch::for_door(AT_ONCE);
+    assert!(
+        !super::start_door_alert_watch(&SLOT, 4, Some("27.0"), io, answered, Duration::ZERO),
+        "no first read back: unwatched"
+    );
+    assert_eq!(watch.next(), WatchEvent::Read, "its first read went");
+    assert!(!SLOT.baseline_in());
+    assert_eq!(SLOT.state().armed, None, "never armed");
+    watch.answer(Some(Vec::new()), true);
+    let report = watch.ended();
+    assert_eq!(
+        (report.watched, report.ended),
+        (Watched::Door(4), AlertWatchEnded::StoppedUnarmed)
+    );
+
+    static BLIND: super::AlertWatchSlot = super::AlertWatchSlot::new();
+    let (io, watch, answered) = ScriptedWatch::for_door(AT_ONCE);
+    // The first read's answer is there before the use's thread waits for it: no list.
+    watch.answer(None, true);
+    assert!(
+        !super::start_door_alert_watch(&BLIND, 6, Some("27.0"), io, answered, WATCH_HANG),
+        "the window list unreadable at the first read: unwatched"
+    );
+    assert_eq!(watch.next(), WatchEvent::Read, "its first read went");
+    let report = watch.ended();
+    assert_eq!(
+        (report.watched, report.ended),
+        (Watched::Door(6), AlertWatchEnded::Blind)
+    );
+    assert_eq!(
+        (BLIND.state().id, BLIND.state().armed),
+        (0, None),
+        "stopped, never armed"
+    );
+
+    static UNMEASURED: super::AlertWatchSlot = super::AlertWatchSlot::new();
+    let (io, watch, answered) = ScriptedWatch::for_door(AT_ONCE);
+    assert!(!super::start_door_alert_watch(
+        &UNMEASURED,
+        5,
+        Some("28.0"),
+        io,
+        answered,
+        WATCH_HANG
+    ));
+    assert!(
+        matches!(
+            watch.events.recv_timeout(WATCH_HANG),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+        ),
+        "no worker, its reach dropped unread"
+    );
+    assert_eq!(UNMEASURED.state().last_id, 0, "the slot is untouched");
+}
+
+/// The door's hold arms and stops only its own pass's watch: an arm or a stop for another pass
+/// leaves the watch as it was, so a hold's late stop never stops a later pass's watch.
+/// NEGATIVE CONTROLS: a `cancel_of` that stops whichever watch is live (its `watched` check taken
+/// out of `cancel_where`) stops the watch at the other pass's stop; an `arm_of` that arms
+/// whichever (its check taken out of `arm_where`) arms it for another pass.
+#[test]
+fn the_doors_hold_arms_and_stops_only_its_own_passs_watch() {
+    use super::{AlertWatchEnded, Watched};
+    static SLOT: super::AlertWatchSlot = super::AlertWatchSlot::new();
+    let (io, watch) = ScriptedWatch::new(AT_ONCE);
+    assert!(super::start_alert_watch(
+        &SLOT,
+        Watched::Door(6),
+        Some("27.0"),
+        io
+    ));
+    assert_eq!(watch.next(), WatchEvent::Read);
+    watch.answer(Some(Vec::new()), true);
+    assert_eq!(watch.next(), WatchEvent::Woke);
+    SLOT.arm_of(Watched::Door(7));
+    assert_eq!(SLOT.state().armed, None, "another pass's arm arms nothing");
+    SLOT.arm_of(Watched::Door(6));
+    assert!(SLOT.state().armed.is_some());
+    assert_eq!(watch.next(), WatchEvent::Read);
+    SLOT.cancel_of(Watched::Door(7));
+    watch.answer(Some(Vec::new()), true);
+    assert_eq!(
+        watch.next(),
+        WatchEvent::Read,
+        "another pass's stop: it reads on"
+    );
+    SLOT.cancel_of(Watched::Door(6));
+    watch.answer(Some(Vec::new()), true);
+    assert_eq!(watch.ended().ended, AlertWatchEnded::NeverSeen);
 }

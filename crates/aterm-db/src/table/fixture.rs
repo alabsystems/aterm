@@ -33,13 +33,34 @@ pub const NETWORK: [u8; 16] = [9; 16];
 /// `rounds` repair passes in which the first Mac exchanges with every other, as a runtime does.
 pub fn repair_commons(lab: &Lab, rounds: usize) {
     let members: Vec<usize> = (0..lab.paths.len()).collect();
-    repair_commons_with(lab, rounds, &members, None);
+    repair_commons_with(lab, rounds, &members, None, None);
 }
 
 /// [`repair_commons`] among `members` alone (the first exchanges with each other), as one side
 /// of a split, each on the system clock.
 pub fn repair_commons_within(lab: &Lab, rounds: usize, members: &[usize]) {
-    repair_commons_with(lab, rounds, members, None);
+    repair_commons_with(lab, rounds, members, None, None);
+}
+
+/// [`repair_commons`] with each round repairing `table` first, as a push names it
+/// (`crate::runtime::Pusher`), with no regular scan: for a test that knows which table moved.
+#[cfg(test)]
+pub fn repair_commons_first(lab: &Lab, rounds: usize, table: [u8; 32]) {
+    let members: Vec<usize> = (0..lab.paths.len()).collect();
+    repair_commons_with(lab, rounds, &members, None, Some(table));
+}
+
+/// [`repair_commons_among`] with each round repairing `table` first ([`repair_commons_first`]).
+#[cfg(test)]
+pub fn repair_commons_among_first(
+    lab: &Lab,
+    rounds: usize,
+    members: &[usize],
+    now: &[u64],
+    table: [u8; 32],
+) {
+    assert_eq!(now.len(), lab.paths.len(), "one clock per Mac");
+    repair_commons_with(lab, rounds, members, Some(now), Some(table));
 }
 
 /// [`repair_commons`] with each Mac's ring windows placed by its own clock, `now[n]` seconds.
@@ -54,13 +75,13 @@ pub fn repair_commons_at(lab: &Lab, rounds: usize, now: &[u64]) {
 #[cfg(test)]
 pub fn repair_commons_among(lab: &Lab, rounds: usize, members: &[usize], now: &[u64]) {
     assert_eq!(now.len(), lab.paths.len(), "one clock per Mac");
-    repair_commons_with(lab, rounds, members, Some(now));
+    repair_commons_with(lab, rounds, members, Some(now), None);
 }
 
 /// [`repair_commons`], handing back each Mac's application report of every exchange, in order.
 pub fn repair_commons_reports(lab: &Lab, rounds: usize) -> Vec<Vec<crate::replica::Report>> {
     let members: Vec<usize> = (0..lab.paths.len()).collect();
-    repair_commons_with(lab, rounds, &members, None)
+    repair_commons_with(lab, rounds, &members, None, None)
 }
 
 fn repair_commons_with(
@@ -68,10 +89,11 @@ fn repair_commons_with(
     rounds: usize,
     members: &[usize],
     now: Option<&[u64]>,
+    first: Option<[u8; 32]>,
 ) -> Vec<Vec<crate::replica::Report>> {
     use crate::control::{Endpoint, Repair, Side};
     use aterm_net::lan::{Connection, Scope as LinkScope};
-    let endpoints: Vec<_> = members
+    let mut endpoints: Vec<_> = members
         .iter()
         .map(|&n| {
             let endpoint = Endpoint::from_bootstrap(&lab.bootstrap(n))
@@ -88,6 +110,10 @@ fn repair_commons_with(
             endpoint
         })
         .collect();
+    if first.is_some() {
+        // The first Mac initiates every exchange, and only an initiator reads what a push names.
+        endpoints[0].prefer(std::sync::Arc::new(std::sync::Mutex::new(first)));
+    }
     let mut repairs: Vec<_> = (0..endpoints.len()).map(|_| Repair::default()).collect();
     let mut reports = vec![Vec::new(); endpoints.len()];
     for _ in 0..rounds {

@@ -528,10 +528,13 @@ fn sys_jobs_is_as_fresh_as_its_jobs_view_and_arms_the_engine_while_it_waits() {
         (Some(7300), Freshness::Fresh, vec![]),
         "the snapshot itself just landed"
     );
+    // The 200 ms is this leg's subject (a pull that never makes a view times out), so the probe
+    // may read the arm after the wait ended: the legs above prove the arming, this one that the
+    // one pull went out (the buffered Pull reaches the probe even once `tx` is dropped).
     let (seq, state, seen) = run("jobs", Duration::from_millis(200), false);
     assert_eq!(
-        (state, seen),
-        (Freshness::Stale, vec![true]),
+        (state, seen.len()),
+        (Freshness::Stale, 1),
         "the pull's reading carried the old view: {seq:?}"
     );
 }

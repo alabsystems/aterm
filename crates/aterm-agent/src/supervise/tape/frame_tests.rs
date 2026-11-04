@@ -7,15 +7,16 @@ use std::io::{ErrorKind, Write};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use astream_effects::EffectRecord;
+use astream_wire::steps::{StepFault, encode_step};
 use aterm_spec::rng::XorShift;
 
-use super::codec::{End, Item, Mark, Stamp, ctl_request};
+use super::codec::{Encoder, End, Item, Mark, Stamp, ctl_request};
 use super::doors;
 use super::frame::{
-    FRAME_RAW, Format, FrameSink, HEAD, Hint, Kind, MAGIC, PLACES, Stopped, TapeWriter, checksum,
-    frame_bytes, place_named, place_word,
+    BODY_HEAD, FRAME_FORMAT, FRAME_RAW, FRAME_RAW_MAX, FrameSink, Hint, Kind, MAGIC, OVERHEAD,
+    Stopped, TapeWriter, frame_bytes,
 };
-use super::recover::{Recovered, Tail, Why, recover, salvage};
+use super::recover::{RECORD_HEAD, Recovered, Tail, Why, recover, salvage, steps};
 
 /// What a [`Memory`] sink was handed.
 #[derive(Debug, Default)]
@@ -140,17 +141,38 @@ pub(super) fn mono(ns: u64) -> Item {
     Item::effect(EffectRecord::Mono(ns))
 }
 
-fn frames_of(bytes: &[u8]) -> Vec<(usize, usize, u8, u32)> {
-    let mut out = Vec::new();
-    let mut at = MAGIC.len();
-    while at + HEAD <= bytes.len() {
-        let raw = u32::from_le_bytes(bytes[at + 1..at + 5].try_into().expect("four bytes"));
-        let comp = u32::from_le_bytes(bytes[at + 5..at + 9].try_into().expect("four bytes"));
-        let end = at + HEAD + if comp == 0 { raw } else { comp } as usize;
-        out.push((at, end, bytes[at], comp));
-        at = end;
-    }
-    out
+/// A whole frame of a tape, as astream's scan finds it.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Framed {
+    /// Where its record starts in the tape's bytes.
+    pub(super) start: usize,
+    /// Where the next one starts.
+    pub(super) end: usize,
+    pub(super) kind: u8,
+    /// Its raw length, as its body says.
+    pub(super) raw: usize,
+    /// Whether its payload is stored compressed (shorter than its raw bytes).
+    pub(super) packed: bool,
+}
+
+/// The whole frames of a tape's bytes, by astream's scan of what follows the magic.
+pub(super) fn frames_of(bytes: &[u8]) -> Vec<Framed> {
+    let records = &bytes[MAGIC.len()..];
+    steps(records)
+        .steps
+        .into_iter()
+        .map(|(_, body)| {
+            let b = &records[body.clone()];
+            let raw = u32::from_le_bytes(b[1..BODY_HEAD].try_into().expect("four bytes")) as usize;
+            Framed {
+                start: MAGIC.len() + body.start - RECORD_HEAD,
+                end: MAGIC.len() + body.end,
+                kind: b[0],
+                raw,
+                packed: b.len() - BODY_HEAD < raw,
+            }
+        })
+        .collect()
 }
 
 fn tape(frames: usize, rng: &mut XorShift) -> (Vec<u8>, Vec<Vec<Item>>) {
@@ -177,32 +199,19 @@ pub(super) fn arranged(bytes: &[u8], order: &[usize]) -> Vec<u8> {
     let frames = frames_of(bytes);
     let mut out = bytes[..MAGIC.len()].to_vec();
     for &i in order {
-        out.extend_from_slice(&bytes[frames[i].0..frames[i].1]);
+        out.extend_from_slice(&bytes[frames[i].start..frames[i].end]);
     }
     out
 }
 
-/// Re-tags a tape as format 1 ([`a_format_1_tape_reads_as_it_always_did`]).
-pub(super) fn as_format_1(bytes: &[u8]) -> Vec<u8> {
-    let mut out = bytes.to_vec();
-    out[..MAGIC.len()].copy_from_slice(&Format::One.magic());
-    for (start, end, kind, _) in frames_of(bytes) {
-        let kind = Kind::of(kind).expect("a frame's kind");
-        let sum = checksum(
-            kind,
-            &bytes[start + 1..start + 9],
-            &bytes[start + HEAD..end],
-        );
-        out[start + 9..start + HEAD].copy_from_slice(&sum.to_le_bytes());
+/// NEGATIVE CONTROL: a reader that reads a fault as a torn tail, keeping the
+/// whole frames before it as a torn tail's reader does.
+pub(super) fn fault_as_torn(bytes: &[u8]) -> Recovered {
+    let mut read = salvage(bytes);
+    if let Tail::Fault { at, .. } = read.tail {
+        read.tail = Tail::Torn { at };
     }
-    out
-}
-
-fn both_formats(bytes: &[u8]) -> [(&'static str, Vec<u8>); 2] {
-    [
-        ("format 2", bytes.to_vec()),
-        ("format 1", as_format_1(bytes)),
-    ]
+    read
 }
 
 #[test]
@@ -245,7 +254,8 @@ fn a_written_tape_reads_back_whole_and_clean() {
     assert_eq!(read.tail, Tail::Clean);
     let frames = frames_of(&bytes);
     assert_eq!(read.frames, frames.len());
-    assert!(frames.iter().any(|f| f.3 != 0), "a frame compressed");
+    assert_eq!(frames.last().map(|f| f.end), Some(bytes.len()));
+    assert!(frames.iter().any(|f| f.packed), "a frame compressed");
     let noise_only = {
         let (mut w, sink, _) = writer();
         w.append(&noise(&mut rng, 2_000));
@@ -253,7 +263,7 @@ fn a_written_tape_reads_back_whole_and_clean() {
         sink.bytes()
     };
     assert!(
-        frames_of(&noise_only).last().is_some_and(|f| f.3 == 0),
+        frames_of(&noise_only).last().is_some_and(|f| !f.packed),
         "a frame that does not compress is stored raw"
     );
     assert!(said.text().is_empty());
@@ -264,7 +274,7 @@ fn each_frame_is_one_write_closed_where_the_plan_closes_it() {
     let (mut w, sink, _) = writer();
     assert_eq!(sink.taken().writes.len(), 1);
     assert!(sink.bytes().starts_with(&MAGIC));
-    assert_eq!(frames_of(&sink.bytes())[0].2, Kind::Header as u8);
+    assert_eq!(frames_of(&sink.bytes())[0].kind, Kind::Header as u8);
     for i in 0..3 {
         w.append(&mono(i));
     }
@@ -309,10 +319,12 @@ fn a_frame_closes_at_64_kib_of_raw_items() {
         2,
         "200 KB of items, no hint: two full frames, the rest open"
     );
-    for (start, ..) in &records {
-        let raw =
-            u32::from_le_bytes(bytes[start + 1..start + 5].try_into().expect("four")) as usize;
-        assert!((FRAME_RAW..FRAME_RAW + 10_100).contains(&raw), "{raw}");
+    for frame in &records {
+        assert!(
+            (FRAME_RAW..FRAME_RAW + 10_100).contains(&frame.raw),
+            "{}",
+            frame.raw
+        );
     }
     drop(w);
     assert_eq!(
@@ -323,85 +335,122 @@ fn a_frame_closes_at_64_kib_of_raw_items() {
 }
 
 #[test]
+fn a_frame_is_an_astream_step_record_whose_step_is_its_place() {
+    let raw = b"atape 1\n";
+    let mut body = vec![Kind::Header as u8];
+    body.extend_from_slice(&8u32.to_le_bytes());
+    body.extend_from_slice(raw);
+    assert_eq!(
+        frame_bytes(Kind::Header, 0, raw).expect("a frame"),
+        encode_step(0, &body).expect("a step record"),
+        "the kind, the raw length and the raw bytes, stored as they are"
+    );
+    let (bytes, _) = tape(3, &mut XorShift::new(17));
+    let records = &bytes[MAGIC.len()..];
+    let scan = steps(records);
+    assert_eq!(scan.valid_len, records.len());
+    assert_eq!(
+        scan.steps.iter().map(|(step, _)| *step).collect::<Vec<_>>(),
+        [0, 1, 2, 3],
+        "the header is step 0, and each frame's step is its place"
+    );
+    assert_eq!(OVERHEAD, RECORD_HEAD + BODY_HEAD);
+    assert_eq!(MAGIC[6], FRAME_FORMAT);
+}
+
+#[test]
 fn every_cut_reads_back_a_prefix_of_whole_frames() {
     let mut rng = XorShift::new(11);
-    let (written, per_frame) = tape(4, &mut rng);
-    let ends: Vec<usize> = frames_of(&written).iter().map(|f| f.1).collect();
+    let (bytes, per_frame) = tape(4, &mut rng);
+    let ends: Vec<usize> = frames_of(&bytes).iter().map(|f| f.end).collect();
     assert_eq!(ends.len(), 5);
-    for (format, bytes) in both_formats(&written) {
-        for cut in 0..=bytes.len() {
-            let read = recover(&bytes[..cut]);
-            let whole = ends.iter().filter(|e| **e <= cut).count();
-            assert_eq!(read.frames, whole, "{format}, cut {cut}");
-            let records = whole.saturating_sub(1);
-            assert_eq!(
-                read.items,
-                prefix(&per_frame, records),
-                "{format}, cut {cut}"
-            );
-            let expected = if cut == 0 || ends.contains(&cut) {
-                Tail::Clean
-            } else if cut < MAGIC.len() {
-                Tail::Torn { at: 0 }
-            } else {
-                Tail::Torn {
-                    at: ends[..whole].last().copied().unwrap_or(MAGIC.len()),
+    for cut in 0..=bytes.len() {
+        let read = recover(&bytes[..cut]);
+        let whole = ends.iter().filter(|e| **e <= cut).count();
+        assert_eq!(read.frames, whole, "cut {cut}");
+        let records = whole.saturating_sub(1);
+        assert_eq!(read.items, prefix(&per_frame, records), "cut {cut}");
+        let expected = if cut == 0 || ends.contains(&cut) {
+            Tail::Clean
+        } else if cut < MAGIC.len() {
+            Tail::Torn { at: 0 }
+        } else {
+            Tail::Torn {
+                at: ends[..whole].last().copied().unwrap_or(MAGIC.len()),
+            }
+        };
+        assert_eq!(read.tail, expected, "cut {cut}");
+        assert_eq!(
+            read.header.as_deref(),
+            (whole > 0).then_some(HEADER),
+            "cut {cut}"
+        );
+    }
+}
+
+/// What `read` makes of every byte of a three-frame tape flipped under three
+/// masks, against what a reader must: a flip in the last frame is a torn tail
+/// that keeps the frames before it; one anywhere before is a fault at the
+/// damaged frame (the magic's, at 0), refused whole, never a torn tail, and
+/// salvage keeps the whole frames before it.
+fn flips_read(read: fn(&[u8]) -> Recovered) -> Result<usize, String> {
+    let mut rng = XorShift::new(5);
+    let (bytes, per_frame) = tape(3, &mut rng);
+    let frames = frames_of(&bytes);
+    let last = frames.last().expect("frames").start;
+    let mut flips = 0;
+    for at in 0..bytes.len() {
+        for mask in [0x01u8, 0x80, 0xff] {
+            let mut damaged = bytes.clone();
+            damaged[at] ^= mask;
+            let got = read(&damaged);
+            let what = format!("byte {at} ^ {mask:#x}");
+            flips += 1;
+            if at >= last {
+                let torn = Tail::Torn { at: last };
+                if got.tail != torn || got.items != prefix(&per_frame, per_frame.len() - 1) {
+                    return Err(format!("{what}: {:?}, not {torn:?}", got.tail));
                 }
-            };
-            assert_eq!(read.tail, expected, "{format}, cut {cut}");
-            assert_eq!(
-                read.header.as_deref(),
-                (whole > 0).then_some(HEADER),
-                "{format}, cut {cut}"
-            );
+                continue;
+            }
+            let start = frames
+                .iter()
+                .map(|f| f.start)
+                .filter(|s| *s <= at)
+                .max()
+                .unwrap_or(0);
+            match &got.tail {
+                Tail::Fault { at: fault, .. } if *fault == start => {}
+                other => return Err(format!("{what}: {other:?}, not a fault at {start}")),
+            }
+            if got.header.is_some() || !got.items.is_empty() || got.frames != 0 {
+                return Err(format!(
+                    "{what}: a refused tape served {} frames",
+                    got.frames
+                ));
+            }
+            let kept = salvage(&damaged);
+            let whole = frames.iter().filter(|f| f.end <= start).count();
+            if kept.tail != got.tail
+                || kept.frames != whole
+                || kept.items != prefix(&per_frame, whole.saturating_sub(1))
+            {
+                return Err(format!("{what}: salvage kept {} frames", kept.frames));
+            }
         }
     }
+    Ok(flips)
 }
 
 #[test]
 fn a_flip_before_a_whole_frame_is_refused_and_one_in_the_last_is_torn() {
-    let mut rng = XorShift::new(5);
-    let (written, per_frame) = tape(3, &mut rng);
-    let frames = frames_of(&written);
-    let last = frames.last().expect("frames").0;
-    for (format, bytes) in both_formats(&written) {
-        for at in 0..bytes.len() {
-            for mask in [0x01u8, 0x80, 0xff] {
-                let mut damaged = bytes.clone();
-                damaged[at] ^= mask;
-                let read = recover(&damaged);
-                let what = format!("{format}, byte {at} ^ {mask:#x}");
-                if at >= last {
-                    assert_eq!(read.tail, Tail::Torn { at: last }, "{what}");
-                    assert_eq!(
-                        read.items,
-                        prefix(&per_frame, per_frame.len() - 1),
-                        "{what}"
-                    );
-                    continue;
-                }
-                let start = frames
-                    .iter()
-                    .map(|f| f.0)
-                    .filter(|s| *s <= at)
-                    .max()
-                    .unwrap_or(0);
-                match &read.tail {
-                    Tail::Fault { at: fault, why } => {
-                        assert_eq!(*fault, start, "{what}: {why}");
-                    }
-                    other => panic!("{what}: {other:?}"),
-                }
-                assert_eq!(read.header, None, "a refused tape serves nothing");
-                assert!(read.items.is_empty() && read.frames == 0);
-                let kept = salvage(&damaged);
-                assert_eq!(kept.tail, read.tail);
-                let whole = frames.iter().filter(|f| f.1 <= start).count();
-                assert_eq!(kept.frames, whole, "{what}");
-                assert_eq!(kept.items, prefix(&per_frame, whole.saturating_sub(1)));
-            }
-        }
-    }
+    let flips = flips_read(recover).unwrap_or_else(|e| panic!("{e}"));
+    assert!(flips > 1_000, "{flips} flips");
+    let control = flips_read(fault_as_torn);
+    assert!(
+        control.as_ref().is_err_and(|e| e.contains("Torn")),
+        "NEGATIVE CONTROL: a reader that reads a fault as torn passes: {control:?}"
+    );
 }
 
 #[test]
@@ -420,12 +469,12 @@ fn whole_frames_out_of_place_are_refused_where_the_first_stands() {
         let at = MAGIC.len()
             + frames_of(&moved)[..place]
                 .iter()
-                .map(|f| f.1 - f.0)
+                .map(|f| f.end - f.start)
                 .sum::<usize>();
-        let why = Why::OutOfPlace {
+        let why = Why::Steps(StepFault::OutOfOrder {
             expected: place as u64,
             found,
-        };
+        });
         let read = recover(&moved);
         assert_eq!(
             read.tail,
@@ -458,46 +507,13 @@ fn whole_frames_out_of_place_are_refused_where_the_first_stands() {
     assert_eq!(unended.items, items[..2]);
     assert!(matches!(items.last(), Some(Item::End(_))));
     assert_eq!(
-        Why::OutOfPlace {
+        Why::Steps(StepFault::OutOfOrder {
             expected: 2,
             found: 3
-        }
+        })
         .to_string(),
-        "frame 3 where frame 2 belongs: whole frames repeated, dropped or moved"
+        "out-of-order step record (step 3, expected 2)"
     );
-}
-
-#[test]
-fn format_1_reads_whole_frames_out_of_place_clean() {
-    let mut rng = XorShift::new(41);
-    let (bytes, per_frame) = tape(4, &mut rng);
-    let one = as_format_1(&bytes);
-    let written = prefix(&per_frame, 4);
-    for (what, order) in [
-        ("repeated", [0, 1, 2, 2, 3, 4].as_slice()),
-        ("dropped", &[0, 1, 3, 4]),
-        ("moved", &[0, 1, 3, 2, 4]),
-    ] {
-        let read = recover(&arranged(&one, order));
-        assert_eq!(read.tail, Tail::Clean, "{what}: format 1 cannot tell");
-        assert_eq!(read.frames, order.len(), "{what}");
-        assert_ne!(read.items, written, "{what}");
-        let theirs: Vec<Item> = order[1..]
-            .iter()
-            .flat_map(|i| per_frame[i - 1].clone())
-            .collect();
-        assert_ne!(
-            read.items, theirs,
-            "{what}: replies decoded on the wrong base"
-        );
-        assert!(matches!(
-            recover(&arranged(&bytes, order)).tail,
-            Tail::Fault {
-                why: Why::OutOfPlace { .. },
-                ..
-            }
-        ));
-    }
 }
 
 fn golden_run() -> (Vec<u8>, Vec<Item>) {
@@ -524,6 +540,37 @@ fn golden_run() -> (Vec<u8>, Vec<Item>) {
     (sink.bytes(), items)
 }
 
+/// [`golden_run`]'s tape in frame format 3: the magic, then astream step records
+/// (the astream frame head `a571 01 00`, its length and CRC-32; the step's version,
+/// number and body length; the body's kind and raw length, then its payload).
+const GOLDEN_FORMAT_3: &str = concat!(
+    "415441504500030aa571010038000000d19ebba40100000000000000002b0000",
+    "000026000000617461706520310a746170653d742d310a6275696c643d67300a",
+    "656e7472793d77617463680aa57101004c00000037b5bec50101000000000000",
+    "003f000000012f020000ff1e050a06000363746c06010474657874009d04726f",
+    "77206f662074686520776f726b657227732073637265656e0a1b00ffea607265",
+    "656e0a30a571010032000000a81f75d501020000000000000025000000012000",
+    "00000508060106010474657874029c040001310b000c455849542073746f7070",
+    "6564",
+);
+
+#[test]
+fn a_format_3_tape_reads_as_it_always_did() {
+    let (bytes, items) = golden_run();
+    assert_eq!(
+        aterm_codec::hex::encode_lower(&bytes),
+        GOLDEN_FORMAT_3,
+        "this build writes format 3's bytes"
+    );
+    let golden = aterm_codec::hex::decode_vec(GOLDEN_FORMAT_3.as_bytes()).expect("hex");
+    let read = recover(&golden);
+    assert_eq!(read.header.as_deref(), Some(HEADER));
+    assert_eq!(read.items, items);
+    assert_eq!((read.frames, read.tail), (3, Tail::Clean));
+}
+
+/// [`golden_run`]'s tape as frame format 1 wrote it: aterm's own frame heads, each
+/// summed with xxh64.
 const GOLDEN_FORMAT_1: &str = concat!(
     "415441504500010a002600000000000000b9e64bf2be72f2aa61746170652031",
     "0a746170653d742d310a6275696c643d67300a656e7472793d77617463680a01",
@@ -533,30 +580,8 @@ const GOLDEN_FORMAT_1: &str = concat!(
     "010474657874029c040001310b000c455849542073746f70706564",
 );
 
-#[test]
-fn a_format_1_tape_reads_as_it_always_did() {
-    let golden = aterm_codec::hex::decode_vec(GOLDEN_FORMAT_1.as_bytes()).expect("hex");
-    let (bytes, items) = golden_run();
-    assert_eq!(as_format_1(&bytes), golden);
-    for (format, tape) in [("format 1", &golden), ("format 2", &bytes)] {
-        let read = recover(tape);
-        assert_eq!(read.header.as_deref(), Some(HEADER), "{format}");
-        assert_eq!(read.items, items, "{format}");
-        assert_eq!((read.frames, read.tail), (3, Tail::Clean), "{format}");
-    }
-    let differ: Vec<usize> = (0..bytes.len())
-        .filter(|&i| bytes[i] != golden[i])
-        .collect();
-    let sums: Vec<usize> = frames_of(&bytes).iter().map(|f| f.0 + 9).collect();
-    assert!(differ.contains(&6), "the magic's number");
-    assert!(
-        differ
-            .iter()
-            .all(|&i| i == 6 || sums.iter().any(|&s| (s..s + 8).contains(&i))),
-        "only the magic's number and the sums: {differ:?}"
-    );
-}
-
+/// [`golden_run`]'s tape as frame format 2 wrote it: format 1's, each sum also
+/// naming its frame's place.
 const GOLDEN_FORMAT_2: &str = concat!(
     "415441504500020a002600000000000000e79143a3fda7acc061746170652031",
     "0a746170653d742d310a6275696c643d67300a656e7472793d77617463680a01",
@@ -567,70 +592,133 @@ const GOLDEN_FORMAT_2: &str = concat!(
 );
 
 #[test]
-fn a_format_2_tape_reads_as_it_always_did() {
-    let golden = aterm_codec::hex::decode_vec(GOLDEN_FORMAT_2.as_bytes()).expect("hex");
-    let (bytes, items) = golden_run();
-    let read = recover(&golden);
-    assert_eq!(read.header.as_deref(), Some(HEADER));
-    assert_eq!(read.items, items);
-    assert_eq!((read.frames, read.tail), (3, Tail::Clean));
-    assert_eq!(Format::of_magic(&golden), Some(Format::Two));
-    for (place, (start, end, kind, _)) in frames_of(&golden).into_iter().enumerate() {
-        let kind = Kind::of(kind).expect("a frame's kind");
-        let hashed = checksum(
-            kind,
-            &golden[start + 1..start + 9],
-            &golden[start + HEAD..end],
-        );
-        let sum = u64::from_le_bytes(golden[start + 9..start + HEAD].try_into().expect("eight"));
+fn a_tape_of_an_earlier_frame_format_is_refused_by_its_number() {
+    for (format, hex) in [(1u8, GOLDEN_FORMAT_1), (2, GOLDEN_FORMAT_2)] {
+        let tape = aterm_codec::hex::decode_vec(hex.as_bytes()).expect("hex");
+        let why = Why::Format(format);
+        let refused = Tail::Fault {
+            at: 0,
+            why: why.clone(),
+        };
+        let read = recover(&tape);
+        assert_eq!(read.tail, refused, "format {format}");
+        assert_eq!((read.header, read.frames), (None, 0), "format {format}");
+        let kept = salvage(&tape);
+        assert_eq!((kept.tail, kept.frames), (refused, 0), "format {format}");
         assert_eq!(
-            place_named(sum, hashed),
-            Some(place as u64),
-            "frame {place}"
+            why.to_string(),
+            format!(
+                "a tape of frame format {format}: this build reads only format 3, astream step \
+                 records"
+            )
         );
-    }
-    assert_eq!(bytes, golden, "this build writes format 2's bytes");
-}
-
-#[test]
-fn a_magic_naming_the_other_format_is_refused() {
-    let (bytes, _) = golden_run();
-    for (format, tape, named, frames) in [
-        ("format 2", bytes.clone(), 1u8, 2u8),
-        ("format 1", as_format_1(&bytes), 2, 1),
-    ] {
-        let mut damaged = tape;
-        damaged[6] = named;
-        assert_eq!(
-            recover(&damaged).tail,
-            Tail::Fault {
-                at: 0,
-                why: Why::MagicFormat { named, frames }
-            },
-            "{format}"
-        );
+        let err = super::show::open(&tape, false).expect_err("refused");
+        assert!(err.contains(&format!("frame format {format}")), "{err}");
     }
 }
 
 #[test]
-fn a_place_reads_back_and_a_damaged_sum_names_none() {
-    let mut damages: Vec<u64> = (0..64).map(|bit| 1u64 << bit).collect();
-    for byte in 0..8 {
-        for mask in [0x01u64, 0x80, 0xff] {
-            damages.push(mask << (8 * byte));
+fn a_magic_damaged_before_this_builds_records_is_named_damaged() {
+    // One byte of the magic damaged at rest, the step records after it intact:
+    // this build's tape, not one of the format a rotted format byte names (3
+    // under 0x01 is 2, under 0x02 is 1) and not no tape at all.
+    let mut rng = XorShift::new(23);
+    for frames in 0..=2 {
+        let (bytes, _) = tape(frames, &mut rng);
+        for byte in 0..MAGIC.len() {
+            for mask in [0x01u8, 0x02, 0x80, 0xff] {
+                let mut damaged = bytes.clone();
+                damaged[byte] ^= mask;
+                let what = format!("{frames} records frames, byte {byte} ^ {mask:#04x}");
+                let read = recover(&damaged);
+                let err = super::show::open(&damaged, false).expect_err("refused");
+                assert!(
+                    err.starts_with(&format!(
+                        "refused at byte 0: a tape magic damaged at byte {byte}: frame format 3's \
+                         astream step records follow it"
+                    )),
+                    "{what}: {err}"
+                );
+                let refused = Tail::Fault {
+                    at: 0,
+                    why: Why::DamagedMagic { byte },
+                };
+                assert_eq!(read.tail, refused, "{what}");
+                assert_eq!((read.header, read.frames), (None, 0), "{what}");
+                let kept = salvage(&damaged);
+                assert_eq!((kept.tail, kept.frames), (read.tail, 0), "{what}");
+            }
         }
     }
-    for n in (0..4_096).chain([PLACES - 1]) {
-        let word = place_word(n);
-        assert_eq!(place_named(word, 0), Some(n));
-        let hashed = 0x9e37_79b9_7f4a_7c15_u64.wrapping_mul(n + 1);
-        assert_eq!(place_named(word ^ hashed, hashed), Some(n));
-        for e in &damages {
-            assert_eq!(place_named(word ^ e, 0), None, "place {n}, damage {e:#x}");
-        }
+}
+
+#[test]
+fn a_last_frame_that_nests_an_astream_frame_reads_a_cut_past_it_as_a_fault() {
+    // astream's rule reads bytes, not intent (`astream_wire::steps`, "A body
+    // that holds a frame of its own"): a raw frame whose items hold a whole
+    // astream frame, cut past that frame's last byte, looks like a rotted
+    // length, so the read refuses where a crash left only a torn tail. Salvage
+    // keeps what a torn read keeps; a cut before the nested frame is whole is
+    // torn.
+    let mut rng = XorShift::new(29);
+    let (mut w, sink, _) = writer();
+    let first = vec![mono(1), noise(&mut rng, 40)];
+    for item in &first {
+        w.append(item);
     }
-    assert_eq!(place_named(place_word(PLACES), 0), None);
-    assert_eq!(place_named(0, 0), None, "a format-1 sum names no place");
+    w.flush_hint(Hint::Act);
+    let nested = encode_step(0, b"a step record read back from a file").expect("a step record");
+    let mut read_bytes: Vec<u8> = (0..24).map(|_| (rng.next_u64() & 0xff) as u8).collect();
+    read_bytes.extend_from_slice(&nested);
+    read_bytes.extend((0..24).map(|_| (rng.next_u64() & 0xff) as u8));
+    w.append(&Item::effect(EffectRecord::File {
+        path: "/l/steps.bin".to_string(),
+        bytes: read_bytes,
+    }));
+    w.flush_hint(Hint::Act);
+    drop(w);
+    let bytes = sink.bytes();
+    let frames = frames_of(&bytes);
+    let last = *frames.last().expect("frames");
+    assert_eq!(frames.len(), 3, "the header and two records frames");
+    assert!(!last.packed, "stored raw, so the nested frame stands whole");
+    let nested_at = bytes
+        .windows(nested.len())
+        .position(|w| w == nested.as_slice())
+        .expect("the nested frame in the tape's bytes");
+    assert!(nested_at > last.start, "inside the last frame");
+    let nested_end = nested_at + nested.len();
+    for cut in last.start + 1..last.end {
+        let read = recover(&bytes[..cut]);
+        let kept = salvage(&bytes[..cut]);
+        if cut < nested_end {
+            assert_eq!(read.tail, Tail::Torn { at: last.start }, "cut {cut}");
+            assert_eq!((read.frames, &read.items), (2, &first), "cut {cut}");
+        } else {
+            let fault = Tail::Fault {
+                at: last.start,
+                why: Why::Steps(StepFault::LengthPastEnd),
+            };
+            assert_eq!(read.tail, fault, "cut {cut}");
+            assert_eq!((read.header, read.frames), (None, 0), "cut {cut}: refused");
+            assert_eq!(kept.tail, fault, "cut {cut}");
+        }
+        assert_eq!(
+            (kept.header.as_deref(), kept.frames, &kept.items),
+            (Some(HEADER), 2, &first),
+            "cut {cut}: salvage keeps the frames before the last"
+        );
+    }
+    let mut rot = bytes.clone();
+    rot[last.end - 1] ^= 0x01;
+    assert!(
+        matches!(
+            recover(&rot).tail,
+            Tail::Fault { at, why: Why::Steps(StepFault::CorruptFrame(_)) } if at == last.start
+        ),
+        "damage to it is a fault too: {:?}",
+        recover(&rot).tail
+    );
 }
 
 #[test]
@@ -653,48 +741,74 @@ fn what_is_not_a_tape_of_this_build_is_named() {
         (0, Why::NotATape)
     );
     let mut newer = MAGIC.to_vec();
-    newer[6] = 3;
-    assert_eq!(fault(recover(&newer)), (0, Why::Format(3)));
+    newer[6] = FRAME_FORMAT + 1;
+    assert_eq!(fault(recover(&newer)), (0, Why::Format(FRAME_FORMAT + 1)));
     assert_eq!(recover(&MAGIC).tail, Tail::Torn { at: MAGIC.len() });
     assert_eq!(recover(&MAGIC[..5]).tail, Tail::Torn { at: 0 });
-    let one = Format::One.magic();
-    assert_eq!(recover(&one[..7]).tail, Tail::Torn { at: 0 });
-    assert_eq!(recover(&one).tail, Tail::Torn { at: MAGIC.len() });
     let records = |items: &[Item]| {
-        let mut enc = super::codec::Encoder::default();
+        let mut enc = Encoder::default();
         let mut raw = Vec::new();
         for item in items {
             enc.item(item, &mut raw);
         }
-        frame_bytes(Kind::Records, 0, &raw)
+        frame_bytes(Kind::Records, 0, &raw).expect("a frame")
     };
-    let header = frame_bytes(Kind::Header, 0, HEADER.as_bytes());
+    let header = frame_bytes(Kind::Header, 0, HEADER.as_bytes()).expect("a frame");
+    let after = MAGIC.len() + header.len();
     let no_header = [MAGIC.as_slice(), &records(&[mono(1)])].concat();
     assert_eq!(fault(recover(&no_header)), (8, Why::NoHeader));
-    let second = frame_bytes(Kind::Header, 1, HEADER.as_bytes());
+    let second = frame_bytes(Kind::Header, 1, HEADER.as_bytes()).expect("a frame");
     let two = [MAGIC.as_slice(), &header, &second].concat();
-    assert_eq!(fault(recover(&two)), (8 + header.len(), Why::SecondHeader));
+    assert_eq!(fault(recover(&two)), (after, Why::SecondHeader));
     let again = [MAGIC.as_slice(), &header, &header].concat();
     assert_eq!(
         fault(recover(&again)),
         (
-            8 + header.len(),
-            Why::OutOfPlace {
+            after,
+            Why::Steps(StepFault::OutOfOrder {
                 expected: 1,
                 found: 0
-            }
+            })
         )
     );
     let wrong = [
         MAGIC.as_slice(),
         &header,
-        &frame_bytes(Kind::Records, 1, &[0x7f]),
+        &frame_bytes(Kind::Records, 1, &[0x7f]).expect("a frame"),
     ]
     .concat();
     assert!(matches!(
         fault(recover(&wrong)),
-        (at, Why::Unreadable(_)) if at == 8 + header.len()
+        (at, Why::Unreadable(_)) if at == after
     ));
+    let body = |kind: u8, raw_len: u32, payload: &[u8]| {
+        let mut body = vec![kind];
+        body.extend_from_slice(&raw_len.to_le_bytes());
+        body.extend_from_slice(payload);
+        let record = encode_step(1, &body).expect("a step record");
+        [MAGIC.as_slice(), &header, &record].concat()
+    };
+    for (what, tape) in [
+        ("a body shorter than its head", {
+            let record = encode_step(1, &[1, 0, 0]).expect("a step record");
+            [MAGIC.as_slice(), &header, &record].concat()
+        }),
+        ("a kind this build lacks", body(2, 0, &[])),
+        ("a payload longer than its raw bytes", body(1, 1, &[0, 0])),
+        (
+            "a payload that does not decompress",
+            body(1, 64, &[0xff; 8]),
+        ),
+        (
+            "a raw length past a frame's",
+            body(1, u32::try_from(FRAME_RAW_MAX + 1).expect("u32"), &[]),
+        ),
+    ] {
+        assert!(
+            matches!(fault(recover(&tape)), (at, Why::Unreadable(_)) if at == after),
+            "{what}"
+        );
+    }
 }
 
 #[test]
@@ -730,6 +844,61 @@ fn the_cap_leaves_a_truncation_mark_and_stops() {
     assert_eq!(sink.bytes(), at_cap, "nothing past the mark");
     assert_eq!(sink.taken().syncs, 1, "the end syncs the capped tape");
     assert!(said.text().is_empty(), "the cap is no failure");
+}
+
+/// An output whose item encodes to `len` bytes, of bytes that do not compress.
+fn output_of(rng: &mut XorShift, len: usize) -> Item {
+    let encoded = |item: &Item| {
+        let mut bytes = Vec::new();
+        Encoder::default().item(item, &mut bytes);
+        bytes.len()
+    };
+    // An output of 2^22 bytes spells its length in as many bytes as one of `len`'s.
+    let probe = 1 << 22;
+    let overhead = encoded(&noise(rng, probe)) - probe;
+    let item = noise(rng, len - overhead);
+    assert_eq!(encoded(&item), len);
+    item
+}
+
+#[test]
+fn an_item_past_what_a_frame_holds_is_truncated_with_its_mark() {
+    let mut rng = XorShift::new(19);
+    let largest = output_of(&mut rng, FRAME_RAW_MAX);
+    let (mut w, sink, said) = writer();
+    w.append(&largest);
+    w.append(&mono(1));
+    w.flush_hint(Hint::Act);
+    assert_eq!(
+        w.stopped(),
+        None,
+        "an item of a frame's most is written whole"
+    );
+    let read = recover(&sink.bytes());
+    assert_eq!(read.tail, Tail::Clean);
+    assert_eq!(read.items, [largest, mono(1)]);
+    let frames = frames_of(&sink.bytes());
+    assert_eq!(
+        (frames[1].raw, frames[1].packed),
+        (FRAME_RAW_MAX, false),
+        "alone in its frame, stored raw: the largest body a step record carries"
+    );
+
+    let over = output_of(&mut rng, FRAME_RAW_MAX + 1);
+    let (mut w, sink, _) = writer();
+    w.append(&mono(2));
+    w.append(&over);
+    w.append(&mono(3));
+    w.flush_hint(Hint::Act);
+    assert_eq!(w.stopped(), Some(Stopped::Capped));
+    let read = recover(&sink.bytes());
+    assert_eq!(read.tail, Tail::Clean);
+    assert_eq!(
+        read.items,
+        [mono(2), Item::Mark(Mark::Truncated { door: 1 })],
+        "what came before, then the mark at the first effect not kept"
+    );
+    assert!(said.text().is_empty(), "the truncation is no failure");
 }
 
 #[test]
@@ -787,7 +956,7 @@ fn a_sink_that_fails_midway_leaves_whole_frames_then_a_torn_tail() {
     let read = recover(&sink.bytes());
     assert_eq!(read.frames, 3, "the header and two records frames");
     assert_eq!(read.items, vec![screen_read(0), screen_read(1)]);
-    let whole = frames_of(&sink.bytes())[2].1;
+    let whole = frames_of(&sink.bytes())[2].end;
     assert_eq!(read.tail, Tail::Torn { at: whole });
     assert_eq!(said.text().lines().count(), 1);
 }

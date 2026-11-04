@@ -13,6 +13,15 @@ use aterm_uds::secret::Secret;
 const REPLY_MAX: usize = 256 * 1024;
 const PROVIDER: &str = "managed:kimi-code";
 
+#[cfg(unix)]
+#[path = "cli_shared_kimi_refresh.rs"]
+mod refresh;
+#[cfg(unix)]
+pub(in crate::harness) use refresh::{
+    Snapshot as RejectedSnapshot, rejected_snapshot, verify_or_refresh,
+    verify_or_refresh_with_rejection,
+};
+
 /// Kimi's native device flow, with a separate staged home on every machine.
 pub struct KimiOauth;
 
@@ -41,7 +50,9 @@ impl KimiOauth {
         match result.outcome {
             login_drive::Outcome::SignedIn { .. } => Execution::Completed,
             login_drive::Outcome::NotRun(why) => Execution::NotStarted(why),
-            login_drive::Outcome::Unverified(why) => Execution::Unknown(why),
+            login_drive::Outcome::PageNotOpened(why) | login_drive::Outcome::Unverified(why) => {
+                Execution::Unknown(why)
+            }
             _ => Execution::Unknown("device-local Kimi sign-in did not complete".into()),
         }
     }
@@ -102,16 +113,36 @@ impl Provider for KimiOauth {
             if let Some(mut journal) =
                 crate::harness::google_federation::recovery::Journal::open(&request, home)
                     .map_err(ObservationError::Unavailable)?
-                && let Some(proof) = journal.observe_existing(
-                    &request,
-                    home,
-                    std::time::Instant::now() + AUTH_CHECK_BUDGET,
-                )?
             {
-                return Ok(Some(Box::new(proof)));
+                let deadline = std::time::Instant::now() + AUTH_CHECK_BUDGET;
+                if let Some(proof) = journal.observe_existing(&request, home, deadline)? {
+                    return Ok(Some(Box::new(proof)));
+                }
+                return journal
+                    .observe_current(&request, home, deadline)
+                    .map(|proof| proof.map(|proof| Box::new(proof) as Box<dyn LoginProof>));
             }
         }
         let now = context.host.now().max(context.env.now);
+        #[cfg(unix)]
+        if let Some(admission) = context.admission {
+            let _claim =
+                crate::harness::browser_window::ProfileLock::claim(staging).map_err(|_| {
+                    ObservationError::Unavailable(
+                        "Kimi native staging is held or unavailable".into(),
+                    )
+                })?;
+            return verify_or_refresh(
+                staging,
+                region,
+                email,
+                now,
+                std::time::Instant::now() + AUTH_CHECK_BUDGET,
+                std::sync::Arc::new(refresh::AdmissionGuard(admission.clone())),
+            )
+            .map(|proof| proof.map(|proof| Box::new(proof) as Box<dyn LoginProof>))
+            .map_err(observation_error);
+        }
         verify_native_classified(
             staging,
             region,
@@ -127,6 +158,12 @@ impl Provider for KimiOauth {
 pub(in crate::harness) fn observation_error(error: NativeError) -> ObservationError {
     match error {
         NativeError::Temporary => ObservationError::Unavailable(error.to_string()),
+        #[cfg(unix)]
+        NativeError::RefreshRejected => ObservationError::RecoveryRequired(error.to_string()),
+        #[cfg(unix)]
+        NativeError::PreviouslyRejected => {
+            ObservationError::ReauthenticationRequired(error.to_string())
+        }
         NativeError::Expired
         | NativeError::Rejected
         | NativeError::Local(_)
@@ -138,6 +175,12 @@ pub(in crate::harness) fn observation_error(error: NativeError) -> ObservationEr
 pub(in crate::harness) enum NativeError {
     /// A supported local bearer whose checked expiry has elapsed. No provider I/O ran.
     Expired,
+    /// The pinned refresh endpoint rejected the grant and its exact snapshot was recorded.
+    #[cfg(unix)]
+    RefreshRejected,
+    /// An unchanged local receipt of a prior confirmed refresh rejection.
+    #[cfg(unix)]
+    PreviouslyRejected,
     Rejected,
     Temporary,
     Local(String),
@@ -147,6 +190,10 @@ impl std::fmt::Display for NativeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Expired => f.write_str("Kimi native credential has expired"),
+            #[cfg(unix)]
+            Self::RefreshRejected | Self::PreviouslyRejected => {
+                f.write_str("Kimi rejected the native refresh grant")
+            }
             Self::Rejected => f.write_str("Kimi rejected the native credential"),
             Self::Temporary => f.write_str("Kimi identity verification is temporarily unavailable"),
             Self::Local(why) | Self::Refused(why) => f.write_str(why),
@@ -171,22 +218,28 @@ pub(in crate::harness) fn verify_native_classified(
     now: i64,
     deadline: std::time::Instant,
 ) -> Result<Option<KimiProof>, NativeError> {
+    verify_native_guarded(staging, region, expected, now, deadline, None)
+}
+
+fn verify_native_guarded(
+    staging: &Path,
+    region: Region,
+    expected: &str,
+    now: i64,
+    deadline: std::time::Instant,
+    guard: Option<std::sync::Arc<dyn aterm_http::Guard>>,
+) -> Result<Option<KimiProof>, NativeError> {
     if std::time::Instant::now() >= deadline {
         return Err(NativeError::Temporary);
     }
-    let status = std::cell::Cell::new(None);
-    let request_failed = std::cell::Cell::new(false);
     let proof = verify_with(staging, region, expected, now, |url, token| {
         let wait = deadline
             .checked_duration_since(std::time::Instant::now())
             .filter(|wait| !wait.is_zero())
-            .ok_or_else(|| {
-                request_failed.set(true);
-                "Kimi identity verification deadline expired".to_owned()
-            })?
+            .ok_or_else(|| "Kimi identity verification deadline expired".to_owned())?
             .min(AUTH_CHECK_BUDGET);
         let client = Client::new(Trust::PlatformVerifier, ProxyMode::Direct, wait);
-        let reply = client
+        let mut request = client
             .get(url)
             .header("Accept", "application/json")
             .secret_header("Authorization", {
@@ -195,27 +248,21 @@ pub(in crate::harness) fn verify_native_classified(
                 Secret::from_vec(header)
             })
             .limit(REPLY_MAX)
-            .backstop(wait)
+            .backstop(wait);
+        if let Some(guard) = &guard {
+            request = request.guard(guard.clone());
+        }
+        let reply = request
             .send(&[])
-            .map_err(|_| {
-                request_failed.set(true);
-                "Kimi identity request did not complete".to_owned()
-            })?;
-        status.set(Some(reply.status()));
+            .map_err(|_| "Kimi identity request did not complete".to_owned())?;
         Ok((reply.status(), reply.body().to_vec()))
-    })
-    .map_err(|why| match status.get() {
-        Some(401) => NativeError::Rejected,
-        Some(429) => NativeError::Temporary,
-        Some(408 | 500..=599) => NativeError::Temporary,
-        _ if request_failed.get() => NativeError::Temporary,
-        Some(_) => NativeError::Refused(why.to_string()),
-        None => why,
-    })?;
-    if std::time::Instant::now() >= deadline {
+    });
+    if std::time::Instant::now() >= deadline
+        || guard.as_ref().is_some_and(|guard| !guard.is_authorized())
+    {
         return Err(NativeError::Temporary);
     }
-    Ok(proof)
+    proof
 }
 
 fn region(row: &accounts::Row) -> Result<Region, String> {
@@ -384,6 +431,8 @@ impl FileEvidence {
 
 pub(in crate::harness) struct KimiProof {
     #[cfg(unix)]
+    native_lock: Option<refresh::native_lock::NativeLock>,
+    #[cfg(unix)]
     region: Region,
     #[cfg(unix)]
     staging: PathBuf,
@@ -422,6 +471,10 @@ impl LoginProof for KimiProof {
         None
     }
     fn check_current(&self) -> Result<(), String> {
+        #[cfg(unix)]
+        if let Some(lock) = &self.native_lock {
+            lock.check_current()?;
+        }
         self.credential.check_current()?;
         self.config.check_current()
     }
@@ -543,21 +596,35 @@ fn verify_with(
     super::wipe_json(token);
     let access = access?;
     let access = std::str::from_utf8(access.expose()).map_err(|_| "invalid Kimi token text")?;
-    let (status, body) = request(&format!("{}/me", base(region)), access)?;
-    if status != 200 || body.len() > REPLY_MAX {
-        return Err("Kimi did not accept the staged identity request".into());
+    let (status, body) =
+        request(&format!("{}/me", base(region)), access).map_err(|_| NativeError::Temporary)?;
+    credential
+        .check_current()
+        .and_then(|()| config.check_current())
+        .map_err(|_| NativeError::Temporary)?;
+    if status == 401 {
+        return Err(NativeError::Rejected);
     }
-    let identity: Value =
-        aterm_json::from_slice(&body).map_err(|_| "Kimi identity response is invalid")?;
+    if status != 200 || body.len() > REPLY_MAX {
+        return Err(NativeError::Temporary);
+    }
+    let identity: Value = aterm_json::from_slice(&body).map_err(|_| NativeError::Temporary)?;
     let email = identity["email"]
         .as_str()
-        .filter(|email| accounts::email_matches(email, expected))
-        .ok_or("Kimi identity does not prove the approved email")?;
+        .filter(|email| accounts::email_refusal(email).is_none())
+        .ok_or(NativeError::Temporary)?;
     let principal = identity["user_id"]
         .as_str()
         .and_then(|user| KimiOauth::principal(region, user))
-        .ok_or("Kimi identity has no full user id")?;
+        .ok_or(NativeError::Temporary)?;
+    if !accounts::email_matches(email, expected) {
+        return Err(NativeError::Refused(
+            "Kimi identity does not match the approved email".into(),
+        ));
+    }
     let proof = KimiProof {
+        #[cfg(unix)]
+        native_lock: None,
         #[cfg(unix)]
         region,
         #[cfg(unix)]
@@ -567,7 +634,7 @@ fn verify_with(
         email: email.to_owned(),
         principal,
     };
-    proof.check_current()?;
+    proof.check_current().map_err(|_| NativeError::Temporary)?;
     Ok(Some(proof))
 }
 
@@ -625,3 +692,6 @@ pub(in crate::harness) fn pending_proof_fixture(
 #[cfg(all(test, unix))]
 #[path = "cli_shared_kimi_tests.rs"]
 mod tests;
+
+#[cfg(all(test, unix))]
+pub(in crate::harness) use refresh::rejection_fixture;

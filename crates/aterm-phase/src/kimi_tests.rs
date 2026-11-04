@@ -175,6 +175,7 @@ fn the_composer_reads_its_draft_and_the_footer_its_context() {
 fn kimi_s_screens_are_its_own_by_name_and_by_sight() {
     assert_eq!(program_of("kimi"), Some(Program::Kimi));
     assert_eq!(program_of("kimi-code"), Some(Program::Kimi));
+    assert_eq!(program_of("kimi-alab"), Some(Program::Kimi));
     for fixture in [
         IDLE,
         DRAFT,

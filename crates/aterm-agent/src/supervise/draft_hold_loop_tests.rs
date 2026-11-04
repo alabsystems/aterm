@@ -1,22 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A GREY SUGGESTION IS NO PERSON'S DRAFT, AND NOTHING IS TYPED INTO A DRAFT INSIDE ITS GRACE. Under a
-//! program that draws grey text a composer's first glyph is told by its cell wherever the cursor
-//! stands (`Session::composer_draft`). Plain, it is a draft, which keeps its full grace from its first
-//! read and then goes to the policy's draft step. Grey with the cursor home on it, it is a suggestion,
-//! typed over at once. Grey with the cursor anywhere else it says neither, since a frame read before
-//! its program placed the cursor and a person's own text drawn grey read the same: nothing is typed
-//! over it, no Enter is pressed on it, the wait's own steps look again, and the host's guards hold as
-//! the door does. Nothing looks at a grace on the way: a composer read empty or grey inside it decides
-//! nothing, however long and after whatever input, since a redraw stalled before its text reads the
-//! same. Any other text is another draft, which a person's edit and a window's reflow both read as, and
-//! the loop's own words are no person's draft (`Session::own_words`). A person's key still holds, a
+//! A GREY SUGGESTION IS NO PERSON'S DRAFT, AND NOTHING IS TYPED INTO A DRAFT INSIDE ITS GRACE. Under
+//! a program that draws grey text a composer's first glyph is told by its cell wherever the cursor
+//! stands (`Session::composer_draft`). Plain, it is a draft, which keeps its full grace from the
+//! first read that says so and then goes to the policy's draft step. Grey with the cursor home on it,
+//! it is a suggestion, typed over at once. Grey with the cursor anywhere else it says neither, since
+//! a frame read before its program placed the cursor and a person's own text drawn grey read the
+//! same: nothing is typed over it, no Enter is pressed on it, the wait's own steps look again, and
+//! the host's guards hold as the door does. Nothing looks at a grace on the way, and a composer read
+//! empty or grey with other words decides nothing inside one, on the same point or a new one, however
+//! long and after whatever input, since a redraw stalled before its text reads the same. Once a read
+//! finds gone the text a decision held the point on, a draft's grace or any other hold's, nothing is
+//! typed for a whole grace from that read (`Session::see_draft`). Any other text is another draft,
+//! which a person's edit and a window's reflow both read as, read on the composer or off it, and the
+//! loop's own words are no person's draft (`Session::own_words`). A person's key still holds, a
 //! person's grace keeps the host's wake, and a screen ticking over a draft or a suggestion asks its
 //! cell no more for that.
 
 use super::*;
-use crate::supervise::policy::turn_end::{MENU_DIVERTS, OWN_WORDS_STAND, PERSON_TYPING};
+use crate::supervise::policy::turn_end::{
+    MENU_DIVERTS, OWN_WORDS_STAND, PERSON_TYPING, SEARCH_DIVERTS,
+};
 
 const SAID: &str = "Stage 1 is in.";
 const HINT: &str = "keep going, then merge when ready";
@@ -245,8 +250,8 @@ fn muse_footer(rows: &[String]) -> usize {
 /// went home reads a suggestion and the continuation is typed over it, never an Enter on it. A cursor
 /// that never goes home is never acted on, and the journal says why.
 /// NEGATIVE CONTROLS: `composer_draft` taking grey for a suggestion wherever the cursor stands, and
-/// the run whose cursor never homes types over the text at once; `composer_draft` asking the cell only
-/// at column 2, as on `5ece62c7b3`, and that run presses Enter on it at 120 s.
+/// the continuation is typed over the text at its first read; `composer_draft` asking the cell only
+/// at column 2, as on `5ece62c7b3`, and an Enter is pressed on it.
 #[test]
 fn grey_text_with_the_cursor_past_it_waits_for_the_cursor() {
     let run = |homes: Option<Duration>| {
@@ -255,7 +260,6 @@ fn grey_text_with_the_cursor_past_it_waits_for_the_cursor() {
         m.cursor_on_caret = true;
         m.cursor_col = Some(2 + HINT.chars().count());
         m.cursor_home_after = homes;
-        m.turn_releases = Some(1);
         m.stall_sleep = Some(Duration::from_secs(3600));
         m.exit_when = Some(acted);
         held_run("draft-past", m)
@@ -264,34 +268,14 @@ fn grey_text_with_the_cursor_past_it_waits_for_the_cursor() {
     run(None).left_it_alone("never homes");
 }
 
-/// THE 174640090a SHAPE: the suggestion drawn whole, the cursor still off the caret's row (where
-/// `fabric_world`'s stand-in left it between its `cat` and its cursor placement), then home. The
-/// continuation is typed over the suggestion once a wait step reads the cursor home, never an Enter
-/// on it.
-/// NEGATIVE CONTROL: as [`grey_text_with_the_cursor_past_it_waits_for_the_cursor`]'s, and the
-/// continuation is typed at the read off the caret.
-#[test]
-fn a_suggestion_read_with_the_cursor_off_its_caret_waits_for_the_cursor() {
-    let mut m = fenced(vec![busy_screen(), tall_with(HINT)]);
-    m.dim_past = true;
-    m.cursor_col = Some(40);
-    m.cursor_home_after = Some(HOME);
-    m.turn_releases = Some(1);
-    m.stall_sleep = Some(Duration::from_secs(3600));
-    m.exit_when = Some(acted);
-    let t = held_run("draft-off-caret", m);
-    t.typed_at_the_step_after_home("off its caret", 1);
-    assert!(t.typed() == 1, "{}", t.evidence());
-}
-
 /// MUSE CODE'S HINT, WHEREVER ITS FRAME LEFT THE CURSOR (`docs/measured/half-drawn-frame-2026-10-22.md`):
 /// no DEC 2026 brackets, its ~2 KB bottom pane drawn in place and its cursor placed last
 /// (`ESC[48;3H`), so a read inside the redraw finds its prompt hint whole with the cursor on the
 /// footer's row, and a read of a frame before that with the cursor past the hint on the caret's row.
 /// Its cell (Muse's grey `676c74`) says grey and its cursor says neither, so nothing is typed until
 /// a wait step reads the cursor home; then the continuation is typed and the hint is never submitted.
-/// NEGATIVE CONTROL: `cell_is_placeholder` ignoring the program's hint ink, and the hint is held as
-/// a person's draft and then sent.
+/// NEGATIVE CONTROL: `cell_is_placeholder` ignoring the program's hint ink, and the hint is held as a
+/// person's draft (`WAITING … a person is typing`, no write at the step after home).
 #[test]
 fn a_muse_hint_waits_for_the_cursor_wherever_its_frame_left_it() {
     use aterm_phase::muse::fixtures as u;
@@ -308,7 +292,7 @@ fn a_muse_hint_waits_for_the_cursor_wherever_its_frame_left_it() {
         m.cell_fg = "676c74";
         m.cell_attrs = "none";
         m.cursor_home_after = Some(HOME);
-        m.turn_releases = Some(1);
+        m.stall_sleep = Some(Duration::from_secs(3600));
         m.exit_when = Some(acted);
         let t = held_run("draft-muse-hint", m);
         t.typed_at_the_step_after_home(&format!("past {past}"), 1);
@@ -319,8 +303,9 @@ fn a_muse_hint_waits_for_the_cursor_wherever_its_frame_left_it() {
 /// `keep going, then` with the cursor after it (a frame read before its program placed the cursor),
 /// no key measured. That read says neither, and the frame's next read, the suggestion whole with the
 /// cursor home, has the continuation typed over it, never an Enter on it.
-/// NEGATIVE CONTROL: `composer_draft` asking the cell only at column 2, as on `5ece62c7b3`: the part
-/// is waited on as a person's draft.
+/// NEGATIVE CONTROL: `composer_draft` asking the cell only at column 2, as on `5ece62c7b3`, and the
+/// part is waited on as a person's draft; `see_draft` marking any other words as the text's leaving,
+/// and the whole suggestion, which begins with the part, is waited on as well.
 #[test]
 fn a_suggestion_read_in_part_is_no_draft() {
     let part = "keep going, then";
@@ -338,32 +323,6 @@ fn a_suggestion_read_in_part_is_no_draft() {
     m.exit_when = Some(acted);
     let t = held_run("draft-hint-in-part", m);
     t.typed_at_once("in part", 1);
-}
-
-/// A SUGGESTION OVER AN EMPTY LATER ROW WAITS FOR THE CURSOR (the review of `d7b6e8aa23`): Claude
-/// Code's one-row suggestion (dim) with an empty composer row drawn under it and the cursor on that
-/// row (a redraw read before the row it left was cleared), no key measured. That reads as a person's
-/// grey text over a Shift+Enter does, so nothing is typed and no Enter pressed; a wait step reads the
-/// cursor home, and the continuation is typed over the suggestion, never an Enter on it.
-/// NEGATIVE CONTROL: `cursor_home` without its later-row test, and the continuation is typed at the
-/// first read.
-#[test]
-fn a_suggestion_over_an_empty_later_row_waits_for_the_cursor() {
-    let mut r = typed_in(SAID, HINT);
-    let caret = r
-        .iter()
-        .position(|row| *row == format!("❯ {HINT}"))
-        .expect("the caret's row");
-    r.insert(caret + 1, "  ".to_string());
-    let mut m = fenced(vec![busy_screen(), r]);
-    m.screen_cursors.insert(1, caret + 1);
-    m.cursor_col = Some(2);
-    m.cursor_home_after = Some(HOME);
-    m.turn_releases = Some(1);
-    m.stall_sleep = Some(Duration::from_secs(3600));
-    m.exit_when = Some(acted);
-    let t = held_run("draft-hint-later-row", m);
-    t.typed_at_the_step_after_home("a later row", 1);
 }
 
 /// A PERSON'S TEXT DRAWN GREY IS NEVER TYPED OVER NOR SENT (the review of `5ad7f68c8f`). A program can
@@ -426,7 +385,6 @@ fn a_persons_text_drawn_grey_is_never_typed_over_nor_sent() {
         cases.push((what, m));
     }
     for (what, mut m) in cases {
-        m.turn_releases = Some(1);
         m.stall_sleep = Some(Duration::from_secs(3600));
         held_run("draft-person-grey", m).left_it_alone(what);
     }
@@ -434,8 +392,8 @@ fn a_persons_text_drawn_grey_is_never_typed_over_nor_sent() {
 
 /// A DICTATION DRAWN GREY IS LEFT ALONE UNTIL IT STANDS PLAIN (the same review): the key that started
 /// it long past its grace, the words growing under the cursor every 20 s, drawn dim, and then standing
-/// plain. Nothing is typed or pressed while they grow, and the draft then keeps a full grace from
-/// their last change before the draft step sends it.
+/// plain. Nothing is typed or pressed while they grow, and the draft then keeps a full grace from the
+/// read that says it typed before the draft step sends it.
 /// NEGATIVE CONTROL: as [`a_persons_text_drawn_grey_is_never_typed_over_nor_sent`]'s, and `keep going`
 /// is written into the first words read.
 #[test]
@@ -470,23 +428,81 @@ fn a_dictation_drawn_grey_is_left_alone_until_it_stands_plain() {
     m.stall_sleep = Some(Duration::from_secs(3600));
     m.exit_when = Some(acted);
     let t = held_run("draft-dictation", m);
-    let last = t.first_read_of(3);
+    let plain = t.first_read_of(4);
     let acted = t.acted_at().unwrap_or_else(|| panic!("{}", t.evidence()));
     assert!(
-        acted >= last + Duration::from_secs(119),
-        "acted {:?} after the words last changed: {}",
-        acted.saturating_duration_since(last),
+        acted >= plain + Duration::from_secs(119),
+        "acted {:?} after the words stood plain: {}",
+        acted.saturating_duration_since(plain),
         t.evidence()
     );
     assert_eq!((t.enters(), t.typed()), (1, 0), "{}", t.evidence());
 }
 
+/// A DRAFT'S GRACE RUNS FROM THE FIRST READ THAT SAYS IT TYPED (the review of `367dfeea26`): the same
+/// words, no key measured, on reads that could not say for a whole grace and more, then plain, as a
+/// dictation that stops changing is. That read is the first sign of a person's text, so it is sent a
+/// full grace from it, never on the reads before.
+/// NEGATIVE CONTROLS: `cell_saw` keeping the first sight of text no read has said typed, and each
+/// arm's Enter comes within 10 ms of the plain read; `cell_saw` leaving text only the rows had found
+/// [`turn_end_loop::DraftCell::Unasked`] on a read that could not say, and the `grey past it` arm's does.
+#[test]
+fn a_drafts_grace_runs_from_the_first_read_that_says_it_typed() {
+    type OnCaret = fn(&mut Mock, usize);
+    let says_neither: [(&str, OnCaret); 3] = [
+        ("its cell refused, the cursor home", |m, _| {
+            m.cell_unread_on.insert(1);
+            m.screen_cols.insert(1, 2);
+        }),
+        ("grey past it", |m, _| {
+            m.cell_attrs_on.insert(1, GREY);
+        }),
+        ("grey, the cursor off the composer", |m, caret| {
+            m.cell_attrs_on.insert(1, GREY);
+            m.screen_cursors.insert(1, caret + 2);
+            m.screen_cols.insert(1, 2);
+        }),
+    ];
+    for (what, set) in says_neither {
+        let shown = typed_in(SAID, DRAFT);
+        let caret = shown
+            .iter()
+            .position(|row| row.starts_with('❯'))
+            .expect("the caret's row");
+        let mut m = fenced(vec![busy_screen(), shown.clone(), shown]);
+        m.cell_attrs = "none";
+        m.dim_past = true;
+        m.cursor_on_caret = true;
+        m.cursor_col = Some(2 + DRAFT.chars().count());
+        set(&mut m, caret);
+        m.timeline = Some((1, vec![Duration::ZERO, Duration::from_secs(125)]));
+        m.stall_sleep = Some(Duration::from_secs(3600));
+        m.exit_when = Some(acted);
+        let t = held_run("draft-first-said", m);
+        let plain = t.first_read_of(2);
+        let enter = t
+            .enter_at()
+            .unwrap_or_else(|| panic!("{what}: {}", t.evidence()));
+        assert!(
+            enter >= plain + Duration::from_secs(119),
+            "{what}: sent {:?} after the plain read: {}",
+            enter.saturating_duration_since(plain),
+            t.evidence()
+        );
+        assert_eq!((t.enters(), t.typed()), (1, 0), "{what}: {}", t.evidence());
+    }
+}
+
 /// WHAT THE GLYPH'S CELL AND THE CURSOR SAY OF A COMPOSER'S TEXT, ARM BY ARM (`composer_draft`), and
-/// which arms read a cell. `cursor_home` takes no row but a later one of the composer: a grid a resize
-/// left drawn one row high has the cursor a row under the caret's
-/// (`docs/DESIGN-wall-resume-2026-09-28.md`), and every real suggestion a tape holds has it on the
-/// caret's row at column 2 (`c8-cruise-placeholder`, 13 of 13 reads). A dim first glyph on more rows
-/// than one is no draft by its rows alone: nothing measured keeps a long suggestion to one row.
+/// which arms read a cell. Home (`cursor_home`) is the caret's row at column 2, where every real
+/// suggestion a tape holds has it (`c8-cruise-placeholder`, 13 of 13 reads), or on a lone line the row
+/// under, where a grid a resize left drawn one row high has it
+/// (`docs/DESIGN-wall-resume-2026-09-28.md`). A dim first glyph on more rows than one is no draft by
+/// its rows alone: Claude Code 2.1.318 cuts a long suggestion to one row and Muse Code 1.4.14 clips
+/// its tip to one (`docs/measured/composer-cells-2026-11-03.md`), so this arm only keeps the rows from
+/// calling grey text on more rows, which nothing measured draws, typed.
+/// NEGATIVE CONTROL: `cursor_home` taking column 2 on any row but a later one of the composer, as on
+/// `bd67622c8c`, and the rows above and under say suggestion.
 #[test]
 fn what_a_composers_cell_and_cursor_say() {
     /// What the case is, the composer's lines, whether its program draws grey text, what the glyph's
@@ -507,7 +523,7 @@ fn what_a_composers_cell_and_cursor_say() {
     let two = ["please also update", "the changelog"];
     let blank_first = ["", "the changelog"];
     let blank: [&str; 1] = [""];
-    let cases: [Case<'_>; 16] = [
+    let cases: [Case<'_>; 19] = [
         ("no text", &blank, true, "dim", CARET, 2, Some(false), 0),
         (
             "a blank first row",
@@ -553,14 +569,35 @@ fn what_a_composers_cell_and_cursor_say() {
             Some(false),
             1,
         ),
+        ("grey, column 2 above", &lone, true, "dim", 2, 2, None, 1),
         (
-            "grey, column 2 above",
+            "grey, column 2 two rows under",
             &lone,
+            true,
+            "dim",
+            CARET + 2,
+            2,
+            None,
+            1,
+        ),
+        (
+            "grey, two rows, column 2 above",
+            &two,
             true,
             "dim",
             2,
             2,
-            Some(false),
+            None,
+            1,
+        ),
+        (
+            "grey, two rows, column 2 under",
+            &two,
+            true,
+            "dim",
+            CARET + 2,
+            2,
+            None,
             1,
         ),
         (
@@ -647,11 +684,13 @@ fn what_a_composers_cell_and_cursor_say() {
 
 /// A REAL DRAFT STANDS ITS FULL GRACE, its caret moved home or not: typed text (no dim) with the
 /// cursor after it, then the same rows with the cursor home on column 2, no key measured. Nothing
-/// decides again until the grace from its first sight is out, and then the policy's draft step sends
-/// it: one Enter, nothing typed over it.
+/// decides again until the grace from its first sight is out, each wait running its whole timeout on
+/// the run's clock, a wait step (20 s) between reads, so nothing polls it; then the policy's draft step
+/// sends it: one Enter, nothing typed over it.
 /// NEGATIVE CONTROLS: `see_draft` dropping the same words read home, and each decision sees the
 /// draft anew: five `WAITING`s, never sent; the policy's draft step without its `Submit` over
-/// `Composer::Typed`, and the continuation is typed over the draft.
+/// `Composer::Typed`, and the continuation is typed over the draft; every step of `wait_for_next`
+/// capped at `HANDBACK_POLL`, about 60 reads.
 #[test]
 fn a_real_draft_is_held_its_full_grace_and_then_submitted() {
     let mut m = fenced(vec![busy_screen(), typed_in(SAID, DRAFT)]);
@@ -659,7 +698,7 @@ fn a_real_draft_is_held_its_full_grace_and_then_submitted() {
     m.cursor_on_caret = true;
     m.cursor_col = Some(2 + DRAFT.chars().count());
     m.cursor_home_after = Some(HOME);
-    m.turn_releases = Some(1);
+    m.stall_sleep = Some(Duration::from_secs(3600));
     m.exit_when = Some(acted);
     let t = held_run("draft-real", m);
     assert_eq!(t.person_waits(), 1, "{}", t.evidence());
@@ -671,54 +710,18 @@ fn a_real_draft_is_held_its_full_grace_and_then_submitted() {
         enter - seen,
         t.evidence()
     );
+    let reads = t.reads_between(seen);
+    assert!(
+        reads <= 120 / 20 + 4,
+        "{reads} reads in the hold: {}",
+        t.evidence()
+    );
     assert_eq!(
         (t.enters(), t.typed()),
         (1, 0),
         "sent once, never typed over: {}",
         t.evidence()
     );
-}
-
-/// A DRAFT CLEARED HOLDS ITS GRACE, A KEY MEASURED OR NOT: the draft read, then cleared at the
-/// next read by an input write no window stamped (another program's key). With the window's key
-/// just measured the grace rests on the key; with none it rests on the draft, and a composer read
-/// empty cannot be told from a redraw stalled before the draft's text, so neither is decided again
-/// on the clear: the point waits the 120 s and only then is the continuation typed.
-/// NEGATIVE CONTROL: a person's grace held as `draft_look` reads it (`draft_holds` true of
-/// `Composer::Typed` at a `WaitUntil`), and the unkeyed run types the continuation at the clear's
-/// read.
-#[test]
-fn a_draft_cleared_holds_its_grace_keyed_or_not() {
-    for keyed in [false, true] {
-        let mut m = fenced(vec![busy_screen(), typed_in(SAID, DRAFT), ended(SAID)]);
-        m.cell_attrs = "none";
-        m.cursor_on_caret = true;
-        m.screen_cols.insert(1, 2 + DRAFT.chars().count());
-        // A wait the screens no longer answer passes its own timeout on the run's clock, a step
-        // of at most a second, so the 120 s grace is a few hundred round trips, not one per
-        // millisecond of it.
-        m.stall_sleep = Some(Duration::from_secs(1));
-        if keyed {
-            m.keyed_at_read = Some(1);
-        }
-        m.exit_when = Some(acted);
-        let tag = if keyed {
-            "draft-keyed"
-        } else {
-            "draft-unkeyed"
-        };
-        let t = held_run(tag, m);
-        assert_eq!(t.person_waits(), 1, "{tag}: {}", t.evidence());
-        let seen = t.first_read_of(1);
-        let sent = t.typed_at().unwrap_or_else(|| panic!("{}", t.evidence()));
-        assert!(
-            sent >= seen + Duration::from_secs(119),
-            "{tag}: typed {:?} after the draft was first read, inside its grace: {}",
-            sent - seen,
-            t.evidence()
-        );
-        assert_eq!(t.enters(), 0, "{tag}: {}", t.evidence());
-    }
 }
 
 /// THE AGY L13 SHAPE (`docs/measured/forever-r11-2026-10-22.md`, `r11cv-agy`): the harness's own
@@ -793,75 +796,6 @@ fn the_harnesss_own_half_echoed_act_is_no_persons_draft() {
     assert_eq!(t.sends().len(), 1, "written once: {}", t.evidence());
 }
 
-/// A PERSON'S DRAFT FIRST READ WITH THE CURSOR OFF THE COMPOSER KEEPS ITS FULL GRACE: typed text
-/// (no dim) read first with the cursor on the composer's top rule (a frame drawn before Claude
-/// Code places its cursor), at the first two or three reads, then with the cursor after its text,
-/// no key measured. The glyph's cell says typed, and the draft is seen from that read on, so the
-/// point waits the person's grace from it and only then does the draft step send it.
-/// NEGATIVE CONTROL: `composer_typed` never calling `cell_saw`, and the Enter goes at the first read,
-/// no `WAITING … a person is typing` journaled.
-#[test]
-fn a_draft_first_read_off_the_composer_keeps_its_full_grace() {
-    for off in [2, 3] {
-        let mut m = fenced(vec![busy_screen(), tall_with(DRAFT)]);
-        m.cell_attrs = "none";
-        m.caret_after_reads = Some(off);
-        m.screen_cols.insert(1, 2 + DRAFT.chars().count());
-        m.turn_releases = Some(1);
-        m.stall_sleep = Some(Duration::from_secs(1));
-        m.exit_when = Some(acted);
-        let t = held_run(&format!("draft-off-composer-{off}"), m);
-        let seen = t.first_read_of(1);
-        let acted = t.acted_at().unwrap_or_else(|| panic!("{}", t.evidence()));
-        assert!(
-            acted >= seen + Duration::from_secs(119),
-            "off={off}: acted {:?} after the draft was first read: {}",
-            acted - seen,
-            t.evidence()
-        );
-        assert_eq!(t.person_waits(), 1, "off={off}: {}", t.evidence());
-        assert_eq!(
-            (t.enters(), t.typed()),
-            (1, 0),
-            "off={off}: the draft sent once, nothing typed over it: {}",
-            t.evidence()
-        );
-    }
-}
-
-/// THE SAME IN MUSE CODE'S SPLIT FRAME: a person's draft (its cell plain, its colour Muse's typed
-/// `ccd3db`, not the hint's `676c74`) read at every look inside Muse's bottom-pane redraw, the cursor
-/// on the footer's row, no key measured. Its cell tells it from the hint
-/// ([`a_muse_hint_is_no_draft_wherever_its_frame_left_the_cursor`]), so it is seen and held its grace
-/// from its first read.
-/// NEGATIVE CONTROL: as [`a_draft_first_read_off_the_composer_keeps_its_full_grace`]'s.
-#[test]
-fn a_muse_draft_read_inside_its_redraw_keeps_its_full_grace() {
-    use aterm_phase::muse::fixtures as u;
-    use aterm_phase::prompt::fixtures::screen;
-    let drafted = muse_typed(DRAFT);
-    let footer = muse_footer(&drafted);
-    let mut m = muse_fenced(vec![screen(u::BUSY_1_4_10), drafted]);
-    m.screen_cursors.remove(&1);
-    m.cursor_row = Some(footer);
-    m.cursor_col = Some(40);
-    m.cell_attrs = "none";
-    m.turn_releases = Some(1);
-    m.stall_sleep = Some(Duration::from_secs(1));
-    m.exit_when = Some(acted);
-    let t = held_run("draft-muse-real-split", m);
-    let seen = t.first_read_of(1);
-    let acted = t.acted_at().unwrap_or_else(|| panic!("{}", t.evidence()));
-    assert!(
-        acted >= seen + Duration::from_secs(119),
-        "acted {:?} after the draft was first read: {}",
-        acted - seen,
-        t.evidence()
-    );
-    assert_eq!(t.person_waits(), 1, "{}", t.evidence());
-    assert_eq!((t.enters(), t.typed()), (1, 0), "{}", t.evidence());
-}
-
 /// `typed_in(SAID, "hello")` with an empty second row under the caret's, and the caret's row.
 fn two_rows() -> (Vec<String>, usize) {
     let mut r = typed_in(SAID, "hello");
@@ -905,7 +839,6 @@ fn a_two_row_draft_with_its_cursor_on_its_empty_row_is_seen() {
     m.cell_attrs = "none";
     m.screen_cursors.insert(1, caret + 1);
     m.cursor_col = Some(2);
-    m.turn_releases = Some(1);
     m.stall_sleep = Some(Duration::from_secs(1));
     m.exit_when = Some(acted);
     let t = held_run("draft-two-rows", m);
@@ -920,182 +853,18 @@ fn a_two_row_draft_with_its_cursor_on_its_empty_row_is_seen() {
     assert_eq!((t.enters(), t.typed()), (1, 0), "{}", t.evidence());
 }
 
-/// A COMPOSER READ EMPTY DECIDES NOTHING, FOR A MOMENT OR FOR GOOD: a draft no key stamped holds the
-/// point; 20 s on, a read finds the composer drawn and empty. Drawn again 400 ms later (a redraw read
-/// between the program's erase and its text), the draft is never typed over, and the draft step
-/// sends it once its grace from its return is out. Empty for good (another writer cleared it), it is
-/// still not decided again inside the draft's grace, as no read tells it from a redraw stalled
-/// there: the continuation is typed once the grace from the draft's first sight is out.
-/// NEGATIVE CONTROL: as [`a_draft_cleared_holds_its_grace_keyed_or_not`]'s, and Cruise's continuation
-/// is typed on the empty read, a moment before the draft comes back.
-#[test]
-fn a_composer_read_empty_decides_nothing() {
-    let run = |back: bool| {
-        let mut screens = vec![busy_screen(), typed_in(SAID, DRAFT), ended(SAID)];
-        let mut at = vec![Duration::ZERO, Duration::from_secs(20)];
-        if back {
-            screens.push(typed_in(SAID, DRAFT));
-            at.push(Duration::from_millis(20_400));
-        }
-        let mut m = fenced(screens);
-        m.cell_attrs = "none";
-        m.cursor_on_caret = true;
-        m.screen_cols.insert(1, 2 + DRAFT.chars().count());
-        m.screen_cols.insert(2, 2);
-        m.screen_cols.insert(3, 2 + DRAFT.chars().count());
-        m.timeline = Some((1, at));
-        m.stall_sleep = Some(Duration::from_secs(3600));
-        m.exit_when = Some(acted);
-        held_run(
-            if back {
-                "draft-blank-moment"
-            } else {
-                "draft-blank-stays"
-            },
-            m,
-        )
-    };
-    let t = run(true);
-    let back = t.first_read_of(3);
-    let acted = t.acted_at().unwrap_or_else(|| panic!("{}", t.evidence()));
-    assert!(
-        acted >= back + Duration::from_secs(119),
-        "acted {:?} after the draft was drawn again: {}",
-        acted.saturating_duration_since(back),
-        t.evidence()
-    );
-    assert_eq!(
-        (t.enters(), t.typed()),
-        (1, 0),
-        "the draft sent once, nothing typed on the empty read: {}",
-        t.evidence()
-    );
-    let t = run(false);
-    let seen = t.first_read_of(1);
-    let typed = t.typed_at().unwrap_or_else(|| panic!("{}", t.evidence()));
-    assert!(
-        typed >= seen + Duration::from_secs(119),
-        "the cleared draft decided again {:?} after its first sight, inside its grace: {}",
-        typed.saturating_duration_since(seen),
-        t.evidence()
-    );
-    assert_eq!((t.enters(), t.typed()), (0, 1), "{}", t.evidence());
-}
-
-/// A PERSON'S GRACE READS THE SCREEN AT THE WAIT'S OWN PACE: a real draft stands its 120 s, no key
-/// measured, each wait running its whole timeout on the run's clock, a wait step (20 s) between
-/// reads; nothing polls it.
-/// NEGATIVE CONTROL: every step of `wait_for_next` capped at `HANDBACK_POLL`, about 60 reads.
-#[test]
-fn a_persons_grace_reads_the_screen_at_the_waits_pace() {
-    let mut m = fenced(vec![busy_screen(), typed_in(SAID, DRAFT)]);
-    m.cell_attrs = "none";
-    m.cursor_on_caret = true;
-    m.cursor_col = Some(2 + DRAFT.chars().count());
-    m.turn_releases = Some(1);
-    m.stall_sleep = Some(Duration::from_secs(3600));
-    m.exit_when = Some(acted);
-    let t = held_run("draft-rest-pace", m);
-    let seen = t.first_read_of(1);
-    let acted = t.acted_at().unwrap_or_else(|| panic!("{}", t.evidence()));
-    assert!(acted >= seen + Duration::from_secs(120), "{}", t.evidence());
-    let reads = t.reads_between(seen);
-    assert!(
-        reads <= 120 / 20 + 4,
-        "{reads} reads in the hold: {}",
-        t.evidence()
-    );
-    assert_eq!((t.enters(), t.typed()), (1, 0), "{}", t.evidence());
-}
-
-/// A person's draft (no key measured) seen; 20 s on, a redraw is read with its composer drawn
-/// empty for `gap`, then the draft again for good: Claude Code's frames, or Muse Code's unbracketed
-/// pane.
-fn stalled_redraw(tag: &str, muse: bool, gap: Duration) -> Held {
-    use aterm_phase::muse::fixtures as u;
-    use aterm_phase::prompt::fixtures::screen;
-    let mut m = if muse {
-        muse_fenced(vec![
-            screen(u::BUSY_1_4_10),
-            muse_typed(DRAFT),
-            muse_typed(""),
-            muse_typed(DRAFT),
-        ])
-    } else {
-        let mut m = fenced(vec![
-            busy_screen(),
-            typed_in(SAID, DRAFT),
-            ended(SAID),
-            typed_in(SAID, DRAFT),
-        ]);
-        m.cursor_on_caret = true;
-        m
-    };
-    m.cell_attrs = "none";
-    m.screen_cols.insert(1, 2 + DRAFT.chars().count());
-    m.screen_cols.insert(2, 2);
-    m.screen_cols.insert(3, 2 + DRAFT.chars().count());
-    m.timeline = Some((
-        1,
-        vec![
-            Duration::ZERO,
-            Duration::from_secs(20),
-            Duration::from_secs(20) + gap,
-        ],
-    ));
-    m.stall_sleep = Some(Duration::from_secs(3600));
-    m.exit_when = Some(acted);
-    held_run(tag, m)
-}
-
-/// A STALLED REDRAW TYPES NOTHING OVER THE DRAFT (the reviews of `b6b17dd4e6` and `d7b6e8aa23`):
-/// under load a program's writer stalls inside a redraw for longer than any settle rules out
-/// (`docs/measured/half-drawn-frame-2026-10-22.md`), so a read can find the composer drawn empty
-/// for seconds while the program still holds the person's draft. The point is not decided again,
-/// nothing is typed into the program's draft, and the draft step sends it once its grace from its
-/// return is out, as on Claude Code's frames so on Muse Code's unbracketed pane.
-/// NEGATIVE CONTROL: as [`a_draft_cleared_holds_its_grace_keyed_or_not`]'s, and Cruise's continuation
-/// is typed on the empty read (20 s), the draft drawn again a moment later.
-#[test]
-fn a_stalled_redraw_types_nothing_over_the_draft() {
-    for muse in [false, true] {
-        for gap_ms in [1_500_u64, 3_000] {
-            let tag = format!(
-                "draft-stalled-{}-{gap_ms}",
-                if muse { "muse" } else { "claude" },
-            );
-            let t = stalled_redraw(&tag, muse, Duration::from_millis(gap_ms));
-            let back = t.first_read_of(3);
-            let acted = t.acted_at().unwrap_or_else(|| panic!("{}", t.evidence()));
-            assert!(
-                acted >= back + Duration::from_secs(119),
-                "{tag}: acted {:?} after the draft was drawn again: {}",
-                acted.saturating_duration_since(back),
-                t.evidence()
-            );
-            assert_eq!(
-                (t.enters(), t.typed()),
-                (1, 0),
-                "{tag}: the draft sent once, nothing typed over it: {}",
-                t.evidence()
-            );
-        }
-    }
-}
-
 /// GREY TEXT OVER A HELD DRAFT DECIDES NOTHING EITHER (the review of `6337470849`): a draft no key
 /// stamped holds the point; 20 s on, a read finds the program's own grey text with other words where
 /// it stood (a cleared Claude Code composer shows its dim suggestion, `docs/measured/
 /// claude-code-dialogs-2026-09-24.md`, Muse Code's idle composer its tip), the cursor home or off the
 /// composer. It stands for a moment and the draft comes back, or it stands for good. No read tells a
 /// redraw from a clear here either, so nothing is typed inside the draft's grace. The draft step
-/// sends a draft that came back once its grace is out: from its return where the grey read's cursor
-/// was home, as that read let the draft go, from its first sight where it was off the composer, as
-/// that read says nothing and the same words came back. A draft that never did is typed over only
-/// once the grace from its first sight is out, and only with the cursor home: off the composer,
-/// grey for good says neither, and is left alone.
-/// NEGATIVE CONTROL: as [`a_draft_cleared_holds_its_grace_keyed_or_not`]'s, and the continuation is
-/// typed at 20 s, over the draft the program still holds.
+/// sends a draft that came back once its grace from its return is out, since other words let its first
+/// sight go wherever the cursor stood. A draft that never did is typed over only once the grace from
+/// the read that found it gone is out, and only with the cursor home: off the composer, grey for good
+/// says neither, and is left alone.
+/// NEGATIVE CONTROL: `see_draft` leaving no mark over text the point was held on, and the
+/// continuation is typed 100 s from that read.
 #[test]
 fn grey_text_over_a_held_draft_decides_nothing() {
     use aterm_phase::muse::fixtures as u;
@@ -1155,34 +924,27 @@ fn grey_text_over_a_held_draft_decides_nothing() {
     for muse in [false, true] {
         for off in [false, true] {
             let what = format!("muse {muse}, off {off}");
-            for gap_ms in [400_u64, 1_500, 3_000] {
-                let t = held(muse, off, Some(Duration::from_millis(gap_ms)));
-                let from = t.first_read_of(if off { 1 } else { 3 });
-                let acted = t.acted_at().unwrap_or_else(|| panic!("{}", t.evidence()));
-                assert!(
-                    acted >= from + Duration::from_secs(119),
-                    "{what}, {gap_ms} ms: acted {:?} into its grace: {}",
-                    acted.saturating_duration_since(from),
-                    t.evidence()
-                );
-                assert_eq!(
-                    (t.enters(), t.typed()),
-                    (1, 0),
-                    "{what}, {gap_ms} ms: {}",
-                    t.evidence()
-                );
-            }
+            let t = held(muse, off, Some(Duration::from_millis(400)));
+            let from = t.first_read_of(3);
+            let acted = t.acted_at().unwrap_or_else(|| panic!("{}", t.evidence()));
+            assert!(
+                acted >= from + Duration::from_secs(119),
+                "{what}: acted {:?} into its grace: {}",
+                acted.saturating_duration_since(from),
+                t.evidence()
+            );
+            assert_eq!((t.enters(), t.typed()), (1, 0), "{what}: {}", t.evidence());
             let t = held(muse, off, None);
             if off {
                 assert_eq!((t.enters(), t.typed()), (0, 0), "{what}: {}", t.evidence());
                 continue;
             }
-            let seen = t.first_read_of(1);
+            let left = t.first_read_of(2);
             let typed = t.typed_at().unwrap_or_else(|| panic!("{}", t.evidence()));
             assert!(
-                typed >= seen + Duration::from_secs(119),
-                "{what}: typed {:?} after the draft's first sight, inside its grace: {}",
-                typed.saturating_duration_since(seen),
+                typed >= left + Duration::from_secs(119),
+                "{what}: typed {:?} after the read that found it gone: {}",
+                typed.saturating_duration_since(left),
                 t.evidence()
             );
             assert_eq!((t.enters(), t.typed()), (0, 1), "{what}: {}", t.evidence());
@@ -1192,12 +954,13 @@ fn grey_text_over_a_held_draft_decides_nothing() {
 
 /// A NEW POINT READ GREY OFF THE COMPOSER KEEPS THE DRAFT (the review of `5ad7f68c8f`): a draft no key
 /// stamped holds the point; 20 s on, a row above the composer moves, so the point's key moves, in a
-/// frame whose composer reads grey with other words or the same, the cursor off it, and 400 ms on the
-/// draft is back. That read says neither, so it costs the draft nothing: nothing is typed, and the
-/// draft step sends it once the grace from its first sight is out, no later.
+/// frame whose composer reads grey, the cursor off it, and 400 ms on the draft is back. That read says
+/// neither, so nothing is typed. Grey with the same words it costs the draft nothing: the draft step
+/// sends it once the grace from its first sight is out, no later. Grey with other words is other text,
+/// which keeps no first sight: the grace runs from the draft's return.
 /// NEGATIVE CONTROLS: `composer_draft` taking grey for a suggestion wherever the cursor stands, and the
 /// continuation is typed at 20 s, into the draft the program still holds; `cell_saw` dropping the
-/// draft over a read that could not say, and it is sent at 140 s, the draft's grace started again.
+/// draft over a read that could not say, and the same words are sent at 140 s.
 #[test]
 fn a_new_point_read_grey_off_the_composer_keeps_the_draft() {
     use aterm_phase::muse::fixtures as u;
@@ -1218,20 +981,20 @@ fn a_new_point_read_grey_off_the_composer_keeps_the_draft() {
         m.stall_sleep = Some(Duration::from_secs(3600));
         m.exit_when = Some(acted);
     };
-    let settled = |what: &str, t: &Held| {
-        let seen = t.first_read_of(1);
+    let settled = |what: &str, t: &Held, from: usize| {
+        let seen = t.first_read_of(from);
         let acted = t
             .acted_at()
             .unwrap_or_else(|| panic!("{what}: {}", t.evidence()));
         assert!(
             acted >= seen + Duration::from_secs(119) && acted < seen + Duration::from_secs(125),
-            "{what}: acted {:?} after the draft's first read: {}",
+            "{what}: acted {:?} after its read: {}",
             acted.saturating_duration_since(seen),
             t.evidence()
         );
         assert_eq!((t.enters(), t.typed()), (1, 0), "{what}: {}", t.evidence());
     };
-    for shown in [other, DRAFT] {
+    for (shown, from) in [(other, 3), (DRAFT, 1)] {
         let mut m = fenced(vec![
             busy_screen(),
             typed_in(SAID, DRAFT),
@@ -1242,7 +1005,7 @@ fn a_new_point_read_grey_off_the_composer_keeps_the_draft() {
         m.cell_attrs_on.insert(2, GREY);
         m.screen_cursors.insert(2, 0);
         m.timeline = Some((1, times.clone()));
-        settled(shown, &held_run("draft-new-point-grey", m));
+        settled(shown, &held_run("draft-new-point-grey", m), from);
     }
     let moved = |text: &str| {
         let mut r = muse_typed(text);
@@ -1267,7 +1030,615 @@ fn a_new_point_read_grey_off_the_composer_keeps_the_draft() {
     m.screen_cursors.remove(&1);
     m.screen_cursors.insert(2, footer);
     m.timeline = Some((1, times));
-    settled("Muse", &held_run("draft-new-point-grey-muse", m));
+    settled("Muse", &held_run("draft-new-point-grey-muse", m), 3);
+}
+
+/// A CURSOR OFF THE ROWS READ SAYS NOTHING, AS ONE OFF THE COMPOSER DOES (the review of `98b9c4d903`): a
+/// draft no key stamped waits its grace; 20 s on a row above the composer moves, in a frame whose
+/// composer reads grey with other words, the cursor off the composer or off the rows read (`text
+/// tail=` over a taller window, the cursor above the tail), at column 40 or column 2; those words at
+/// home or an empty composer 400 ms on; the draft back 1.1 s on. The other words let the draft's
+/// first sight go wherever
+/// the cursor stood, and no read says what became of the draft, so it is sent a grace from its return.
+/// NEGATIVE CONTROL: `draft_read` answering by the column with the cursor off the rows read, as on
+/// `98b9c4d903`, and the continuation is typed at 20.4 s, onto the words the program still holds.
+#[test]
+fn a_cursor_off_the_rows_read_says_nothing_of_other_words() {
+    const MOVED: &str = "Stage 2 is in too.";
+    let other = "/export saves the conversation to a text file";
+    let past = 2 + DRAFT.chars().count();
+    for (what, row, col, empty) in [
+        ("off the composer, column 40", 0, 40, false),
+        ("off the composer, column 2", 0, 2, false),
+        ("off the rows read, column 40", 999, 40, false),
+        ("off the rows read, column 2", 999, 2, false),
+        ("off the composer, then empty", 0, 40, true),
+    ] {
+        let mut m = fenced(vec![
+            busy_screen(),
+            typed_in(SAID, DRAFT),
+            typed_in(MOVED, other),
+            if empty {
+                ended(MOVED)
+            } else {
+                typed_in(MOVED, other)
+            },
+            typed_in(MOVED, DRAFT),
+        ]);
+        m.cell_attrs = "none";
+        m.cursor_on_caret = true;
+        m.screen_cols.insert(1, past);
+        m.cell_attrs_on.insert(2, GREY);
+        m.screen_cursors.insert(2, row);
+        m.screen_cols.insert(2, col);
+        if !empty {
+            m.cell_attrs_on.insert(3, GREY);
+        }
+        m.screen_cols.insert(3, 2);
+        m.screen_cols.insert(4, past);
+        m.timeline = Some((
+            1,
+            vec![
+                Duration::ZERO,
+                Duration::from_secs(20),
+                Duration::from_millis(20_400),
+                Duration::from_millis(21_500),
+            ],
+        ));
+        m.stall_sleep = Some(Duration::from_secs(3600));
+        m.exit_when = Some(acted);
+        let t = held_run("draft-off-the-rows", m);
+        let back = t.first_read_of(4);
+        let acted = t
+            .acted_at()
+            .unwrap_or_else(|| panic!("{what}: {}", t.evidence()));
+        assert!(
+            acted >= back + Duration::from_secs(119),
+            "{what}: acted {:?} after the draft's return: {}",
+            acted.saturating_duration_since(back),
+            t.evidence()
+        );
+        assert_eq!((t.enters(), t.typed()), (1, 0), "{what}: {}", t.evidence());
+    }
+}
+
+/// A NEW POINT READ GONE AT HOME KEEPS A DRAFT TOO (the review of `98b9c4d903`, on base as well): a
+/// draft no key stamped waits its grace; 20 s on a row above the composer moves, in a frame whose
+/// composer reads empty or grey at home with other words, or with words that begin with the draft
+/// (the review of `367dfeea26`: its cell said typed, so it was no suggestion drawn in part); 1.5 s on
+/// the draft is back. The policy decides again at that read, and the wait the draft's grace rested on
+/// is gone, but the text the point was held on leaves its mark: the draft is sent a grace from its
+/// return, and nothing is typed onto the words the program still holds.
+/// NEGATIVE CONTROLS: `decide_to_act` keeping no text for a person's grace, and `see_draft` leaving no
+/// mark over text the point was held on: each types the continuation at 20 s; `see_draft` taking any
+/// words that begin with the text for a suggestion, whatever its cell said, as on `367dfeea26`, and
+/// the third arm's continuation is typed at 20 s.
+#[test]
+fn a_new_point_read_gone_at_home_keeps_the_draft() {
+    const MOVED: &str = "Stage 2 is in too.";
+    let other = "/export saves the conversation to a text file";
+    let begun = format!("{DRAFT}, then merge when ready");
+    for (what, gone, attrs) in [
+        ("empty", ended(MOVED), "none"),
+        ("grey other words", typed_in(MOVED, other), GREY),
+        ("grey words begun by it", typed_in(MOVED, &begun), GREY),
+    ] {
+        let mut m = fenced(vec![
+            busy_screen(),
+            typed_in(SAID, DRAFT),
+            gone,
+            typed_in(MOVED, DRAFT),
+        ]);
+        m.cell_attrs = "none";
+        m.cursor_on_caret = true;
+        m.screen_cols.insert(1, 2 + DRAFT.chars().count());
+        m.cell_attrs_on.insert(2, attrs);
+        m.screen_cols.insert(2, 2);
+        m.screen_cols.insert(3, 2 + DRAFT.chars().count());
+        m.timeline = Some((
+            1,
+            vec![
+                Duration::ZERO,
+                Duration::from_secs(20),
+                Duration::from_millis(21_500),
+            ],
+        ));
+        m.stall_sleep = Some(Duration::from_secs(3600));
+        m.exit_when = Some(acted);
+        let t = held_run("draft-new-point-home", m);
+        let back = t.first_read_of(3);
+        let acted = t
+            .acted_at()
+            .unwrap_or_else(|| panic!("{what}: {}", t.evidence()));
+        assert!(
+            acted >= back + Duration::from_secs(119),
+            "{what}: acted {:?} after the draft's return: {}",
+            acted.saturating_duration_since(back),
+            t.evidence()
+        );
+        assert_eq!((t.enters(), t.typed()), (1, 0), "{what}: {}", t.evidence());
+    }
+}
+
+/// What a scene sets on its run's Mock.
+type SetUp = fn(&mut Mock);
+
+/// One way a composer's read says neither, over screen 1 of a run: its cell refused, its first cell
+/// read inside a frame, or grey with the cursor past the text.
+const SAYS_NEITHER: [(&str, SetUp); 3] = [
+    ("its cell refused", |m| m.cell_unreadable = true),
+    ("a frame open", |m| m.cell_open_reads = 1),
+    ("grey past it", |m| {
+        m.cell_attrs = GREY;
+        m.dim_past = true;
+    }),
+];
+
+/// `screens` from screen 1 on, `at` their times, the cursor past `DRAFT` on its caret's row but on
+/// screens whose text is gone, where it is home.
+fn hold_run(tag: &str, screens: Vec<Vec<String>>, at: Vec<Duration>, set: SetUp) -> Held {
+    let gone: Vec<usize> = screens
+        .iter()
+        .enumerate()
+        .filter(|(_, rows)| !rows.iter().any(|r| *r == format!("❯ {DRAFT}")))
+        .map(|(i, _)| i + 1)
+        .collect();
+    let mut all = vec![busy_screen()];
+    all.extend(screens);
+    let mut m = fenced(all);
+    m.cell_attrs = "none";
+    m.cursor_on_caret = true;
+    m.cursor_col = Some(2 + DRAFT.chars().count());
+    for i in gone {
+        m.screen_cols.insert(i, 2);
+        m.cell_attrs_on.insert(i, GREY);
+    }
+    set(&mut m);
+    m.timeline = Some((1, at));
+    m.stall_sleep = Some(Duration::from_secs(3600));
+    m.exit_when = Some(acted);
+    held_run(tag, m)
+}
+
+/// TEXT A HOLD STANDS ON, READ GONE, DECIDES NOTHING FOR A GRACE (the review of `bd67622c8c`): a
+/// composer whose read says neither holds the point, no key measured; 20 s on, a read finds it empty
+/// or grey at home with other words, and 1.5 s on the text is back. No read tells that from a redraw
+/// stalled before its text, as on a plain draft's grace, so nothing is typed. A read of the words
+/// back that says typed has them sent a grace from their return; one that still says neither holds.
+/// NEGATIVE CONTROL: `see_draft` leaving no mark over text the point was held on, and the continuation
+/// is typed at 20 s, onto the words the program still holds.
+#[test]
+fn text_a_hold_stands_on_read_gone_decides_nothing_for_a_grace() {
+    let times = vec![
+        Duration::ZERO,
+        Duration::from_secs(20),
+        Duration::from_millis(21_500),
+    ];
+    let other = "/export saves the conversation to a text file";
+    for (what, set) in SAYS_NEITHER {
+        for gone in [ended(SAID), typed_in(SAID, other)] {
+            let t = hold_run(
+                "draft-hold-gone",
+                vec![typed_in(SAID, DRAFT), gone, typed_in(SAID, DRAFT)],
+                times.clone(),
+                set,
+            );
+            let back = t.first_read_of(3);
+            assert_eq!(t.typed(), 0, "{what}: {}", t.evidence());
+            if let Some(enter) = t.enter_at() {
+                assert!(
+                    enter >= back + Duration::from_secs(119),
+                    "{what}: sent {:?} after its return: {}",
+                    enter.saturating_duration_since(back),
+                    t.evidence()
+                );
+            }
+        }
+    }
+}
+
+/// A HOLD STANDS ON THE TEXT ITS LAST LOOK READ (the review of `bd67622c8c`): grey text past its cursor
+/// makes the hold, no key measured; 10 s on, a look reads longer words past it; 10 s on, a read finds
+/// a suggestion at home that begins with the first text and not with the second. Those words left, so
+/// the continuation is typed a grace from that read, never over them at once.
+/// NEGATIVE CONTROL: `draft_look` keeping the text the hold began on, and it is typed at that read.
+#[test]
+fn a_hold_stands_on_the_text_its_last_look_read() {
+    let (first, edited) = ("keep going", "keep going fix the tests");
+    let mut m = fenced(vec![
+        busy_screen(),
+        typed_in(SAID, first),
+        typed_in(SAID, edited),
+        typed_in(SAID, HINT),
+    ]);
+    m.cell_attrs = GREY;
+    m.dim_past = true;
+    m.cursor_on_caret = true;
+    m.screen_cols.insert(1, 2 + first.chars().count());
+    m.screen_cols.insert(2, 2 + edited.chars().count());
+    m.screen_cols.insert(3, 2);
+    m.timeline = Some((
+        1,
+        vec![
+            Duration::ZERO,
+            Duration::from_secs(10),
+            Duration::from_secs(20),
+        ],
+    ));
+    m.stall_sleep = Some(Duration::from_secs(3600));
+    m.exit_when = Some(acted);
+    let t = held_run("draft-hold-last-look", m);
+    let left = t.first_read_of(3);
+    let typed = t
+        .acted_at()
+        .unwrap_or_else(|| panic!("no act: {}", t.evidence()));
+    assert!(
+        typed >= left + Duration::from_secs(119),
+        "typed {:?} after the read: {}",
+        typed.saturating_duration_since(left),
+        t.evidence()
+    );
+    assert_eq!((t.enters(), t.typed()), (0, 1), "{}", t.evidence());
+}
+
+/// A FRAME WITH NO COMPOSER BETWEEN A DRAFT AND A READ OF IT GONE KEEPS THE MARK (the review of
+/// `367dfeea26`, on base as well): a draft no key stamped waits its grace; 60 s on a frame draws no
+/// composer; 300 ms on a read finds the composer empty; and 300 ms on the draft is back, or never. That
+/// frame says nothing of the draft, so the read after it leaves the mark it would have left: nothing is
+/// typed there for a grace, and a draft back is sent a grace from its return.
+/// NEGATIVE CONTROL: `hold_on` letting the text go at the frame with no composer, and the continuation
+/// is typed at 60.3 s, onto the words the program still holds.
+#[test]
+fn a_frame_with_no_composer_keeps_the_mark_of_the_text_read_gone_after_it() {
+    let past = 2 + DRAFT.chars().count();
+    for back in [true, false] {
+        let mut screens = vec![
+            busy_screen(),
+            typed_in(SAID, DRAFT),
+            rows(&["Stage 1 is in.", "", "user@mac aterm % "]),
+            ended(SAID),
+        ];
+        let mut at = vec![
+            Duration::ZERO,
+            Duration::from_secs(60),
+            Duration::from_millis(60_300),
+        ];
+        if back {
+            screens.push(typed_in(SAID, DRAFT));
+            at.push(Duration::from_millis(60_600));
+        }
+        let mut m = fenced(screens);
+        m.cell_attrs = "none";
+        m.cursor_on_caret = true;
+        m.screen_cols.insert(1, past);
+        m.screen_cols.insert(2, 0);
+        m.screen_cursors.insert(2, 2);
+        m.screen_cols.insert(3, 2);
+        m.screen_cols.insert(4, past);
+        m.timeline = Some((1, at));
+        m.stall_sleep = Some(Duration::from_secs(3600));
+        m.exit_when = Some(acted);
+        let t = held_run("draft-no-composer", m);
+        let from = t.first_read_of(if back { 4 } else { 3 });
+        let acted = t.acted_at().unwrap_or_else(|| panic!("{}", t.evidence()));
+        assert!(
+            acted >= from + Duration::from_secs(119),
+            "back {back}: acted {:?} after that read: {}",
+            acted.saturating_duration_since(from),
+            t.evidence()
+        );
+        let expected = if back { (1, 0) } else { (0, 1) };
+        assert_eq!((t.enters(), t.typed()), expected, "{}", t.evidence());
+    }
+}
+
+/// TEXT A HOLD STOOD ON, GONE FOR GOOD, IS TYPED OVER A GRACE FROM ITS LEAVING: a composer whose read says
+/// neither, or a person's line quoting a whole upgrade head (`Composer::Own`, asked about at once),
+/// read empty from 20 s on. The continuation is typed 120 s from that read, never an Enter.
+/// NEGATIVE CONTROL: as [`text_a_hold_stands_on_read_gone_decides_nothing_for_a_grace`]'s, and it is
+/// typed at 20 s.
+#[test]
+fn text_a_hold_stood_on_gone_for_good_is_typed_over_a_grace_from_its_leaving() {
+    let run = |tag: &str, text: &str, set: SetUp| {
+        let mut m = fenced(vec![busy_screen(), typed_in(SAID, text), ended(SAID)]);
+        m.cell_attrs = "none";
+        m.cursor_on_caret = true;
+        m.screen_cols.insert(1, 2 + text.chars().count());
+        m.screen_cols.insert(2, 2);
+        set(&mut m);
+        m.timeline = Some((1, vec![Duration::ZERO, Duration::from_secs(20)]));
+        m.stall_sleep = Some(Duration::from_secs(3600));
+        m.exit_when = Some(acted);
+        held_run(tag, m)
+    };
+    let quote = format!(
+        "{}please also note this",
+        crate::harness::upgrade::TELL_HEAD
+    );
+    let mut cases: Vec<(&str, &str, SetUp)> = vec![("a quote of a head", &quote, |_| {})];
+    cases.extend(SAYS_NEITHER.map(|(what, set)| (what, DRAFT, set)));
+    for (what, text, set) in cases {
+        let t = run("draft-hold-gone-for-good", text, set);
+        let left = t.first_read_of(2);
+        let typed = t
+            .typed_at()
+            .unwrap_or_else(|| panic!("{what}: {}", t.evidence()));
+        assert!(
+            typed >= left + Duration::from_secs(119),
+            "{what}: typed {:?} after the read that found it gone: {}",
+            typed.saturating_duration_since(left),
+            t.evidence()
+        );
+        assert_eq!((t.enters(), t.typed()), (0, 1), "{what}: {}", t.evidence());
+    }
+}
+
+/// THE MARK COUNTS A SLEEP AS EVERY STAMP OF THE PERSON DOES (`Session::person_slept`, the review of
+/// `98b9c4d903`): a hold's text read gone at 20 s, and the Mac asleep 600 s from 30 s on, far past any
+/// grace. Nobody can have typed in the sleep, so the continuation is typed once the wake has settled,
+/// 30 s on, as after any sleep.
+/// NEGATIVE CONTROL: `person_slept` leaving `draft_left` on the awake clock, and it waits out the rest
+/// of the grace after the wake, 110 s.
+#[test]
+fn a_sleep_past_the_marks_grace_lets_it_go_at_the_wake() {
+    let mut m = fenced(vec![
+        busy_screen(),
+        typed_in(SAID, DRAFT),
+        ended(SAID),
+        ended(SAID),
+    ]);
+    m.cell_attrs = "none";
+    m.cell_attrs_on.insert(1, GREY);
+    m.dim_past = true;
+    m.cursor_on_caret = true;
+    m.screen_cols.insert(1, 2 + DRAFT.chars().count());
+    m.screen_cols.insert(2, 2);
+    m.screen_cols.insert(3, 2);
+    m.sleeps_at.insert(3, 600);
+    m.timeline = Some((
+        1,
+        vec![
+            Duration::ZERO,
+            Duration::from_secs(20),
+            Duration::from_secs(30),
+        ],
+    ));
+    m.stall_sleep = Some(Duration::from_secs(3600));
+    m.exit_when = Some(acted);
+    let t = held_run("draft-mark-slept", m);
+    let wake = t.first_read_of(3);
+    let typed = t.typed_at().unwrap_or_else(|| panic!("{}", t.evidence()));
+    assert!(
+        typed < wake + Duration::from_secs(60),
+        "typed {:?} after the wake, 600 s past any grace: {}",
+        typed.saturating_duration_since(wake),
+        t.evidence()
+    );
+}
+
+/// THE MARK LASTS UNTIL A TURN RUNS: text a hold stood on read gone, and a turn runs and ends inside
+/// what would be its grace. The program took input, so no redraw is still to come: the continuation
+/// is typed at the turn's end.
+/// NEGATIVE CONTROL: `turn_end_at_point` keeping `draft_left` over a turn's work, and the continuation
+/// waits out the rest of the grace.
+#[test]
+fn a_turn_that_ran_ends_a_held_texts_mark() {
+    let mut m = fenced(vec![
+        busy_screen(),
+        typed_in(SAID, DRAFT),
+        ended(SAID),
+        busy_screen(),
+        ended("Stage 2 is in too."),
+    ]);
+    m.cell_unreadable = true;
+    m.cursor_on_caret = true;
+    m.screen_cols.insert(1, 2 + DRAFT.chars().count());
+    m.screen_cols.insert(2, 2);
+    m.timeline = Some((
+        1,
+        vec![
+            Duration::ZERO,
+            Duration::from_secs(20),
+            Duration::from_secs(25),
+            Duration::from_secs(40),
+        ],
+    ));
+    m.stall_sleep = Some(Duration::from_secs(3600));
+    m.exit_when = Some(acted);
+    let t = held_run("draft-hold-gone-turn", m);
+    let over = t.first_read_of(4);
+    let typed = t.typed_at().unwrap_or_else(|| panic!("{}", t.evidence()));
+    assert!(
+        typed < over + Duration::from_secs(5),
+        "typed {:?} after the turn's end: {}",
+        typed.saturating_duration_since(over),
+        t.evidence()
+    );
+    assert_eq!((t.enters(), t.typed()), (0, 1), "{}", t.evidence());
+}
+
+/// THE LOOP'S OWN LINE GONE IS NO PERSON'S TEXT GONE: its continuation left in the composer (its Enter
+/// refused, no key measured), then read empty. A row above moved first, a new point with the line read
+/// grey past its cursor, so a hold stands on it; or other grey words were read off the composer, on the
+/// same point. No person's words were seen to leave, so no grace is waited: it is written again at
+/// the read that finds it gone.
+/// NEGATIVE CONTROLS: `hold_on` taking the loop's own line for the hold's text, and over the hold it
+/// waits out a person's grace for nobody; `see_draft` marking that line when a read that could not
+/// say lets it go, and over the other words it does.
+#[test]
+fn the_loops_own_line_gone_waits_no_grace() {
+    const MOVED: &str = "Stage 2 is in too.";
+    let line = "keep going";
+    let other = "/export saves the conversation to a text file";
+    let past = 2 + line.chars().count();
+    for (what, between, at_end, row, col) in [
+        ("a hold on it", typed_in(MOVED, line), MOVED, 5, past),
+        ("other words off it", typed_in(SAID, other), SAID, 0, 40),
+    ] {
+        let mut m = fenced(vec![
+            busy_screen(),
+            ended(SAID),
+            typed_in(SAID, line),
+            between,
+            ended(at_end),
+        ]);
+        m.gen_fence = true;
+        m.sends_gen = true;
+        m.help = FENCED_HELP.to_string();
+        m.cursor_on_caret = true;
+        m.cell_attrs = "none";
+        m.dim_past = true;
+        m.screen_cols.insert(2, past);
+        m.cell_attrs_on.insert(3, GREY);
+        m.screen_cursors.insert(3, row);
+        m.screen_cols.insert(3, col);
+        m.cell_attrs_on.insert(4, GREY);
+        m.screen_cols.insert(4, 2);
+        m.key_replies
+            .push_back(ok("OK skipped reason=person seq=101\n"));
+        m.stall_sleep = Some(Duration::from_secs(3600));
+        m.exit_when = Some(|m| {
+            m.requests
+                .iter()
+                .filter(|r| r.starts_with("turn ") || r.starts_with("send "))
+                .count()
+                >= 2
+        });
+        let t = held_run("draft-own-gone", m);
+        assert_eq!(t.typed(), 2, "{what}: {}", t.evidence());
+        assert_eq!(t.person_waits(), 0, "{what}: {}", t.evidence());
+        let read = t.first_read_of(4);
+        let last = t.m.read_times.last().map(|(_, at)| *at).expect("a read");
+        assert!(
+            last < read + Duration::from_secs(21),
+            "{what}: still reading {:?} after the read that found it gone: {}",
+            last.saturating_duration_since(read),
+            t.evidence()
+        );
+    }
+}
+
+/// A WORKER FROZEN UNDER A COMPOSER THAT COULD NOT SAY IS HEARD (the review of `bd67622c8c`): grey text
+/// with the cursor past it holds the point, and the worker stops reading its input after that hold's
+/// first steps. Every other hold reads `status` at each wait step, and this one does too, so the freeze
+/// is journaled at its first step past the stall's threshold.
+/// NEGATIVE CONTROL: `wait_for_next` looking at the composer before its `stall_step`, as on
+/// `bd67622c8c`, and the run reaches its deadline with no `FROZEN`.
+#[test]
+fn a_worker_frozen_under_a_composer_that_could_not_say_is_heard() {
+    let mut m = fenced(vec![busy_screen(), typed_in(SAID, HINT)]);
+    m.cell_attrs = GREY;
+    m.dim_past = true;
+    m.cursor_on_caret = true;
+    m.cursor_col = Some(2 + HINT.chars().count());
+    m.stall_sleep = Some(Duration::from_secs(3600));
+    m.input = INPUT_CLEAR;
+    m.input_after = vec![(2, INPUT_STALLED)];
+    m.exit_when = Some(|m| m.status_reads >= 8);
+    let t = held_run("draft-hold-frozen", m);
+    assert_eq!((t.enters(), t.typed()), (0, 0), "{}", t.evidence());
+    assert!(
+        t.journal.iter().any(|l| l.starts_with("FROZEN ")),
+        "{}",
+        t.evidence()
+    );
+}
+
+/// ONE SCREEN, ONE ANSWER (the review of `bd67622c8c`): the loop's `composer_draft` and Claude Code's
+/// upgrade gate read every composer alike, over a lone line, one with an empty row under it and two
+/// rows of text, dim or plain, the cursor on each kind of place: the gate calls it empty just where the
+/// loop calls it a suggestion, and neither writes where the loop holds. The rows' own word
+/// (`draft_read`), where they give one over grey text, is what the cell then says: none only where it
+/// reads a suggestion, typed only where it reads neither. A cursor above the rows read is none to the
+/// gate (`upgrade_drive`'s reader) and off them to the loop and the rows: all say neither.
+/// NEGATIVE CONTROLS: `composer_is_empty` as on `bd67622c8c`, which took dim text for no draft with the
+/// cursor off the composer and held dim text of two rows with the cursor home; [`cursor_home`] taking
+/// no cursor for home, as the gate did, and the cursor above the rows differs; `draft_read` answering
+/// by the column with the cursor off the rows read, as on `98b9c4d903`, and the rows say none there.
+///
+/// [`cursor_home`]: crate::supervise::screen::cursor_home
+#[test]
+fn the_loop_and_the_upgrade_gate_read_one_screen_alike() {
+    let lone = typed_in(SAID, DRAFT);
+    let (empty_under, _) = two_rows();
+    let (two, _) = wrapped("please also update", "the changelog");
+    for rows in [lone, empty_under, two] {
+        let composer = Program::Claude
+            .reader()
+            .composer(&rows)
+            .expect("a composer");
+        let caret = composer.0;
+        for attrs in ["dim", "none"] {
+            for cursor in [
+                (caret, 2),
+                (caret, 30),
+                (caret + 1, 2),
+                (caret + 1, 4),
+                (caret + 2, 2),
+                (0, 2),
+                (0, 40),
+            ] {
+                let mut m = Mock::new(vec![rows.clone()]);
+                m.cell_attrs = attrs;
+                m.dim_past = true;
+                let screen = Screen {
+                    rows: rows.clone(),
+                    cursor_row: cursor.0,
+                    cursor_col: cursor.1,
+                    ..Screen::default()
+                };
+                let mut s = session(&mut m, None);
+                let verdict = s.composer_draft(Some(&composer), true, None, &screen);
+                let dim = crate::harness::upgrade::composer_dim_row(&rows, Some(cursor)).is_some()
+                    && attrs == "dim";
+                let empty = crate::harness::upgrade::composer_is_empty(&rows, Some(cursor), dim);
+                assert_eq!(
+                    empty,
+                    verdict == Some(false),
+                    "{attrs}, the cursor at {cursor:?}, rows {:?}: the loop says {verdict:?}",
+                    composer.1,
+                );
+                if attrs == "dim" {
+                    let by_rows = draft_read(Some(&composer), true, &screen);
+                    assert!(
+                        match by_rows {
+                            Some(false) => verdict == Some(false),
+                            Some(true) => verdict.is_none(),
+                            None => true,
+                        },
+                        "the cursor at {cursor:?}, rows {:?}: the rows say {by_rows:?}, the cell \
+                         {verdict:?}",
+                        composer.1,
+                    );
+                }
+            }
+            let mut m = Mock::new(vec![rows.clone()]);
+            m.cell_attrs = attrs;
+            m.dim_past = true;
+            let above = Screen {
+                rows: rows.clone(),
+                first: 5,
+                cursor_row: 0,
+                cursor_col: 2,
+                ..Screen::default()
+            };
+            assert_eq!(above.cursor_index(), None);
+            assert_eq!(
+                draft_read(Some(&composer), true, &above),
+                None,
+                "{attrs}, rows {:?}",
+                composer.1
+            );
+            let mut s = session(&mut m, None);
+            let verdict = s.composer_draft(Some(&composer), true, None, &above);
+            assert_ne!(verdict, Some(false), "{attrs}, rows {:?}", composer.1);
+            assert!(
+                !crate::harness::upgrade::composer_is_empty(&rows, None, attrs == "dim"),
+                "{attrs}, rows {:?}",
+                composer.1
+            );
+        }
+    }
 }
 
 /// A PERSON'S DRAFT OVER A MENU ITS ENTER WOULD RUN HOLDS ITS GRACE AND IS ASKED ABOUT: a person's
@@ -1307,9 +1678,7 @@ fn a_draft_over_a_menu_its_enter_would_run_holds_its_grace_and_is_asked_about() 
             ));
             m
         } else {
-            let mut m = fenced(vec![busy_screen(), at_end.clone()]);
-            m.turn_releases = Some(1);
-            m
+            fenced(vec![busy_screen(), at_end.clone()])
         };
         m.cursor_row = Some(caret);
         m.cursor_col = Some(2 + "/config".chars().count());
@@ -1358,6 +1727,249 @@ fn a_draft_over_a_menu_its_enter_would_run_holds_its_grace_and_is_asked_about() 
     }
 }
 
+/// A measured search screen ([`history_searches`]): its tag, its rows, its cursor, and its composer
+/// row's first glyphs' `cell` replies by row and column.
+type MeasuredSearch = (
+    &'static str,
+    Vec<String>,
+    (usize, usize),
+    Vec<((usize, usize), String)>,
+);
+
+/// The measured screens of Claude Code 2.1.318's prompt-history search (Ctrl-R) open at a turn
+/// end, each with its cursor and the cells of its composer row's first glyphs: its match in typed
+/// ink (doc scene C), nothing (its query matching nothing over an empty composer), the grey
+/// suggestion it opened over, and its match under a status line, where the search heads the
+/// footer's second row; and its match and nothing in windows of 60, 44 and 26 columns and nothing at
+/// 34, where its label wraps in its own column, by whole words or (at 26) within them.
+fn history_searches() -> Vec<MeasuredSearch> {
+    use aterm_phase::prompt::fixtures::{
+        HISTORY_SEARCH_2_1_318, HISTORY_SEARCH_26COL_2_1_318, HISTORY_SEARCH_26COL_CELLS_2_1_318,
+        HISTORY_SEARCH_44COL_2_1_318, HISTORY_SEARCH_44COL_CELLS_2_1_318,
+        HISTORY_SEARCH_60COL_2_1_318, HISTORY_SEARCH_60COL_CELLS_2_1_318,
+        HISTORY_SEARCH_CELLS_2_1_318, HISTORY_SEARCH_NO_MATCH_2_1_318,
+        HISTORY_SEARCH_NO_MATCH_26COL_2_1_318, HISTORY_SEARCH_NO_MATCH_34COL_2_1_318,
+        HISTORY_SEARCH_NO_MATCH_44COL_2_1_318, HISTORY_SEARCH_NO_MATCH_60COL_2_1_318,
+        HISTORY_SEARCH_OVER_SUGGESTION_2_1_318, HISTORY_SEARCH_OVER_SUGGESTION_CELLS_2_1_318,
+        HISTORY_SEARCH_UNDER_STATUSLINE_2_1_318, HISTORY_SEARCH_UNDER_STATUSLINE_CELLS_2_1_318,
+        cells, cursor, screen,
+    };
+    [
+        (
+            "match",
+            HISTORY_SEARCH_2_1_318,
+            HISTORY_SEARCH_CELLS_2_1_318,
+        ),
+        ("no-match", HISTORY_SEARCH_NO_MATCH_2_1_318, ""),
+        (
+            "over-suggestion",
+            HISTORY_SEARCH_OVER_SUGGESTION_2_1_318,
+            HISTORY_SEARCH_OVER_SUGGESTION_CELLS_2_1_318,
+        ),
+        (
+            "under-statusline",
+            HISTORY_SEARCH_UNDER_STATUSLINE_2_1_318,
+            HISTORY_SEARCH_UNDER_STATUSLINE_CELLS_2_1_318,
+        ),
+        (
+            "60col",
+            HISTORY_SEARCH_60COL_2_1_318,
+            HISTORY_SEARCH_60COL_CELLS_2_1_318,
+        ),
+        ("no-match-60col", HISTORY_SEARCH_NO_MATCH_60COL_2_1_318, ""),
+        (
+            "44col",
+            HISTORY_SEARCH_44COL_2_1_318,
+            HISTORY_SEARCH_44COL_CELLS_2_1_318,
+        ),
+        ("no-match-44col", HISTORY_SEARCH_NO_MATCH_44COL_2_1_318, ""),
+        ("no-match-34col", HISTORY_SEARCH_NO_MATCH_34COL_2_1_318, ""),
+        (
+            "26col",
+            HISTORY_SEARCH_26COL_2_1_318,
+            HISTORY_SEARCH_26COL_CELLS_2_1_318,
+        ),
+        ("no-match-26col", HISTORY_SEARCH_NO_MATCH_26COL_2_1_318, ""),
+    ]
+    .into_iter()
+    .map(|(tag, text, cell_text)| {
+        let at = cursor(text).expect("a measured cursor");
+        let cells = cells(cell_text)
+            .into_iter()
+            .map(|(r, c, reply)| ((r, c), reply))
+            .collect();
+        (tag, screen(text), at, cells)
+    })
+    .collect()
+}
+
+/// THE PROMPT-HISTORY SEARCH IS NEVER PRESSED OR TYPED INTO (doc scene C, measured on 2.1.318): open
+/// at a turn end over its match, which its Enter would send as an old prompt; over nothing, where
+/// typing goes into its query; over a suggestion; over its match under a status line; and over its
+/// match and nothing in narrow windows, where its label wraps in its own column. No key
+/// measured, standing for good. Nothing is ever typed or pressed, and the point is asked about with
+/// the search's own reason (`SEARCH_DIVERTS`) at once, never held as an unknown composer: the
+/// search's row is no person's draft, so no person's grace waits on it.
+/// NEGATIVE CONTROLS: `aterm_phase::phase::history_search` reading nothing, and the match is sent with
+/// the loop's Enter once its grace is out, the continuation is typed into the query over nothing, and
+/// the suggestion is held as an unknown composer, asked about by no one; it reading the footer's
+/// first row alone, and the match under the status line is sent; it reading the label only whole on
+/// one row, and the narrow matches are entered after a person's grace and the narrow nothings typed
+/// into; the policy not reading the search
+/// (`TurnEndReading::of_slept`), and all are held as unknown composers, asked about by no one;
+/// `Session::composer_typed` keeping the search's row as a draft seen, and each waits a person's
+/// grace from the loop's own read.
+#[test]
+fn the_history_search_is_never_pressed_or_typed_into_and_is_asked_about() {
+    let reason = &SEARCH_DIVERTS[..60];
+    let outcomes: Vec<_> = history_searches()
+        .into_iter()
+        .map(|(tag, at_end, (row, col), cells)| {
+            let mut m = fenced(vec![busy_screen(), at_end]);
+            m.cursor_row = Some(row);
+            m.cursor_col = Some(col);
+            m.cells = cells.into_iter().collect();
+            m.stall_sleep = Some(Duration::from_secs(3600));
+            m.exit_when = Some(acted_or_asked);
+            let t = held_run(&format!("history-search-{tag}"), m);
+            let asked =
+                t.m.requests
+                    .iter()
+                    .any(|r| r.starts_with("meta set attention") && r.contains(reason));
+            let unknown = t
+                .journal
+                .iter()
+                .any(|l| l.ends_with("why=composer-unknown"));
+            let waited = t.journal.iter().any(|l| l.ends_with(PERSON_TYPING));
+            (
+                tag,
+                (t.enters(), t.typed(), asked, unknown, waited),
+                t.evidence(),
+            )
+        })
+        .collect();
+    let wrong: Vec<_> = outcomes
+        .iter()
+        .filter(|(_, got, _)| *got != (0, 0, true, false, false))
+        .collect();
+    assert!(
+        wrong.is_empty(),
+        "(enters, typed, asked with the search's reason, held as unknown, waited a person's grace) \
+         of each: {:#?}\n{:#?}",
+        outcomes
+            .iter()
+            .map(|(tag, got, _)| (tag, got))
+            .collect::<Vec<_>>(),
+        wrong
+            .iter()
+            .map(|(tag, _, evidence)| (tag, evidence))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// A PERSON WHO LEAVES THE SEARCH HAS THE COMPOSER JUDGED AS USUAL: the search open over its match
+/// (doc scene C) at a turn end, no key measured, standing 150 s, past a person's grace, then left
+/// (Esc): the footer back and the composer empty. Nothing is typed or pressed while the search
+/// stands; the continuation is typed once it has gone, with no Enter on the old prompt.
+/// NEGATIVE CONTROLS: `aterm_phase::phase::history_search` reading nothing, and the match is entered
+/// once its grace is out; `Session::draft_look` keeping a diverted hold whatever it reads, and
+/// nothing is typed after the search goes.
+#[test]
+fn a_person_who_leaves_the_search_has_the_composer_judged_as_usual() {
+    use aterm_phase::prompt::fixtures::{HISTORY_SEARCH_NO_MATCH_2_1_318, screen};
+    let (_, open, (row, col), cells) = history_searches().swap_remove(0);
+    let mut left = screen(HISTORY_SEARCH_NO_MATCH_2_1_318);
+    let footer = left.len() - 1;
+    left[footer] = "  ⏵⏵ auto mode on (shift+tab to cycle)".to_string();
+    let caret = left
+        .iter()
+        .rposition(|r| r.starts_with('❯'))
+        .expect("the caret");
+    let mut m = fenced(vec![busy_screen(), open, left]);
+    m.screen_cursors.insert(1, row);
+    m.screen_cols.insert(1, col);
+    m.screen_cursors.insert(2, caret);
+    m.screen_cols.insert(2, 2);
+    m.cells = cells.into_iter().collect();
+    m.timeline = Some((1, vec![Duration::ZERO, Duration::from_secs(150)]));
+    m.stall_sleep = Some(Duration::from_secs(3600));
+    m.exit_when = Some(acted);
+    let t = held_run("history-search-left", m);
+    let gone = t.first_read_of(2);
+    let typed = t.typed_at().unwrap_or_else(|| panic!("{}", t.evidence()));
+    assert!(
+        typed >= gone,
+        "typed while the search stood: {}",
+        t.evidence()
+    );
+    assert_eq!((t.enters(), t.typed()), (0, 1), "{}", t.evidence());
+}
+
+/// THE UPGRADE GATE NEVER READS THE SEARCH AS AN EMPTY COMPOSER (`upgrade::composer_is_empty`, which
+/// the Claude upgrade's typing and the window's own `/` commands go through): over every measured
+/// search of `history_searches`, each with its measured cursor and its first glyph's ink.
+/// NEGATIVE CONTROLS: `composer_is_empty` not asking `history_search`, and over nothing it reads
+/// empty; `history_search` reading the label only whole on one row, and over nothing in a narrow
+/// window it reads empty.
+#[test]
+fn the_upgrade_gate_never_reads_the_history_search_as_an_empty_composer() {
+    for (tag, rows, at, cells) in history_searches() {
+        let dim = cells.iter().any(|(_, reply)| reply.ends_with(" dim"));
+        assert!(
+            !crate::harness::upgrade::composer_is_empty(&rows, Some(at), dim),
+            "{tag}"
+        );
+    }
+}
+
+/// A SEARCH LEFT AT A BREAK LEAVES NO DRAFT BEHIND (the review of `09eff949d8`): a break of the
+/// agent's own background work, the prompt-history search open over an empty composer, its query
+/// matching nothing and the cursor on its row (as `claude-2.1.318-history-search-no-match` draws it),
+/// no key measured; then left (Esc), the composer empty and the cursor home. While the search stands
+/// the door's read at a write finds no composer it could type into; once it has gone nothing holds
+/// the break's lines as a draft.
+/// NEGATIVE CONTROLS: `Session::composer_draft` not asking `history_search`, and the door reads the
+/// search's empty row as an empty composer to type into; `Session::composer_typed` keeping the
+/// search's row as a draft seen, and the break's guards hold an empty draft after the search has
+/// gone.
+#[test]
+fn a_search_left_at_a_break_leaves_no_draft_behind() {
+    let (closed, caret) = at_break("");
+    let footer = closed.len() - 1;
+    let mut open = closed.clone();
+    open[footer] = format!("  no matching prompt: zzq  {}", closed[footer].trim_start());
+    let mut m = Mock::new(vec![open, closed]);
+    m.cell_attrs = "none";
+    m.dim_past = true;
+    m.screen_cursors.insert(0, footer);
+    m.screen_cols.insert(0, 27);
+    m.screen_cursors.insert(1, caret);
+    m.screen_cols.insert(1, 2);
+    let opts = hosted(600);
+    let mut s = session(&mut m, Some("@s-1".to_string()));
+    s.set_clock(TEST_NOW, PDT);
+    s.setup.background_settle = Duration::ZERO;
+    let mut since = Some(Instant::now());
+    let searching = s.screen().expect("the search");
+    s.host_steps_in_background(&searching, &mut since, Some(&opts.policy), &mut Alone)
+        .expect("the break's step");
+    assert_eq!(
+        s.door_draft(&searching),
+        None,
+        "the door's read of the search"
+    );
+    let left = s.screen().expect("the search left");
+    s.host_steps_in_background(&left, &mut since, Some(&opts.policy), &mut Alone)
+        .expect("the break's next step");
+    let guards = s.occupancy_guards(s.fx.mono(), &opts.policy, &left.rows);
+    assert_eq!(
+        (guards.draft, s.door_draft(&left)),
+        (false, Some(false)),
+        "held after the search went: seen {:?}",
+        s.draft_seen
+    );
+}
+
 /// ATERM'S OWN UPGRADE WORDS ARE NO PERSON'S DRAFT (the review of `b6b17dd4e6`): a line headed by any
 /// of its upgrade words (`upgrade::own_words`, the policy's `Composer::Own`) standing typed in the
 /// composer, no key measured. Nobody typed it, so no person's grace waits 120 s on it: the policy's
@@ -1377,7 +1989,6 @@ fn aterms_own_upgrade_words_are_asked_about_with_no_persons_grace() {
         m.cell_attrs = "none";
         m.cursor_on_caret = true;
         m.cursor_col = Some(2 + line.chars().count());
-        m.turn_releases = Some(1);
         m.stall_sleep = Some(Duration::from_secs(3600));
         m.exit_when = Some(acted_or_asked);
         let t = held_run("draft-upgrade-words", m);
@@ -1417,7 +2028,6 @@ fn a_persons_part_of_an_upgrade_head_keeps_its_grace() {
         m.cell_attrs = "none";
         m.cursor_on_caret = true;
         m.cursor_col = Some(2 + draft.chars().count());
-        m.turn_releases = Some(1);
         m.stall_sleep = Some(Duration::from_secs(3600));
         m.exit_when = Some(acted_or_asked);
         let t = held_run("draft-upgrade-part", m);
@@ -1474,7 +2084,6 @@ fn a_draft_reflowed_only_stretches_its_hold() {
     let mut s = virtual_session(&mut m, None);
     s.set_clock(TEST_NOW, PDT);
     let _ = s.screen().expect("the two rows");
-    assert!(s.draft_seen.is_some(), "the draft seen at its first read");
     let _ = s.screen().expect("the reflowed row");
     let now = s.fx.mono();
     let guards = s.occupancy_guards(now, &opts.policy, &one);
@@ -1579,87 +2188,17 @@ fn a_persons_edit_of_a_drafts_whitespace_starts_a_new_grace() {
     }
 }
 
-/// A READ OFF THE COMPOSER'S ROWS SAYS NOTHING OF A DRAFT (`draft_read`, `fabric_world`'s
-/// `174640090a`): a lone line, the cursor on a row above the composer or under it, as a program that
-/// places its cursor last is read between the two. A read of that sees no draft, so the host's guards
-/// hold nothing over a suggestion so read, and it costs a draft already seen nothing.
-/// NEGATIVE CONTROLS: `draft_read`'s off-composer arm answering `Some(true)`, as on `5ece62c7b3`, or
-/// either half of its condition gone, and the off read stands as a draft.
-#[test]
-fn a_read_off_the_composers_rows_says_nothing_of_a_draft() {
-    let shown = typed_in(SAID, HINT);
-    let caret = shown
-        .iter()
-        .position(|row| *row == format!("❯ {HINT}"))
-        .expect("the caret's row");
-    for off in [caret - 1, caret + 1] {
-        let mut m = fenced(vec![shown.clone(), shown.clone()]);
-        m.cell_attrs = "none";
-        m.screen_cursors.insert(0, off);
-        m.screen_cols.insert(0, 40);
-        m.screen_cursors.insert(1, caret);
-        m.screen_cols.insert(1, 2 + HINT.chars().count());
-        let mut s = virtual_session(&mut m, None);
-        s.set_clock(TEST_NOW, PDT);
-        let _ = s.screen().expect("the read off the composer");
-        assert!(s.draft_seen.is_none(), "row {off}: {:?}", s.draft_seen);
-        let _ = s.screen().expect("the read past the line");
-        let seen = s.draft_seen.clone().expect("a draft seen");
-
-        let mut m = fenced(vec![shown.clone(), shown.clone()]);
-        m.cell_attrs = "none";
-        m.screen_cursors.insert(0, caret);
-        m.screen_cols.insert(0, 2 + HINT.chars().count());
-        m.screen_cursors.insert(1, off);
-        m.screen_cols.insert(1, 40);
-        let mut s = virtual_session(&mut m, None);
-        s.set_clock(TEST_NOW, PDT);
-        let _ = s.screen().expect("the read past the line");
-        let held = s.draft_seen.clone().expect("a draft seen");
-        let _ = s.screen().expect("the read off the composer");
-        assert_eq!(s.draft_seen, Some(held), "row {off}: kept, over {seen:?}");
-    }
-}
-
-/// A DRAFT FIRST READ WITH ITS CARET HOME IS SEEN BY ITS CELL (pre-existing on `595b785510`, the
-/// review of `b6b17dd4e6`): a person's draft first read with the cursor at column 2 on the
-/// caret's row (a Home pressed, an Esc's restored prompt), its cell plain, no key measured. The
-/// policy's read of the cell says typed, and the draft is seen from that read on, so the point waits
-/// the person's grace before the draft step sends it.
-/// NEGATIVE CONTROL: `composer_typed` never calling `cell_saw`, and the draft is sent at its first
-/// read, no `WAITING … a person is typing` journaled.
-#[test]
-fn a_draft_first_read_with_its_caret_home_keeps_its_full_grace() {
-    let mut m = fenced(vec![busy_screen(), typed_in(SAID, DRAFT)]);
-    m.cell_attrs = "none";
-    m.cursor_on_caret = true;
-    m.cursor_col = Some(2);
-    m.turn_releases = Some(1);
-    m.stall_sleep = Some(Duration::from_secs(1));
-    m.exit_when = Some(acted);
-    let t = held_run("draft-first-home", m);
-    assert_eq!(t.person_waits(), 1, "{}", t.evidence());
-    let seen = t.first_read_of(1);
-    let acted = t.acted_at().unwrap_or_else(|| panic!("{}", t.evidence()));
-    assert!(
-        acted >= seen + Duration::from_secs(119),
-        "acted {:?} after the draft was first read: {}",
-        acted - seen,
-        t.evidence()
-    );
-    assert_eq!((t.enters(), t.typed()), (1, 0), "{}", t.evidence());
-}
-
 /// A COMPOSER WHOSE CELL COULD NOT SAY IS LOOKED AT AGAIN (the reviews of `6337470849`): the
 /// decision's read of the glyph's cell comes from a frame still open (` frame=open`), with no key
 /// measured and no content seq moving after it. That read decides nothing, and the next wait step's
-/// read looks again: a plain cell is a draft, which keeps its grace from its first sight and is then
+/// read looks again: a plain cell is a draft, which keeps its grace from that read and is then
 /// sent; a dim one with the cursor home is a suggestion, typed over at that step. A host that refuses
-/// the cell for good is never written to, its screen read at the wait's pace, no faster, and the
+/// the cell for good is never written to, its screen read once per wait step, no faster, and the
 /// journal says what holds the point.
 /// NEGATIVE CONTROLS: `wait_for_next` without its `Composer::Unknown` step, and the first two never
 /// act: no read moves the point past a cell that came back; `turn_end_write` without its
-/// `composer-unknown` arm, and the journal says only `why=policy`.
+/// `composer-unknown` arm, and the journal says only `why=policy`; `moved_past` reading the screen on
+/// that step too, and 61 reads over the run's 600 s, the look's own read being the next one.
 #[test]
 fn a_composer_whose_cell_could_not_say_is_looked_at_again() {
     let run = |attrs: &'static str, col: usize| {
@@ -1669,7 +2208,6 @@ fn a_composer_whose_cell_could_not_say_is_looked_at_again() {
         m.cell_open_reads = 1;
         m.cursor_on_caret = true;
         m.cursor_col = Some(col);
-        m.turn_releases = Some(1);
         m.stall_sleep = Some(Duration::from_secs(3600));
         m.exit_when = Some(acted);
         held_run("draft-cell-open", m)
@@ -1678,7 +2216,7 @@ fn a_composer_whose_cell_could_not_say_is_looked_at_again() {
     let seen = t.first_read_of(1);
     let acted = t.acted_at().unwrap_or_else(|| panic!("{}", t.evidence()));
     assert!(
-        acted >= seen + Duration::from_secs(119),
+        acted >= seen + Duration::from_secs(139),
         "a draft sent {:?} after its first sight: {}",
         acted - seen,
         t.evidence()
@@ -1699,13 +2237,12 @@ fn a_composer_whose_cell_could_not_say_is_looked_at_again() {
     m.cell_unreadable = true;
     m.cursor_on_caret = true;
     m.cursor_col = Some(2 + HINT.chars().count());
-    m.turn_releases = Some(1);
     m.stall_sleep = Some(Duration::from_secs(3600));
     let t = held_run("draft-cell-refused", m);
     t.left_it_alone("refused");
     let reads = t.m.read_times.len();
     assert!(
-        reads <= 2 * (600 / 20) + 4,
+        reads <= 600 / 20 + 4,
         "{reads} reads over the run's 600 s: {}",
         t.evidence()
     );
@@ -1724,7 +2261,6 @@ fn a_persons_grace_keeps_the_wake_on_a_host_that_has_one() {
     m.cell_attrs = "none";
     m.cursor_on_caret = true;
     m.cursor_col = Some(2 + DRAFT.chars().count());
-    m.turn_releases = Some(1);
     m.stall_sleep = Some(Duration::from_secs(3600));
     m.exit_when = Some(acted);
     let t = held_run("draft-wake", m);
@@ -1769,7 +2305,6 @@ fn a_cell_read_from_a_later_frame_writes_nothing() {
     m.cell_later_frames = 2;
     m.cursor_on_caret = true;
     m.cursor_col = Some(2);
-    m.turn_releases = Some(1);
     m.stall_sleep = Some(Duration::from_secs(1));
     m.exit_when = Some(|m| {
         m.requests
@@ -1926,29 +2461,72 @@ fn a_breaks_draft_that_went_and_came_back_is_asked_again() {
     assert!(s.draft_seen.is_some(), "the cell says typed again");
 }
 
+/// THE GUARDS' MEMORY IS OF THE CURSOR TOO (`composer_for_guards`, the review of `bd67622c8c`): a
+/// suggestion its cursor is home on, the guards holding nothing; the same words, the cursor moved off
+/// home by its column alone or its row alone, as a person who took the suggestion or a redraw leaves
+/// it. The next step asks the cell again, which says neither, and the guards hold.
+/// NEGATIVE CONTROLS: `composer_for_guards` remembering no column, and the column's move holds
+/// nothing; no row, and the row's.
+#[test]
+fn a_breaks_guards_ask_again_when_the_cursor_moves_off_a_suggestion() {
+    let (shown, caret) = at_break(HINT);
+    for (what, from, to) in [
+        ("its column", (caret + 1, 2), (caret + 1, 40)),
+        ("its row", (caret, 2), (0, 2)),
+    ] {
+        let mut m = Mock::new(vec![shown.clone(), shown.clone()]);
+        m.cell_attrs = "dim";
+        m.dim_past = true;
+        m.screen_cursors.insert(0, from.0);
+        m.screen_cols.insert(0, from.1);
+        m.screen_cursors.insert(1, to.0);
+        m.screen_cols.insert(1, to.1);
+        let opts = hosted(600);
+        let mut s = session(&mut m, Some("@s-1".to_string()));
+        s.set_clock(TEST_NOW, PDT);
+        s.setup.background_settle = Duration::ZERO;
+        let mut since = Some(Instant::now());
+        let first = s.screen().expect("the break");
+        s.host_steps_in_background(&first, &mut since, Some(&opts.policy), &mut Alone)
+            .expect("the break's step");
+        let now = s.fx.mono();
+        let guards = s.occupancy_guards(now, &opts.policy, &first.rows);
+        assert_eq!((guards.draft, guards.person), (false, false), "{what}");
+        let moved = s.screen().expect("the cursor moved");
+        s.host_steps_in_background(&moved, &mut since, Some(&opts.policy), &mut Alone)
+            .expect("the break's next step");
+        let now = s.fx.mono();
+        let guards = s.occupancy_guards(now, &opts.policy, &moved.rows);
+        assert_eq!((guards.draft, guards.person), (true, true), "{what}");
+    }
+}
+
+/// A turn's end at screen 1, and `rows` redrawn every second for `span` seconds.
+fn ticking(rows: &[String], span: u32) -> Mock {
+    let mut screens = vec![busy_screen()];
+    screens.extend((0..=span).map(|_| rows.to_vec()));
+    let mut m = fenced(screens);
+    m.timeline = Some((
+        1,
+        (0..=span)
+            .map(|k| Duration::from_secs(u64::from(k)))
+            .collect(),
+    ));
+    m.stall_sleep = Some(Duration::from_secs(3600));
+    m
+}
+
 /// A SCREEN TICKING OVER A COMPOSER ASKS ITS CELL NO MORE FOR IT (the review of `5ad7f68c8f`): a footer
 /// that ticks every second moves the content seq, so each move is a read. At an idle point over a real
 /// draft no survey is drawn and nothing else reads the draft, so no read of the 120 s asks the cell
 /// but the decision's. At a break, the same composer and cursor are asked about once: a draft, and a
-/// suggestion its cursor is home on.
+/// suggestion its cursor is home on, of one row or wrapped onto two.
 /// NEGATIVE CONTROLS: `survey` asking the cell with no survey drawn and none in hand, and the idle
 /// point's cells count its reads (135); `composer_for_guards` without its memory, and the break's do
-/// (145).
+/// (145); `draft_read` saying typed of two rows with the cursor home, and the two-row suggestion
+/// flips between seen and let go at every read (145).
 #[test]
 fn a_screen_ticking_over_a_composer_asks_its_cell_no_more_for_it() {
-    let ticking = |rows: &[String], span: u32| {
-        let mut screens = vec![busy_screen()];
-        screens.extend((0..=span).map(|_| rows.to_vec()));
-        let mut m = fenced(screens);
-        m.timeline = Some((
-            1,
-            (0..=span)
-                .map(|k| Duration::from_secs(u64::from(k)))
-                .collect(),
-        ));
-        m.stall_sleep = Some(Duration::from_secs(3600));
-        m
-    };
     let mut m = ticking(&typed_in(SAID, DRAFT), 130);
     m.cell_attrs = "none";
     m.cursor_on_caret = true;
@@ -1959,11 +2537,19 @@ fn a_screen_ticking_over_a_composer_asks_its_cell_no_more_for_it() {
     assert!(t.cells() <= 4, "{} cells: {}", t.cells(), t.evidence());
     assert_eq!((t.enters(), t.typed()), (1, 0), "{}", t.evidence());
 
-    for (what, text, attrs, col) in [
-        ("a draft", DRAFT, "none", 2 + DRAFT.chars().count()),
-        ("a suggestion", HINT, "dim", 2),
+    let (wrapped_hint, wrapped_caret) = at_break(HINT);
+    let mut wrapped_hint = wrapped_hint;
+    wrapped_hint.insert(wrapped_caret + 1, "  and then the rest of it".to_string());
+    for (what, shown, attrs, col) in [
+        (
+            "a draft",
+            at_break(DRAFT).0,
+            "none",
+            2 + DRAFT.chars().count(),
+        ),
+        ("a suggestion", at_break(HINT).0, "dim", 2),
+        ("a suggestion of two rows", wrapped_hint, "dim", 2),
     ] {
-        let (shown, _) = at_break(text);
         let mut m = ticking(&shown, 120);
         m.cell_attrs = attrs;
         m.dim_past = true;
@@ -2009,6 +2595,47 @@ impl IdleHost for IdleTeller {
     }
 }
 
+/// A HOLD ASKS EACH READ ITS CELL ONCE (the review of `98b9c4d903`): grey text with the cursor past it,
+/// for good, a screen ticking every second, under a host that wants its steps. The hold's look reads
+/// the cell of each read, and the host's step before its guards asks nothing more of that read.
+/// NEGATIVE CONTROL: `host_steps_here` asking for its guards under a hold too, and the cells outnumber
+/// the reads, 263 to 204.
+#[test]
+fn a_hold_asks_each_read_its_cell_once() {
+    let clock = virtual_clock();
+    let host = Arc::new(IdleTeller {
+        clock: Arc::clone(&clock),
+        steps: std::sync::Mutex::new(Vec::new()),
+    });
+    let mut m = ticking(&typed_in(SAID, HINT), 60);
+    m.cell_attrs = GREY;
+    m.dim_past = true;
+    m.cursor_on_caret = true;
+    m.cursor_col = Some(2 + HINT.chars().count());
+    m.exit_at_request = Some(600);
+    let (dir, journal) = journal_file("draft-hold-one-cell");
+    let opts = SuperviseOpts {
+        journal: Some(journal),
+        idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+        ..hosted(600)
+    };
+    let _ = record_watch_on(&mut m, &opts, clock, |s| {
+        s.set_turn_end_timing(TurnEndTiming {
+            min_work: Duration::ZERO,
+            ..TurnEndTiming::default()
+        });
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+    let count = |head: &str| m.requests.iter().filter(|r| r.starts_with(head)).count();
+    let (reads, cells) = (count("text "), count("cell "));
+    assert!(reads > 50, "it ticked: {reads} reads");
+    assert!(
+        cells <= reads,
+        "{cells} cells over {reads} reads: {:#?}",
+        m.requests
+    );
+}
+
 /// THE HOST'S GUARDS AT A POINT WITH NOTHING DUE LET A SUGGESTION GO (the review of `5ad7f68c8f`): the
 /// turn over, an empty composer, no continuation due; `text` then drawn with the cursor past it (a
 /// frame read before its program placed the cursor), and home 300 ms on in a frame of its own, or 30 s
@@ -2035,7 +2662,6 @@ fn the_hosts_guards_at_a_point_with_nothing_due_let_a_suggestion_go() {
         }
         let mut m = fenced(screens);
         m.cell_attrs = attrs;
-        m.dim_past = true;
         m.cursor_on_caret = true;
         m.screen_cols.insert(1, 2);
         m.screen_cols

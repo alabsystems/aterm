@@ -25,6 +25,92 @@ pub use auth_scope::{
     LifetimeScope, ManagedContexts, ManagedScope, note_auth_in_context, note_auth_on_default,
 };
 
+#[path = "accounts_workflow_scope.rs"]
+mod workflow_scope;
+pub use workflow_scope::{
+    WorkflowContexts, WorkflowCustody, WorkflowToken, current_sign_in_attempt,
+    current_sign_in_blocked, current_sign_in_task, current_workflow, workflow_event_matches,
+    workflow_token_current,
+};
+
+/// Capture an explicit sign-in policy admission without changing untouched workflow records.
+pub(in crate::harness) fn admit_workflow(logins: &mut Logins, label: &str) -> Result<(), String> {
+    workflow_scope::admit(logins, label)
+}
+
+/// Read a captured descriptor; publication still checks it against the current raw policy.
+pub(in crate::harness) fn captured_workflow(logins: &Logins, label: &str) -> Option<WorkflowToken> {
+    workflow_scope::captured_workflow(logins, label)
+}
+
+/// Environment choices in the workflow conformance replay, linked by the source audit.
+#[cfg(any(test, debug_assertions))]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountWorkflowScope",
+        action = "Seed",
+        reason = "The fixture seeds admitted task and attempt observations through real account transactions."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountWorkflowScope",
+        action = "Legacy",
+        reason = "The fixture selects persisted raw history without producer custody; this supplies no current authority."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountWorkflowScope",
+        action = "AnotherProvider",
+        reason = "Fixture selection repeats the replay for another supported provider."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountWorkflowScope",
+        action = "AnotherEdit",
+        reason = "Fixture selection chooses the policy or nonpolicy edit before replaying its transaction."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountWorkflowScope",
+        action = "Activity",
+        reason = "The fixture combines served-login, notice and authentication observations; no single workflow operation represents this input."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountWorkflowScope",
+        action = "Back",
+        reason = "The environment restores configured policy or a bound directory through existing account transactions."
+    )
+)]
+#[doc(hidden)]
+pub fn account_workflow_scope_environment() {}
+
+#[cfg(test)]
+pub(super) fn begin_workflow_projection_for_test(raw: &Roster, logins: &mut Logins) {
+    workflow_scope::begin(Some(raw), logins);
+}
+
+#[cfg(test)]
+pub(super) fn finish_workflow_projection_for_test(
+    before: &Logins,
+    raw: &Roster,
+    logins: &mut Logins,
+    events: &mut [Event],
+) -> Result<bool, String> {
+    workflow_scope::finish(before, Some(raw), logins, events)
+}
+
 #[path = "accounts_shared.rs"]
 pub mod shared;
 
@@ -37,6 +123,8 @@ use sync_commit::usage_target;
 
 #[path = "accounts_directory.rs"]
 mod directory;
+#[cfg(unix)]
+pub(super) use directory::retained_directory_owner_at;
 pub(super) use directory::{
     lists_directory, naming_row, retained_directory_owner, shared_staging_retained,
 };
@@ -215,6 +303,10 @@ pub const WEEK_WINDOW_S: i64 = 7 * 24 * 3600;
 /// [`WEEK_WINDOW_S`]).
 pub const RESET_BELIEVED_S: i64 = 8 * 24 * 3600;
 
+/// How far past its own row a [`MONTH_LIMIT`] wall's reset may stand and still be believed
+/// ([`note_wall`]): the longest month and a day.
+pub const MONTH_RESET_BELIEVED_S: i64 = 32 * 24 * 3600;
+
 /// A session's row older than this is dropped when the state is saved ([`drop_stale_sessions`]).
 pub const SESSION_KEEP_S: i64 = 30 * 24 * 3600;
 
@@ -313,6 +405,9 @@ pub const SESSION_LIMIT: &str = "five_hour";
 
 /// The limit type of the week of all models ([`Account::warned_week`]).
 pub const WEEK_LIMIT: &str = "seven_day";
+
+/// The limit type of Kimi Code's monthly total ([`note_panel_window`]).
+pub const MONTH_LIMIT: &str = "monthly";
 
 /// The variable that moves a process's Claude home ([`LOGIN_ENV`]).
 pub const HOME_ENV: &str = "CLAUDE_CONFIG_DIR";
@@ -590,9 +685,9 @@ impl Roster {
     /// # Errors
     ///
     /// As [`Roster::parse`], and: a vendor key this CLI does not take (Claude Code takes none);
-    /// a `region` other than `global` or `mainland-cn`, or a Kimi row with an `email` and no
+    /// a `region` other than `global` or `mainland-cn`, or a Kimi row with a declared identity and no
     /// `region`; a `flow` other than `browser` or `device`; `identity_email` outside
-    /// Claude or Codex, an invalid identity address, or two rows expecting the same identity.
+    /// Claude, Codex, Kimi or agy, an invalid identity address, or two rows expecting the same identity.
     /// Duplicate email addresses are scoped to one provider realm.
     pub fn parse_for(cli: Cli, text: &str) -> Result<Roster, String> {
         let file = cli.accounts().roster_file;
@@ -657,11 +752,12 @@ impl Roster {
                     drop_one_of(twin, &row)
                 ));
             }
-            if matches!(cli, Cli::Claude | Cli::Codex)
+            if matches!(cli, Cli::Claude | Cli::Codex | Cli::Kimi | Cli::Agy)
                 && let Some(twin) = rows.iter().find(|r| {
-                    r.expected_identity_email()
-                        .zip(row.expected_identity_email())
-                        .is_some_and(|(a, b)| email_matches(a, b))
+                    same_provider_realm(cli, r.vendor.region, row.vendor.region)
+                        && r.expected_identity_email()
+                            .zip(row.expected_identity_email())
+                            .is_some_and(|(a, b)| email_matches(a, b))
                 })
             {
                 return Err(format!(
@@ -836,14 +932,15 @@ fn row_of(cli: Cli, item: &aterm_toml::Value, n: usize) -> Result<Row, String> {
         !matches!(
             k.as_str(),
             "label" | "class" | "dir" | "email" | "browser" | "held_by"
-        ) && !(matches!(cli, Cli::Claude | Cli::Codex) && k.as_str() == "identity_email")
+        ) && !(matches!(cli, Cli::Claude | Cli::Codex | Cli::Kimi | Cli::Agy)
+            && k.as_str() == "identity_email")
             && Some(k.as_str()) != vendor_key
     }) {
         let holds = vendor_key.map_or_else(
             || "email, browser and held_by".to_owned(),
             |key| format!("email, browser, held_by and {key}"),
         );
-        let holds = if matches!(cli, Cli::Claude | Cli::Codex) {
+        let holds = if matches!(cli, Cli::Claude | Cli::Codex | Cli::Kimi | Cli::Agy) {
             format!("{holds}, and identity_email")
         } else {
             holds
@@ -970,9 +1067,14 @@ fn row_of(cli: Cli, item: &aterm_toml::Value, n: usize) -> Result<Row, String> {
                     })
                 })
                 .transpose()?;
-            if region.is_none() && email.is_some() {
+            if region.is_none() && (email.is_some() || identity_email.is_some()) {
+                let address = if email.is_some() {
+                    "an email"
+                } else {
+                    "an identity_email"
+                };
                 return Err(format!(
-                    "{file}: row `{label}` has an email and no region: name `global` (kimi.ai) \
+                    "{file}: row `{label}` has {address} and no region: name `global` (kimi.ai) \
                      or `mainland-cn` (kimi.com), since a sign-in on the other region's site can \
                      make a new account"
                 ));
@@ -1329,17 +1431,41 @@ pub fn default_login_made(cli: Cli, home: &Path) -> bool {
 /// publication directory alone cannot enroll a login.
 #[must_use]
 pub fn login_made(dir: &Path) -> bool {
-    std::fs::read_dir(dir).is_ok_and(|mut entries| {
-        entries.any(|entry| {
-            entry.is_ok_and(|entry| {
-                let name = entry.file_name();
-                name != RENEWAL_CHECKPOINT_FILE
-                    && !name
-                        .to_str()
-                        .is_some_and(|name| name.starts_with(RENEWAL_CHECKPOINT_STAGE_PREFIX))
-            })
-        })
-    })
+    login_made_checked(dir).unwrap_or(false)
+}
+
+/// The same footprint decision, retaining I/O uncertainty when no entry proves presence.
+/// # Errors
+/// The directory or an entry cannot be read and no known entry establishes a footprint.
+pub(super) fn login_made_checked(dir: &Path) -> io::Result<bool> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let mut unavailable = None;
+    for entry in entries {
+        match entry {
+            Ok(entry) => {
+                if !login_bookkeeping(&entry.file_name()) {
+                    return Ok(true);
+                }
+            }
+            Err(error) => unavailable = Some(error),
+        }
+    }
+    unavailable.map_or(Ok(false), Err)
+}
+
+/// Whether `name` is a file aterm keeps beside a login, which holds nobody's: a renewal's checkpoint
+/// or its stage, or the lock on a login's file, which every take of it leaves
+/// ([`super::codex_app_login::AuthLock`]).
+pub(super) fn login_bookkeeping(name: &std::ffi::OsStr) -> bool {
+    name == RENEWAL_CHECKPOINT_FILE
+        || name == super::codex_app_login::AUTH_LOCK_FILE
+        || name
+            .to_str()
+            .is_some_and(|name| name.starts_with(RENEWAL_CHECKPOINT_STAGE_PREFIX))
 }
 
 /// Whether `row`'s login is here: the enrolled set is the one answer, a default-home row
@@ -1778,6 +1904,7 @@ impl RenewalParent {
             // These observations carry no account identity or parent authority.
             binding.sign_in_attempt = None;
             binding.sign_in_task = None;
+            binding.served_at = None;
             // A first failed attempt may create a report-only default binding.
             // It carries the same identity facts as no binding at all.
             if binding != Binding::default() {
@@ -2113,24 +2240,87 @@ pub(super) fn read_renewal_checkpoint_for(
     actual_dir: &Path,
     now: i64,
 ) -> Option<RenewalCheckpoint> {
-    use std::io::Read as _;
-    let file = astream_sys::open_nonblocking(
-        &staging.join(RENEWAL_CHECKPOINT_FILE),
-        astream_sys::Links::Refuse,
+    read_renewal_checkpoint_checked_for(cli, staging, actual_dir, now)
+        .ok()
+        .flatten()
+}
+
+/// Read local completion evidence while distinguishing unavailable I/O from absent or invalid data.
+/// # Errors
+/// A checkpoint, its declared directory or its already-required native grant cannot be read.
+pub(super) fn read_renewal_checkpoint_checked_for(
+    cli: Cli,
+    staging: &Path,
+    actual_dir: &Path,
+    now: i64,
+) -> io::Result<Option<RenewalCheckpoint>> {
+    read_renewal_checkpoint_with(
+        cli,
+        staging,
+        actual_dir,
+        now,
+        aterm_uds::regular_file::open,
+        |path| std::fs::canonicalize(path),
+        native_google_digest_checked,
     )
-    .ok()?;
-    let metadata = file.metadata().ok()?;
+}
+
+fn read_renewal_checkpoint_with(
+    cli: Cli,
+    staging: &Path,
+    actual_dir: &Path,
+    now: i64,
+    open: impl FnOnce(&Path) -> io::Result<(std::fs::File, std::fs::Metadata)>,
+    canonicalize: impl FnOnce(&Path) -> io::Result<PathBuf>,
+    grant_digest: impl FnOnce(&Path) -> io::Result<Option<[u8; 32]>>,
+) -> io::Result<Option<RenewalCheckpoint>> {
+    use std::io::Read as _;
+    let (file, metadata) = match open(&staging.join(RENEWAL_CHECKPOINT_FILE)) {
+        Ok(file) => file,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::InvalidData
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
     if !metadata.is_file() || metadata.len() > RENEWAL_CHECKPOINT_MAX {
-        return None;
+        return Ok(None);
     }
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.len())
+            .unwrap_or(0)
+            .saturating_add(1),
+    );
     file.take(RENEWAL_CHECKPOINT_MAX + 1)
-        .read_to_end(&mut bytes)
-        .ok()?;
+        .read_to_end(&mut bytes)?;
     if bytes.len() as u64 > RENEWAL_CHECKPOINT_MAX {
-        return None;
+        return Ok(None);
     }
-    let doc: Value = aterm_json::from_str(std::str::from_utf8(&bytes).ok()?).ok()?;
+    let Some(checkpoint) = decode_renewal_checkpoint(cli, &bytes) else {
+        return Ok(None);
+    };
+    if checkpoint.checked_at > now {
+        return Ok(None);
+    }
+    if let Some(digest) = checkpoint.google_grant_digest
+        && grant_digest(staging)? != Some(digest)
+    {
+        return Ok(None);
+    }
+    let declared = match canonicalize(Path::new(&checkpoint.dir)) {
+        Ok(path) => path,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    Ok((declared == actual_dir).then_some(checkpoint))
+}
+
+fn decode_renewal_checkpoint(cli: Cli, bytes: &[u8]) -> Option<RenewalCheckpoint> {
+    let doc: Value = aterm_json::from_str(std::str::from_utf8(bytes).ok()?).ok()?;
     // Schema 1 has no parent evidence; Kimi's schema 2 has no region evidence. Preserve
     // either for inspection without inventing the missing scope from current policy.
     // Google's schema 4 likewise lacks the binding revision and state-root scope.
@@ -2180,13 +2370,7 @@ pub(super) fn read_renewal_checkpoint_for(
             clock: doc.get("parent_clock")?.as_u64()?,
         },
     };
-    (checkpoint.valid()
-        && (cli != Cli::Agy || checkpoint.proved_by == Some(Proof::Status))
-        && checkpoint
-            .google_grant_digest
-            .is_none_or(|digest| native_google_digest(staging) == Some(digest))
-        && checkpoint.checked_at <= now
-        && std::fs::canonicalize(&checkpoint.dir).ok()?.as_path() == actual_dir)
+    (checkpoint.valid() && (cli != Cli::Agy || checkpoint.proved_by == Some(Proof::Status)))
         .then_some(checkpoint)
 }
 
@@ -2244,7 +2428,7 @@ pub(super) fn checkpoint_current(
 }
 
 pub(super) fn checkpoint_identity_matches(cli: Cli, row: &Row, proof: &RenewalCheckpoint) -> bool {
-    let expected = if matches!(cli, Cli::Claude | Cli::Codex) {
+    let expected = if matches!(cli, Cli::Claude | Cli::Codex | Cli::Kimi | Cli::Agy) {
         row.expected_identity_email()
     } else {
         row.email.as_deref()
@@ -2372,16 +2556,6 @@ impl AttemptOutcome {
     }
 }
 
-/// Whether `label`'s last automatic sign-in was stopped by its page
-/// ([`AttemptOutcome::Blocked`]).
-#[must_use]
-pub fn sign_in_blocked(logins: &Logins, label: &str) -> bool {
-    logins
-        .get(label)
-        .and_then(|binding| binding.sign_in_attempt.as_ref())
-        .is_some_and(|attempt| attempt.outcome == AttemptOutcome::Blocked)
-}
-
 /// A row's last automatic sign-in: how it ended, the routes its ladder tried (one bounded line
 /// that never holds a URL, code, password or email), and since when that has been so.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2427,14 +2601,15 @@ impl SignInAction {
     /// person names its sign-in on a terminal ([`Cli::sign_in_verb`]).
     #[must_use]
     pub fn next_step(self, cli: Cli, label: &str) -> String {
-        let id = cli.id();
+        use super::accounts_step::Step;
         match self {
             Self::Browser if cli.renews_headlessly() => format!(
-                "Run aterm harness accounts browser {label} --cli {id}, then aterm harness \
-                 accounts renew {label} --cli {id}"
+                "Run {}, then {}",
+                Step::Browser(cli, label.to_owned()),
+                Step::Renew(cli, label.to_owned())
             ),
             Self::Browser | Self::Login => {
-                format!("Run aterm harness accounts login {label} --cli {id}")
+                format!("Run {}", Step::Login(cli, label.to_owned()))
             }
         }
     }
@@ -2598,6 +2773,10 @@ pub struct Logins {
     /// Last allocated renewal generation. Retained even when labels move or disappear;
     /// only the store transaction allocates from this machine-local counter.
     pub generation_clock: u64,
+    /// Last allocated workflow identity, independent of credential and success generations.
+    pub workflow_clock: u64,
+    /// Workflow custody, including tombstones that prevent label reuse reviving old evidence.
+    pub workflows: BTreeMap<String, WorkflowCustody>,
     /// Last allocated in-place sign-in receipt, independent of credential fences.
     pub sign_in_clock: u64,
     /// Successful in-place sign-ins by label, including unbound default logins.
@@ -2621,6 +2800,9 @@ pub struct Logins {
     /// Captured entry contexts for observations created during an admitted publication.
     #[doc(hidden)]
     pub auth_contexts: ManagedContexts,
+    /// Captured workflow contexts for all CLI providers; never serialized.
+    #[doc(hidden)]
+    pub workflow_contexts: WorkflowContexts,
 }
 
 impl Logins {
@@ -2689,6 +2871,7 @@ impl Logins {
                 ),
             );
         }
+        workflow_scope::write_json(self, &mut o);
         let labels = self
             .labels
             .iter()
@@ -2978,9 +3161,12 @@ impl Logins {
                 sign_in_receipts.insert(label.clone(), receipt);
             }
         }
+        let (workflow_clock, workflows) = workflow_scope::from_json(&doc)?;
         Ok(Logins {
             labels,
             generation_clock,
+            workflow_clock,
+            workflows,
             sign_in_clock,
             sign_in_receipts,
             pending_sign_in_invalidations: BTreeSet::new(),
@@ -2988,6 +3174,7 @@ impl Logins {
             native_rotations,
             pending_native_retirement: None,
             auth_contexts: ManagedContexts::default(),
+            workflow_contexts: WorkflowContexts::default(),
         })
     }
 }
@@ -3219,6 +3406,12 @@ pub fn bound(roster: &Roster, logins: &Logins) -> Roster {
                     ..row.clone()
                 }
             }
+            // A row on the login its roster row names, whose binding keeps what it left (the
+            // default login's row after a reassignment): a session still there is this row's.
+            Some(b) if !b.was.is_empty() => Row {
+                was: b.was.clone(),
+                ..row.clone()
+            },
             _ => row.clone(),
         })
         .collect();
@@ -3390,23 +3583,32 @@ pub fn wrong_accounts(roster: &Roster, logins: &Logins) -> Vec<String> {
         .collect()
 }
 
-/// The roster's pending human sign-in actions, in roster order.
+/// The configured raw roster's current human sign-in actions, in roster order.
 #[must_use]
 pub fn sign_in_tasks(roster: &Roster, logins: &Logins) -> Vec<(String, SignInAction)> {
     roster
         .rows
         .iter()
         .filter_map(|row| {
-            let task = logins.get(&row.label)?.sign_in_task?;
+            let task = current_sign_in_task(row, logins)?;
             Some((row.label.clone(), task.action))
         })
         .collect()
 }
 
 /// Records a renewal's remaining human action without changing its login binding.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountWorkflowScope",
+        action = "FreshTask",
+        project = "aterm_agent::harness::accounts::workflow_scope_tests::workflow_transition"
+    )
+)]
 pub fn note_sign_in_task(logins: &mut Logins, label: &str, action: SignInAction, at: i64) {
     if let Some(binding) = logins.entry(label) {
         binding.sign_in_task = Some(SignInTask { action, at });
+        workflow_scope::stamp(logins, label, workflow_scope::Guidance::Task);
     }
 }
 
@@ -3416,8 +3618,16 @@ pub const AUTO_SIGN_IN: &str = "auto";
 
 /// Records how `label`'s automatic sign-in ended at `at` and the `routes` its ladder tried,
 /// without changing its login binding: one [`Kind::SignIn`] event (`auto <outcome>: <routes>`)
-/// when the outcome or the routes differ from the row's last attempt, and nothing at all when
-/// they are the same, so an unchanged failure is written once however often it is tried again.
+/// when the workflow, outcome or routes differ from the row's last attempt. An unchanged
+/// failure within the same workflow is written once however often it is tried again.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountWorkflowScope",
+        action = "FreshAttempt",
+        project = "aterm_agent::harness::accounts::workflow_scope_tests::workflow_transition"
+    )
+)]
 pub fn note_sign_in_attempt(
     logins: &mut Logins,
     label: &str,
@@ -3426,13 +3636,20 @@ pub fn note_sign_in_attempt(
     at: i64,
 ) -> Vec<Event> {
     let routes = one_line(routes, ROUTES_MAX);
+    if !admissible_label(label) {
+        return Vec::new();
+    }
+    let current = workflow_scope::attempt_current(logins, label);
+    // An identical summary still observes this workflow and must fence later replacement.
+    workflow_scope::stamp(logins, label, workflow_scope::Guidance::Attempt);
     let Some(binding) = logins.entry(label) else {
         return Vec::new();
     };
-    if binding
-        .sign_in_attempt
-        .as_ref()
-        .is_some_and(|last| last.outcome == outcome && last.routes == routes)
+    if current
+        && binding
+            .sign_in_attempt
+            .as_ref()
+            .is_some_and(|last| last.outcome == outcome && last.routes == routes)
     {
         return Vec::new();
     }
@@ -3464,12 +3681,13 @@ pub fn needs_sign_in(row: &Row, state: &State, logins: &Logins, enrolled: bool, 
             && matches!(login_state(row, logins, state, now), LoginState::Due { .. })))
 }
 
-/// The rows of `roster` whose last automatic sign-in failed and which still need one
+/// The bound rows whose current automatic sign-in failed and which still need one
 /// ([`needs_sign_in`]: not enrolled, signed out, or due for renewal), in roster order, with that
-/// attempt.
+/// attempt. `raw_roster` supplies each workflow's configured policy.
 #[must_use]
 pub fn failing_sign_ins(
     roster: &Roster,
+    raw_roster: &Roster,
     state: &State,
     logins: &Logins,
     now: i64,
@@ -3480,7 +3698,7 @@ pub fn failing_sign_ins(
         .iter()
         .filter(|row| needs_sign_in(row, state, logins, is_enrolled(row, &enrolled), now))
         .filter_map(|row| {
-            let attempt = logins.get(&row.label)?.sign_in_attempt.clone()?;
+            let attempt = current_sign_in_attempt(raw_roster.row(&row.label)?, logins)?.clone();
             attempt
                 .outcome
                 .failing()
@@ -3654,6 +3872,7 @@ pub(super) fn note_checked_sign_in(
         }
         Vec::new()
     };
+    workflow_scope::replace(logins, label);
     if !state.contextual_auth {
         auth_scope::replace_lifetime(logins, label);
     }
@@ -3668,6 +3887,7 @@ pub(super) fn note_checked_sign_in(
         binding.sign_in_task = None;
         binding.clear_failed_sign_in();
     }
+    workflow_scope::clear_absent(logins, label);
     if !state.contextual_auth {
         auth_scope::clear_absent_lifetime(logins, label);
         auth_scope::stamp_lifetime(logins, label, auth_scope::Clock::Renewal, None);
@@ -3707,6 +3927,7 @@ pub fn note_renewed(
     at: i64,
 ) -> Vec<Event> {
     let mut out = Vec::new();
+    workflow_scope::replace(logins, label);
     if !state.contextual_auth {
         auth_scope::replace_lifetime(logins, label);
     }
@@ -3733,6 +3954,7 @@ pub fn note_renewed(
     binding.subscription = subscription
         .map(|s| one_line(s, SUBSCRIPTION_MAX))
         .filter(|s| !s.is_empty());
+    workflow_scope::clear_absent(logins, label);
     if !state.contextual_auth {
         auth_scope::clear_absent_lifetime(logins, label);
         auth_scope::stamp_lifetime(logins, label, auth_scope::Clock::Renewal, None);
@@ -3783,19 +4005,33 @@ fn google_principal(value: &Value) -> Option<[u8; 32]> {
 
 #[cfg(unix)]
 fn native_google_digest(staging: &Path) -> Option<[u8; 32]> {
+    native_google_digest_checked(staging).ok().flatten()
+}
+
+#[cfg(unix)]
+fn native_google_digest_checked(staging: &Path) -> io::Result<Option<[u8; 32]>> {
     let path = staging.join(".gemini/antigravity-cli/antigravity-oauth-token");
-    let bytes = aterm_secrets::fsx::read_private(&path, 64 * 1024).ok()??;
+    let Some(bytes) = aterm_secrets::fsx::read_private(&path, 64 * 1024)
+        .map_err(|_| io::Error::other("native grant could not be read"))?
+    else {
+        return Ok(None);
+    };
     if bytes.is_empty() {
-        return None;
+        return Ok(None);
     }
     let mut digest = aterm_digest::Sha256::new();
     digest.update(bytes.as_slice());
-    Some(digest.finalize())
+    Ok(Some(digest.finalize()))
 }
 
 #[cfg(not(unix))]
 fn native_google_digest(_staging: &Path) -> Option<[u8; 32]> {
     None
+}
+
+#[cfg(not(unix))]
+fn native_google_digest_checked(_staging: &Path) -> io::Result<Option<[u8; 32]>> {
+    Ok(None)
 }
 
 /// Refuse replacing a retained Google subject with another canonical subject.
@@ -3837,6 +4073,7 @@ pub fn note_wrong_account(logins: &mut Logins, label: &str, at: i64) -> Vec<Even
         Some(binding) => {
             binding.wrong_at = Some(at);
             binding.sign_in_task = None;
+            workflow_scope::clear_absent(logins, label);
             vec![Event::new(at, Kind::WrongAccount, label)]
         }
         None => Vec::new(),
@@ -3969,6 +4206,7 @@ fn finish_default_login_made(
     }) {
         return out;
     }
+    workflow_scope::replace(logins, label);
     if !state.contextual_auth {
         auth_scope::replace_lifetime(logins, label);
     }
@@ -3978,6 +4216,7 @@ fn finish_default_login_made(
         binding.sign_in_task = None;
         binding.clear_failed_sign_in();
     }
+    workflow_scope::clear_absent(logins, label);
     if !state.contextual_auth {
         auth_scope::clear_absent_lifetime(logins, label);
     }
@@ -4059,6 +4298,7 @@ pub fn move_accounts(
         }
     }
     auth_scope::move_contexts(logins, moves);
+    workflow_scope::move_contexts(logins, moves);
     let moved: Vec<_> = map
         .iter()
         .map(|(from, to)| {
@@ -4155,6 +4395,7 @@ pub(super) fn label_is_retained(state: &State, logins: &Logins, label: &str) -> 
 /// another account: its observations (walls, samples, auth word) and its binding's turns served.
 /// The login directory the label is bound to is kept: what it holds is checked where it is run.
 pub fn forget_account(state: &mut State, logins: &mut Logins, label: &str) {
+    workflow_scope::replace(logins, label);
     state
         .pending_auth
         .retain(|intent| intent.raw.label != label);
@@ -4342,6 +4583,19 @@ impl Sample {
                 .map(|(_, end)| end)
         };
         at(self.session(now), LOW_SESSION_PCT).max(at(self.week(now), LOW_WEEK_PCT))
+    }
+
+    /// When `window`'s limit resets, where this sample shows that limit reached. A read short of the
+    /// limit names when the window turns over, which says nothing of when a wall there ends, so a
+    /// wall it stands beside keeps the rungs of one that names no reset ([`NO_RESET_WALL_S`]).
+    #[must_use]
+    pub fn reached_reset(&self, window: &str) -> Option<i64> {
+        let (used, reset) = match window {
+            "seven_day" => (self.week_pct, self.week_reset),
+            "five_hour" => (self.session_pct, self.session_reset),
+            _ => return None,
+        };
+        reset.filter(|_| used.is_some_and(|used| used >= 100))
     }
 
     /// Returns whether any running window in this sample is at or above its low threshold at `now`.
@@ -7601,6 +7855,8 @@ pub struct Event {
     /// The account's lab key (`ac-<16hex>`), set when the row is published from the account's
     /// learned key ([`Account::pk`], [`super::journal::observe`]).
     pub pk: Option<String>,
+    /// Captured sign-in workflow custody; an explicit legacy zero is never retargeted.
+    pub workflow: Option<WorkflowToken>,
 }
 
 impl Event {
@@ -7615,6 +7871,7 @@ impl Event {
             sid: None,
             why: String::new(),
             pk: None,
+            workflow: None,
         }
     }
 
@@ -7699,6 +7956,9 @@ impl Event {
         {
             o.insert("pk".to_owned(), Value::from(pk));
         }
+        if let Some(token) = self.workflow {
+            o.insert("workflow".into(), Value::from(token.value()));
+        }
         aterm_json::to_string(&Value::Object(o)).unwrap_or_else(|_| String::from("{}"))
     }
 
@@ -7721,6 +7981,10 @@ impl Event {
                 .and_then(Value::as_str)
                 .filter(|pk| super::journal::Key::new(pk).is_some())
                 .map(str::to_owned),
+            workflow: match doc.get("workflow") {
+                None => None,
+                Some(value) => Some(WorkflowToken::from_value(value.as_u64()?)),
+            },
         })
     }
 }
@@ -7757,7 +8021,9 @@ pub fn believed_reset(until: Option<i64>, at: i64) -> Option<i64> {
     until.filter(|until| until.saturating_sub(at) <= RESET_BELIEVED_S)
 }
 
-/// Records a quota wall hit by `account` and returns any resulting ledger events.
+/// Records a quota wall hit by `account` and returns any resulting ledger events. Its reset
+/// `until` is believed as [`believed_reset`] says, or up to [`MONTH_RESET_BELIEVED_S`] past `at`
+/// for a [`MONTH_LIMIT`] wall.
 pub fn note_wall(
     state: &mut State,
     account: &str,
@@ -7767,7 +8033,11 @@ pub fn note_wall(
     now: i64,
 ) -> Vec<Event> {
     let window = one_line(window, WORD_MAX);
-    let until = believed_reset(until, at);
+    let until = if window == MONTH_LIMIT {
+        until.filter(|until| until.saturating_sub(at) <= MONTH_RESET_BELIEVED_S)
+    } else {
+        believed_reset(until, at)
+    };
     let by = state.machine.clone();
     let mut out = Vec::new();
     if window.is_empty() {
@@ -7779,6 +8049,14 @@ pub fn note_wall(
     if record.cleared_since(&window, at, now).is_some() {
         return out;
     }
+    // A wall that names no reset says nothing of one a read named: it stands until then.
+    let until = until.or_else(|| {
+        record
+            .walls
+            .get(&window)
+            .and_then(|old| old.until)
+            .filter(|known| *known > at)
+    });
     let late = u32::from(until.is_none_or(|u| at > u));
     if let Some(old) = record.walls.get_mut(&window) {
         old.at = old.at.min(now);
@@ -9138,13 +9416,24 @@ pub(crate) fn read_bounded(path: &Path, max: u64) -> io::Result<Option<String>> 
         }
         Err(e) => return Err(e),
     };
-    if !file.metadata()?.is_file() {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "not a regular file",
         ));
     }
-    let mut bytes = Vec::new();
+    if metadata.len() > max {
+        return Err(io::Error::new(
+            io::ErrorKind::FileTooLarge,
+            format!("larger than {max} bytes"),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.len())
+            .unwrap_or(0)
+            .saturating_add(1),
+    );
     file.take(max.saturating_add(1)).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > max {
         return Err(io::Error::new(
@@ -9306,6 +9595,23 @@ pub(super) struct RenewalPolicy<'a> {
     pub roster: &'a Roster,
     pub row: &'a Row,
     pub logins: &'a Logins,
+}
+
+impl RenewalPolicy<'_> {
+    /// Require the captured roster, effective row and login parent under the writer.
+    ///
+    /// # Errors
+    /// Refuses when the captured roster, effective row or login parent changed.
+    pub(super) fn require_current(self, raw: &Roster, logins: &Logins) -> Result<(), String> {
+        if raw != self.roster || bound(raw, logins).row(&self.row.label) != Some(self.row) {
+            return Err(format!(
+                "account `{}` configuration or login changed during sign-in; nothing recorded",
+                self.row.label
+            ));
+        }
+        RenewalParent::capture(self.logins, &self.row.label)
+            .require_current(logins, &self.row.label)
+    }
 }
 
 /// The machine-wide sign-in lock's file, in Claude Code's store ([`Store::signin_within`]).
@@ -11085,19 +11391,16 @@ impl Store {
         policy: RenewalPolicy<'_>,
         edit: impl FnOnce(&mut State, &mut Logins) -> Result<Vec<Event>, String>,
     ) -> Result<Vec<Event>, String> {
-        self.transact_roster_logins_held(held, policy.roster_path, now, note, |raw, state, logins| {
-            if raw != policy.roster
-                || bound(raw, logins).row(&policy.row.label) != Some(policy.row)
-            {
-                return Err(format!(
-                    "account `{}` configuration or login changed during sign-in; nothing recorded",
-                    policy.row.label
-                ));
-            }
-            RenewalParent::capture(policy.logins, &policy.row.label)
-                .require_current(logins, &policy.row.label)?;
-            edit(state, logins)
-        })
+        self.transact_roster_logins_held(
+            held,
+            policy.roster_path,
+            now,
+            note,
+            |raw, state, logins| {
+                policy.require_current(raw, logins)?;
+                edit(state, logins)
+            },
+        )
     }
 
     /// The local logins' transaction while the caller retains the account writer lock.
@@ -12000,6 +12303,10 @@ mod auth_scope_publication_tests;
 #[path = "accounts_lifetime_scope_tests.rs"]
 mod lifetime_scope_tests;
 
+#[cfg(test)]
+#[path = "accounts_workflow_scope_tests.rs"]
+mod workflow_scope_tests;
+
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::spec_unmodeled(
@@ -12022,3 +12329,7 @@ mod lock_tests;
 #[cfg(test)]
 #[path = "accounts_auth_context_tests.rs"]
 mod auth_context_tests;
+
+#[cfg(test)]
+#[path = "accounts_checkpoint_read_tests.rs"]
+mod checkpoint_read_tests;

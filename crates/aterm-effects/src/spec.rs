@@ -1562,35 +1562,16 @@ mod tests {
     use super::*;
 
     const TINY_TRIUMPHS: &str = include_str!("../toy-packs/community/tiny-triumphs/pack.toml");
+    const COMMUNITY_TOY_PACKS: &[(&str, &str)] = &[("tiny-triumphs", TINY_TRIUMPHS)];
 
     #[test]
     fn every_checked_in_community_toy_pack_compiles() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("toy-packs")
-            .join("community");
-        let mut manifests = Vec::new();
-        for entry in std::fs::read_dir(&root).expect("read community toy-pack directory") {
-            let path = entry.expect("read community toy-pack entry").path();
-            if !path.is_dir() {
-                continue;
-            }
-            let manifest = path.join("pack.toml");
-            assert!(
-                manifest.is_file(),
-                "community Toy Pack directory {} must contain a regular pack.toml",
-                path.display()
-            );
-            manifests.push(manifest);
-        }
-        manifests.sort();
         assert!(
-            !manifests.is_empty(),
+            !COMMUNITY_TOY_PACKS.is_empty(),
             "the community gallery has an example"
         );
-        for manifest in manifests {
-            let source = read_toy_pack_file(&manifest).expect("read pack manifest");
-            compile_toy_pack_toml(&source)
-                .unwrap_or_else(|error| panic!("{}:\n{error}", manifest.display()));
+        for &(name, source) in COMMUNITY_TOY_PACKS {
+            compile_toy_pack_toml(source).unwrap_or_else(|error| panic!("{name}:\n{error}"));
         }
     }
 
@@ -1737,15 +1718,12 @@ ink = { kind = "self_glow", window_ms = 9000 }
 
     #[test]
     fn toy_pack_file_read_is_regular_utf8_and_bounded() {
-        use std::sync::atomic::{AtomicU64, Ordering};
-
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let serial = NEXT.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "aterm-toy-pack-reader-{}-{serial}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&root).expect("create reader fixture directory");
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("at-toy-pack-")
+            .suffix(".noindex")
+            .tempdir()
+            .expect("create reader fixture directory");
+        let root = dir.path();
 
         let regular = root.join("regular.toml");
         std::fs::write(&regular, TINY_TRIUMPHS).expect("write regular fixture");
@@ -1754,7 +1732,7 @@ ink = { kind = "self_glow", window_ms = 9000 }
             TINY_TRIUMPHS
         );
 
-        let directory_error = read_toy_pack_file(&root).expect_err("directory rejected");
+        let directory_error = read_toy_pack_file(root).expect_err("directory rejected");
         assert_eq!(directory_error.kind(), std::io::ErrorKind::InvalidInput);
 
         let invalid_utf8 = root.join("invalid-utf8.toml");
@@ -1774,8 +1752,6 @@ ink = { kind = "self_glow", window_ms = 9000 }
                 .contains(&MAX_TOY_PACK_BYTES.to_string()),
             "{oversized_error}"
         );
-
-        std::fs::remove_dir_all(root).expect("remove reader fixtures");
     }
 
     #[test]

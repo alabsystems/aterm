@@ -3178,8 +3178,6 @@ fn a_displaced_grid_never_makes_a_placeholder_a_draft() {
         "OK p 999999 111318 dim",
         "OK p d0d0d0 111318 none",
         "ERR out of range",
-        "OK p 999999 111318 dim",
-        "OK p 999999 111318 dim",
         "OK %20 d0d0d0 111318 none",
     ]);
     assert!(
@@ -3195,12 +3193,12 @@ fn a_displaced_grid_never_makes_a_placeholder_a_draft() {
         "displaced, unreadable: a draft"
     );
     assert!(
-        composer_empty(&mut c, "s-x", &screen(None)),
-        "no cursor at all: the dim cell decides"
+        !composer_empty(&mut c, "s-x", &screen(None)),
+        "no cursor on the rows read says neither, to the loop too: nothing is asked"
     );
     assert!(
-        composer_empty(&mut c, "s-x", &screen(Some((0, 40)))),
-        "a cursor on another row says nothing of the composer"
+        !composer_empty(&mut c, "s-x", &screen(Some((0, 40)))),
+        "a cursor on another row says neither, to the loop too: nothing is asked"
     );
     assert!(
         !composer_empty(&mut c, "s-x", &screen(Some((1, 40)))),
@@ -3213,7 +3211,7 @@ fn a_displaced_grid_never_makes_a_placeholder_a_draft() {
     drop(c);
     assert_eq!(
         server.join().expect("server"),
-        vec!["@s-x cell 55 2"; 6],
+        vec!["@s-x cell 55 2"; 4],
         "always the caret row, never the cursor's"
     );
 }
@@ -3962,6 +3960,8 @@ struct Answers {
     /// of it (`reason=guard`) left there, and a person's key after it where `person_key`
     /// says; `key … ctrl+u` kills the line when its `if-gen=` names the screen drawn.
     prompt: Option<Prompt>,
+    /// The `native-act …` reply, to every request of a native restart's operation.
+    native: &'static str,
 }
 
 /// What [`Answers::prompt`]'s stand-in prompt holds and how it is drawn.
@@ -4023,6 +4023,7 @@ impl Default for Answers {
             cell: "OK %20 d0d0d0 111318 none",
             who: None,
             prompt: None,
+            native: "ERR unscripted",
         }
     }
 }
@@ -4162,6 +4163,7 @@ fn instance_for(
                 }
             }
             "send" => answers.send.to_string(),
+            "native-act" => answers.native.to_string(),
             "key" => "OK seq=1".to_string(),
             "signal" if !answers.signal.is_empty() => answers.signal.to_string(),
             "signal" => match line
@@ -11709,8 +11711,19 @@ fn restart_asked(
     whys: impl FnOnce(u32) -> Vec<(Restart, Scene)>,
     prior: impl FnOnce(u32, u32) -> St,
 ) -> Asks {
+    restart_asked_with(name, Answers::default(), whys, prior)
+}
+
+/// [`restart_asked`], the tab's stand-in answering as `answers` says.
+#[cfg(unix)]
+fn restart_asked_with(
+    name: &str,
+    answers: Answers,
+    whys: impl FnOnce(u32) -> Vec<(Restart, Scene)>,
+    prior: impl FnOnce(u32, u32) -> St,
+) -> Asks {
     let dir = scratch(name);
-    let (sock, asked) = instance_with(&dir, Answers::default());
+    let (sock, asked) = instance_with(&dir, answers);
     let opts = Opts {
         sock: Some(sock),
         only_sid: Some(TAB.to_string()),
@@ -12220,8 +12233,9 @@ fn a_restart_asked_while_its_asker_is_exiting_waits_on_that_exit() {
 
 /// A RESTART THAT NAMES NO PROCESS, ASKED AGAIN OVER ITS OWN RECORD, CARRIES IT: the restart's
 /// relaunch answered a wait (the process it started not yet registered within the held wait, or
-/// its ledger's evidence unread), so the loop asks it again on its back-off, and the
-/// conversation's record is that restart's own, `Relaunched` and landed in the asker (adopted, or
+/// its ledger's evidence unread), so the loop asks it again under the same ask (on its back-off,
+/// or for a way back put off to a quiet moment at a later turn end), and the conversation's record
+/// is that restart's own, `Relaunched` and landed in the asker (adopted, or
 /// not yet), claimed by an ask of that restart (`St::ask`, the [`RestartAsk`] every ask of it
 /// carries). Made over it, the restart would end the very process it started; carried, it adopts
 /// that process: `adopted`, nothing signalled, the asker running on, the record its own. A memory
@@ -12367,6 +12381,95 @@ fn a_restart_asked_over_an_earlier_restarts_landed_record_of_its_cause_is_made_o
     assert!(
         wrong.is_empty(),
         "each asker is signalled, under the asked restart's own claim: {wrong:#?}"
+    );
+}
+
+/// A RESTART ASKED OVER A LANDED RECORD THAT CARRIES A NATIVE MOVE GOES ITS OWN WAY AT ITS NEXT
+/// ASK (ATERM-KI-1101-3): the conversation's record is another restart's, `Relaunched` in the very
+/// process that asks (adopted, `relaunched_pid`, or not yet), with the native restart's operation
+/// still bound in it (`St::native`), which the host has committed. Carrying the record observes
+/// and completes that operation (`native_restart::complete`), so it is carried; but its held wait
+/// then finds the asker and answered `adopted`, nothing signalled, and the loop books a memory
+/// restart, a model's move and its way back on that word: the restart asked was never made, the
+/// process it was asked for left running (a lost line's, its process named, stood asked). Now
+/// the carry answers `wait:native-carried`, a deferral the loop asks again under the same ask (on
+/// its back-off, or for a move put off to a quiet moment at a later turn end), the native move
+/// completed and gone from the record, and the next ask supersedes the record as one
+/// with no native move in it: past the carry, to the asked restart's own path. That conversation
+/// stays native-coordinated (`St::native_coordination`), so with no private token, as here, that
+/// path refuses a raw signal (`wait:native-coordinated-unavailable`, the gate
+/// `relaunch_native_gate_tests.rs` holds); with one it is the native restart's.
+#[cfg(unix)]
+#[test]
+fn a_restart_asked_over_a_landed_native_record_goes_its_own_way_at_its_next_ask() {
+    let mut wrong = Vec::new();
+    for tag in ["memory", "input-lost"] {
+        for adopted in [true, false] {
+            let name = format!("native-landed-{tag}-{adopted}");
+            let why = |agent: u32| match tag {
+                "memory" => Restart::Memory,
+                _ => Restart::InputLost {
+                    of: (Some(agent), None),
+                    line: LINE_B,
+                },
+            };
+            let Asks { said, asked, runs } = restart_asked_with(
+                &name,
+                Answers {
+                    native: "OK native-act state=committed claim=builtin revision=-",
+                    ..Answers::default()
+                },
+                |agent| {
+                    vec![
+                        (why(agent), Scene::default()),
+                        (why(agent), Scene::default()),
+                    ]
+                },
+                |agent, _| St {
+                    phase: Phase::Relaunched { at_s: now_s() },
+                    pid: dead_pid(),
+                    shell: std::process::id(),
+                    tab: TAB.to_string(),
+                    from: "2.1.281".to_string(),
+                    to: "2.1.283".to_string(),
+                    source: "native".to_string(),
+                    exited_at: now_s() - 3,
+                    relaunched_pid: if adopted { agent } else { 0 },
+                    native: Some(crate::harness::native_act::Binding {
+                        id: "ab".repeat(16),
+                        capability: "cd".repeat(32),
+                    }),
+                    ..St::default()
+                },
+            );
+            let [(first, after_first), (second, after_second)] = &said[..] else {
+                panic!("two asks: {}", said.len());
+            };
+            let signalled = asked.iter().any(|l| l.contains(" signal "));
+            let completed = after_first
+                .as_ref()
+                .is_some_and(|st| st.native.is_none() && st.native_prepare.is_empty());
+            let deferred = first.step == crate::harness::relaunch::NATIVE_CARRIED;
+            let own_way = second.step == "wait:native-coordinated-unavailable";
+            if !(deferred && completed && own_way && !signalled && runs) {
+                wrong.push(format!(
+                    "{name}: first {:?} (native completed {completed}), then {:?} \
+                     signalled={signalled} runs={runs} saved={:?}",
+                    first.step,
+                    second.step,
+                    after_second.as_ref().map(|st| (
+                        st.phase.clone(),
+                        st.cause.clone(),
+                        st.native_coordination
+                    ))
+                ));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "the first ask completes the native move and defers, the next one goes its own way: \
+         {wrong:#?}"
     );
 }
 
@@ -16745,6 +16848,40 @@ fn the_planned_relaunch_line_carries_the_usage_tap_only_where_its_gate_holds() {
     assert_eq!(planned(&opts, &argv, true), plain, "a profile store config");
     std::fs::remove_file(configs.join("default.json")).expect("remove");
     assert_eq!(planned(&opts, &argv, true), tapped, "and back");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The tap's profile-store fact counts a store under the host's `XDG_CONFIG_HOME` as well as one
+/// under the home's `.config`, either alone.
+#[test]
+fn the_tap_profile_store_counts_the_hosts_xdg_store_beside_the_homes() {
+    let dir = scratch("tap-xdg-store");
+    let home = dir.join("home");
+    std::fs::create_dir_all(&home).expect("home");
+    let xdg = dir.join("xdg");
+    let xdg_configs = xdg.join("anthropic/configs");
+    std::fs::create_dir_all(&xdg_configs).expect("xdg configs");
+    std::fs::write(xdg_configs.join("p.json"), "{}").expect("write");
+    let bare = dir.join("bare-xdg");
+    std::fs::create_dir_all(&bare).expect("bare");
+    let (xdg, bare) = (xdg.to_str().expect("utf-8"), bare.to_str().expect("utf-8"));
+    assert!(!tap_profile_store_in(&home, None), "no store anywhere");
+    assert!(
+        !tap_profile_store_in(&home, Some(bare)),
+        "an XDG dir with no store"
+    );
+    assert!(
+        tap_profile_store_in(&home, Some(xdg)),
+        "the host's XDG store alone"
+    );
+    let home_configs = home.join(".config/anthropic/configs");
+    std::fs::create_dir_all(&home_configs).expect("home configs");
+    std::fs::write(home_configs.join("d.json"), "{}").expect("write");
+    assert!(
+        tap_profile_store_in(&home, Some(bare)),
+        "the home's store beside a bare XDG dir"
+    );
+    assert!(tap_profile_store_in(&home, None), "the home's store alone");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -31501,16 +31638,26 @@ fn a_press_under_off_types_only_the_relaunch_line() {
 }
 
 /// Carries `st` on over `rig` on a thread of its own, waited for at most the one-minute hang
-/// detector.
+/// detector; every exchange but the requests `unanswered` names, which the stand-in leaves
+/// unanswered, waits the hang detector too ([`crate::AnsweredBut`]).
 #[cfg(unix)]
-fn carried(rig: Rig, mut st: St) -> (Rig, St, Report) {
+fn carried(rig: Rig, mut st: St, unanswered: fn(&str) -> bool) -> (Rig, St, Report) {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
+        let _answered = crate::AnsweredBut::set(unanswered);
         let r = rig.carry_on_from(&mut st, MODEL_WAIT);
         let _ = tx.send((rig, st, r));
     });
     rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN)
         .expect("the carry within the hang detector")
+}
+
+/// The verb of the control request `line`, past its `@<sid>` target.
+#[cfg(unix)]
+fn verb_of(line: &str) -> &str {
+    line.split_whitespace()
+        .find(|w| !w.starts_with('@'))
+        .unwrap_or("")
 }
 
 /// A transcript whose last turn owes a continuation.
@@ -31534,11 +31681,11 @@ fn a_carry_whose_screen_read_goes_unanswered_waits_and_carries_on_next() {
     let mut rig = Rig::with("carry-unanswered-screen", &owed_continuation(), answers);
     rig.opts.timings.drive_reply = Duration::from_millis(200);
     let st = rig.st.clone();
-    let (rig, st, r) = carried(rig, st);
+    let (rig, st, r) = carried(rig, st, |l| verb_of(l) == "text");
     assert_eq!(r.step, "wait:no-socket", "{r:?}");
     assert!(matches!(st.phase, Phase::Relaunched { .. }), "{st:?}");
     assert!(rig.typed().is_empty(), "{:?}", rig.typed());
-    let (rig, st, r) = carried(rig, st);
+    let (rig, st, r) = carried(rig, st, |_| false);
     assert_eq!(r.step, "continued", "the next carry answered: {r:?}");
     assert_eq!(rig.typed().len(), 1, "{:?}", rig.typed());
     assert_eq!(st.phase, Phase::Done);
@@ -31559,7 +31706,7 @@ fn an_unanswered_continuation_is_read_off_the_agents_record() {
     );
     rig.opts.timings.drive_reply = Duration::from_millis(200);
     let st = rig.st.clone();
-    let (rig, st, r) = carried(rig, st);
+    let (rig, st, r) = carried(rig, st, |l| verb_of(l) == "turn");
     assert_eq!(r.step, "wait:unanswered", "{r:?}");
     assert!(matches!(st.phase, Phase::Relaunched { .. }), "{st:?}");
     assert_eq!(rig.typed().len(), 1, "{:?}", rig.typed());
@@ -31596,7 +31743,7 @@ fn an_unanswered_continuation_is_read_off_the_agents_record() {
         }
     });
     let st = rig.st.clone();
-    let (rig, st, r) = carried(rig, st);
+    let (rig, st, r) = carried(rig, st, |l| verb_of(l) == "turn");
     assert_eq!(r.step, "continued", "{r:?}");
     assert_eq!(st.phase, Phase::Done);
     assert_eq!(rig.typed().len(), 1, "typed once: {:?}", rig.typed());
@@ -31638,6 +31785,7 @@ fn an_unanswered_relaunch_line_may_have_run() {
         std::fs::create_dir_all(opts.home.join(".claude/sessions")).expect("empty roster");
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
+            let _answered = crate::AnsweredBut::set(|l| matches!(verb_of(l), "turn" | "send"));
             let mut c = connect(&opts, TAB).expect("control connection");
             let _ = tx.send(type_relaunch_line(
                 &opts,
@@ -31726,6 +31874,7 @@ fn an_unanswered_restore_line_waits_and_is_never_lost() {
         },
     );
     rig.opts.timings.drive_reply = Duration::from_millis(200);
+    let _answered = crate::AnsweredBut::set(|l| verb_of(l) == "turn");
     let mut st = rig.st.clone();
     st.quiet = true;
     st.relaunched_at = now_s().saturating_sub(5);

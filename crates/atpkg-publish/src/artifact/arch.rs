@@ -94,7 +94,7 @@ const HEAD: usize = 8 + 16 * 32;
 #[must_use]
 pub fn read(path: &Path) -> Option<Object> {
     let (mut f, _) = crate::identity::open_regular_nonblock(path).ok()?;
-    let mut b = Vec::with_capacity(HEAD);
+    let mut b = Vec::with_capacity(HEAD + 1);
     f.by_ref().take(HEAD as u64).read_to_end(&mut b).ok()?;
     if b.len() < 20 {
         return None;

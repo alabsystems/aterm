@@ -1330,7 +1330,10 @@ fn a_codex_pool_judges_the_program_a_launch_runs_not_the_managed_copy() {
     let exe = crate::harness::codex_alab::lay_package(&b.dir.path().join("store/codex"), true);
     std::fs::create_dir_all(b.pkg.bin_dir()).expect("bin");
     let launcher = crate::harness::codex_alab::twin_text(&exe);
-    std::fs::write(b.pkg.bin_dir().join("codex"), &launcher).expect("managed copy");
+    let copy = b
+        .pkg
+        .shim(&atpkg::store::ToolName::new("codex").expect("a tool name"));
+    std::fs::write(&copy, &launcher).expect("managed copy");
     let config = b.dir.path().join("config");
     std::fs::create_dir_all(&config).expect("config");
     std::fs::create_dir_all(b.home.join(".codex")).expect("default home");
@@ -1378,10 +1381,10 @@ fn a_codex_pool_judges_the_program_a_launch_runs_not_the_managed_copy() {
     let f = gather(&at(now), &CODEX);
     assert_eq!(
         f.managed.as_ref().map(|managed| managed.path.clone()),
-        Some(b.pkg.bin_dir().join("codex")),
+        Some(copy.clone()),
         "PRECONDITION: the managed copy is atpkg's bin/codex"
     );
-    assert!(crate::harness::codex_alab::auth_path_unread(&b.pkg.bin_dir().join("codex")).is_none());
+    assert!(crate::harness::codex_alab::auth_path_unread(&copy).is_none());
     let pool = f.pool.as_ref().expect("codex pool");
     assert!(pool.unread && pool.default_only, "{pool:?}");
     assert_eq!(pool.serving_label.as_deref(), Some("main"));
@@ -1408,7 +1411,7 @@ fn a_codex_pool_judges_the_program_a_launch_runs_not_the_managed_copy() {
     assert_eq!(pool.next.as_deref(), Some("main"));
     assert!(crate::ai::login::default_home_sign_in(pool), "{pool:?}");
 
-    std::fs::write(b.pkg.agents_dir().join("codex"), &launcher).expect("atpkg's twin");
+    std::fs::write(b.twin("codex"), &launcher).expect("atpkg's twin");
     let f = gather(&at(later), &CODEX);
     let pool = f.pool.as_ref().expect("codex pool");
     assert!(!pool.unread && !pool.default_only, "CONTROL: {pool:?}");
@@ -1744,7 +1747,7 @@ fn under_a_pin_on_a_row_of_its_own_a_walled_default_row_is_told_its_pin() {
     assert!(
         refused.contains(&pin)
             && refused.contains(&ends(p))
-            && refused.contains(crate::harness::codex_alab::UNPIN_FIX),
+            && refused.contains(&crate::harness::codex_alab::unpin_fix()),
         "{refused}"
     );
     let row = crate::ai::state::assess(&f, true, DoctorPool::NOW);

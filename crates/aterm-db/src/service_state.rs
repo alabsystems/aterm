@@ -998,6 +998,9 @@ mod tests {
         listener: std::net::TcpListener,
         paths: Paths,
         url: String,
+        /// The server is the test's own on loopback, which answers: this thread's reads of it
+        /// wait the hang detector.
+        _answering: client::ServersAnswering,
     }
 
     impl VaultFixture {
@@ -1025,6 +1028,7 @@ mod tests {
                 root,
                 server: Some(running),
                 listener: held_listener,
+                _answering: client::ServersAnswering::within(aterm_spec::wait::MUST_HAPPEN),
             };
             let import = fixture.root.path().join("entries.secrets");
             fsx::ensure_private_dir(&import).unwrap();

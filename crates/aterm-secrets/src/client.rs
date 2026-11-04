@@ -125,10 +125,10 @@ pub use readmit::{
     refuses_before_possession_at_ms,
 };
 pub use remove::{
-    ListedMac, MemberRemoval, RemovedNote, RemovedNotes, UndoOffer, UndoShare, member_list,
-    read_after_cutoff_lines, remove_member, removed_notes, removes_by_log, reseal_waits,
-    revoke_by_log, tend_epochs, tend_epochs_at, undo_offers, undo_removals, vault_admin_named,
-    vault_pass_at,
+    ListedMac, MemberRemoval, RemovedNote, RemovedNotes, UndoOffer, UndoShare,
+    epoch_convergence_environment, member_list, read_after_cutoff_lines, remove_member,
+    removed_notes, removes_by_log, reseal_waits, revoke_by_log, tend_epochs, tend_epochs_at,
+    undo_offers, undo_removals, vault_admin_named, vault_pass_at,
 };
 #[cfg(any(test, debug_assertions))]
 pub use remove::{test_put_everyone, test_remove_unposted};
@@ -168,6 +168,16 @@ mod own_head_tests;
 mod parent_history_tests;
 #[cfg(test)]
 mod peer_candidates_tests;
+mod peer_selection;
+#[cfg(test)]
+mod peer_selection_tests;
+
+#[cfg(test)]
+mod cold_read_tests;
+#[cfg(test)]
+mod envelope_denial_tests;
+#[cfg(test)]
+mod log_only_tests;
 #[cfg(test)]
 mod probe_reads_tests;
 #[cfg(test)]
@@ -1971,7 +1981,24 @@ fn with_ready_state<T>(
     })))
 }
 
+struct OpenedLockers {
+    everyone: BTreeMap<String, Entry>,
+    hosts: BTreeMap<String, Entry>,
+}
+
 fn open_lockers(envelope: &Envelope, identity: &Identity) -> crate::Result<Option<Vec<Entry>>> {
+    let Some(mut entries) = open_locker_audiences(envelope, identity)? else {
+        return Ok(None);
+    };
+    entries.everyone.extend(entries.hosts);
+    Ok(Some(entries.everyone.into_values().collect()))
+}
+
+/// Validate every readable locker before applying any cross-audience precedence.
+fn open_locker_audiences(
+    envelope: &Envelope,
+    identity: &Identity,
+) -> crate::Result<Option<OpenedLockers>> {
     let identities = std::slice::from_ref(identity);
     let mut everyone: BTreeMap<String, Entry> = BTreeMap::new();
     let mut hosts: BTreeMap<String, Entry> = BTreeMap::new();
@@ -2008,8 +2035,7 @@ fn open_lockers(envelope: &Envelope, identity: &Identity) -> crate::Result<Optio
     if !opened {
         return Ok(None);
     }
-    everyone.extend(hosts);
-    Ok(Some(everyone.into_values().collect()))
+    Ok(Some(OpenedLockers { everyone, hosts }))
 }
 
 /// What this Mac's applied vault version shows for credential requests' absence proof
@@ -2119,14 +2145,18 @@ pub(crate) fn sight(paths: &Paths) -> crate::Result<Option<crate::need::Sight>> 
     if verdict != Verdict::Unchanged || !matches!(pinned, Pin::Same) {
         return Ok(None);
     }
+    let seeded = log_entries::trusted_seeded_log(paths, &config, &envelope)?;
+    if !log_entries::applied_log_available(&state, seeded.as_ref()) {
+        return Ok(None);
+    }
     let mut hidden = false;
     let mut held = BTreeSet::new();
     if steward::local_recipient_denied_in_roster(paths) {
         return Ok(None);
     }
-    if let Some((log, _)) = log_entries::trusted_seeded_log(paths, &config, &envelope)?
+    if let Some((log, _)) = &seeded
         && (log.removes(&identity.recipient())
-            || (log_entries::log_base(Some(&log), &envelope, &identity)?
+            || (log_entries::log_base(Some(log), &envelope, &identity)?
                 != log_entries::LogBase::Behind
                 && log.audience_left_out_recipient(
                     &crate::membership_log::EpochAudience::Everyone,
@@ -2135,7 +2165,10 @@ pub(crate) fn sight(paths: &Paths) -> crate::Result<Option<crate::need::Sight>> 
     {
         return Ok(None);
     }
-    if let Some((log, _)) = log_entries::readable_log(paths, &config, &envelope, &identity)? {
+    if let Some((log, _)) = &seeded
+        && log_entries::log_base(Some(log), &envelope, &identity)? == log_entries::LogBase::Covers
+        && log_entries::reads_log(log, &identity)
+    {
         let Some(opened) = log.open_entry_set(&identity)? else {
             return Ok(None);
         };
@@ -2215,14 +2248,14 @@ pub(crate) fn observe_commons(paths: &Paths) -> crate::Result<crate::commons::Ob
         Option<[u8; 32]>,
         [u8; 32],
         [u8; 32],
-        Option<Vec<[u8; 32]>>,
+        Option<[u8; 32]>,
     );
     static OBSERVE_COMMONS_CACHE: std::sync::Mutex<
         std::collections::VecDeque<(ObserveCommonsKey, crate::commons::Snapshot)>,
     > = std::sync::Mutex::new(std::collections::VecDeque::new());
 
     let unavailable = |reason| Ok(Observation::Unavailable(reason));
-    let Some(_observation) = StateLock::observe(paths)? else {
+    let Some(observation) = StateLock::observe(paths)? else {
         if fsx::kind(&paths.lock_file())? != fsx::Kind::Missing {
             return unavailable(Unavailable::Busy);
         }
@@ -2257,59 +2290,58 @@ pub(crate) fn observe_commons(paths: &Paths) -> crate::Result<crate::commons::Ob
         let Some(identity) = read_identity(paths)? else {
             return unavailable(Unavailable::MissingIdentity);
         };
-        let records_frontier = load_records(paths).ok().map(|s| s.frontier());
+        let Some(configured) = log_entries::trusted_configured_log(paths, &config)? else {
+            return unavailable(Unavailable::IncompleteApply);
+        };
         let obs_key = (
             config.clone(),
             state.seq,
             None,
             identity.recipient().0,
             [0; 32],
-            records_frontier,
+            Some(log_entries::records_heads_digest(&configured.log)),
         );
-        if obs_key.5.is_some()
-            && let Ok(cache) = OBSERVE_COMMONS_CACHE.lock()
+        if configured.log.recipient_is_removed(&identity.recipient())
+            || configured.log.audience_left_out_recipient(
+                &crate::membership_log::EpochAudience::Everyone,
+                &identity.recipient(),
+            )
+            || steward::local_recipient_denial_held(paths, &observation)?
+        {
+            return unavailable(Unavailable::Revoked);
+        }
+        if configured.log.audience_left_out_recipient(
+            &crate::membership_log::EpochAudience::Commons,
+            &identity.recipient(),
+        ) {
+            return unavailable(Unavailable::ControlExcluded);
+        }
+        if let Ok(cache) = OBSERVE_COMMONS_CACHE.lock()
             && let Some((_, snapshot)) = cache.iter().find(|(k, _)| *k == obs_key)
         {
             return Ok(Observation::Visible(snapshot.clone()));
         }
-        if let Some(configured) = log_entries::trusted_configured_log(paths, &config)? {
-            if configured.log.recipient_is_removed(&identity.recipient())
-                || configured.log.audience_left_out_recipient(
-                    &crate::membership_log::EpochAudience::Everyone,
-                    &identity.recipient(),
-                )
-                || steward::local_recipient_denied_in_roster(paths)
-            {
-                return unavailable(Unavailable::Revoked);
-            }
-            if configured.log.audience_left_out_recipient(
-                &crate::membership_log::EpochAudience::Commons,
-                &identity.recipient(),
-            ) {
-                return unavailable(Unavailable::ControlExcluded);
-            }
-            return Ok(
-                match open_commons_control_from_log(&configured.log, &identity)? {
-                    Some(control) => {
-                        let snapshot = crate::commons::Snapshot::verified_from_log(
-                            config,
-                            pin,
-                            *configured.log.genesis().id(),
-                            identity.recipient(),
-                            control,
-                        );
-                        if let Ok(mut cache) = OBSERVE_COMMONS_CACHE.lock() {
-                            if cache.len() >= 16 {
-                                cache.pop_front();
-                            }
-                            cache.push_back((obs_key, snapshot.clone()));
+        return Ok(
+            match open_commons_control_from_log(&configured.log, &identity)? {
+                Some(control) => {
+                    let snapshot = crate::commons::Snapshot::verified_from_log(
+                        config,
+                        pin,
+                        *configured.log.genesis().id(),
+                        identity.recipient(),
+                        control,
+                    );
+                    if let Ok(mut cache) = OBSERVE_COMMONS_CACHE.lock() {
+                        if cache.len() >= 16 {
+                            cache.pop_front();
                         }
-                        Observation::Visible(snapshot)
+                        cache.push_back((obs_key, snapshot.clone()));
                     }
-                    None => Observation::Unavailable(Unavailable::ControlNotVisible),
-                },
-            );
-        }
+                    Observation::Visible(snapshot)
+                }
+                None => Observation::Unavailable(Unavailable::ControlNotVisible),
+            },
+        );
     }
     let Some(digest) = state.digest else {
         return unavailable(Unavailable::IncompleteApply);
@@ -2326,21 +2358,6 @@ pub(crate) fn observe_commons(paths: &Paths) -> crate::Result<crate::commons::Ob
     let Some(bytes) = fsx::read_private(&paths.cache_file(), envelope::MAX_ENVELOPE)? else {
         return unavailable(Unavailable::MissingCache);
     };
-    let records_frontier = load_records(paths).ok().map(|s| s.frontier());
-    let obs_key = (
-        config.clone(),
-        state.seq,
-        Some(digest),
-        identity.recipient().0,
-        envelope::digest_bytes(bytes.as_slice()),
-        records_frontier,
-    );
-    if obs_key.5.is_some()
-        && let Ok(cache) = OBSERVE_COMMONS_CACHE.lock()
-        && let Some((_, snapshot)) = cache.iter().find(|(k, _)| *k == obs_key)
-    {
-        return Ok(Observation::Visible(snapshot.clone()));
-    }
     let (envelope, pinned, verdict) = envelope::verify_for_reader(
         bytes.as_slice(),
         &config.name,
@@ -2353,7 +2370,10 @@ pub(crate) fn observe_commons(paths: &Paths) -> crate::Result<crate::commons::Ob
     }
     let mut control = None;
     let seeded = log_entries::trusted_seeded_log(paths, &config, &envelope)?;
-    if steward::local_recipient_denied_in_roster(paths) {
+    if !log_entries::applied_log_available(&state, seeded.as_ref()) {
+        return unavailable(Unavailable::IncompleteApply);
+    }
+    if steward::local_recipient_denial_held(paths, &observation)? {
         return unavailable(Unavailable::Revoked);
     }
     if let Some((log, _)) = &seeded
@@ -2377,15 +2397,30 @@ pub(crate) fn observe_commons(paths: &Paths) -> crate::Result<crate::commons::Ob
     {
         return unavailable(Unavailable::ControlExcluded);
     }
+    let obs_key = (
+        config.clone(),
+        state.seq,
+        Some(digest),
+        identity.recipient().0,
+        envelope::digest_bytes(bytes.as_slice()),
+        seeded.as_ref().map(|(_, digest)| *digest),
+    );
+    if let Ok(cache) = OBSERVE_COMMONS_CACHE.lock()
+        && let Some((_, snapshot)) = cache.iter().find(|(k, _)| *k == obs_key)
+    {
+        return Ok(Observation::Visible(snapshot.clone()));
+    }
     if let Some((log, _)) = &seeded
         && log.has_commons_epochs()
         && log_entries::log_base(Some(log), &envelope, &identity)? != log_entries::LogBase::Behind
         && log_entries::reads_log(log, &identity)
     {
         control = log.open_commons_control(&identity)?;
-    } else if let Some((log, _)) = log_entries::readable_log(paths, &config, &envelope, &identity)?
+    } else if let Some((log, _)) = &seeded
+        && log_entries::log_base(Some(log), &envelope, &identity)? == log_entries::LogBase::Covers
+        && log_entries::reads_log(log, &identity)
     {
-        control = open_commons_control_from_log(&log, &identity)?;
+        control = open_commons_control_from_log(log, &identity)?;
     } else {
         for locker in envelope
             .lockers
@@ -2865,10 +2900,11 @@ fn changed_files(paths: &Paths, state: &State) -> BTreeSet<String> {
 }
 
 fn cache_intact(paths: &Paths, state: &State) -> bool {
-    config(paths)
-        .ok()
-        .flatten()
-        .is_some_and(|config| config.signer.is_none() || held_copy(paths, &config, state).is_some())
+    config(paths).ok().flatten().is_some_and(|config| {
+        config.signer.is_none()
+            || (state.membership == Stored::In
+                && verified_cached_envelope(paths, &config, state).is_some())
+    })
 }
 
 fn place(source: &Source) -> String {
@@ -2891,8 +2927,49 @@ fn read_held_copy(paths: &Paths, config: &Config, state: &State) -> crate::Resul
     read_verified_cached_envelope(paths, config, state)
 }
 
+/// Publication additionally requires the applied log and no received local denial.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "VaultCachedPublication",
+        action = "Revoke",
+        reason = "An authenticated removal arrives before materialization"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "VaultCachedPublication",
+        action = "Publish",
+        project = "aterm_secrets::client::peer_selection_tests::cached_publication_transition"
+    )
+)]
+fn publishable_copy(paths: &Paths, config: &Config, state: &State) -> Option<Vec<u8>> {
+    let copy = held_copy(paths, config, state)?;
+    let envelope = envelope::parse(&copy).ok()?;
+    let seeded = log_entries::trusted_seeded_log(paths, config, &envelope).ok()?;
+    if state.records_digest.is_some() && seeded.is_none() {
+        return None;
+    }
+    if let Some((log, _)) = seeded {
+        let identity = read_identity(paths).ok().flatten()?;
+        if log.removes(&identity.recipient())
+            || log_entries::recipient_denied_by_roster_or_log(None, &log, &identity.recipient())
+            || (log_entries::log_base(Some(&log), &envelope, &identity).ok()?
+                != log_entries::LogBase::Behind
+                && log.audience_left_out_recipient(
+                    &crate::membership_log::EpochAudience::Everyone,
+                    &identity.recipient(),
+                ))
+        {
+            return None;
+        }
+    }
+    Some(copy)
+}
+
 /// The exact authenticated cached envelope for local reading, even while admission is pending.
-/// Only [`held_copy`] admits one for publication back to a server.
+/// [`publishable_copy`] additionally admits one for publication back to a server.
 fn verified_cached_envelope(paths: &Paths, config: &Config, state: &State) -> Option<Vec<u8>> {
     read_verified_cached_envelope(paths, config, state)
         .ok()
@@ -2907,10 +2984,7 @@ fn read_verified_cached_envelope(
     let Some(pin) = config.signer else {
         return Ok(None);
     };
-    let elsewhere = state
-        .source_identity
-        .is_some_and(|bound| bound != source_identity(config));
-    if elsewhere || pin_gives_way(config) {
+    if !source_bound(config, state) || pin_gives_way(config) {
         return Ok(None);
     }
     let Some(cached) = fsx::read_private(&paths.cache_file(), envelope::MAX_ENVELOPE)? else {
@@ -3119,6 +3193,22 @@ fn write_record_buffered(
 ///
 /// # Errors
 /// The mark cannot be stored (the file is then left as it was), or the file cannot be written.
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::refines(
+        machine = "SwarmRecordsCapacity",
+        action = "MacTakes",
+        project = "aterm_secrets::client::record_persistence_tests::records_capacity_mac"
+    )
+)]
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::refines(
+        machine = "SwarmRecordsCapacity",
+        action = "MacTakeFails",
+        project = "aterm_secrets::client::record_persistence_tests::records_capacity_mac"
+    )
+)]
 fn write_records(paths: &Paths, store: &crate::membership_log::Store) -> crate::Result<()> {
     let crosses = crate::crossing::past_legacy(
         store
@@ -3637,7 +3727,7 @@ fn sync_records_until(
     });
     let total = bounded::budget(
         pulls_by,
-        pulls_by.map_or(total, |_| total.min(PROBE_DEADLINE)),
+        pulls_by.map_or(total, |_| total.min(servers_within(PROBE_DEADLINE))),
     )?;
     let primary_named = named(primary_url);
     let sub_ref = subscriber.as_deref();
@@ -4125,6 +4215,22 @@ fn sync_records_until(
 ///
 /// # Errors
 /// The mark cannot be stored (the file is then left as it was), or the file cannot be written.
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::refines(
+        machine = "SwarmRecordsCapacity",
+        action = "MacPulls",
+        project = "aterm_secrets::client::record_persistence_tests::records_capacity_mac"
+    )
+)]
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::refines(
+        machine = "SwarmRecordsCapacity",
+        action = "MacPullDies",
+        project = "aterm_secrets::client::record_persistence_tests::records_capacity_mac"
+    )
+)]
 fn write_taught_by_crossed(
     paths: &Paths,
     mark: &crate::crossing::Mark,
@@ -4505,6 +4611,7 @@ fn peer_subsumes_held(
     config: &Config,
     before: &State,
     probed: &SyncPeerHead,
+    held_bytes: Option<&[u8]>,
 ) -> bool {
     if before.membership != Stored::In {
         return true;
@@ -4517,39 +4624,56 @@ fn peer_subsumes_held(
         return false;
     }
     let Ok(Some(identity)) = read_identity(paths) else {
-        return true;
+        return false;
     };
     let Ok(probed_env) = envelope::parse(&probed.envelope) else {
         return false;
     };
+    let Ok(seeded) = log_entries::trusted_seeded_log(paths, config, &probed_env) else {
+        return false;
+    };
+    if !matches!(
+        log_entries::log_base(seeded.as_ref().map(|(log, _)| log), &probed_env, &identity),
+        Ok(base) if base != log_entries::LogBase::Behind
+    ) {
+        return false;
+    }
+    // A signed descendant may intentionally remove this reader. Requiring an
+    // open locker first would suppress precisely those proven revocations.
+    if before
+        .digest
+        .is_some_and(|held_digest| probed.parents.contains(&held_digest))
+    {
+        return true;
+    }
     let Ok((Some(probed_entries), _)) =
         log_entries::open_entries_preferring_log(paths, config, &probed_env, &identity)
     else {
         return false;
     };
-    if !probed.parents.is_empty() {
-        return true;
-    }
-    let Some(held_bytes) = held_copy(paths, config, before) else {
-        return true;
+    let Some(held_bytes) = held_bytes else {
+        // Sequence alone cannot show that an unparented peer preserves the
+        // version already held. Recover its exact body before comparing it.
+        return before.digest.is_none();
     };
-    let Ok(held_env) = envelope::parse(&held_bytes) else {
-        return true;
+    let Ok(held_env) = envelope::parse(held_bytes) else {
+        return false;
     };
     let Ok((Some(held_entries), _)) =
         log_entries::open_entries_preferring_log(paths, config, &held_env, &identity)
     else {
-        return true;
+        return false;
     };
     held_entries.iter().all(|held_entry| {
         let Some(probed_entry) = probed_entries.iter().find(|e| e.name == held_entry.name) else {
             return false;
         };
         match (&held_entry.audience, &probed_entry.audience) {
+            (_, Audience::Everyone) => true,
+            (Audience::Everyone, Audience::Hosts(_)) => false,
             (Audience::Hosts(held_hosts), Audience::Hosts(probed_hosts)) => {
                 held_hosts.iter().all(|h| probed_hosts.contains(h))
             }
-            _ => true,
         }
     })
 }
@@ -4628,8 +4752,8 @@ fn sync_repairing_hearing(
     if pass {
         remove::vault_pass(paths, posts_by);
     }
-    let pending_records =
-        log_entries::current_records_digest(paths, &config, &before) != before.records_digest;
+    let pending_records = log_entries::current_records_digest(paths, &config, &before)
+        .is_some_and(|digest| Some(digest) != before.records_digest);
     let waited_on_primary =
         matches!(&config.source, Source::Url(_)) && wait.is_some() && !pending_records;
     let outcome = network_refresh::run(paths, &config, |refresh| {
@@ -4685,7 +4809,9 @@ fn sync_repairing_hearing(
         let primary_advanced = match (&primary_result, config.signer.as_ref()) {
             (Ok(Fetched::Body(bytes)), Some(pin)) => {
                 envelope::verify_for_reader(bytes, &config.name, pin, &config.followed, None)
-                    .is_ok_and(|(envelope, _, _)| envelope.seq > before.seq)
+                    .is_ok_and(|(envelope, pinned, _)| {
+                        peer_selection::primary_advances(&before, &envelope, pinned)
+                    })
             }
             _ => false,
         };
@@ -4767,44 +4893,17 @@ fn sync_repairing_hearing(
                         }
                     }
                 }
-                let exact_held_peer = before.digest.and_then(|held_digest| {
-                    found
-                        .iter()
-                        .find(|p| p.seq == before.seq && p.digest == held_digest)
-                        .map(|p| (p.envelope.clone(), p.network_body))
-                });
-                if let Some(probed) = found.into_iter().max_by_key(|p| (p.seq, p.digest)) {
-                    let take_peer = match &primary_result {
-                        Err(_) => {
-                            probed.seq > before.seq
-                                || (probed.seq == before.seq
-                                    && before.digest.is_none_or(|digest| digest == probed.digest))
-                        }
-                        Ok(Fetched::Missing) => probed.seq > before.seq || before.seq == 0,
-                        Ok(Fetched::NoNewer(_) | Fetched::Body(_)) => {
-                            probed.seq > before.seq
-                                && peer_subsumes_held(paths, &config, &before, &probed)
-                        }
-                    };
-                    if take_peer {
-                        network_body = probed.network_body;
-                        primary_result = Ok(Fetched::Body(probed.envelope));
-                    } else if let Some((exact_env, exact_body)) = exact_held_peer
-                        && match &primary_result {
-                            Err(_) => true,
-                            Ok(Fetched::Body(primary_bytes)) => envelope::parse(primary_bytes)
-                                .is_ok_and(|parsed| {
-                                    parsed.seq == before.seq
-                                        && Some(parsed.digest()) != before.digest
-                                }),
-                            Ok(Fetched::Missing | Fetched::NoNewer(_)) => false,
-                        }
-                    {
-                        // An offline primary or an equal-seq split cannot hide the verified head
-                        // this reader already holds. Keep it steady until an admin merges the split.
-                        network_body = exact_body;
-                        primary_result = Ok(Fetched::Body(exact_env));
-                    }
+                if let Some(peer) = peer_selection::select(
+                    paths,
+                    &config,
+                    &before,
+                    &primary_result,
+                    found,
+                    true,
+                    None,
+                )? {
+                    network_body = peer.network_body;
+                    primary_result = Ok(Fetched::Body(peer.envelope));
                 }
             }
         }
@@ -4815,7 +4914,8 @@ fn sync_repairing_hearing(
         // 0.145 Mac reads with nobody acting.
         if is_local_admin
             && let Source::Url(primary_url) = &config.source
-            && log_entries::current_records_digest(paths, &config, &before) != before.records_digest
+            && log_entries::current_records_digest(paths, &config, &before)
+                .is_some_and(|digest| Some(digest) != before.records_digest)
         {
             let mut mirror_urls = vec![primary_url.clone()];
             mirror_urls.extend(peer_urls().iter().cloned());
@@ -4882,16 +4982,17 @@ fn sync_repairing_hearing(
         if network_body.is_some() {
             refresh.peer_response();
         }
-        let fetched = primary_result?;
-        match apply_fetched_repairing(
+        match apply_response_until(
             paths,
             config.clone(),
             before,
-            network_observation::Received {
+            primary_result.map(|fetched| network_observation::Received {
                 fetched,
                 body: network_body,
-            },
+            }),
             repaired.as_deref_mut(),
+            None,
+            wait.is_none(),
         ) {
             Ok(outcome) => Ok(outcome),
             Err(err)
@@ -5045,37 +5146,124 @@ fn apply_fetched_repairing(
 
 fn apply_fetched_until(
     paths: &Paths,
-    mut config: Config,
+    config: Config,
     before: State,
     fetched: impl Into<network_observation::Received>,
     repaired: Option<&mut Repaired>,
     deadline: Option<Instant>,
 ) -> crate::Result<SyncOutcome> {
-    let network_observation::Received {
-        mut fetched,
-        mut body,
-    } = fetched.into();
+    apply_response_until(
+        paths,
+        config,
+        before,
+        Ok(fetched.into()),
+        repaired,
+        deadline,
+        false,
+    )
+}
+
+/// Cache decisions use the current locked state, never a pre-fetch snapshot.
+fn apply_response_until(
+    paths: &Paths,
+    config: Config,
+    before: State,
+    received: crate::Result<network_observation::Received>,
+    repaired: Option<&mut Repaired>,
+    deadline: Option<Instant>,
+    repair_requested: bool,
+) -> crate::Result<SyncOutcome> {
+    apply_until(
+        paths,
+        config,
+        before,
+        ApplyInput::Response(received),
+        repaired,
+        deadline,
+        repair_requested,
+    )
+}
+
+enum ApplyInput {
+    Response(crate::Result<network_observation::Received>),
+    Cached,
+}
+
+fn apply_until(
+    paths: &Paths,
+    mut config: Config,
+    before: State,
+    input: ApplyInput,
+    repaired: Option<&mut Repaired>,
+    deadline: Option<Instant>,
+    repair_requested: bool,
+) -> crate::Result<SyncOutcome> {
     let lock = bounded::take(paths, deadline)?;
     if self::config(paths)?.as_ref() != Some(&config) {
         return Ok(SyncOutcome::Unchanged { seq: before.seq });
     }
     let requested_config = config.clone();
     let mut state = load_state(paths)?;
-    if deadline.is_some()
-        && log_entries::current_records_digest(paths, &config, &state) != state.records_digest
-        && match &fetched {
-            Fetched::Missing | Fetched::NoNewer(_) => true,
-            Fetched::Body(bytes) => envelope::parse(bytes)
-                .is_ok_and(|body| body.name == config.name && body.seq < state.seq),
+    if matches!(&input, ApplyInput::Cached | ApplyInput::Response(Err(_)))
+        && let Some(configured) = peer_selection::configured_log_recovery(paths, &config, &state)
+    {
+        return apply_configured_log(paths, &config, &mut state, configured);
+    }
+    let network_observation::Received {
+        mut fetched,
+        mut body,
+    } = match input {
+        ApplyInput::Response(Ok(received)) => received,
+        ApplyInput::Cached => {
+            let Some(copy) = peer_selection::cached_materialization(
+                paths,
+                &config,
+                &state,
+                repair_requested || long_poll_after(&config, &state).is_none(),
+                false,
+                None,
+                &mut None,
+            )
+            .or_else(|| peer_selection::cached_log_progress(paths, &config, &state, &mut None)) else {
+                return Ok(SyncOutcome::Unchanged { seq: state.seq });
+            };
+            Fetched::Body(copy).into()
         }
-        && let Some(copy) = verified_cached_envelope(paths, &config, &state)
+        ApplyInput::Response(Err(error)) => {
+            // Local repair and downloaded log progress do not require a live
+            // endpoint. Only the current locked cache can supply either, and
+            // neither is evidence of a successful network response.
+            if let Some(copy) = peer_selection::cached_materialization(
+                paths,
+                &config,
+                &state,
+                repair_requested || long_poll_after(&config, &state).is_none(),
+                false,
+                None,
+                &mut None,
+            ) {
+                Fetched::Body(copy).into()
+            } else if let Some(copy) =
+                peer_selection::cached_log_progress(paths, &config, &state, &mut None)
+            {
+                Fetched::Body(copy).into()
+            } else {
+                return Err(error);
+            }
+        }
+    };
+    if match &fetched {
+        Fetched::Missing | Fetched::NoNewer(_) => true,
+        Fetched::Body(bytes) => envelope::parse(bytes)
+            .is_ok_and(|body| body.name == config.name && body.seq < state.seq),
+    } && let Some(copy) = peer_selection::cached_log_progress(paths, &config, &state, &mut body)
     {
         // Local record progress must not depend on repairing an unavailable or older
         // envelope server. The normal verifier below still checks the cached head and log.
         fetched = Fetched::Body(copy);
         body = None;
     }
-    let bytes = match fetched {
+    let mut bytes = match fetched {
         Fetched::NoNewer(served) => {
             if now().saturating_sub(state.heard) >= 60 {
                 state.heard = now();
@@ -5084,12 +5272,10 @@ fn apply_fetched_until(
             let older = served.filter(|served| {
                 *served < state.seq && (state.seq, state.digest) == (before.seq, before.digest)
             });
-            if let Some((served, copy)) =
-                older.and_then(|served| Some((served, held_copy(paths, &config, &state)?)))
+            if deadline.is_none()
+                && let Some((served, copy)) = older
+                    .and_then(|served| Some((served, publishable_copy(paths, &config, &state)?)))
             {
-                if deadline.is_some() {
-                    return Ok(SyncOutcome::Unchanged { seq: state.seq });
-                }
                 drop(lock);
                 transport::publish(&config.source, &copy).map_err(|error| {
                     Error::of_kind(
@@ -5107,9 +5293,21 @@ fn apply_fetched_until(
                     served: Some(served),
                 });
             }
-            if log_entries::current_records_digest(paths, &config, &state) != state.records_digest
-                && let Some(copy) = held_copy(paths, &config, &state)
+            if let Some(copy) = peer_selection::cached_materialization(
+                paths,
+                &config,
+                &state,
+                repair_requested || long_poll_after(&config, &state).is_none(),
+                deadline.is_none() && (state.seq, state.digest) == (before.seq, before.digest),
+                served,
+                &mut body,
+            ) {
+                copy
+            } else if let Some(copy) =
+                peer_selection::cached_log_progress(paths, &config, &state, &mut body)
             {
+                // A log admission can activate a pending reader. Reading that
+                // progress does not require permission to publish this body.
                 body = None;
                 copy
             } else if state.digest.is_none()
@@ -5129,7 +5327,7 @@ fn apply_fetched_until(
                 return apply_configured_log(paths, &config, &mut state, configured);
             }
             let copy = match config.source {
-                Source::Url(_) => held_copy(paths, &config, &state),
+                Source::Url(_) => publishable_copy(paths, &config, &state),
                 Source::Path(_) => None,
             };
             let Some(copy) = copy else {
@@ -5158,10 +5356,30 @@ fn apply_fetched_until(
     };
     if config.signer.is_some()
         && state.seq > before.seq
-        && log_entries::current_records_digest(paths, &config, &state) == state.records_digest
-        && envelope::parse(&bytes).is_ok_and(|parsed| parsed.seq <= state.seq)
+        && envelope::parse(&bytes)
+            .is_ok_and(|parsed| parsed.name == config.name && parsed.seq < state.seq)
     {
-        return Ok(SyncOutcome::Unchanged { seq: state.seq });
+        // An in-flight response can be overtaken by another local apply. Its
+        // bytes supply no current-version evidence; recover only from the
+        // current cache while still honoring this caller's repair policy.
+        if let Some(copy) = peer_selection::cached_materialization(
+            paths,
+            &config,
+            &state,
+            repair_requested || long_poll_after(&config, &state).is_none(),
+            false,
+            None,
+            &mut body,
+        ) {
+            bytes = copy;
+        } else if let Some(copy) =
+            peer_selection::cached_log_progress(paths, &config, &state, &mut body)
+        {
+            bytes = copy;
+            body = None;
+        } else {
+            return Ok(SyncOutcome::Unchanged { seq: state.seq });
+        }
     }
     let Some(pin) = config.signer else {
         let Source::Path(path) = &config.source else {
@@ -5224,7 +5442,7 @@ fn apply_fetched_until(
                 _ => None,
             };
             let Some((served, copy)) =
-                older.and_then(|served| Some((served, held_copy(paths, &config, &state)?)))
+                older.and_then(|served| Some((served, publishable_copy(paths, &config, &state)?)))
             else {
                 return Err(error);
             };
@@ -5250,20 +5468,22 @@ fn apply_fetched_until(
         }
     };
     state.heard = now();
-    if let Pin::Replaced(_) = pinned {
-        state.seq = 0;
-        state.digest = None;
-        state.records_digest = None;
-    }
+    let mut next_config = config.clone();
     if let Pin::Rotated(new) | Pin::Replaced(new) = pinned {
-        prepare_materialization(paths, &mut state)?;
-        config.signer = Some(new);
-        config.followed = envelope.reached_from();
-        save_config(paths, &config)?;
+        next_config.signer = Some(new);
+        next_config.followed = envelope.reached_from();
     }
-    let seeded_log = log_entries::trusted_seeded_log(paths, &config, &envelope)?;
+    let seeded_log = log_entries::trusted_seeded_log(paths, &next_config, &envelope)?;
     let current_records_digest = seeded_log.as_ref().map(|(_, d)| *d);
+    if !matches!(pinned, Pin::Replaced(_))
+        && peer_selection::awaiting_applied_log(&state, current_records_digest)
+    {
+        // A verified envelope can predate values already obtained from the log,
+        // even when its envelope sequence advances. Log loss is not an edit.
+        return Ok(SyncOutcome::Unchanged { seq: state.seq });
+    }
     if verdict == Verdict::Unchanged
+        && matches!(pinned, Pin::Same)
         && state.records_digest == current_records_digest
         && state.membership == Stored::In
         && source_bound(&config, &state)
@@ -5310,7 +5530,7 @@ fn apply_fetched_until(
     if base == log_entries::LogBase::Behind
         && log_entries::adopt_held_draft(paths, &envelope, &identity)?
     {
-        seeded_log = log_entries::trusted_seeded_log(paths, &config, &envelope)?;
+        seeded_log = log_entries::trusted_seeded_log(paths, &next_config, &envelope)?;
         base = log_entries::log_base(
             seeded_log.as_ref().map(|(log, _)| log),
             &envelope,
@@ -5320,6 +5540,16 @@ fn apply_fetched_until(
     if base == log_entries::LogBase::Behind {
         save_state(paths, &state)?;
         return Ok(SyncOutcome::Unchanged { seq: state.seq });
+    }
+    if let Pin::Replaced(_) = pinned {
+        state.seq = 0;
+        state.digest = None;
+        state.records_digest = None;
+    }
+    if let Pin::Rotated(_) | Pin::Replaced(_) = pinned {
+        prepare_materialization(paths, &mut state)?;
+        config = next_config;
+        save_config(paths, &config)?;
     }
     let (opened, applied_records_digest) = match seeded_log {
         Some((log, digest))
@@ -5369,7 +5599,7 @@ fn apply_fetched_until(
     }
     state.membership = Stored::In;
     state.failed = apply_failed(&report);
-    state.source_identity = (!state.failed).then(|| source_identity(&config));
+    state.source_identity = Some(source_identity(&config));
     network_observation::record(
         paths,
         &lock,
@@ -5405,22 +5635,7 @@ fn apply_configured_log(
     }
     let identity = read_identity(paths)?
         .ok_or_else(|| Error::new("this machine has no key: run aterm secrets join"))?;
-    let opened = if configured.log.removes(&identity.recipient())
-        || log_entries::recipient_denied_by_roster_or_log(
-            None,
-            &configured.log,
-            &identity.recipient(),
-        )
-        || configured.log.audience_left_out_recipient(
-            &crate::membership_log::EpochAudience::Everyone,
-            &identity.recipient(),
-        )
-        || !log_entries::reads_log(&configured.log, &identity)
-    {
-        None
-    } else {
-        configured.log.open_entries(&identity)?
-    };
+    let opened = log_entries::configured_entries(&configured.log, &identity)?;
     state.records_digest = Some(digest);
     let Some(entries) = opened else {
         state.membership = match state.membership {
@@ -5434,7 +5649,7 @@ fn apply_configured_log(
     let report = apply_entries(paths, state, &entries)?;
     state.membership = Stored::In;
     state.failed = apply_failed(&report);
-    state.source_identity = (!state.failed).then(|| source_identity(config));
+    state.source_identity = Some(source_identity(config));
     save_state(paths, state)?;
     let _ = mailbox_index::record_applied(paths, config, state, &entries);
     Ok(SyncOutcome::Applied {
@@ -5654,6 +5869,23 @@ const HELD: Duration = Duration::from_secs(1);
 /// and not every few seconds.
 fn failed_over_idle(pass: Pass) -> bool {
     pass.source == SourceSaid::Nothing && !pass.moved
+}
+
+/// A local apply can need convergence while the source is still unavailable.
+/// Keep its recovery trigger for the first pass that actually hears the source.
+fn converge_after_pass(
+    due: &mut crate::converge::Due,
+    outcome: &SyncOutcome,
+    now_ms: u64,
+    routes: crate::converge::Routes,
+    last: crate::converge::Last,
+    source: SourceSaid,
+) -> bool {
+    if source == SourceSaid::Nothing {
+        due.after_unreachable_pass(outcome, now_ms, routes, last)
+    } else {
+        due.after_pass(outcome, now_ms, routes, last)
+    }
 }
 
 /// The pause after a pass that ended with `outcome`, from its start. A pass that moved this
@@ -6237,11 +6469,13 @@ fn subscriber_loop_until(
                 // keeping a profile that already authenticates.
                 notary.after_round(paths, &config, log);
                 // A version applied, or (its own route read) moved routes or the recheck.
-                let due = converge.after_pass(
+                let due = converge_after_pass(
+                    &mut converge,
                     &outcome,
                     now_ms(),
                     (converging.routes)(),
                     crate::converge::Last::of(runner.as_mut()),
+                    pass.source,
                 );
                 converge_if(due, &mut runner);
                 let requested = || load_state(paths).ok().map(|state| state.requested);
@@ -8605,15 +8839,15 @@ pub const PROBE_DEADLINE: Duration = Duration::from_millis(1500);
 /// `product`, or the hang detector a test set on this thread (`ServersAnswering`): every
 /// vault server such a test reads is one it started on loopback, which answers, so a read a
 /// loaded machine slows is waited for rather than taken for a server that is not there.
-fn servers_within(product: Duration) -> Duration {
-    #[cfg(test)]
+pub(crate) fn servers_within(product: Duration) -> Duration {
+    #[cfg(any(test, debug_assertions))]
     if let Some(within) = SERVERS_WITHIN.get() {
         return within;
     }
     product
 }
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 thread_local! {
     static SERVERS_WITHIN: std::cell::Cell<Option<Duration>> =
         const { std::cell::Cell::new(None) };
@@ -8622,18 +8856,29 @@ thread_local! {
 /// While held, every read of a vault server on this thread waits the hang detector for its
 /// answer ([`servers_within`]); its connect keeps [`transport::PROBE_CONNECT`], which a loopback
 /// listener's kernel completes without the server running. Its drop, a panic's unwind included,
-/// puts back the bound it replaced.
-#[cfg(test)]
-pub(crate) struct ServersAnswering(Option<Duration>);
+/// puts back the bound it replaced. Public under `debug_assertions` for the tests of the crates
+/// that call this one, and of this crate's `tests/`, which build it without `cfg(test)`.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub struct ServersAnswering(Option<Duration>);
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 impl ServersAnswering {
+    /// [`Self::within`] the hang detector, for this crate's own tests.
+    #[cfg(test)]
     pub(crate) fn set() -> Self {
-        Self(SERVERS_WITHIN.replace(Some(aterm_spec::wait::MUST_HAPPEN)))
+        Self::within(aterm_spec::wait::MUST_HAPPEN)
+    }
+
+    /// Lift this thread's server reads to `bound`, a test's hang detector
+    /// (`aterm_spec::wait::MUST_HAPPEN`), until the guard drops.
+    #[must_use = "the bound is put back when the guard drops"]
+    pub fn within(bound: Duration) -> Self {
+        Self(SERVERS_WITHIN.replace(Some(bound)))
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 impl Drop for ServersAnswering {
     fn drop(&mut self) {
         SERVERS_WITHIN.set(self.0);
@@ -12245,6 +12490,61 @@ mod tests {
     const HANG_DETECTOR: Duration = Duration::from_secs(60);
 
     #[test]
+    fn offline_materialization_keeps_convergence_due_for_the_returning_source() {
+        use crate::converge::{Due, Last};
+        for prior_failure in [false, true] {
+            let mut due = Due::default();
+            assert!(due.at_start(1, [None; 3], Last::None));
+            if prior_failure {
+                due.failed();
+            }
+            let applied = SyncOutcome::Applied {
+                seq: 4,
+                report: Report::default(),
+            };
+            assert!(converge_after_pass(
+                &mut due,
+                &applied,
+                2,
+                [None; 3],
+                Last::Ended,
+                SourceSaid::Nothing,
+            ));
+            let unchanged = SyncOutcome::Unchanged { seq: 4 };
+            assert!(!converge_after_pass(
+                &mut due,
+                &unchanged,
+                3,
+                [None; 3],
+                Last::Ended,
+                SourceSaid::Nothing,
+            ));
+            assert!(converge_after_pass(
+                &mut due,
+                &unchanged,
+                4,
+                [None; 3],
+                Last::Ended,
+                SourceSaid::AtOnce,
+            ));
+            assert!(!converge_after_pass(
+                &mut due,
+                &unchanged,
+                5,
+                [None; 3],
+                Last::Ended,
+                SourceSaid::AtOnce,
+            ));
+
+            // The old direct call consumed failure on the local apply, so an
+            // unchanged network recovery on the same routes started nothing.
+            let mut old = Due::default();
+            assert!(old.after_pass(&applied, 2, [None; 3], Last::Ended));
+            assert!(!old.after_pass(&unchanged, 3, [None; 3], Last::Ended));
+        }
+    }
+
+    #[test]
     fn config_debug_omits_nested_url_credentials() {
         let query = "synthetic-vault-query-credential";
         let fragment = "synthetic-vault-fragment-credential";
@@ -13816,6 +14116,9 @@ mod tests {
         admin_publish(&admin, &opened, &doc).unwrap();
         assert!(materialization_ready(&admin).unwrap());
         std::fs::remove_file(&token).unwrap();
+        // With no admissible local cache, a failed fetch must leave the repair
+        // due for when the source returns. An intact cache repairs offline.
+        fsx::write_atomic(&admin.cache_file(), b"damaged cache", 0o600).unwrap();
         server.stop();
         let gone = Unserved::at(&socket);
         assert!(subscriber_pass(&admin, &mut repaired, &FOUND_NONE).is_err());
@@ -14827,7 +15130,8 @@ mod tests {
         };
         assert!(!report.failed.is_empty());
         let partial = load_state(&admin).expect("failed materialization state");
-        assert!(partial.failed && partial.source_identity.is_none());
+        assert!(partial.failed && source_bound(&current, &partial));
+        assert!(!materialization_ready(&admin).expect("failed files are not ready"));
         let mut cold = None;
         let (_, seq, approval) = approval_here(&admin, &mut cold)
             .expect("verified cache despite failed file")
@@ -14885,6 +15189,8 @@ mod tests {
         }
 
         join_pinned(&admin, &sources[0], "admin");
+        // The server it reads from here on is its own on loopback, which answers.
+        let _answering = ServersAnswering::set();
         // The open vault admits only a member's Allow, so a person approves it by its key.
         let from_a_key = machine_identity(&from_a).unwrap().recipient().to_bech32();
         assert_eq!(
@@ -15650,6 +15956,8 @@ mod tests {
     /// the older server's line is skipped and "an older server's tagged line" fails.
     #[test]
     fn the_alab_vaults_approver_lets_in_no_plain_ask() {
+        // Every server it reads is its own on loopback, which answers.
+        let _answering = ServersAnswering::set();
         let root = aterm_tempfile::tempdir().unwrap();
         let socket = bound();
         let server = serve(&root.path().join("store"), &socket);
@@ -16116,7 +16424,12 @@ mod tests {
             assert!(served() == stale, "{what}: nothing published");
         }
         fsx::write_atomic(&member.cache_file(), &newest, 0o600).expect("cache");
-        let (_, outcome) = subscriber_pass(&member, &mut None, &FOUND_NONE).expect("a pass");
+        let exact_socket = bound();
+        let exact = serve(&root.path().join("exact-peer"), &exact_socket);
+        let exact_url = format!("http://{}/v1/team", exact.addr);
+        transport::publish(&Source::Url(exact_url.clone()), &newest).expect("seed exact peer");
+        let outcome = sync_with_candidates(&member, Some(Duration::ZERO), &[exact_url])
+            .expect("a no-change pass with an exact peer");
         assert_eq!(
             outcome,
             SyncOutcome::PutBack {
@@ -16125,6 +16438,7 @@ mod tests {
             }
         );
         assert!(served() == newest, "the newest copy is served");
+        exact.stop();
 
         // A pass that does not long-poll (a repair is due) hears an older copy as a signed body,
         // not a `204` naming its seq: it puts the newest back all the same, and the repair it
@@ -16161,13 +16475,17 @@ mod tests {
             SyncOutcome::Applied { seq: 4, .. }
         ));
         let rotated = std::fs::read(member.cache_file()).expect("the member's copy");
+        let peer_socket = bound();
+        let peer = serve(&root.path().join("rotated-peer"), &peer_socket);
+        let peer_url = format!("http://{}/v1/team", peer.addr);
+        transport::publish(&Source::Url(peer_url.clone()), &rotated)
+            .expect("an exact peer holds the rotated copy");
         server.stop();
         let server = serve(&root.path().join("rotated"), &socket);
         transport::publish(&source, &stale).expect("the stale copy, signed before the rotation");
         std::fs::remove_file(&token).expect("the token gone");
         let mut repaired = None;
-        let (_, outcome) =
-            subscriber_pass(&member, &mut repaired, &FOUND_NONE).expect("a repair pass");
+        let outcome = sync_with_candidates(&member, None, &[peer_url]).expect("a repair pass");
         assert_eq!(
             outcome,
             SyncOutcome::PutBack {
@@ -16182,11 +16500,14 @@ mod tests {
             matches!(outcome, SyncOutcome::Applied { seq: 4, .. }),
             "{outcome:?}"
         );
+        peer.stop();
         server.stop();
     }
 
     #[test]
     fn bounded_member_join_and_sync_keep_normal_admission_and_materialization() {
+        // Every server it reads is its own on loopback, which answers.
+        let _answering = ServersAnswering::set();
         let root = aterm_tempfile::tempdir().expect("tempdir");
         let socket = bound();
         let (server, url, admin, _) = a_vault_with_a_member(root.path(), &socket);
@@ -16260,6 +16581,33 @@ mod tests {
     }
 
     #[test]
+    fn bounded_local_write_failure_still_reads_a_newer_network_version() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let socket = bound();
+        let (server, _, admin, member) = a_vault_with_a_member(root.path(), &socket);
+        let token = materialize::target_path(&member.home, "token").unwrap();
+        std::fs::remove_file(&token).unwrap();
+        std::fs::create_dir(&token).unwrap();
+        let before = load_state(&member).unwrap();
+        let opened = admin_open(&admin).unwrap();
+        let mut doc = opened.doc.clone();
+        doc.set_entry(&Audience::Everyone, "new-note", b"new-version")
+            .unwrap();
+        let published = admin_publish(&admin, &opened, &doc).unwrap();
+        assert!(published.seq > before.seq);
+        let outcome = sync_reader_until(&member, Instant::now() + HANG_DETECTOR).unwrap();
+        assert!(matches!(outcome, SyncOutcome::Applied { seq, .. } if seq == published.seq));
+        let after = load_state(&member).unwrap();
+        assert_eq!(after.seq, published.seq);
+        assert!(after.failed, "the local obstruction is still reported");
+        assert_eq!(
+            std::fs::read(materialize::target_path(&member.home, "new-note").unwrap()).unwrap(),
+            b"new-version"
+        );
+        server.stop();
+    }
+
+    #[test]
     fn bounded_member_operations_do_not_wait_forever_for_the_state_lock() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
         let socket = bound();
@@ -16299,6 +16647,8 @@ mod tests {
 
     #[test]
     fn bounded_member_sync_defers_putting_back_a_missing_server_envelope() {
+        // Every server it reads is its own on loopback, which answers.
+        let _answering = ServersAnswering::set();
         let root = aterm_tempfile::tempdir().expect("tempdir");
         let socket = bound();
         let (server, url, admin, member) = a_vault_with_a_member(root.path(), &socket);

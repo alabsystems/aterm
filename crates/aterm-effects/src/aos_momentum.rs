@@ -1779,12 +1779,13 @@ struct Hosted {
 #[inline]
 fn refill(v: &mut Vec<GlowQuad>, from: &[GlowQuad]) {
     if from.is_empty() {
-        *v = Vec::new();
+        // Empty presentations release the old allocation rather than retaining it.
+        drop(std::mem::take(v));
         return;
     }
     if v.capacity() < from.len() {
         let room = from.len().max(v.capacity().saturating_mul(2));
-        *v = Vec::new();
+        drop(std::mem::take(v));
         v.reserve_exact(room);
     } else {
         v.clear();

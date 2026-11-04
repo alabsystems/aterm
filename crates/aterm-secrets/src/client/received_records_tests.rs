@@ -457,6 +457,11 @@ fn decoded_receive_preserves_seat_order_and_current_store_floor() {
 
 #[test]
 fn decoded_receive_preserves_fresh_network_fallback_and_capacity_refusal() {
+    crate::crossing::fixture::LEGACY.within(decoded_receive_at_a_full_held_store);
+}
+
+fn decoded_receive_at_a_full_held_store() {
+    let limit = crate::crossing::fixture::LEGACY.held;
     let mut history = History::new();
     let (_, _, _, other) = entrant(8);
     let other_genesis = Record::found(&[9; 32], vec![other], 1).unwrap();
@@ -472,17 +477,13 @@ fn decoded_receive_preserves_fresh_network_fallback_and_capacity_refusal() {
     assert_eq!(actual.store.inventory(), history.store.inventory());
 
     let mut previous = *history.genesis.id();
-    for sequence in 1..crate::membership_log::MAX_HELD_RECORDS as u64 {
+    for sequence in 1..limit as u64 {
         let next = history.name(vec![previous], (sequence > 1).then_some(previous), sequence);
         previous = *next.id();
         history.store.insert(next).unwrap();
     }
-    assert_eq!(history.store.len(), crate::membership_log::MAX_HELD_RECORDS);
-    let beyond = history.name(
-        vec![previous],
-        Some(previous),
-        crate::membership_log::MAX_HELD_RECORDS as u64,
-    );
+    assert_eq!(history.store.len(), limit);
+    let beyond = history.name(vec![previous], Some(previous), limit as u64);
     let actual = compare(&history.store, &history.store, beyond.bytes().to_vec());
     assert!(actual.whole);
     assert!(!actual.store.contains(beyond.id()));

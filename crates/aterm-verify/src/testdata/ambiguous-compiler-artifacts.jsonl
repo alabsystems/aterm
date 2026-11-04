@@ -1,0 +1,10 @@
+{"reason":"compiler-artifact","target":{"kind":["lib"],"name":"x"},"profile":{"test":true},"executable":"/first","executable":"/last"}
+{"reason":"compiler-artifact","target":{"kind":["lib"],"name":"x"},"profile":{"test":false},"profile":{"test":true},"executable":"/last"}
+{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"other"},"target":{"kind":["lib"],"name":"x"},"profile":{"test":true},"executable":"/last"}
+{"reason":"compiler-artifact","target":{"kind":["lib"],"name":"x"},"profile":{"test":false,"test":true},"executable":"/last"}
+{"reason":"compiler-artifact","target":{"kind":["lib"],"name":"other","name":"x"},"profile":{"test":true},"executable":"/last"}
+{"reason":"compiler-artifact","target":{"kind":["bin"],"kind":["lib"],"name":"x"},"profile":{"test":true},"executable":"/last"}
+{"reason":"build-finished","reason":"compiler-artifact","target":{"kind":["lib"],"name":"x"},"profile":{"test":true},"executable":"/last"}
+{"reason":"compiler-artifact","reason":"build-finished","target":{"kind":["lib"],"name":"x"},"profile":{"test":true},"executable":"/last"}
+{"target":{"kind":["lib"],"name":"x"},"reason":"compiler-artifact","profile":{"test":true},"executable":"/first","executable":"/last"}
+{"\u0072eason":"compiler-artifact","target":{"kind":["lib"],"name":"x"},"profile":{"test":true},"executable":"/first","executable":"/last"}

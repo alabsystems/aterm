@@ -133,6 +133,7 @@ pub fn immutable_uri(db: &Path) -> String {
 
 /// Open `p`'s regular final component for reading, refusing a link there.
 /// Ancestor directories may still be links.
+#[cfg(all(test, unix))]
 fn open_no_link(p: &Path) -> std::io::Result<std::fs::File> {
     crate::regular_file::open(p).map(|(file, _)| file)
 }
@@ -142,18 +143,17 @@ fn slurp_unlocked(from: &Path, was: &Identity, max_bytes: u64) -> Result<Vec<u8>
     if !was.regular || was.len > max_bytes {
         return Err(Unread::Failed);
     }
-    let src = open_no_link(from).map_err(|e| {
+    let (src, opened) = crate::regular_file::open(from).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             Unread::Changed
         } else {
             Unread::Failed
         }
     })?;
-    let opened = src.metadata().map_err(|_| Unread::Failed)?;
     if identity_of(&opened) != *was {
         return Err(Unread::Changed);
     }
-    let cap = usize::try_from(was.len).map_err(|_| Unread::Failed)?;
+    let cap = usize::try_from(was.len.saturating_add(1)).map_err(|_| Unread::Failed)?;
     let limit = max_bytes.saturating_add(1);
     let mut buf = Vec::with_capacity(cap);
     use std::io::Read as _;

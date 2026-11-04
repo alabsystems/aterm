@@ -511,9 +511,19 @@ impl FileStamp {
 /// The [`FileStamp`] of what is at `path` (`lstat`, so a symlink's own, never its target's), or
 /// `None` when nothing is there or it cannot be examined.
 pub fn stamp(path: &Path) -> Option<FileStamp> {
-    std::fs::symlink_metadata(path)
-        .ok()
-        .map(|meta| FileStamp::of(&meta))
+    stamp_if_present(path).ok().flatten()
+}
+
+/// Read a file's stamp without treating an observation failure as an absent file.
+///
+/// # Errors
+/// The metadata read fails for any reason other than a missing path.
+pub(crate) fn stamp_if_present(path: &Path) -> crate::Result<Option<FileStamp>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => Ok(Some(FileStamp::of(&meta))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(Error::new(format!("{}: {error}", path.display()))),
+    }
 }
 
 /// Append `bytes` to the regular file at `path` (never through a symlink) while it is still
@@ -1011,6 +1021,16 @@ mod tests {
 
     fn scratch() -> aterm_tempfile::TempDir {
         aterm_tempfile::tempdir().expect("tempdir")
+    }
+
+    #[test]
+    fn a_stamp_distinguishes_missing_paths_from_failed_observations() {
+        let root = scratch();
+        let path = root.path().join("file");
+        assert_eq!(stamp_if_present(&path).unwrap(), None);
+        write_atomic(&path, b"present", 0o600).unwrap();
+        assert!(stamp_if_present(&path).unwrap().is_some());
+        assert!(stamp_if_present(&path.join("cannot-be-a-child")).is_err());
     }
 
     /// F23 (rule 5): an append refuses a file renamed over the one its writer last left, though

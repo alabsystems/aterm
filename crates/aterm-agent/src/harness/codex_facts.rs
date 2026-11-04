@@ -397,10 +397,7 @@ impl CodexFactsTail {
     /// the file was replaced, shrank or gained more than [`TAIL_BYTES`]. Whether any line was
     /// folded; a rollout that cannot be opened as a regular file reads nothing.
     pub fn read(&mut self) -> bool {
-        let Some(mut file) = super::footer::open_regular(&self.path) else {
-            return false;
-        };
-        let Ok(meta) = file.metadata() else {
+        let Some((mut file, meta)) = super::footer::open_regular_with_meta(&self.path) else {
             return false;
         };
         let id = super::session_usage::open_identity(&file, &meta);
@@ -417,9 +414,11 @@ impl CodexFactsTail {
                 len.saturating_sub(TAIL_BYTES)
             }
         };
-        let mut buf = Vec::new();
+        let want = len - from;
+        let cap = usize::try_from(want.saturating_add(1)).unwrap_or(0);
+        let mut buf = Vec::with_capacity(cap);
         if file.seek(SeekFrom::Start(from)).is_err()
-            || (&mut file).take(len - from).read_to_end(&mut buf).is_err()
+            || (&mut file).take(want).read_to_end(&mut buf).is_err()
         {
             self.at = None;
             return false;

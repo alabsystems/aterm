@@ -250,6 +250,51 @@ fn codex_step_rows_materialize_no_text() {
     assert_eq!((batch.lost, batch.overflow), (0, 0));
     assert_eq!(batch.steps.len(), 8, "{:?}", batch.steps);
     assert!(!format!("{:?}", batch.steps).contains("SENTINEL"));
+    let gated = [
+        format!(
+            r#"{{"timestamp":"{at}","type":"turn_context","payload":{{"turn_id":"turn-2","cwd":"{CWD}","model":"gpt-6.1-sol","effort":"high"}}}}"#
+        ),
+        format!(
+            r#"{{"timestamp":"{at}","type":"event_msg","payload":{{"type":"task_started","turn_id":"turn-2","turn_attribution":{{"turn_id":"turn-2","turn_trigger":"alab_autopilot","note":"{big}"}},"text":"{big}"}}}}"#
+        ),
+        format!(
+            r#"{{"timestamp":"{at}","type":"response_item","payload":{{"type":"function_call","name":"exec","namespace":"functions","arguments":"{big}","call_id":"call-3"}}}}"#
+        ),
+        format!(
+            r#"{{"timestamp":"{at}","type":"event_msg","payload":{{"type":"item_completed","thread_id":"{thread}","turn_id":"turn-2","item":{{"type":"commandExecution","id":"call-3","command":["{big}"],"aggregated_output":"{big}","status":"failed","exit_code":3}}}}}}"#
+        ),
+        format!(
+            r#"{{"timestamp":"{at}","type":"response_item","payload":{{"type":"function_call_output","call_id":"call-3","output":"{big}"}}}}"#
+        ),
+        format!(
+            r#"{{"timestamp":"{at}","type":"event_msg","payload":{{"type":"task_complete","turn_id":"turn-2","last_agent_message":"{big}","duration_ms":12}}}}"#
+        ),
+    ];
+    let mut fold = codex_steps::CodexStepFold::ungated(0);
+    fold.bind(1, None, 0);
+    let mut end = 0u64;
+    for row in rows.iter().take(1).chain(&gated) {
+        end += row.len() as u64 + 1;
+        within("codex gated steps", 4 * 1024, 64, || {
+            fold.push(row.as_bytes(), end)
+        });
+    }
+    assert!(!fold.broken());
+    let batch = fold.take();
+    assert_eq!((batch.lost, batch.overflow), (0, 0));
+    let said = format!("{:?}", batch.steps);
+    assert!(!said.contains("SENTINEL"), "{said}");
+    let harness = batch
+        .steps
+        .iter()
+        .filter(|s| matches!(s.ev, steps::StepEvent::HarnessTurn { .. }))
+        .count();
+    let failed = batch
+        .steps
+        .iter()
+        .filter(|s| matches!(s.ev, steps::StepEvent::ToolResult { error: true, .. }))
+        .count();
+    assert_eq!((harness, failed), (1, 1), "{said}");
 }
 
 fn codex_rollout_scan_and_thread_sample_bound_allocations() {

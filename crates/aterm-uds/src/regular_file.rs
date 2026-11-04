@@ -22,7 +22,11 @@ use std::path::Path;
 /// is a link, reparse point or anything other than a regular file. Other than Unix and Windows,
 /// this returns [`io::ErrorKind::Unsupported`] before examining `path`.
 pub fn open(path: &Path) -> io::Result<(File, Metadata)> {
-    #[cfg(any(unix, windows))]
+    #[cfg(unix)]
+    {
+        open_unix(path)
+    }
+    #[cfg(windows)]
     {
         open_after_check(path, || {})
     }
@@ -33,40 +37,57 @@ pub fn open(path: &Path) -> io::Result<(File, Metadata)> {
     }
 }
 
-#[cfg(any(unix, windows))]
+#[cfg(unix)]
+fn open_unix(path: &Path) -> io::Result<(File, Metadata)> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "not a regular file");
+    let mut options = OpenOptions::new();
+    options.read(true);
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(err) => {
+            if err.kind() != io::ErrorKind::NotFound
+                && std::fs::symlink_metadata(path).is_ok_and(|m| !m.file_type().is_file())
+            {
+                return Err(invalid());
+            }
+            return Err(err);
+        }
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(invalid());
+    }
+    Ok((file, metadata))
+}
+
+#[cfg(any(test, windows))]
 fn open_after_check(path: &Path, checked: impl FnOnce()) -> io::Result<(File, Metadata)> {
     let invalid = || io::Error::new(io::ErrorKind::InvalidData, "not a regular file");
     if !std::fs::symlink_metadata(path)?.file_type().is_file() {
         return Err(invalid());
     }
     checked();
-    let mut options = OpenOptions::new();
-    options.read(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        open_unix(path)
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::OpenOptionsExt as _;
+        use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    let file = options.open(path)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() {
-        return Err(invalid());
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt as _;
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
-        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        let file = options.open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             return Err(invalid());
         }
+        Ok((file, metadata))
     }
-    Ok((file, metadata))
 }
 
 #[cfg(test)]

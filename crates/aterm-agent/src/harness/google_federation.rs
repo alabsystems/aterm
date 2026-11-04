@@ -200,7 +200,7 @@ impl PendingFederation {
         journal: Option<&recovery::Journal>,
     ) -> Result<(), String> {
         let cached = self.native.take();
-        self.complete_checked(request, outcome, deadline, journal, |scope| {
+        let native = self.complete_checked(request, outcome, deadline, journal, |scope| {
             if let Some(journal) = journal {
                 journal.check(request)?;
             }
@@ -232,8 +232,14 @@ impl PendingFederation {
                 }
                 Err(error) => Err(error.to_string()),
             }
-        })
-        .map(|_| ())
+        })?;
+        if let Some(native) = native
+            && let Some(admission) = request.admission.filter(|a| !a.is_shared_root())
+        {
+            let journal = journal.ok_or("pool Kimi proof has no native staging claim")?;
+            admission.retain_kimi(native, journal.native_claim())?;
+        }
+        Ok(())
     }
 
     pub(super) fn commit_recovered(
@@ -344,10 +350,15 @@ pub(super) fn configured(approver: &mut VendorApprover, handoff: &Handoff<'_>) -
             "Google federation for this provider is not implemented",
         ));
     }
-    if !handoff
-        .email
-        .is_some_and(|email| email.eq_ignore_ascii_case(binding.expected_email()))
-    {
+    let Some(attempt) = approver
+        .native_attempt
+        .as_ref()
+        .filter(|attempt| attempt.cli == *cli && attempt.row.label == *account)
+        .cloned()
+    else {
+        return Some(quiet("Google federation has no bound native attempt"));
+    };
+    if !native_identity_matches(&attempt.row, handoff.email, binding.expected_email()) {
         return Some(Approval::Refused(
             "Google binding does not match the native account identity".into(),
         ));
@@ -356,14 +367,6 @@ pub(super) fn configured(approver: &mut VendorApprover, handoff: &Handoff<'_>) -
         return Some(Approval::NotRun(
             "Google credential home is unavailable".into(),
         ));
-    };
-    let Some(attempt) = approver
-        .native_attempt
-        .as_ref()
-        .filter(|attempt| attempt.cli == *cli && attempt.row.label == *account)
-        .cloned()
-    else {
-        return Some(quiet("Google federation has no bound native attempt"));
     };
     let Some(revision) = registry.binding_revision(provider, account) else {
         return Some(quiet("Google federation binding is unavailable"));
@@ -1139,12 +1142,81 @@ pub(super) fn google_action(
     )
 }
 
+fn native_identity_matches(
+    row: &super::accounts::Row,
+    login: Option<&str>,
+    expected: &str,
+) -> bool {
+    let login_matches = match (row.email.as_deref(), login) {
+        (Some(declared), Some(reported)) => super::accounts::email_matches(declared, reported),
+        (None, None) => true,
+        _ => false,
+    };
+    login_matches
+        && row
+            .expected_identity_email()
+            .is_some_and(|identity| super::accounts::email_matches(identity, expected))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const GOOGLE: &str = "https://accounts.google.com/o/oauth2/v2/auth?client_id=vendor-client&redirect_uri=https%3A%2F%2Fwww.kimi.ai%2Fgoogle-callback&scope=email%20profile&state=inner-state";
     const HOSTS: &[&str] = &["auth.kimi.ai", "www.kimi.ai"];
+
+    #[test]
+    fn native_binding_checks_both_login_alias_and_canonical_identity() {
+        let row = super::super::accounts::Row {
+            email: Some("login-alias@example.com".into()),
+            identity_email: Some("native-owner@example.com".into()),
+            ..Default::default()
+        };
+        assert!(native_identity_matches(
+            &row,
+            Some("LOGIN-ALIAS@example.com"),
+            "native-owner@example.com"
+        ));
+        assert!(!native_identity_matches(
+            &row,
+            Some("another-login@example.com"),
+            "native-owner@example.com"
+        ));
+        assert!(!native_identity_matches(
+            &row,
+            Some("login-alias@example.com"),
+            "another-owner@example.com"
+        ));
+        assert!(!native_identity_matches(
+            &row,
+            None,
+            "native-owner@example.com"
+        ));
+    }
+
+    #[test]
+    fn canonical_only_native_binding_requires_absent_alias_and_exact_identity() {
+        let row = super::super::accounts::Row {
+            identity_email: Some("native-owner@example.com".into()),
+            ..Default::default()
+        };
+        assert!(native_identity_matches(
+            &row,
+            None,
+            "NATIVE-OWNER@example.com"
+        ));
+        assert!(!native_identity_matches(
+            &row,
+            Some("native-owner@example.com"),
+            "native-owner@example.com"
+        ));
+        assert!(!native_identity_matches(&row, None, "another@example.com"));
+        assert!(!native_identity_matches(
+            &super::super::accounts::Row::default(),
+            None,
+            "native-owner@example.com"
+        ));
+    }
 
     #[test]
     fn google_federation_uses_one_harness_identity_root() {
@@ -1492,6 +1564,33 @@ mod tests {
             root.path(),
             oauth::MailboxConfig::default(),
         );
+        let store = super::super::accounts::Store::at_for(root.path(), Cli::Kimi, root.path());
+        let row = super::super::accounts::Row {
+            label: "work".into(),
+            email: Some("person@example.com".into()),
+            vendor: super::super::accounts::Vendor {
+                region: Some(Region::Global),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let route = Cli::Kimi
+            .accounts()
+            .signin
+            .as_ref()
+            .unwrap()
+            .route(None)
+            .unwrap();
+        approver.native_attempt = Some(NativeAttempt::capture(&login_drive::Request {
+            recovery: None,
+            admission: None,
+            cli: Cli::Kimi,
+            row: &row,
+            route,
+            staging: root.path(),
+            store: &store,
+            hosts: HOSTS,
+        }));
         let handoff = Handoff {
             url: "https://www.kimi.ai/login?user_code=ABCD",
             code: Some("ABCD"),

@@ -1461,15 +1461,28 @@ pub(crate) fn families(counts: Families) -> Vec<String> {
         .collect()
 }
 
-/// What a self-claim's holder did, each nonzero count in [`Families`]' order and words, `, `
-/// between them (`3 kept going, 1 approved`); empty where it did nothing that counts.
+/// The measured facts a self-claim's acts carried (gap 23): aterm's words that rode its acts,
+/// booked to its holder ([`aterm_agent::harness::stats::SelfClaimed::facts_told`]); aterm's own
+/// `Facts told (<kind>)` rows stay aterm's alone.
+pub(crate) const FACTS_TOLD: CountWords = CountWords {
+    label: "Facts told",
+    one: "fact told",
+    many: "facts told",
+};
+
+/// What a self-claim's holder did, at most `at_most` nonzero counts in [`Families`]' order and
+/// words, then the facts its acts carried ([`FACTS_TOLD`]) where any, `, ` between them
+/// (`3 kept going, 1 approved, 1 fact told`); empty where it did nothing that counts.
 #[must_use]
 fn self_claimed_words(s: &aterm_agent::harness::stats::SelfClaimed, at_most: usize) -> String {
-    families(Families::of_self_claimed(s))
+    let mut words: Vec<String> = families(Families::of_self_claimed(s))
         .into_iter()
         .take(at_most)
-        .collect::<Vec<_>>()
-        .join(", ")
+        .collect();
+    if s.facts_told > 0 {
+        words.push(FACTS_TOLD.count(s.facts_told));
+    }
+    words.join(", ")
 }
 
 /// A ROW OF ITS OWN FOR WHAT EACH AGENT THAT SUPERVISES ITSELF DID (WHAT THE HARNESS DID): `codex-alab did  3 kept going, 1 approved today · 12 kept going, 4 approved, 1 landed in 7 days`, one per holder name the week holds ([`HarnessStats::self_claimed`]), its counts in aterm's own words ([`self_claimed_words`]), `none today` where today holds none — never in the rows of aterm's own counts, which say what aterm's harness did.
@@ -3465,7 +3478,7 @@ fn read_machines_file(path: &Path, nofollow: bool) -> std::io::Result<String> {
             "machines file is not a bounded regular file",
         ));
     }
-    let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
     file.take(MAX_MACHINES_FILE_BYTES + 1)
         .read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_MACHINES_FILE_BYTES {
@@ -3508,24 +3521,23 @@ fn raw_local_host_name_gui() -> String {
     RAW_HOST_NAME
         .get_or_init(|| {
             #[cfg(target_os = "macos")]
-            if !cfg!(test)
-                && aterm_uds::test_binary::scratch_root().is_none()
-                && let Some(sc) =
-                    run_cmd_stdout_bounded("/usr/sbin/scutil", &["--get", "LocalHostName"], 80)
-                        .or_else(|| {
-                            run_cmd_stdout_bounded(
-                                "/usr/sbin/scutil",
-                                &["--get", "ComputerName"],
-                                80,
-                            )
-                        })
-            {
-                let trimmed = sc.trim();
-                if !trimmed.is_empty() {
-                    return trimmed.to_string();
+            let scutil = {
+                let live = !cfg!(test) && aterm_uds::test_binary::scratch_root().is_none();
+                move |key: &str| {
+                    if live {
+                        run_cmd_stdout_bounded("/usr/sbin/scutil", &["--get", key], 80)
+                    } else {
+                        None
+                    }
                 }
-            }
-            plain_host_name()
+            };
+            #[cfg(not(target_os = "macos"))]
+            let scutil = |_: &str| None::<String>;
+            local_host_name_from(
+                scutil,
+                || std::env::var("HOSTNAME").ok(),
+                aterm_uds::process::host_name,
+            )
         })
         .clone()
 }
@@ -3538,12 +3550,35 @@ fn raw_local_host_name_known() -> String {
 
 /// This Mac's name from `HOSTNAME`, else the kernel's host name, else `this Mac`.
 fn plain_host_name() -> String {
-    std::env::var("HOSTNAME")
-        .ok()
+    local_host_name_from(
+        |_| None,
+        || std::env::var("HOSTNAME").ok(),
+        aterm_uds::process::host_name,
+    )
+}
+
+/// This Mac's own name, trimmed: `scutil`'s `LocalHostName` (its Bonjour name, which
+/// `discover_bonjour_lan_computers` probes as `<name>.local`), else its `ComputerName`, else
+/// `$HOSTNAME`, else its host name short of a trailing dot and `.local` or `.localdomain`, else
+/// "this Mac".
+fn local_host_name_from(
+    scutil: impl Fn(&str) -> Option<String>,
+    hostname_env: impl FnOnce() -> Option<String>,
+    host_name: impl FnOnce() -> Option<String>,
+) -> String {
+    let named = |key: &str| {
+        scutil(key)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    if let Some(name) = named("LocalHostName").or_else(|| named("ComputerName")) {
+        return name;
+    }
+    hostname_env()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .or_else(|| {
-            let h = aterm_uds::process::host_name()?;
+            let h = host_name()?;
             let base = h.trim().trim_end_matches('.');
             let short = base
                 .strip_suffix(".local")

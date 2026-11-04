@@ -55,6 +55,63 @@ impl Reader {
             Self::BoundedLog(peer) => peer.can_exchange(source),
         }
     }
+
+    /// Why the allowing member hands this reader no log of `source`, a history it cannot take
+    /// ([`Self::can_take`]), naming the Mac whose aterm must be updated: the new Mac where it
+    /// reads no log, reads only an uncrossed one (a build before the crossed fence) or holds
+    /// fewer records than `source` may; else the allowing Mac, whose bound is short of the
+    /// history the new Mac states (a crossed one, where the member holds at least
+    /// [`crate::membership_log::LEGACY_RECORDS`]). The member says it to the person and on the wire, where an
+    /// older new Mac shows it as the member's reason.
+    pub(crate) fn refusal(self, source: RecordsBound) -> String {
+        match self {
+            Self::Files => "the new Mac's aterm reads no membership log: update aterm on the new \
+                            Mac, then ask again"
+                .to_owned(),
+            Self::LegacyLog => format!(
+                "this vault's membership log has passed the {} records an older aterm takes, and \
+                 the new Mac runs one: update aterm on the new Mac, then ask again",
+                crate::membership_log::LEGACY_RECORDS
+            ),
+            // Only one side can be short: the new Mac of a history up to `source.held`, or the
+            // member of one up to `peer.held`.
+            Self::BoundedLog(peer) if peer.held < source.held => format!(
+                "this vault's membership log may hold {} records, more than the {} the new Mac's \
+                 aterm takes: update aterm on the new Mac, then ask again",
+                source.held, peer.held
+            ),
+            Self::BoundedLog(_) => format!(
+                "the new Mac's membership log may hold more records than the {} the allowing \
+                 Mac's aterm takes: update aterm on the allowing Mac, then ask again",
+                source.held
+            ),
+        }
+    }
+}
+
+/// Why a new Mac holding `local` takes no member's log bundle that stated `source` (`None` for
+/// `alab-join-bundle/2`, which only a member before the crossed fence hands for a joiner that
+/// states a bound), naming the Mac whose aterm must be updated: the mirror of
+/// [`Reader::refusal`], seen from the new Mac. `None` where it takes it.
+pub(crate) fn source_refusal(local: RecordsBound, source: Option<RecordsBound>) -> Option<String> {
+    match source {
+        None if local.crossed => Some(
+            "this Mac's membership log has crossed past the records the allowing Mac's older \
+             aterm takes: update aterm on the allowing Mac, then ask again"
+                .to_owned(),
+        ),
+        Some(source) if !local.can_exchange(source) && local.held < source.held => Some(format!(
+            "the allowing Mac's membership log may hold {} records, more than the {} this Mac's \
+             aterm takes: update aterm on this Mac, then ask again",
+            source.held, local.held
+        )),
+        Some(source) if !local.can_exchange(source) => Some(format!(
+            "this Mac's membership log may hold more records than the {} the allowing Mac's aterm \
+             takes: update aterm on the allowing Mac, then ask again",
+            source.held
+        )),
+        _ => None,
+    }
 }
 
 /// One join bundle. Its files are wiped with it.

@@ -127,7 +127,8 @@ fn sys_carries_the_places_line_and_object_with_unknowns_not_sampled() {
     );
 }
 
-/// The network band leads with the place away from the ALab LAN (`Away from ALab LAN · phone
+/// With a current, history-ready observer, the network band leads with the place away from the
+/// ALab LAN (`Away from ALab LAN · phone
 /// hotspot · 41 known`, short `Away · hotspot`), and on the ALab LAN, before any place was read,
 /// while checking (learning) and with no fleet to learn a home from, the observer's own words
 /// (Commons' reachable count) stand.
@@ -137,10 +138,13 @@ fn sys_carries_the_places_line_and_object_with_unknowns_not_sampled() {
 /// "Checking(Learning): the observer's words stand" fails.
 #[test]
 fn the_network_band_leads_with_the_place_away_from_the_alab_lan() {
-    let snapshot = aterm_types::network_state::NetworkStateSnapshot::default();
+    let mut snapshot = aterm_types::network_state::NetworkStateSnapshot::default();
+    snapshot.network.visibility = aterm_types::network_state::Visibility::Active;
+    snapshot.network.history = aterm_types::network_state::HistoryState::Ready;
     let observer = crate::network_deck::summary_at(&snapshot, None);
     let away = aterm_netplace::sample::hotspot(SINCE_MS, SINCE_MS);
-    let (long, short) = crate::network_deck::place_caption(Some(&away)).expect("away words");
+    let caption = crate::network_deck::place_caption(Some(&away)).expect("away words");
+    let (long, short) = (caption.long, caption.short);
     assert_eq!(
         crate::network_deck::summary_at(&snapshot, Some(&away)),
         long,
@@ -188,9 +192,12 @@ fn the_network_band_leads_with_the_place_away_from_the_alab_lan() {
 /// read".
 #[test]
 fn paint_reads_the_cached_place_and_asks_for_no_read() {
-    let snapshot = aterm_types::network_state::NetworkStateSnapshot::default();
+    let mut snapshot = aterm_types::network_state::NetworkStateSnapshot::default();
+    snapshot.network.visibility = aterm_types::network_state::Visibility::Active;
+    snapshot.network.history = aterm_types::network_state::HistoryState::Ready;
     let away = aterm_netplace::sample::hotspot(SINCE_MS, SINCE_MS);
-    let (long, short) = crate::network_deck::place_caption(Some(&away)).expect("away words");
+    let caption = crate::network_deck::place_caption(Some(&away)).expect("away words");
+    let (long, short) = (caption.long, caption.short);
     hold(Some(away));
     let g = crate::stats_deck::DeckGeom {
         w: 700.0,

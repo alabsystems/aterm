@@ -506,7 +506,14 @@ fn reconcile_dns_sd(
 }
 
 /// Render the macOS `LaunchAgent` plist for `systems.alab.aterm-node`, putting `atpkg`'s managed
-/// `pkg/bin` first on `PATH` (C8, C20).
+/// `pkg/bin` first on `PATH` (C8, C20). Its `ProcessType` is `Interactive`, which clamps none of
+/// the job's threads: `Background` held every thread and child at priority 4, which a loaded Mac
+/// starves for minutes (`docs/measured/fleet-lan-m100-2026-11-02.md`), and `Standard` clamps them
+/// all at utility, where no lift reaches (the fleet book's lock holder kept the lock at utility).
+/// The job holds itself at utility thread by thread instead (`aterm node serve`,
+/// `aterm_gui::hold_process_as_background_work`), so its routine work runs where `Standard` ran
+/// it. A plist an earlier build wrote is rewritten by the next `sync.node` pass
+/// ([`ensure_for_sync_with`]).
 #[must_use]
 pub fn node_plist_text(
     program: &Path,
@@ -553,7 +560,7 @@ pub fn node_plist_text(
          \t<key>KeepAlive</key>\n\
          \t<true/>\n\
          \t<key>ProcessType</key>\n\
-         \t<string>Standard</string>\n\
+         \t<string>Interactive</string>\n\
          {associated}\
          \t<key>StandardOutPath</key>\n\
          \t{}\n\
@@ -745,6 +752,12 @@ pub trait ServiceSupervisor {
     /// The supervisor refused the restart.
     fn renew(&self) -> Result<(), String> {
         Ok(())
+    }
+    /// Why the unit file under `home` is not this supervisor's to write or remove, `None` where
+    /// it is: an install refuses it, and a removal keeps it and says so.
+    fn leaves_unit_alone(&self, home: &Path) -> Option<String> {
+        let _ = home;
+        None
     }
 }
 
@@ -1237,11 +1250,63 @@ fn live_launchd(launchctl: &dyn Launchctl) -> Launchd<'_> {
     }
 }
 
-/// Inert supervisor for isolated test environments (`ATERM_STATE_HOME` or `CI`), writing/removing
-/// unit files under `home` without calling the host's live `launchctl` or `systemctl`.
-pub struct FileOnlySupervisor;
+/// Inert supervisor for isolated environments (a private state root or `CI`): it writes and
+/// removes unit files without calling the host's live `launchctl` or `systemctl`, and only under
+/// a home that is not the account's own. The unit file under the account's own home is the one
+/// the account's launchd or systemd loads: a job it started runs on (it is kept alive) after a
+/// removal no stop came with, and a unit written there starts the account's job on this
+/// process's program and state at its next load. A job a session outside `CI` loaded can stand
+/// there whatever this process installed, so the file is left alone.
+pub struct FileOnlySupervisor {
+    /// The account's own home, `None` where it could not be read, which leaves every unit file
+    /// alone.
+    account_home: Option<PathBuf>,
+}
+
+impl FileOnlySupervisor {
+    /// The file-only supervisor of the account this process runs as, whose home is the account
+    /// database's ([`aterm_uds::account::home`]), whatever `$HOME` says.
+    #[must_use]
+    pub fn of_this_account() -> Self {
+        Self::guarding(aterm_uds::account::home())
+    }
+
+    /// One that leaves alone the unit file under `account_home`, taken for the account's own.
+    #[must_use]
+    pub(crate) const fn guarding(account_home: Option<PathBuf>) -> Self {
+        Self { account_home }
+    }
+
+    /// Whether the unit file under `home` is the one under the account's home `account`: `home`
+    /// is that home ([`aterm_types::dirs::same_directory`]), or the unit's folder under it is the
+    /// account's, reached through a link (a scratch home whose `Library` links to the account's).
+    fn reaches_accounts_unit(&self, home: &Path, account: &Path) -> bool {
+        let folder = |home: &Path| self.unit_file(home).parent().map(Path::to_path_buf);
+        aterm_types::dirs::same_directory(home, account)
+            || folder(home)
+                .zip(folder(account))
+                .is_some_and(|(home, account)| aterm_types::dirs::same_directory(&home, &account))
+    }
+}
 
 impl ServiceSupervisor for FileOnlySupervisor {
+    fn leaves_unit_alone(&self, home: &Path) -> Option<String> {
+        match &self.account_home {
+            Some(account) if !self.reaches_accounts_unit(home, account) => None,
+            Some(_) => Some(
+                "it is this account's own, and this process (under a private state root or CI) \
+                 reaches none of the account's jobs, so it neither writes nor removes it"
+                    .to_owned(),
+            ),
+            None => Some(
+                "this account's home could not be read, so it may be the account's own, and \
+                 this process (under a private state root or CI) reaches none of the account's \
+                 jobs, so it neither writes nor removes it"
+                    .to_owned(),
+            ),
+        }
+    }
+
     fn unit_file(&self, home: &Path) -> PathBuf {
         LiveSupervisor.unit_file(home)
     }
@@ -1313,7 +1378,9 @@ pub fn state_with(home: &Path, supervisor: &dyn ServiceSupervisor) -> Result<Nod
 /// is true.
 ///
 /// # Errors
-/// Returns an error if writing the unit file or loading the job fails.
+/// Returns an error if the supervisor leaves the unit file under `home` alone
+/// ([`ServiceSupervisor::leaves_unit_alone`]), changing nothing, or if writing the unit file or
+/// loading the job fails.
 pub fn install_with(
     program: &Path,
     home: &Path,
@@ -1333,6 +1400,13 @@ fn install_locked(
     clear_off: bool,
     supervisor: &dyn ServiceSupervisor,
 ) -> Result<PathBuf, String> {
+    let unit = supervisor.unit_file(home);
+    if let Some(why) = supervisor.leaves_unit_alone(home) {
+        return Err(format!(
+            "{} was left alone, and nothing changed: {why}",
+            unit.display()
+        ));
+    }
     aterm_uds::private_file::ensure_private_dir(state_dir).map_err(|e| e.to_string())?;
     if clear_off {
         let off = off_path(state_dir);
@@ -1342,7 +1416,6 @@ fn install_locked(
             Err(e) => return Err(format!("{}: {e}", off.display())),
         }
     }
-    let unit = supervisor.unit_file(home);
     if let Some(parent) = unit.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
     }
@@ -1353,9 +1426,28 @@ fn install_locked(
     Ok(unit)
 }
 
+/// What a removal of `systems.alab.aterm-node` did with its unit file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Removal {
+    /// Nothing was removed, and there is nothing to say: no unit file stood under the home, or a
+    /// join after the leave owns the job.
+    Nothing,
+    /// The job was stopped and this unit file removed.
+    Removed(PathBuf),
+    /// This unit file was left alone, and no job was stopped.
+    Kept {
+        /// The unit file.
+        unit: PathBuf,
+        /// Why it is not the supervisor's to remove
+        /// ([`ServiceSupervisor::leaves_unit_alone`]).
+        why: String,
+    },
+}
+
 /// Stop and remove `systems.alab.aterm-node`. When `record_off` is true (`aterm node off`),
 /// writes `<state_dir>/node-off` so `sync.node` leaves it off; when false (`aterm fleet leave`),
-/// removes the unit cleanly without recording `node-off`.
+/// removes the unit cleanly without recording `node-off`. A unit file the supervisor leaves
+/// alone is kept ([`Removal::Kept`]), `node-off` recorded all the same.
 ///
 /// # Errors
 /// Returns an error if writing `node-off`, stopping the loaded job or removing the unit file
@@ -1365,7 +1457,7 @@ pub fn remove_with(
     state_dir: &Path,
     record_off: bool,
     supervisor: &dyn ServiceSupervisor,
-) -> Result<Option<PathBuf>, String> {
+) -> Result<Removal, String> {
     #[cfg(unix)]
     let _guard = node_admin_lock(state_dir)?;
     remove_locked(home, state_dir, record_off, supervisor)
@@ -1381,10 +1473,10 @@ pub(crate) fn remove_after_fleet_leave_with(
     home: &Path,
     state_dir: &Path,
     supervisor: &dyn ServiceSupervisor,
-) -> Result<Option<PathBuf>, String> {
+) -> Result<Removal, String> {
     let _guard = node_admin_lock(state_dir)?;
     match aterm_net::fleet::read_key_file(state_dir) {
-        Ok(_) => return Ok(None),
+        Ok(_) => return Ok(Removal::Nothing),
         Err(aterm_net::fleet::KeyFileError::Missing) => {}
         Err(why) => {
             return Err(format!(
@@ -1401,7 +1493,7 @@ fn remove_locked(
     state_dir: &Path,
     record_off: bool,
     supervisor: &dyn ServiceSupervisor,
-) -> Result<Option<PathBuf>, String> {
+) -> Result<Removal, String> {
     if record_off {
         aterm_uds::private_file::ensure_private_dir(state_dir).map_err(|e| e.to_string())?;
         aterm_uds::private_file::write_private(
@@ -1413,10 +1505,21 @@ fn remove_locked(
     }
     let unit = supervisor.unit_file(home);
     let existed = unit.is_file();
+    if let Some(why) = supervisor.leaves_unit_alone(home) {
+        return Ok(if existed {
+            Removal::Kept { unit, why }
+        } else {
+            Removal::Nothing
+        });
+    }
     supervisor.stop_and_unload(&unit)?;
     match std::fs::remove_file(&unit) {
-        Ok(()) => Ok(Some(unit)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(existed.then_some(unit)),
+        Ok(()) => Ok(Removal::Removed(unit)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(if existed {
+            Removal::Removed(unit)
+        } else {
+            Removal::Nothing
+        }),
         Err(e) => Err(format!("{}: {e}", unit.display())),
     }
 }
@@ -1425,12 +1528,15 @@ fn remove_locked(
 /// where this process runs under a private state root (a build with dev seams told so by
 /// `ATERM_STATE_HOME`: [`aterm_types::dirs::runs_under_private_state_root`]) or under `CI`, since
 /// its launchd or systemd is still the host's and the job loaded there serves other state, else
-/// [`LiveSupervisor`]. Outside `CI`, a release build, whose state is the person's whatever
+/// [`LiveSupervisor`]. The file-only one writes and removes a unit file only under a home that
+/// is not the account's own, so `aterm node`, `fleet leave` and `sync.node` there leave the
+/// account's own unit alone. Outside `CI`, a release build, whose state is the person's whatever
 /// `ATERM_STATE_HOME` says, reaches the person's job, that state's.
 #[must_use]
 pub fn supervisor_here() -> &'static dyn ServiceSupervisor {
+    static FILE_ONLY: std::sync::OnceLock<FileOnlySupervisor> = std::sync::OnceLock::new();
     if aterm_types::dirs::runs_under_private_state_root() || std::env::var_os("CI").is_some() {
-        &FileOnlySupervisor
+        FILE_ONLY.get_or_init(FileOnlySupervisor::of_this_account)
     } else {
         &LiveSupervisor
     }
@@ -1832,11 +1938,17 @@ pub fn run_admin_subcommand(
         "off" => {
             let removed = remove_with(home, state_dir, true, supervisor)
                 .map_err(|e| (format!("aterm node off: {e}"), 1))?;
+            let off = off_path(state_dir);
             Ok(match removed {
-                Some(unit) => format!("{NODE_LABEL}: stopped and removed ({})\n", unit.display()),
-                None => format!(
-                    "{NODE_LABEL}: off (recorded in {})\n",
-                    off_path(state_dir).display()
+                Removal::Removed(unit) => {
+                    format!("{NODE_LABEL}: stopped and removed ({})\n", unit.display())
+                }
+                Removal::Nothing => format!("{NODE_LABEL}: off (recorded in {})\n", off.display()),
+                Removal::Kept { unit, why } => format!(
+                    "{NODE_LABEL}: off (recorded in {}); {} was left alone, and no job was \
+                     stopped: {why}\n",
+                    off.display(),
+                    unit.display()
                 ),
             })
         }

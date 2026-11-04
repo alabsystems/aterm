@@ -124,13 +124,6 @@ fn read(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
 }
 
-fn sock_dir(tag: &str) -> aterm_tempfile::TempDir {
-    aterm_tempfile::Builder::new()
-        .prefix(&format!("atl-{tag}-"))
-        .tempdir_in("/tmp")
-        .expect("the broker's socket dir")
-}
-
 fn fault(to: &str, also: &str) -> String {
     format!("sync escalate=/f/{FLEET}/in/*/{to}/*/note {also}")
 }
@@ -157,7 +150,7 @@ fn post(w: &World, from: &str, to: &str, text: &str) {
 #[test]
 fn a_poisoned_log_exits_75_and_the_restarted_broker_lands_the_post_once() {
     let tag = "poison";
-    let dir = sock_dir(tag);
+    let dir = harness::sock_dir(tag);
     let sock = dir.path().join("b.sock").to_string_lossy().into_owned();
     let w = World::boot_at(tag, &[], &[], Some(&sock));
     let (a, b) = w.two_sessions();
@@ -245,7 +238,7 @@ fn a_poisoned_log_exits_75_and_the_restarted_broker_lands_the_post_once() {
 #[test]
 fn with_the_exit_switched_off_posts_stay_refused_and_the_link_reads_poisoned() {
     let tag = "poistay";
-    let dir = sock_dir(tag);
+    let dir = harness::sock_dir(tag);
     let sock = dir.path().join("b.sock").to_string_lossy().into_owned();
     let w = World::boot_at(tag, &[], &[], Some(&sock));
     let (a, b) = w.two_sessions();
@@ -304,7 +297,7 @@ fn replies_to(w: &World, sid: &str, off: u64, kind: &str) -> Vec<String> {
 #[test]
 fn a_reply_and_a_verdict_made_while_the_poisoned_broker_is_down_land_after_its_restart() {
     let tag = "poisrep";
-    let dir = sock_dir(tag);
+    let dir = harness::sock_dir(tag);
     let sock = dir.path().join("b.sock").to_string_lossy().into_owned();
     let w = World::boot_at(tag, &[], &[], Some(&sock));
     let (a, b) = w.two_sessions();

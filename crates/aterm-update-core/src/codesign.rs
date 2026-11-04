@@ -421,9 +421,8 @@ mod tests {
     #[test]
     fn an_unreadable_file_is_not_a_verdict_and_an_unsigned_one_is() {
         use std::os::unix::fs::PermissionsExt as _;
-        let dir = std::env::temp_dir().join(format!("codesign-verdict-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("thin");
+        let dir = crate::test_scratch_dir("codesign-verdict");
+        let file = dir.path().join("thin");
         let mut thin = 0xCFFA_EDFEu32.to_be_bytes().to_vec();
         thin.extend_from_slice(&[0u8; 60]);
         std::fs::write(&file, &thin).unwrap();
@@ -443,7 +442,6 @@ mod tests {
             assert!(unreadable.judged_nothing_at(&file), "{unreadable}");
         }
         assert!(!unsigned.judged_nothing_at(&file), "{unsigned}");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A small file keeps 30 s, a 238 MB binary gets 143 s, nothing more than the cap.

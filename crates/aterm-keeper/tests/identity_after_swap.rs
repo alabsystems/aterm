@@ -79,6 +79,7 @@ impl Scratch {
     fn new(prefix: &str) -> Self {
         let dir = aterm_tempfile::Builder::new()
             .prefix(&format!("{prefix}-"))
+            .suffix(".noindex")
             .tempdir_in("/private/tmp")
             .expect("scratch")
             .keep();

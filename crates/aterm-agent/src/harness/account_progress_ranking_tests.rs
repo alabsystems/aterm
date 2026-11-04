@@ -166,6 +166,7 @@ fn project(case: i64, raw_ranking: bool) -> [(&'static str, i64); 7] {
     enrich_inventory(
         &mut progress,
         &roster,
+        &roster,
         &state,
         &logins,
         &enrolled,

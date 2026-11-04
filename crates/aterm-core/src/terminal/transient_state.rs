@@ -114,7 +114,10 @@ pub(super) struct TransientState {
     pub(super) process_wall_ms: Option<u64>,
     /// SGR attribute stack for XTPUSHSGR/XTPOPSGR.
     pub(super) sgr_stack: VecDeque<SgrStackEntry>,
-    /// Per-frame pipeline timing for keystroke-to-pixel decomposition.
+    /// Per-frame pipeline timing for keystroke-to-pixel decomposition. A reset starts its timings
+    /// over and keeps its batch count and profiling switch, which are the host's: a renderer
+    /// compares the count with a snapshot's, and a count restarted at 1 could match one taken
+    /// before the reset.
     pub(super) pipeline_timestamps: PipelineTimestamps,
     /// Whether the last combining character added was a ZWJ (U+200D); gates the grid lookup in `should_combine_with_previous_zwj`.
     pub(super) last_combining_was_zwj: bool,
@@ -314,7 +317,11 @@ impl TransientState {
         self.app_sync_closed = None;
         self.app_sync_open_mark = None;
         self.sgr_stack.clear();
-        self.pipeline_timestamps = PipelineTimestamps::default();
+        self.pipeline_timestamps = PipelineTimestamps {
+            process_sequence: self.pipeline_timestamps.process_sequence,
+            profiling_enabled: self.pipeline_timestamps.profiling_enabled,
+            ..PipelineTimestamps::default()
+        };
         self.last_combining_was_zwj = false;
         self.has_transient_extras = false;
         self.pending_parser_reset = false;

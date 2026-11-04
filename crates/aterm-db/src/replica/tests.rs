@@ -343,6 +343,196 @@ fn unreadable_membership_recovery_preserves_control_but_never_reports_applicatio
     assert!(Bootstrap::cached(&p.lab.paths[1]).is_err());
 }
 
+/// Membership records left for a later session hold up no table repair over `atdb/5`: each side's
+/// store is full (a held total of two) and holds a record the other lacks, so each refuses the
+/// other's, both stop the membership rounds after the same round with the records deferred, and
+/// the session goes on to repair the table, which converges.
+///
+/// NEGATIVE CONTROL (in the test): the mutant that ends the session on deferred records
+/// ([`crate::control::mutants::Mutant::DeferredEndsSession`], as the session did before this fix)
+/// leaves the table unrepaired.
+#[test]
+fn deferred_membership_records_hold_up_no_table_repair() {
+    use crate::control::mutants::{self, Mutant};
+    use aterm_secrets::{
+        client::{load_records, save_records, test_found},
+        membership_log::{Body, Entrant, Log, RecordBudgets, encode_records},
+    };
+    const FULL: RecordBudgets = RecordBudgets {
+        held: 2,
+        ..RecordBudgets::PRODUCTION
+    };
+    for mutant in [false, true] {
+        let p = Pair::new(false, 1);
+        let founders: Vec<_> = (0..2)
+            .map(|n| Entrant {
+                request: p.lab.bootstrap(n).request().unwrap(),
+                node_key: [u8::try_from(n).unwrap() + 1; 32],
+                name: format!("full-{n}"),
+                label: format!("m{}", n + 1),
+            })
+            .collect();
+        let genesis = test_found(&p.lab.paths[0], founders, 1_000).unwrap();
+        for n in 0..2 {
+            let bootstrap = p.lab.bootstrap(n);
+            let request = bootstrap.request().unwrap();
+            let name = bootstrap.device().with_seed(|seed| {
+                Log::new(genesis.clone())
+                    .unwrap()
+                    .draft(
+                        &request.binding().actor(),
+                        1_001,
+                        Body::Name {
+                            name: format!("only-{n}"),
+                        },
+                    )
+                    .sign(seed, *request.binding().incarnation())
+                    .unwrap()
+            });
+            save_records(&p.lab.paths[n], &encode_records([&genesis, &name])).unwrap();
+        }
+        let endpoints = FULL.within(|| [p.endpoint(0, true), p.endpoint(1, true)]);
+        let session = |endpoint: &Endpoint, connection, side, repair: &mut PeerRepair| {
+            FULL.within(|| {
+                let run = || endpoint.exchange(connection, side, repair);
+                if mutant {
+                    mutants::with(Mutant::DeferredEndsSession, run)
+                } else {
+                    run()
+                }
+            })
+        };
+        let (mut ra, mut rb) = (PeerRepair::default(), PeerRepair::default());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        thread::scope(|threads| {
+            let server = threads.spawn(|| {
+                let connection =
+                    Connection::admit(listener.accept().unwrap().0, LinkScope::Loopback).unwrap();
+                session(&endpoints[1], connection, Side::Responder, &mut rb)
+            });
+            let connection =
+                Connection::connect(address, LinkScope::Loopback, Duration::from_secs(60)).unwrap();
+            session(&endpoints[0], connection, Side::Initiator, &mut ra).unwrap();
+            server.join().unwrap().unwrap();
+        });
+        for repair in [&ra, &rb] {
+            assert!(
+                repair
+                    .membership()
+                    .is_some_and(|report| report.deferred > 0)
+            );
+            assert_eq!(repair.application().is_some(), !mutant, "mutant {mutant}");
+        }
+        assert_eq!(p.count(1), usize::from(!mutant), "mutant {mutant}");
+        FULL.within(|| {
+            for paths in &p.lab.paths {
+                assert_eq!(load_records(paths).unwrap().len(), 2);
+            }
+        });
+    }
+}
+
+/// A Mac whose records are not crossed completes table sync with a legacy peer, a build that
+/// offers `atdb/3` alone, both holding a log of 4,071 records, near the legacy count: the hello's
+/// witness, each inventory and the legacy witness decode stay within
+/// [`aterm_secrets::membership_log::LEGACY_RECORDS`], and the table converges.
+///
+/// NEGATIVE CONTROL (in the test): the same pair with this Mac's records crossed refuses the legacy
+/// peer before any membership frame, and the table stays unrepaired, so the session above ran the
+/// legacy protocol.
+#[test]
+fn a_mac_not_crossed_completes_table_sync_with_a_legacy_peer_of_4071_records() {
+    use aterm_secrets::{
+        client::{load_records, save_records, test_found},
+        membership_log::{Body, Entrant, Log, encode_records},
+    };
+    const HELD: usize = 4_071;
+    for crossed in [false, true] {
+        let p = Pair::new(false, 1);
+        let founders: Vec<_> = (0..2)
+            .map(|n| Entrant {
+                request: p.lab.bootstrap(n).request().unwrap(),
+                node_key: [u8::try_from(n).unwrap() + 1; 32],
+                name: format!("legacy-{n}"),
+                label: format!("m{}", n + 1),
+            })
+            .collect();
+        let genesis = test_found(&p.lab.paths[0], founders, 1_000).unwrap();
+        let bootstrap = p.lab.bootstrap(0);
+        let request = bootstrap.request().unwrap();
+        let log = bootstrap.device().with_seed(|seed| {
+            let mut log = Log::new(genesis.clone()).unwrap();
+            for n in 1..HELD as u64 {
+                let record = log
+                    .draft(
+                        &request.binding().actor(),
+                        1_000 + n,
+                        Body::Name {
+                            name: format!("host-{n}"),
+                        },
+                    )
+                    .sign(seed, *request.binding().incarnation())
+                    .unwrap();
+                log.insert(record).unwrap();
+            }
+            log
+        });
+        assert_eq!(log.held_count(), HELD);
+        for paths in &p.lab.paths {
+            save_records(paths, &encode_records(log.records())).unwrap();
+        }
+        if crossed {
+            aterm_secrets::fsx::write_atomic(
+                &p.lab.paths[0].records_file().with_extension("crossed"),
+                b"crossed\n",
+                0o600,
+            )
+            .unwrap();
+        }
+        let mut endpoints = [p.endpoint(0, true), p.endpoint(1, true)];
+        endpoints[1].legacy_credentials = true;
+        let (mut ra, mut rb) = (PeerRepair::default(), PeerRepair::default());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (dialed, answered) = thread::scope(|threads| {
+            let server = threads.spawn(|| {
+                endpoints[1].exchange(
+                    Connection::admit(listener.accept().unwrap().0, LinkScope::Loopback).unwrap(),
+                    Side::Responder,
+                    &mut rb,
+                )
+            });
+            let dialed = endpoints[0].exchange(
+                Connection::connect(address, LinkScope::Loopback, Duration::from_secs(60)).unwrap(),
+                Side::Initiator,
+                &mut ra,
+            );
+            (dialed, server.join().unwrap())
+        });
+        if crossed {
+            assert!(dialed.is_err() || answered.is_err());
+            assert!(ra.application().is_none() && rb.application().is_none());
+            assert!(ra.membership().is_none() && rb.membership().is_none());
+            assert_eq!(p.count(1), 0);
+            continue;
+        }
+        assert!(
+            dialed.is_ok() && answered.is_ok(),
+            "{dialed:?} {answered:?}"
+        );
+        for repair in [&ra, &rb] {
+            assert!(repair.membership_error().is_none(), "{repair:?}");
+            assert!(repair.application().is_some());
+            assert!(repair.application_error().is_none());
+        }
+        assert_eq!(p.count(1), 1);
+        for paths in &p.lab.paths {
+            assert_eq!(load_records(paths).unwrap().len(), HELD);
+        }
+    }
+}
+
 #[test]
 fn a_negotiated_control_only_peer_does_not_enter_application_repair() {
     let p = Pair::new(false, 1);

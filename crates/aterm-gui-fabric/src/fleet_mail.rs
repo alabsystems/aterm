@@ -433,7 +433,7 @@ fn sealed_file(
             ));
         }
     };
-    let mut head = Vec::with_capacity(SEALED.len());
+    let mut head = Vec::with_capacity(SEALED.len() + 1);
     file.take(SEALED.len() as u64)
         .read_to_end(&mut head)
         .map_err(|e| format!("a direct mailbox beside the key does not read: {e}"))?;

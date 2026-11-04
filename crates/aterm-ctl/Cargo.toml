@@ -54,8 +54,6 @@ aterm-sysprobe = { workspace = true }
 [dev-dependencies]
 # Scratch directories for the tests' sockets, removed on drop.
 aterm-tempfile = { workspace = true }
-# The tests' scratch-directory stamp.
-aterm-time = { workspace = true }
 
 # tests/terminal_output.rs puts the CLI's stdout or stderr on a real pty.
 [target.'cfg(unix)'.dev-dependencies]

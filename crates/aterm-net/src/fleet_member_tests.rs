@@ -551,6 +551,38 @@ fn a_holder_at_a_background_class_holds_the_books_lock_at_the_default_class() {
     );
 }
 
+/// A taker at a lower class is lifted before it takes the book's lock, so it waits for a held one
+/// at the default class too, read off it from outside while it waits: a lift made only once the
+/// take succeeded left a moment, between the take and the lift, where it held the lock at its own
+/// class, where a thread at background can wait minutes for a core.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_taker_at_a_lower_class_waits_for_the_books_lock_at_the_default_class() {
+    use libc::qos_class_t::{QOS_CLASS_DEFAULT, QOS_CLASS_UTILITY};
+    let state = State::new("liftwait");
+    let held = BookLock::take(state.dir(), Duration::ZERO).unwrap();
+    let (told, heard) = std::sync::mpsc::channel();
+    let dir = state.dir().to_path_buf();
+    let taker = std::thread::spawn(move || {
+        // SAFETY: sets this thread's own class; takes no pointers and mutates no shared state.
+        let rc = unsafe { libc::pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0) };
+        assert_eq!(rc, 0);
+        waiting(HANG, Some(told), || hold_book(&dir).map(drop))
+    });
+    heard
+        .recv_timeout(HANG)
+        .expect("the taker found the lock held");
+    let waited_at = aterm_uds::qos::requested_class_of(&taker).map(|(class, _)| class);
+    drop(held);
+    taker.join().unwrap().unwrap();
+    assert_eq!(
+        waited_at,
+        Some(QOS_CLASS_DEFAULT as libc::c_uint),
+        "a utility-class taker waited for the book's lock at 0x{:x}",
+        waited_at.unwrap_or_default()
+    );
+}
+
 #[test]
 fn a_node_key_is_minted_once_and_read_back_as_itself() {
     let state = State::new("nodekey");

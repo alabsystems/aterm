@@ -390,7 +390,8 @@ fn read_marker(root: impl std::os::fd::AsFd) -> Result<Option<HeldMarker>, ()> {
     {
         return Err(());
     }
-    let mut bytes = Vec::new();
+    let mut bytes =
+        Vec::with_capacity(usize::try_from(metadata.len().saturating_add(1)).unwrap_or(0));
     if std::io::Read::by_ref(&mut file)
         .take(super::MAX_RECORD as u64 + 1)
         .read_to_end(&mut bytes)

@@ -771,7 +771,7 @@ pub fn read_index(path: &Path) -> Result<Option<String>, &'static str> {
     if !metadata.is_file() || metadata.len() != 32 {
         return Err("index-shape");
     }
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(33);
     file.by_ref()
         .take(33)
         .read_to_end(&mut bytes)

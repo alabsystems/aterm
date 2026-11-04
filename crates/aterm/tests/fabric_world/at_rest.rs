@@ -118,11 +118,11 @@ fn a_broker_seals_a_plaintext_log_at_the_start_that_finds_a_key() {
     );
     assert!(!holds_sentinel(&log), "no sentinel in the sealed log");
     assert_eq!(records(&log, harness::REST_KEY), 4, "every record reads");
-    // The start line says what of the log it keeps decoded (D10): aterm sets no residency
-    // budget, so every record it found.
+    // The start line says what of the log it keeps decoded (D10): the two records it found,
+    // the newest of them at least.
     let (resident, retained) = resident_of(&sealing).expect("the start line's residency");
     assert!(
-        retained >= 2 && resident == retained,
+        retained >= 2 && (1..=retained).contains(&resident),
         "{resident} of {retained}: {sealing}"
     );
 }

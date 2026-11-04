@@ -208,8 +208,8 @@ pub enum Verb {
     Harness,
     /// `aterm keeper` — the PTY keeper (`start | stop | status | serve`).
     Keeper,
-    /// `aterm acaffiene` — the macOS menu-bar keep-awake helper.
-    Acaffiene,
+    /// `aterm acaffeine` — the macOS menu-bar keep-awake helper.
+    Acaffeine,
     /// `aterm theme` — list, check, create, export, import, pack and install themes.
     Theme,
     /// `aterm edit` — amacs editor (also the `amacs` argv0 alias).
@@ -249,7 +249,7 @@ impl Verb {
         Verb::Email,
         Verb::Harness,
         Verb::Keeper,
-        Verb::Acaffiene,
+        Verb::Acaffeine,
         Verb::Theme,
         Verb::Edit,
         Verb::NewTab,
@@ -284,7 +284,7 @@ impl Verb {
             Verb::Email => "email",
             Verb::Harness => "harness",
             Verb::Keeper => "keeper",
-            Verb::Acaffiene => "acaffiene",
+            Verb::Acaffeine => "acaffeine",
             Verb::Theme => "theme",
             Verb::Edit => "edit",
             Verb::NewTab => "new-tab",
@@ -323,7 +323,7 @@ impl Verb {
             | Verb::Email
             | Verb::Harness
             | Verb::Keeper
-            | Verb::Acaffiene
+            | Verb::Acaffeine
             | Verb::Theme
             | Verb::Edit => false,
         }
@@ -358,7 +358,7 @@ impl Verb {
             Verb::Email => "aterm email <cmd>",
             Verb::Harness => "aterm harness <cmd>",
             Verb::Keeper => "aterm keeper <cmd>",
-            Verb::Acaffiene => "aterm acaffiene [<cmd>]",
+            Verb::Acaffeine => "aterm acaffeine [<cmd>]",
             Verb::Theme => "aterm theme <cmd>",
             Verb::Edit => "aterm edit [+L[:C]] <file>...",
             Verb::NewTab => "aterm new-tab [-d dir]",
@@ -496,7 +496,7 @@ impl Verb {
                 "a crashed window's shells live on (start | stop |",
                 "status | serve). On by default; macOS only.",
             ],
-            Verb::Acaffiene => &[
+            Verb::Acaffeine => &[
                 "The menu-bar keep-awake mug: a click keeps this",
                 "Mac awake, a right click picks 1, 8 or 24 hours or",
                 "forever (on | off | status | startup …). macOS.",
@@ -530,25 +530,10 @@ impl Verb {
         }
     }
 
-    /// The other words this verb answers to as `argv[1]`, which help does not list: the
-    /// `acaffeine` spelling of aCaffiene. Its old name, `caffeine`, is none: the front door
-    /// answers it before the verb table (`aterm_acaffiene::legacy`).
-    #[must_use]
-    pub const fn operand_aliases(self) -> &'static [&'static str] {
-        if matches!(self, Verb::Acaffiene) {
-            &["acaffeine"]
-        } else {
-            &[]
-        }
-    }
-
-    /// Resolve an `argv[1]` operand to a verb: its name, or one of its
-    /// [`Verb::operand_aliases`].
+    /// Resolve an `argv[1]` operand to a verb by its name. aCaffeine's old name, `caffeine`,
+    /// is none: the front door answers it before the verb table (`aterm_acaffeine::legacy`).
     pub fn from_operand(operand: &str) -> Option<Verb> {
-        Verb::ALL
-            .iter()
-            .copied()
-            .find(|v| v.name() == operand || v.operand_aliases().contains(&operand))
+        Verb::ALL.iter().copied().find(|v| v.name() == operand)
     }
 }
 
@@ -886,12 +871,11 @@ const PRIVACY_CONFIG_PARAGRAPH: &str = "\n\
      \x20                         time: the Local Network question; while Full Disk Access reads\n\
      \x20                         off, System Settings at Privacy & Security \u{25b8} Full Disk Access\n\
      \x20                         with aterm's panel beside it (its icon to drag into the list,\n\
-     \x20                         I've switched it on, and Not now); the Developer Tools page;\n\
-     \x20                         and once per Mac and account debugger access (macOS's developer\n\
-     \x20                         mode), behind macOS's own password dialog. Each page comes once\n\
-     \x20                         per approval, never on a build whose grant would not last (ad\n\
-     \x20                         hoc or unsigned); Not now holds until Permissions is set up\n\
-     \x20                         again. aterm presses nothing there: switching it on is yours.\n\
+     \x20                         I've switched it on, and Not now); and the Developer Tools\n\
+     \x20                         page. Each page comes once per approval, never on a build\n\
+     \x20                         whose grant would not last (ad hoc or unsigned); Not now holds\n\
+     \x20                         until Permissions is set up again. aterm presses nothing there:\n\
+     \x20                         switching it on is yours.\n\
      \x20                         Later, a grant aterm verified that reads off again (found at\n\
      \x20                         launch, or when macOS shows its \"access data from other apps\"\n\
      \x20                         dialog for a program of yours) puts one line on aterm's\n\
@@ -1598,7 +1582,7 @@ struct FactReads<'a> {
     /// [`fabric_fact`], given why every program's command line goes unread.
     fabric: &'a (dyn Fn(Option<&str>) -> FabricFact + Sync),
     /// [`awake_fact`].
-    awake: &'a (dyn Fn() -> Option<aterm_acaffiene::held::Held> + Sync),
+    awake: &'a (dyn Fn() -> Option<aterm_acaffeine::held::Held> + Sync),
     /// The `end=` token the leftover view offers a pid ([`offered_token_live`]), asked only of an
     /// unsupervised broker ([`aterm_ctl::census::supervise`]).
     offered: &'a (dyn Fn(u32) -> Option<String> + Sync),
@@ -1855,8 +1839,8 @@ struct MachineFacts {
     /// Unix: this Mac's network place in the words every reporter uses ([`network_fact`]):
     /// whether it is away from the ALab LAN, and the place's summary.
     network: Option<(bool, String)>,
-    /// macOS: whether aCaffiene keeps this Mac awake now ([`awake_fact`]).
-    awake: Option<aterm_acaffiene::held::Held>,
+    /// macOS: whether aCaffeine keeps this Mac awake now ([`awake_fact`]).
+    awake: Option<aterm_acaffeine::held::Held>,
 }
 
 impl MachineFacts {
@@ -1911,16 +1895,16 @@ fn network_rows(facts: &MachineFacts) -> Vec<DoctorRow> {
         .collect()
 }
 
-/// macOS: whether aCaffiene keeps this Mac awake now, as macOS lists its assertion
-/// ([`aterm_acaffiene::held::held`]); `None` elsewhere.
-fn awake_fact() -> Option<aterm_acaffiene::held::Held> {
-    cfg!(target_os = "macos").then(aterm_acaffiene::held::held)
+/// macOS: whether aCaffeine keeps this Mac awake now, as macOS lists its assertion
+/// ([`aterm_acaffeine::held::held`]); `None` elsewhere.
+fn awake_fact() -> Option<aterm_acaffeine::held::Held> {
+    cfg!(target_os = "macos").then(aterm_acaffeine::held::held)
 }
 
 /// The `awake:` row: whether the mug holds the assertion that keeps this Mac from idle sleep,
 /// read from the power manager, not off the saved mode.
 fn awake_rows(facts: &MachineFacts) -> Vec<DoctorRow> {
-    use aterm_acaffiene::held::Held;
+    use aterm_acaffeine::held::Held;
     let because = |why: &Option<String>| {
         why.as_ref()
             .map_or_else(String::new, |why| format!(" ({why})"))
@@ -1932,18 +1916,18 @@ fn awake_rows(facts: &MachineFacts) -> Vec<DoctorRow> {
         Held::NotHere(why) => (Mark::Note, format!("not read: {why}"), true),
         Held::Off => (
             Mark::Note,
-            "aCaffiene is off by your choice; `aterm acaffiene on` keeps this Mac awake".to_owned(),
+            "aCaffeine is off by your choice; `aterm acaffeine on` keeps this Mac awake".to_owned(),
             false,
         ),
         Held::Held { pid } => (
             Mark::Ok,
-            format!("aCaffiene (pid {pid}) holds macOS's idle-sleep assertion"),
+            format!("aCaffeine (pid {pid}) holds macOS's idle-sleep assertion"),
             false,
         ),
         Held::NotHeld { pid, why } => (
             Mark::Warn,
             format!(
-                "aCaffiene (pid {pid}) runs, but macOS lists no idle-sleep assertion of it{}; it \
+                "aCaffeine (pid {pid}) runs, but macOS lists no idle-sleep assertion of it{}; it \
                  asks again every minute",
                 because(why)
             ),
@@ -1952,7 +1936,7 @@ fn awake_rows(facts: &MachineFacts) -> Vec<DoctorRow> {
         Held::Stopped { why } => (
             Mark::Warn,
             format!(
-                "no aCaffiene mug runs, so this Mac may idle-sleep{}; `aterm acaffiene start` \
+                "no aCaffeine mug runs, so this Mac may idle-sleep{}; `aterm acaffeine start` \
                  starts it",
                 because(why)
             ),
@@ -1961,7 +1945,7 @@ fn awake_rows(facts: &MachineFacts) -> Vec<DoctorRow> {
         Held::Unread { pid, why } => (
             Mark::Note,
             format!(
-                "aCaffiene (pid {pid}) runs; whether macOS holds its assertion is unread: {why}"
+                "aCaffeine (pid {pid}) runs; whether macOS holds its assertion is unread: {why}"
             ),
             true,
         ),
@@ -4988,31 +4972,6 @@ mod tests {
         assert_eq!(Verb::from_operand(""), None);
     }
 
-    /// `acaffeine` is aCaffiene's (not a window, nor a store tool of that name), no verb's name
-    /// and not advertised in help. `caffeine`, its old name, is no verb: the front door answers
-    /// it before the verb table.
-    #[test]
-    fn the_misspelt_name_reaches_acaffiene() {
-        let help = help_text();
-        let alias = "acaffeine";
-        assert_eq!(Verb::from_operand(alias), Some(Verb::Acaffiene));
-        assert!(!is_tool_candidate(Some(alias)));
-        assert!(!Verb::ALL.iter().any(|v| v.name() == alias));
-        assert!(
-            !help
-                .lines()
-                .any(|line| line.trim_start().starts_with(&format!("aterm {alias}"))),
-            "{alias} is advertised"
-        );
-        for verb in Verb::ALL {
-            for alias in verb.operand_aliases() {
-                assert_eq!(Verb::from_operand(alias), Some(*verb), "{alias}");
-            }
-        }
-        assert_eq!(Verb::from_operand("caffein"), None);
-        assert_eq!(Verb::from_operand("caffeine"), None);
-    }
-
     #[test]
     fn path_injection_prepends_once_and_is_idempotent() {
         let sep = if cfg!(windows) { ';' } else { ':' };
@@ -7028,7 +6987,7 @@ mod tests {
     /// row.
     #[test]
     fn the_awake_row_reads_the_assertion() {
-        use aterm_acaffiene::held::Held;
+        use aterm_acaffeine::held::Held;
         let row = |held: Held| {
             let facts = MachineFacts {
                 awake: Some(held),

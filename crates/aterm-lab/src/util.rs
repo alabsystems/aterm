@@ -428,9 +428,14 @@ fn open_regular_with_meta(
     Ok((file, meta))
 }
 
+/// Opens a regular file at `path` with `O_NONBLOCK | O_CLOEXEC` and returns its metadata.
+pub fn open_regular_file_with_meta(path: &Path) -> io::Result<(std::fs::File, std::fs::Metadata)> {
+    open_regular_with_meta(path, 0)
+}
+
 /// Opens a regular file at `path` with `O_NONBLOCK | O_CLOEXEC`.
 pub fn open_regular_file(path: &Path) -> io::Result<std::fs::File> {
-    open_regular_with_meta(path, 0).map(|(file, _)| file)
+    open_regular_file_with_meta(path).map(|(file, _)| file)
 }
 
 fn read_regular_with_meta(

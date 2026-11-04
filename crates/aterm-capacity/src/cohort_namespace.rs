@@ -564,7 +564,7 @@ pub(crate) fn create(parent: &File, name: &str) -> io::Result<File> {
 }
 
 fn read(parent: &File, name: &str) -> io::Result<String> {
-    let mut text = String::new();
+    let mut text = String::with_capacity(256);
     regular(parent, name)?
         .take(MAX + 1)
         .read_to_string(&mut text)?;

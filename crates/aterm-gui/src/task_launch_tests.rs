@@ -2215,7 +2215,7 @@ fn a_spawn_refused_for_a_walled_default_on_a_program_that_ignores_codex_auth_pat
 #[test]
 fn a_pin_on_a_row_of_its_own_on_a_program_that_ignores_codex_auth_path_reads_the_default_first() {
     use aterm_agent::harness::accounts::Cli;
-    use aterm_agent::harness::codex_alab::{DefaultRow, UNPIN_FIX, unread_fix};
+    use aterm_agent::harness::codex_alab::{DefaultRow, unpin_fix, unread_fix};
     use aterm_agent::harness::usage::rfc3339_utc;
     let pool = CodexPool::new();
     let old = aterm_agent::harness::codex_alab::lay_package(&pool.root.join("store/old"), false);
@@ -2234,7 +2234,7 @@ fn a_pin_on_a_row_of_its_own_on_a_program_that_ignores_codex_auth_path_reads_the
         refused.contains(&pin) && refused.contains(&rfc3339_utc(until)),
         "the pin of `main`, for once the wall ends: {refused}"
     );
-    assert!(refused.contains(UNPIN_FIX), "the pin's end: {refused}");
+    assert!(refused.contains(&unpin_fix()), "the pin's end: {refused}");
 }
 
 /// CONTROL: A PROGRAM THAT KEEPS `CODEX_AUTH_PATH`'S LOGIN ITS OWN still rotates past the walled

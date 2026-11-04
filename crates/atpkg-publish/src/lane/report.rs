@@ -152,7 +152,8 @@ fn trim_log(path: &Path) {
     if file.seek(SeekFrom::Start(offset)).is_err() {
         return;
     }
-    let mut bytes = Vec::new();
+    let want = (meta.len() - offset).min(window);
+    let mut bytes = Vec::with_capacity(usize::try_from(want.saturating_add(1)).unwrap_or(0));
     if file.take(window).read_to_end(&mut bytes).is_err() {
         return;
     }

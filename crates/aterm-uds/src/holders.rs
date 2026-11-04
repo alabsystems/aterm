@@ -191,6 +191,34 @@ pub fn scan_file_holders(_path: &std::path::Path, _skip: &[u32]) -> io::Result<H
 /// leaves ownership unknown.
 #[cfg(target_vendor = "apple")]
 pub fn scan_listener_holders(path: &std::path::Path, skip: &[u32]) -> io::Result<HolderScan> {
+    listener_scan(path, skip, SCAN_DEADLINE)
+}
+
+/// [`scan_listener_holders`] whose connection to `path` is waited for at most `hang` in place of
+/// [`SCAN_DEADLINE`]: an integration test whose own broker serves `path` passes the one-minute
+/// hang detector, since a loaded machine can keep the spawn lock's holder and the broker from
+/// running for longer than the scan's 10 s.
+///
+/// # Errors
+/// [`scan_listener_holders`]'s, with the connection's `TimedOut` once `hang` is up.
+#[cfg(all(target_vendor = "apple", any(test, debug_assertions)))]
+#[doc(hidden)]
+pub fn scan_listener_holders_within(
+    path: &std::path::Path,
+    skip: &[u32],
+    hang: std::time::Duration,
+) -> io::Result<HolderScan> {
+    listener_scan(path, skip, hang)
+}
+
+/// [`scan_listener_holders`], its connection to `path` waited for at most `hang`
+/// ([`serving_pid`]).
+#[cfg(target_vendor = "apple")]
+fn listener_scan(
+    path: &std::path::Path,
+    skip: &[u32],
+    hang: std::time::Duration,
+) -> io::Result<HolderScan> {
     use std::os::unix::fs::MetadataExt as _;
     listener_target_inode(
         std::fs::symlink_metadata(path).map(|m| (m.ino(), m.file_type().is_symlink())),
@@ -208,7 +236,7 @@ pub fn scan_listener_holders(path: &std::path::Path, skip: &[u32]) -> io::Result
         aterm_sysprobe::jobs::darwin::unix_listeners(&table).as_deref(),
         own,
         &SocketPath::of(path),
-        || serving_pid(path, SCAN_DEADLINE),
+        || serving_pid(path, hang),
         &uid_pids()?,
         skip,
     )

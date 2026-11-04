@@ -425,7 +425,17 @@ fn bodies_under(w: &World, filter: &str) -> Vec<String> {
 
 /// **A BRIDGE THROUGH AN UPDATE'S ORDERING: the predecessor's aterm goes while
 /// its bridge is mid-drain, and the successor's starts at once on the same
-/// state dir.**
+/// state dir.** Two posts wait for the broker; the drain sends the first and,
+/// before the second's send, reads the first's answer (the new lane's
+/// subject-budget read), and parks at that post's retirement. So one post is
+/// sent and one is not when aterm goes. The successor's bridge stands by while
+/// the orphan holds the state dir, and still does at the release; released, the
+/// orphan meets its aterm gone at the first post's `outbox sent` and must send
+/// nothing more (the drain's send looks again after that answer,
+/// `Bridge::unsendable`, and the unsent post keeps no in-flight entry for the
+/// successor's attach to replay, `Bridge::fate_unknown`) and exit, and the
+/// successor carries the node one incarnation on. The lane is read before the
+/// release, so a post on it after was the orphan's or the successor's.
 #[test]
 fn an_orphaned_bridge_mid_drain_neither_publishes_more_nor_shares_the_node() {
     #[derive(Debug, PartialEq, Eq)]
@@ -485,6 +495,40 @@ fn an_orphaned_bridge_mid_drain_neither_publishes_more_nor_shares_the_node() {
         harness::alive(orphan),
         "the orphan exited before the successor's bridge started: no overlap was run"
     );
+    let lane_face = format!("/f/{FLEET}/in/{}/{b}/>", w.node);
+    let count = |lane: &[String], text: &str| {
+        lane.iter()
+            .filter(|body| body.contains(&format!("text={text}")))
+            .count()
+    };
+    let at_release = bodies_under(&w, &lane_face);
+    assert_eq!(count(&at_release, "orphanfirst"), 1, "{at_release:#?}");
+    assert_eq!(
+        count(&at_release, "orphansecond"),
+        0,
+        "the drain sent both posts before the park: none is left unsent at the release, so \
+         this test cannot see an orphan that goes on draining: {at_release:#?}"
+    );
+    // Still standing by at the release, so not beside the orphan at any time in the park: an
+    // attach is not undone (its status reads connected, its pid is the state dir's, its live
+    // row carries the next incarnation), so this look covers the park since the first.
+    let fs = w.verb("fabric status").header().to_string();
+    assert_eq!(
+        (kv(&fs, "state"), kv(&fs, "reason")),
+        (Some("stalled"), Some("state-locked")),
+        "the successor's bridge left its standby while the orphan held the state dir: {fs}"
+    );
+    let holder: Option<i32> = std::fs::read_to_string(w.state.join("pid"))
+        .ok()
+        .and_then(|pid| pid.trim().parse().ok());
+    assert_eq!(holder, Some(orphan), "the state dir's pid at the release");
+    let node_rows = bodies_under(&w, &node_face);
+    assert!(
+        node_rows
+            .iter()
+            .all(|row| kv(row, "inc").and_then(|n| n.parse::<u64>().ok()) <= Some(inc)),
+        "the node carried a later incarnation than the parked orphan's: {node_rows:#?}"
+    );
 
     std::fs::remove_file(w.state.join("park-retire")).expect("release the orphan");
     until("the orphan to exit", || {
@@ -520,16 +564,10 @@ fn an_orphaned_bridge_mid_drain_neither_publishes_more_nor_shares_the_node() {
             .then_some(())
     });
 
-    let lane = bodies_under(&w, &format!("/f/{FLEET}/in/{}/{b}/>", w.node));
-    let count = |text: &str| {
-        lane.iter()
-            .filter(|body| body.contains(&format!("text={text}")))
-            .count()
-    };
-    assert_eq!(count("orphanfirst"), 1, "{lane:#?}");
+    let lane = bodies_under(&w, &lane_face);
     assert_eq!(
-        count("orphansecond"),
-        0,
-        "the orphan published a post after its aterm was gone: {lane:#?}"
+        lane, at_release,
+        "a post was published after the orphan's aterm was gone (by the orphan, or by the \
+         successor for it), or one went twice"
     );
 }

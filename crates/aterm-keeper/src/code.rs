@@ -256,9 +256,8 @@ mod tests {
 
     #[test]
     fn the_sweep_removes_only_copies_whose_keeper_is_gone_and_ran() {
-        let dir = std::env::temp_dir().join(format!("akcopies-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("dir");
+        let scratch = crate::test_scratch_dir("copies");
+        let dir = scratch.path();
         let live = Birth {
             seconds: 100,
             micros: 1,
@@ -280,16 +279,15 @@ mod tests {
         }
         let born = |pid| (pid == 7).then_some(live);
         let now = std::time::SystemTime::now();
-        assert_eq!(sweep_at(&dir, born, now), 3);
+        assert_eq!(sweep_at(dir, born, now), 3);
         for (name, _, kept, _) in names {
             assert_eq!(dir.join(name).exists(), kept, "{name}");
         }
         let later = now + aterm_uds::deadline::FIRST_EXEC_HANG;
-        assert_eq!(sweep_at(&dir, born, later), 1);
+        assert_eq!(sweep_at(dir, born, later), 1);
         for (name, _, _, kept) in names {
             assert_eq!(dir.join(name).exists(), kept, "{name}, later");
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// An ad-hoc-signed bundle (Info.plist and a resource sealed, an argv0 alias as a symbolic
@@ -299,8 +297,8 @@ mod tests {
     #[test]
     fn a_copied_bundle_keeps_its_signature() {
         aterm_uds::deadline::require_trust_service();
-        let dir = std::env::temp_dir().join(format!("akbundle-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let scratch = crate::test_scratch_dir("bundle");
+        let dir = scratch.path();
         let app = dir.join("t.app");
         let macos = app.join("Contents").join("MacOS");
         std::fs::create_dir_all(&macos).expect("bundle");
@@ -342,6 +340,5 @@ mod tests {
         );
         std::fs::write(copy.join("Contents").join("Resources").join("r.txt"), "x").expect("r");
         assert!(!verify(&copy).status.success(), "a changed copy verifies");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

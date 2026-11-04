@@ -74,13 +74,13 @@ impl Account {
 
     fn sweep_within(&self, hang: Duration) -> (bool, String, String) {
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let ok = self_uninstall_with_acaffiene(
+        let ok = self_uninstall_with_acaffeine(
             &self.places,
             None,
             false,
             &mut out,
             &mut err,
-            sweep_acaffiene,
+            sweep_acaffeine,
             hang,
         );
         (
@@ -1241,8 +1241,8 @@ fn shell_setup_under_an_open_umask_shares_no_directory() {
 }
 
 #[test]
-fn an_uninstall_quits_the_acaffiene_mug_and_removes_its_files() {
-    let a = Account::new("acaffiene");
+fn an_uninstall_quits_the_acaffeine_mug_and_removes_its_files() {
+    let a = Account::new("acaffeine");
     let home = a.home().to_path_buf();
     let log = a.dir.join("asked.log");
     let app = home.join("Applications/aterm.app");
@@ -1263,7 +1263,7 @@ fn an_uninstall_quits_the_acaffiene_mug_and_removes_its_files() {
     );
     std::fs::remove_file(&log).expect("the ask's line");
 
-    let a = Account::new("acaffiene-left");
+    let a = Account::new("acaffeine-left");
     let home = a.home().to_path_buf();
     let app = home.join("Applications/aterm.app");
     bundle(&app, None);
@@ -1273,48 +1273,48 @@ fn an_uninstall_quits_the_acaffiene_mug_and_removes_its_files() {
         &format!("#!/bin/sh\necho \"$*\" >>'{}'\n", log.display()),
     );
     let support = home.join("Library/Application Support/aterm");
-    write(&support.join("acaffiene.state"), "mode=off\n");
-    write(&support.join("acaffiene.lock"), "");
-    write(&support.join("acaffiene.bridge"), "4242\n");
+    write(&support.join("acaffeine.state"), "mode=off\n");
+    write(&support.join("acaffeine.lock"), "");
+    write(&support.join("acaffeine.bridge"), "4242\n");
     write(
-        &support.join("acaffiene.trouble"),
+        &support.join("acaffeine.trouble"),
         "since=1\nwhy=a full disk\n",
     );
-    write(&support.join("acaffiene/l.plist"), "<plist/>");
+    write(&support.join("acaffeine/l.plist"), "<plist/>");
     write(
-        &support.join("acaffiene-code.noindex/l/1-2/aterm.app/Contents/Info.plist"),
+        &support.join("acaffeine-code.noindex/l/1-2/aterm.app/Contents/Info.plist"),
         "<plist/>",
     );
-    write(&support.join("acaffiene-code.noindex/l/1-2/ran"), "");
+    write(&support.join("acaffeine-code.noindex/l/1-2/ran"), "");
     let (ok, out, err) = a.sweep(None, true);
     assert!(ok, "{out}{err}");
-    for step in ["acaffiene startup off", "acaffiene quit"] {
+    for step in ["acaffeine startup off", "acaffeine quit"] {
         assert!(
             out.contains(&format!("would run {} {step}", aterm.display())),
             "{out}"
         );
     }
     for name in [
-        "acaffiene-code.noindex",
-        "acaffiene",
-        "acaffiene.state",
-        "acaffiene.bridge",
+        "acaffeine-code.noindex",
+        "acaffeine",
+        "acaffeine.state",
+        "acaffeine.bridge",
     ] {
         let path = support.join(name);
         assert!(
-            out.contains(&format!("would remove aCaffiene file: {}", path.display())),
+            out.contains(&format!("would remove aCaffeine file: {}", path.display())),
             "the dry run names what the real one removes: {out}"
         );
     }
     assert!(
         out.contains(&format!(
-            "would leave aCaffiene lock rendezvous: {}",
-            support.join("acaffiene.lock").display()
+            "would leave aCaffeine lock rendezvous: {}",
+            support.join("acaffeine.lock").display()
         )),
         "{out}"
     );
     assert!(
-        support.join("acaffiene.state").exists(),
+        support.join("acaffeine.state").exists(),
         "a dry run keeps it"
     );
     assert!(!log.exists(), "a dry run starts no helper");
@@ -1322,41 +1322,41 @@ fn an_uninstall_quits_the_acaffiene_mug_and_removes_its_files() {
     assert!(ok, "{out}{err}");
     assert_eq!(
         std::fs::read_to_string(&log).expect("asked"),
-        "help acaffiene\nacaffiene startup off\nacaffiene quit\n--version\n"
+        "help acaffeine\nacaffeine startup off\nacaffeine quit\n--version\n"
     );
     for name in [
-        "acaffiene-code.noindex",
-        "acaffiene",
-        "acaffiene.state",
-        "acaffiene.bridge",
-        "acaffiene.trouble",
+        "acaffeine-code.noindex",
+        "acaffeine",
+        "acaffeine.state",
+        "acaffeine.bridge",
+        "acaffeine.trouble",
     ] {
         assert!(!present(&support.join(name)), "{name}: {out}");
     }
     assert!(
-        support.join("acaffiene.lock").is_file(),
+        support.join("acaffeine.lock").is_file(),
         "the rendezvous stays"
     );
     assert!(!app.exists(), "the bundle went after its aterm was asked");
     let (ok, out, err) = a.sweep(None, false);
     assert!(ok, "{out}{err}");
-    assert!(out.contains("left aCaffiene lock rendezvous"), "{out}");
-    assert!(support.join("acaffiene.lock").is_file());
-    let lock = support.join("acaffiene.lock");
+    assert!(out.contains("left aCaffeine lock rendezvous"), "{out}");
+    assert!(support.join("acaffeine.lock").is_file());
+    let lock = support.join("acaffeine.lock");
     let held =
         crate::lock::Flock::try_lock(std::fs::File::open(&lock).expect("open")).expect("hold");
     let (ok, out, err) = a.sweep(None, false);
     assert!(!ok, "a held lock is a running mug: {out}{err}");
-    assert!(err.contains("aCaffiene lock is busy"), "{err}");
+    assert!(err.contains("aCaffeine lock is busy"), "{err}");
     drop(held);
-    let plist = home.join("Library/LaunchAgents/com.aterm.aterm.acaffiene.plist");
+    let plist = home.join("Library/LaunchAgents/com.aterm.aterm.acaffeine.plist");
     write(&plist, "<plist/>");
     let (ok, out, err) = a.sweep(None, false);
     assert!(!ok, "a login plist starts a mug: {out}{err}");
-    assert!(err.contains("aCaffiene stop was not confirmed"), "{err}");
+    assert!(err.contains("aCaffeine stop was not confirmed"), "{err}");
     assert!(plist.is_file() && lock.is_file());
 
-    let a = Account::new("acaffiene-quit-acts");
+    let a = Account::new("acaffeine-quit-acts");
     let home = a.home().to_path_buf();
     let support = home.join("Library/Application Support/aterm");
     let app = home.join("Applications/aterm.app");
@@ -1364,24 +1364,24 @@ fn an_uninstall_quits_the_acaffiene_mug_and_removes_its_files() {
     exe(
         &app.join("Contents/MacOS/aterm"),
         &format!(
-            "#!/bin/sh\n[ \"$*\" = 'acaffiene quit' ] || exit 0\nrm -rf '{code}'\n\
+            "#!/bin/sh\n[ \"$*\" = 'acaffeine quit' ] || exit 0\nrm -rf '{code}'\n\
              echo mode=off >'{state}'\n",
-            code = support.join("acaffiene-code.noindex").display(),
-            state = support.join("acaffiene.state").display()
+            code = support.join("acaffeine-code.noindex").display(),
+            state = support.join("acaffeine.state").display()
         ),
     );
     write(
-        &support.join("acaffiene-code.noindex/l/aterm.app/Contents/Info.plist"),
+        &support.join("acaffeine-code.noindex/l/aterm.app/Contents/Info.plist"),
         "<plist/>",
     );
-    write(&support.join("acaffiene/l.plist"), "<plist/>");
+    write(&support.join("acaffeine/l.plist"), "<plist/>");
     let (ok, out, err) = a.sweep(None, false);
     assert!(ok, "{out}{err}");
-    for name in ["acaffiene-code.noindex", "acaffiene", "acaffiene.state"] {
+    for name in ["acaffeine-code.noindex", "acaffeine", "acaffeine.state"] {
         assert!(!present(&support.join(name)), "{name}: {out}");
     }
     assert!(
-        support.join("acaffiene.lock").is_file(),
+        support.join("acaffeine.lock").is_file(),
         "the rendezvous made for the cleanup stays: {out}"
     );
 
@@ -1391,8 +1391,8 @@ fn an_uninstall_quits_the_acaffiene_mug_and_removes_its_files() {
         let app = a.home().join("Applications/aterm.app");
         bundle(&app, None);
         let refuse = match kind {
-            "quit-fails" | "lock-only-quit-fails" => "acaffiene quit",
-            "unsupported" => "help acaffiene",
+            "quit-fails" | "lock-only-quit-fails" => "acaffeine quit",
+            "unsupported" => "help acaffeine",
             _ => "never",
         };
         exe(
@@ -1401,10 +1401,10 @@ fn an_uninstall_quits_the_acaffiene_mug_and_removes_its_files() {
         );
         let lock_only = kind == "lock-only-quit-fails";
         if !lock_only {
-            write(&support.join("acaffiene.state"), "mode=off\n");
-            write(&support.join("acaffiene-code.noindex/keep"), "copy bytes");
+            write(&support.join("acaffeine.state"), "mode=off\n");
+            write(&support.join("acaffeine-code.noindex/keep"), "copy bytes");
         }
-        let lock = support.join("acaffiene.lock");
+        let lock = support.join("acaffeine.lock");
         write(&lock, "");
         let held = (kind == "busy" || lock_only).then(|| {
             crate::lock::Flock::try_lock(std::fs::File::open(&lock).expect("open")).expect("hold")
@@ -1418,11 +1418,11 @@ fn an_uninstall_quits_the_acaffiene_mug_and_removes_its_files() {
         assert_eq!(tree(&support), before, "{kind}");
         if !lock_only {
             assert_eq!(
-                std::fs::read_to_string(support.join("acaffiene.state")).expect("state"),
+                std::fs::read_to_string(support.join("acaffeine.state")).expect("state"),
                 "mode=off\n"
             );
             assert_eq!(
-                std::fs::read_to_string(support.join("acaffiene-code.noindex/keep")).expect("copy"),
+                std::fs::read_to_string(support.join("acaffeine-code.noindex/keep")).expect("copy"),
                 "copy bytes"
             );
         }
@@ -1434,28 +1434,28 @@ fn an_uninstall_quits_the_acaffiene_mug_and_removes_its_files() {
         drop(held);
     }
 
-    let a = Account::new("acaffiene-mediated-help-refused");
+    let a = Account::new("acaffeine-mediated-help-refused");
     let app = a.home().join("Applications/aterm.app");
     bundle(&app, None);
     let aterm = app.join("Contents/MacOS/aterm");
     exe(&aterm, "#!/bin/sh\nexit 99\n");
     let image = std::fs::read(&aterm).expect("the helper");
     let support = a.home().join("Library/Application Support/aterm");
-    let state = support.join("acaffiene.state");
+    let state = support.join("acaffeine.state");
     write(&state, "mode=on\n");
     let preflight = as_account_argv(501, Path::new(TRUE), &[]);
-    let help = as_account_argv(501, &aterm, &["help", "acaffiene"]);
+    let help = as_account_argv(501, &aterm, &["help", "acaffeine"]);
     let mut calls = Vec::new();
     let mut failed = Vec::new();
     let (mut out, mut err) = (Vec::new(), Vec::new());
-    let ok = self_uninstall_with_acaffiene(
+    let ok = self_uninstall_with_acaffeine(
         &a.places,
         None,
         false,
         &mut out,
         &mut err,
         |s, p, dirs| {
-            failed = sweep_acaffiene_with(
+            failed = sweep_acaffeine_with(
                 s,
                 p,
                 dirs,
@@ -1488,11 +1488,11 @@ fn an_uninstall_quits_the_acaffiene_mug_and_removes_its_files() {
     assert_eq!(std::fs::read_to_string(state).expect("state"), "mode=on\n");
 }
 
-/// An uninstall removes acaffiene.state's temporaries whose writer is gone and that are over
+/// An uninstall removes acaffeine.state's temporaries whose writer is gone and that are over
 /// an hour old, first and whatever else it does, and nothing a writer may still rename.
 #[test]
 fn an_uninstall_removes_saves_cut_short_and_nothing_a_writer_may_rename() {
-    let a = Account::new("acaffiene-cut-short");
+    let a = Account::new("acaffeine-cut-short");
     let support = a.home().join("Library/Application Support/aterm");
     let ago = std::time::SystemTime::now() - Duration::from_secs(2 * 60 * 60);
     let date = |file: &Path| {
@@ -1503,35 +1503,35 @@ fn an_uninstall_removes_saves_cut_short_and_nothing_a_writer_may_rename() {
             .set_modified(ago)
             .expect("date");
     };
-    let cut_short = support.join(".acaffiene.state.tmp.4294967295.0123abcd");
+    let cut_short = support.join(".acaffeine.state.tmp.4294967295.0123abcd");
     write(&cut_short, "mode=forever\n");
     date(&cut_short);
-    let young = support.join(".acaffiene.state.tmp.4294967295.89abcdef");
+    let young = support.join(".acaffeine.state.tmp.4294967295.89abcdef");
     write(&young, "");
     let saving = support.join(format!(
-        ".acaffiene.state.tmp.{}.0123abcd",
+        ".acaffeine.state.tmp.{}.0123abcd",
         std::process::id()
     ));
     write(&saving, "");
     date(&saving);
-    let bridged = support.join(".acaffiene.bridge.tmp.4294967295.0123abcd");
-    let troubled = support.join(".acaffiene.trouble.tmp.4294967295.0123abcd");
+    let bridged = support.join(".acaffeine.bridge.tmp.4294967295.0123abcd");
+    let troubled = support.join(".acaffeine.trouble.tmp.4294967295.0123abcd");
     let old = [
         support.join(".caffeine.state.tmp.4294967295.0123abcd"),
         support.join(".caffeine.bridge.tmp.4294967295.0123abcd"),
     ];
     let agents = a.home().join("Library/LaunchAgents");
     let items = [
-        agents.join(".com.aterm.aterm.acaffiene.plist.tmp.4294967295.0123abcd"),
-        agents.join(".com.aterm.aterm.acaffiene.plist.tmp.4294967295.fedcba98"),
-        agents.join(".com.aterm.aterm.acaffiene.dev.0123abcd.plist.tmp.4294967295.0123abcd"),
+        agents.join(".com.aterm.aterm.acaffeine.plist.tmp.4294967295.0123abcd"),
+        agents.join(".com.aterm.aterm.acaffeine.plist.tmp.4294967295.fedcba98"),
+        agents.join(".com.aterm.aterm.acaffeine.dev.0123abcd.plist.tmp.4294967295.0123abcd"),
         agents.join(".com.aterm.aterm.caffeine.dev.0123abcd.plist.tmp.4294967295.0123abcd"),
     ];
     let others = [
         agents.join(".com.example.other.plist.tmp.4294967295.0123abcd"),
-        agents.join(".com.aterm.aterm.acaffiene.dev.4567CDEF.plist.tmp.4294967295.0123abcd"),
+        agents.join(".com.aterm.aterm.acaffeine.dev.4567CDEF.plist.tmp.4294967295.0123abcd"),
         agents.join(format!(
-            ".com.aterm.aterm.acaffiene.plist.tmp.{}.0123abcd",
+            ".com.aterm.aterm.acaffeine.plist.tmp.{}.0123abcd",
             std::process::id()
         )),
     ];
@@ -1544,19 +1544,19 @@ fn an_uninstall_removes_saves_cut_short_and_nothing_a_writer_may_rename() {
         write(temp, "");
         date(temp);
     }
-    let young_item = agents.join(".com.aterm.aterm.acaffiene.plist.tmp.4294967295.89abcdef");
+    let young_item = agents.join(".com.aterm.aterm.acaffeine.plist.tmp.4294967295.89abcdef");
     write(&young_item, "");
     let (ok, out, err) = a.sweep(None, true);
     assert!(ok, "{out}{err}");
     for (temp, what) in [
-        (&cut_short, "aCaffiene save"),
-        (&bridged, "aCaffiene save"),
-        (&troubled, "aCaffiene save"),
+        (&cut_short, "aCaffeine save"),
+        (&bridged, "aCaffeine save"),
+        (&troubled, "aCaffeine save"),
         (&old[0], "old Caffeine save"),
         (&old[1], "old Caffeine save"),
-        (&items[0], "aCaffiene login item"),
-        (&items[1], "aCaffiene login item"),
-        (&items[2], "aCaffiene login item"),
+        (&items[0], "aCaffeine login item"),
+        (&items[1], "aCaffeine login item"),
+        (&items[2], "aCaffeine login item"),
         (&items[3], "old Caffeine login item"),
     ] {
         let line = format!("would remove {what} cut short: {}", temp.display());
@@ -1581,37 +1581,37 @@ fn an_uninstall_removes_saves_cut_short_and_nothing_a_writer_may_rename() {
     assert!(young_item.is_file(), "written within the hour");
     assert!(young.is_file(), "written within the hour");
     assert!(saving.is_file(), "a live writer's is its own to rename");
-    for lock in ["acaffiene.lock", "caffeine.lock"] {
+    for lock in ["acaffeine.lock", "caffeine.lock"] {
         assert!(
             !support.join(lock).exists(),
-            "with no other aCaffiene file there, no hold was taken: {out}"
+            "with no other aCaffeine file there, no hold was taken: {out}"
         );
     }
 
-    let a = Account::new("acaffiene-cut-short-held");
+    let a = Account::new("acaffeine-cut-short-held");
     let app = a.home().join("Applications/aterm.app");
     bundle(&app, None);
     exe(&app.join("Contents/MacOS/aterm"), "#!/bin/sh\nexit 0\n");
     let support = a.home().join("Library/Application Support/aterm");
-    let lock = support.join("acaffiene.lock");
+    let lock = support.join("acaffeine.lock");
     write(&lock, "");
-    write(&support.join("acaffiene.state"), "mode=off\n");
-    let cut_short = support.join(".acaffiene.state.tmp.4294967295.0123abcd");
+    write(&support.join("acaffeine.state"), "mode=off\n");
+    let cut_short = support.join(".acaffeine.state.tmp.4294967295.0123abcd");
     write(&cut_short, "");
     date(&cut_short);
     let held =
         crate::lock::Flock::try_lock(std::fs::File::open(&lock).expect("open")).expect("hold");
     let (ok, out, err) = a.sweep(None, false);
     assert!(!ok, "a held lock keeps the mug's files: {out}{err}");
-    assert!(err.contains("aCaffiene lock is busy"), "{err}");
-    assert!(support.join("acaffiene.state").is_file());
+    assert!(err.contains("aCaffeine lock is busy"), "{err}");
+    assert!(support.join("acaffeine.state").is_file());
     assert!(
         !cut_short.exists(),
         "its writer is gone, mug or no mug: {out}"
     );
     drop(held);
 
-    let a = Account::new("acaffiene-cut-short-unlistable");
+    let a = Account::new("acaffeine-cut-short-unlistable");
     let support = a.home().join("Library/Application Support/aterm");
     let cut_short = support.join(".caffeine.bridge.tmp.4294967295.0123abcd");
     write(&cut_short, "");
@@ -1621,14 +1621,14 @@ fn an_uninstall_removes_saves_cut_short_and_nothing_a_writer_may_rename() {
     };
     let item = a
         .home()
-        .join("Library/LaunchAgents/.com.aterm.aterm.acaffiene.plist.tmp.4294967295.0123abcd");
+        .join("Library/LaunchAgents/.com.aterm.aterm.acaffeine.plist.tmp.4294967295.0123abcd");
     write(&item, "");
     date(&item);
     mode(0o300);
     let (_, out, err) = a.sweep(None, false);
     mode(0o700);
     assert_eq!(
-        err.matches("its aCaffiene saves cut short could not be listed")
+        err.matches("its aCaffeine saves cut short could not be listed")
             .count(),
         1,
         "{out}{err}"
@@ -1636,14 +1636,14 @@ fn an_uninstall_removes_saves_cut_short_and_nothing_a_writer_may_rename() {
     assert!(cut_short.is_file(), "{out}{err}");
     assert!(item.is_file(), "none goes after the skip: {out}{err}");
 
-    let a = Account::new("acaffiene-cut-short-locked-agents");
+    let a = Account::new("acaffeine-cut-short-locked-agents");
     let support = a.home().join("Library/Application Support/aterm");
-    let cut_short = support.join(".acaffiene.state.tmp.4294967295.0123abcd");
+    let cut_short = support.join(".acaffeine.state.tmp.4294967295.0123abcd");
     write(&cut_short, "");
     date(&cut_short);
     let agents = a.home().join("Library/LaunchAgents");
     write(
-        &agents.join(".com.aterm.aterm.acaffiene.plist.tmp.4294967295.0123abcd"),
+        &agents.join(".com.aterm.aterm.acaffeine.plist.tmp.4294967295.0123abcd"),
         "",
     );
     let lock = |bits| {
@@ -1658,7 +1658,7 @@ fn an_uninstall_removes_saves_cut_short_and_nothing_a_writer_may_rename() {
     );
     assert!(!cut_short.exists(), "the support folder's still go: {out}");
 
-    let a = Account::new("acaffiene-cut-short-no-folder");
+    let a = Account::new("acaffeine-cut-short-no-folder");
     let support = a.home().join("Library/Application Support/aterm");
     write(&support, "");
     write(&a.home().join("Library/LaunchAgents"), "");
@@ -1688,49 +1688,49 @@ fn a_dry_run_of_the_mugs_files_says_what_the_real_one_does() {
         crate::lock::Flock::try_lock(std::fs::File::open(lock).expect("open")).expect("hold")
     };
 
-    let a = Account::new("acaffiene-unasked");
+    let a = Account::new("acaffeine-unasked");
     let support = a.home().join("Library/Application Support/aterm");
-    write(&support.join("acaffiene.state"), "mode=off\n");
-    write(&support.join("acaffiene.lock"), "");
+    write(&support.join("acaffeine.state"), "mode=off\n");
+    write(&support.join("acaffeine.lock"), "");
     let (ok, out, err) = a.sweep(None, true);
     assert!(!ok, "{out}{err}");
     assert!(
-        err.contains("aCaffiene stop would not be confirmed; its files would be kept"),
+        err.contains("aCaffeine stop would not be confirmed; its files would be kept"),
         "no aterm here to stop the mug: {err}"
     );
-    assert!(!out.contains("would remove aCaffiene file"), "{out}");
+    assert!(!out.contains("would remove aCaffeine file"), "{out}");
     let (ok, out, err) = a.sweep(None, false);
     assert!(!ok, "{out}{err}");
-    assert!(err.contains("aCaffiene stop was not confirmed"), "{err}");
-    assert!(support.join("acaffiene.state").is_file(), "{out}");
-    std::fs::remove_file(support.join("acaffiene.state")).expect("rm");
-    let held = hold(&support.join("acaffiene.lock"));
+    assert!(err.contains("aCaffeine stop was not confirmed"), "{err}");
+    assert!(support.join("acaffeine.state").is_file(), "{out}");
+    std::fs::remove_file(support.join("acaffeine.state")).expect("rm");
+    let held = hold(&support.join("acaffeine.lock"));
     let (ok, out, err) = a.sweep(None, true);
     assert!(
         !ok,
         "a lone lock a mug holds, with no aterm to quit it: {out}{err}"
     );
     assert!(
-        err.contains("aCaffiene lock is busy or could not be acquired; its files would be kept"),
+        err.contains("aCaffeine lock is busy or could not be acquired; its files would be kept"),
         "{err}"
     );
-    assert!(!out.contains("would leave aCaffiene lock"), "{out}");
+    assert!(!out.contains("would leave aCaffeine lock"), "{out}");
     let (ok, _, err) = a.sweep(None, false);
-    assert!(!ok && err.contains("aCaffiene lock is busy"), "{err}");
+    assert!(!ok && err.contains("aCaffeine lock is busy"), "{err}");
     drop(held);
 
-    let a = Account::new("acaffiene-unlocked");
+    let a = Account::new("acaffeine-unlocked");
     let home = a.home().to_path_buf();
     let app = home.join("Applications/aterm.app");
     bundle(&app, None);
     exe(&app.join("Contents/MacOS/aterm"), "#!/bin/sh\nexit 0\n");
     let support = home.join("Library/Application Support/aterm");
     let (lock, state) = (
-        support.join("acaffiene.lock"),
-        support.join("acaffiene.state"),
+        support.join("acaffeine.lock"),
+        support.join("acaffeine.state"),
     );
     write(&state, "mode=off\n");
-    let code = support.join("acaffiene-code.noindex");
+    let code = support.join("acaffeine-code.noindex");
     let copy = young(&code);
     let (ok, out, err) = a.sweep(None, true);
     assert!(
@@ -1739,7 +1739,7 @@ fn a_dry_run_of_the_mugs_files_says_what_the_real_one_does() {
     );
     assert!(
         out.contains(&format!(
-            "would make and leave aCaffiene lock rendezvous: {}",
+            "would make and leave aCaffeine lock rendezvous: {}",
             lock.display()
         )),
         "{out}"
@@ -1748,29 +1748,29 @@ fn a_dry_run_of_the_mugs_files_says_what_the_real_one_does() {
     assert!(err.contains("macOS may still be assessing"), "{err}");
     assert!(!removes(&out, &code), "{out}");
     assert!(
-        out.contains(&format!("would remove aCaffiene file: {}", state.display())),
+        out.contains(&format!("would remove aCaffeine file: {}", state.display())),
         "{out}"
     );
     assert!(
-        out.contains("requires a helper above that stops aCaffiene"),
+        out.contains("requires a helper above that stops aCaffeine"),
         "a removal that hangs on the helper's answer says so: {out}"
     );
     let (ok, out, err) = a.sweep(None, false);
     assert!(!ok, "{out}{err}");
-    assert!(out.contains("left aCaffiene lock rendezvous"), "{out}");
+    assert!(out.contains("left aCaffeine lock rendezvous"), "{out}");
     assert!(
         lock.is_file() && copy.is_dir() && !present(&state),
         "{out}{err}"
     );
 
-    let a = Account::new("acaffiene-held-asked");
+    let a = Account::new("acaffeine-held-asked");
     let app = a.home().join("Applications/aterm.app");
     bundle(&app, None);
     exe(&app.join("Contents/MacOS/aterm"), "#!/bin/sh\nexit 0\n");
     let support = a.home().join("Library/Application Support/aterm");
     let (lock, state) = (
-        support.join("acaffiene.lock"),
-        support.join("acaffiene.state"),
+        support.join("acaffeine.lock"),
+        support.join("acaffeine.state"),
     );
     write(&state, "mode=on\n");
     write(&lock, "");
@@ -1908,7 +1908,7 @@ fn an_uninstall_removes_what_the_mug_left_under_its_old_name() {
     );
     for path in &files {
         let what = if path.ends_with("caffeine-code.noindex") {
-            "aCaffiene file"
+            "aCaffeine file"
         } else {
             "old Caffeine file"
         };
@@ -2005,27 +2005,27 @@ fn an_uninstall_removes_what_the_mug_left_under_its_old_name() {
 }
 
 #[test]
-fn a_root_sweep_asks_acaffiene_as_the_homes_owner() {
+fn a_root_sweep_asks_acaffeine_as_the_homes_owner() {
     let me = aterm_uds::peer::our_uid();
     assert_ne!(me, 0, "the tests run unprivileged");
     let own = aterm_uds::account::home_of(me).expect("this account's home");
     let meta = std::fs::metadata(&own).expect("home");
     assert_eq!(
-        acaffiene_account(0, &own),
+        acaffeine_account(0, &own),
         Some((me, meta.gid())),
         "root, the account's own home"
     );
-    assert_eq!(acaffiene_account(me, &own), None, "not root");
-    let a = Account::new("acaffiene-account");
+    assert_eq!(acaffeine_account(me, &own), None, "not root");
+    let a = Account::new("acaffeine-account");
     assert_eq!(
-        acaffiene_account(0, a.home()),
+        acaffeine_account(0, a.home()),
         None,
         "the account's directory, not its home"
     );
-    assert_eq!(acaffiene_account(0, Path::new("/")), None, "root's own");
-    assert_eq!(acaffiene_account(0, &a.home().join("missing")), None);
+    assert_eq!(acaffeine_account(0, Path::new("/")), None, "root's own");
+    assert_eq!(acaffeine_account(0, &a.home().join("missing")), None);
     let aterm = Path::new("/A/aterm.app/Contents/MacOS/aterm");
-    let args = ["acaffiene", "quit", "own"];
+    let args = ["acaffeine", "quit", "own"];
     assert_eq!(
         as_account_argv(501, aterm, &args),
         [
@@ -2043,11 +2043,11 @@ fn a_root_sweep_asks_acaffiene_as_the_homes_owner() {
     );
     assert_eq!(
         helper_line(aterm, &args, Some((501, 20))),
-        "/usr/bin/sudo -n -H -u #501 -- /A/aterm.app/Contents/MacOS/aterm acaffiene quit own"
+        "/usr/bin/sudo -n -H -u #501 -- /A/aterm.app/Contents/MacOS/aterm acaffeine quit own"
     );
     assert_eq!(
         helper_line(aterm, &args, None),
-        "/A/aterm.app/Contents/MacOS/aterm acaffiene quit own"
+        "/A/aterm.app/Contents/MacOS/aterm acaffeine quit own"
     );
 }
 
@@ -2151,25 +2151,25 @@ fn a_root_sweep_runs_nothing_an_account_could_replace() {
     assert!(store_entry_is_ours(&planted, RunAs::Me));
     assert!(ran.exists(), "asked as this process");
 
-    let a = Account::new("acaffiene-root-nobody");
+    let a = Account::new("acaffeine-root-nobody");
     let app = a.home().join("Applications/aterm.app");
     bundle(&app, None);
     exe(&app.join("Contents/MacOS/aterm"), "#!/bin/sh\nexit 0\n");
     write(
         &a.home()
-            .join("Library/Application Support/aterm/acaffiene.state"),
+            .join("Library/Application Support/aterm/acaffeine.state"),
         "mode=on\n",
     );
     let mut failed = Vec::new();
     let (mut out, mut err) = (Vec::new(), Vec::new());
-    let ok = self_uninstall_with_acaffiene(
+    let ok = self_uninstall_with_acaffeine(
         &a.places,
         None,
         false,
         &mut out,
         &mut err,
         |s, p, dirs| {
-            failed = sweep_acaffiene_with(
+            failed = sweep_acaffeine_with(
                 s,
                 p,
                 dirs,
@@ -2189,7 +2189,7 @@ fn a_root_sweep_runs_nothing_an_account_could_replace() {
 }
 
 #[test]
-fn the_acaffiene_cleanup_holds_only_the_accounts_lock() {
+fn the_acaffeine_cleanup_holds_only_the_accounts_lock() {
     thread_local! {
         static MADE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     }
@@ -2208,26 +2208,26 @@ fn the_acaffiene_cleanup_holds_only_the_accounts_lock() {
         MADE.with(|n| n.set(n.get() + 1));
         true
     }
-    let dir = crate::testdir::dir("atpkg-acaffiene-hold-");
-    let lock = dir.join("acaffiene.lock");
+    let dir = crate::testdir::dir("atpkg-acaffeine-hold-");
+    let lock = dir.join("acaffeine.lock");
     let me = aterm_uds::peer::our_uid();
     let gid = std::fs::metadata(&dir).expect("dir").gid();
-    assert!(acaffiene_cleanup_hold(&lock, Some((me, gid)), cannot).is_none());
-    assert!(acaffiene_cleanup_hold(&lock, Some((me, gid)), gone).is_none());
+    assert!(acaffeine_cleanup_hold(&lock, Some((me, gid)), cannot).is_none());
+    assert!(acaffeine_cleanup_hold(&lock, Some((me, gid)), gone).is_none());
     assert!(!lock.exists(), "made by nobody but its account");
-    let held = acaffiene_cleanup_hold(&lock, Some((me, gid)), makes).expect("its account's");
+    let held = acaffeine_cleanup_hold(&lock, Some((me, gid)), makes).expect("its account's");
     assert_eq!(MADE.with(std::cell::Cell::get), 3);
     let mode = std::fs::metadata(&lock).expect("lock").mode();
     assert_eq!(mode & 0o777, 0o600, "private, as a mug makes it");
     drop(held);
-    assert!(acaffiene_cleanup_hold(&lock, Some((me + 1, gid)), refuse).is_none());
+    assert!(acaffeine_cleanup_hold(&lock, Some((me + 1, gid)), refuse).is_none());
     let second = dir.join("second-name");
     std::fs::hard_link(&lock, &second).expect("link");
-    assert!(acaffiene_cleanup_hold(&lock, Some((me, gid)), refuse).is_none());
-    assert!(acaffiene_cleanup_hold(&lock, None, refuse).is_none());
+    assert!(acaffeine_cleanup_hold(&lock, Some((me, gid)), refuse).is_none());
+    assert!(acaffeine_cleanup_hold(&lock, None, refuse).is_none());
     std::fs::remove_file(&second).expect("unlink");
     std::fs::remove_file(&lock).expect("unlink");
-    assert!(acaffiene_cleanup_hold(&lock, None, refuse).is_some());
+    assert!(acaffeine_cleanup_hold(&lock, None, refuse).is_some());
     assert!(lock.is_file(), "this process's own sweep makes it");
 }
 
@@ -2238,13 +2238,13 @@ fn a_dry_runs_lock_probe_answers_as_the_cleanup_hold_does() {
     fn refuse(_: &Path, _: u32) -> bool {
         panic!("a lock that is there is never made")
     }
-    let dir = crate::testdir::dir("atpkg-acaffiene-probe-");
-    let lock = dir.join("acaffiene.lock");
+    let dir = crate::testdir::dir("atpkg-acaffeine-probe-");
+    let lock = dir.join("acaffeine.lock");
     let me = aterm_uds::peer::our_uid();
     let gid = std::fs::metadata(&dir).expect("dir").gid();
     let agree = |account: Option<(u32, u32)>| {
         let probed = cleanup_lock_free(&lock, account);
-        let held = acaffiene_cleanup_hold(&lock, account, refuse).is_some();
+        let held = acaffeine_cleanup_hold(&lock, account, refuse).is_some();
         assert_eq!(probed, held, "{account:?}");
         probed
     };
@@ -2282,7 +2282,7 @@ fn a_dry_runs_lock_probe_answers_as_the_cleanup_hold_does() {
 }
 
 #[test]
-fn an_uninstall_keeps_a_acaffiene_copy_macos_may_still_be_assessing() {
+fn an_uninstall_keeps_a_acaffeine_copy_macos_may_still_be_assessing() {
     use std::cell::Cell;
     use std::io::{Error, ErrorKind};
 
@@ -2305,7 +2305,7 @@ fn an_uninstall_keeps_a_acaffiene_copy_macos_may_still_be_assessing() {
                 out: &mut out,
                 err: &mut err,
             };
-            sweep_acaffiene_code_with(&mut s, code, now, metadata, entries);
+            sweep_acaffeine_code_with(&mut s, code, now, metadata, entries);
             (s.removed, s.skipped)
         };
         (
@@ -2316,10 +2316,10 @@ fn an_uninstall_keeps_a_acaffiene_copy_macos_may_still_be_assessing() {
         )
     }
 
-    let a = Account::new("acaffiene-young");
+    let a = Account::new("acaffeine-young");
     let code = a
         .home()
-        .join("Library/Application Support/aterm/acaffiene-code.noindex");
+        .join("Library/Application Support/aterm/acaffeine-code.noindex");
     let plist = "aterm.app/Contents/Info.plist";
     for copy in ["a/9-0", "l/9-1", "l/9-2", "l/9-3.partial", "l/9-4", "m/9-5"] {
         write(&code.join(copy).join(plist), "<plist/>");
@@ -2374,7 +2374,7 @@ fn an_uninstall_keeps_a_acaffiene_copy_macos_may_still_be_assessing() {
                     } else {
                         code.join("l/9-2")
                     };
-                    return collect_acaffiene_code_entries([
+                    return collect_acaffeine_code_entries([
                         Ok(first),
                         Err(Error::new(ErrorKind::Interrupted, "injected entry refusal")),
                     ]);
@@ -2384,7 +2384,7 @@ fn an_uninstall_keeps_a_acaffiene_copy_macos_may_still_be_assessing() {
                     "injected enumeration refusal",
                 ));
             }
-            acaffiene_code_entries(path)
+            acaffeine_code_entries(path)
         };
         let (removed, skipped, out, err) = sweep(&code, now, &metadata, &entries);
         assert!(refused.get(), "the injected refusal was reached");
@@ -2397,7 +2397,7 @@ fn an_uninstall_keeps_a_acaffiene_copy_macos_may_still_be_assessing() {
     }
 
     let entries = |path: &Path| {
-        let mut entries = acaffiene_code_entries(path)?;
+        let mut entries = acaffeine_code_entries(path)?;
         if path == code {
             entries.push(code.join("already-gone"));
         }
@@ -2439,7 +2439,7 @@ fn an_uninstall_keeps_a_acaffiene_copy_macos_may_still_be_assessing() {
             out: &mut out,
             err: &mut err,
         };
-        sweep_acaffiene_code(&mut s, &code, now);
+        sweep_acaffeine_code(&mut s, &code, now);
         assert_eq!((s.removed, s.skipped), (expected_removed, 0));
         assert!(!present(&code));
     }
@@ -2564,7 +2564,7 @@ fn a_root_sweep_changes_an_accounts_folder_only_as_that_account() {
 #[test]
 fn a_file_gone_before_its_removal_is_not_skipped() {
     let dir = aterm_tempfile::tempdir().expect("tempdir");
-    let gone = dir.path().join("acaffiene.bridge");
+    let gone = dir.path().join("acaffeine.bridge");
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let mut s = Sweep {
         dry: false,
@@ -2577,30 +2577,30 @@ fn a_file_gone_before_its_removal_is_not_skipped() {
         out: &mut out,
         err: &mut err,
     };
-    s.rm(&gone, "aCaffiene file");
+    s.rm(&gone, "aCaffeine file");
     assert_eq!((s.removed, s.skipped), (0, 0));
     let blocked = dir.path().join("a-file");
     write(&blocked, "");
-    s.rm(&blocked.join("inside"), "aCaffiene file");
+    s.rm(&blocked.join("inside"), "aCaffeine file");
     assert_eq!((s.removed, s.skipped), (0, 1));
     let (out, err) = (String::from_utf8_lossy(&out), String::from_utf8_lossy(&err));
-    assert!(out.contains("gone already: aCaffiene file"), "{out}");
-    assert!(!err.contains("acaffiene.bridge"), "{err}");
+    assert!(out.contains("gone already: aCaffeine file"), "{out}");
+    assert!(!err.contains("acaffeine.bridge"), "{err}");
 }
 
 #[test]
 fn an_uninstall_quits_a_mug_the_stores_aterm_runs() {
     for fails in [false, true] {
         let mut a = Account::new(if fails {
-            "acaffiene-store-fails"
+            "acaffeine-store-fails"
         } else {
-            "acaffiene-store"
+            "acaffeine-store"
         });
         let support = a.home().join("Library/Application Support/aterm");
         let store = a.dir.join("store");
         let log = a.dir.join("asked.log");
         let fail = if fails {
-            "[ \"$*\" = 'acaffiene quit' ] && exit 1\n"
+            "[ \"$*\" = 'acaffeine quit' ] && exit 1\n"
         } else {
             ""
         };
@@ -2614,18 +2614,18 @@ fn an_uninstall_quits_a_mug_the_stores_aterm_runs() {
         );
         aterm_spec::wait::first_exec(&store.join("aterm"), &["--version"]);
         a.places.store_dir = store.clone();
-        write(&support.join("acaffiene.state"), "mode=off\n");
-        write(&support.join("acaffiene.lock"), "");
+        write(&support.join("acaffeine.state"), "mode=off\n");
+        write(&support.join("acaffeine.lock"), "");
         let (ok, out, err) = a.sweep(None, false);
         assert_eq!(
             std::fs::read_to_string(&log).expect("the store's aterm was asked"),
-            "help acaffiene\nacaffiene startup off\nacaffiene quit\n",
+            "help acaffeine\nacaffeine startup off\nacaffeine quit\n",
             "{out}{err}"
         );
         assert_eq!(ok, !fails, "{out}{err}");
         assert_eq!(store.join("aterm").exists(), fails, "{out}{err}");
         assert_eq!(
-            present(&support.join("acaffiene.state")),
+            present(&support.join("acaffeine.state")),
             fails,
             "{out}{err}"
         );
@@ -2636,9 +2636,9 @@ fn an_uninstall_quits_a_mug_the_stores_aterm_runs() {
 fn a_scoped_uninstall_quits_only_its_own_mug() {
     for old in [false, true] {
         let mut a = Account::new(if old {
-            "acaffiene-scoped-old"
+            "acaffeine-scoped-old"
         } else {
-            "acaffiene-scoped"
+            "acaffeine-scoped"
         });
         let home = a.home().to_path_buf();
         let support = home.join("Library/Application Support/aterm");
@@ -2647,7 +2647,7 @@ fn a_scoped_uninstall_quits_only_its_own_mug() {
         let scoped = home.join("aterm.app");
         bundle(&scoped, None);
         let refuse = if old {
-            "[ \"$*\" = 'acaffiene quit own' ] && exit 2\n"
+            "[ \"$*\" = 'acaffeine quit own' ] && exit 2\n"
         } else {
             ""
         };
@@ -2659,17 +2659,17 @@ fn a_scoped_uninstall_quits_only_its_own_mug() {
             ),
         );
         a.places.install_dir = Some(home.clone());
-        write(&support.join("acaffiene.state"), "mode=off\n");
-        write(&support.join("acaffiene.lock"), "");
+        write(&support.join("acaffeine.state"), "mode=off\n");
+        write(&support.join("acaffeine.lock"), "");
         let (ok, out, err) = a.sweep(None, false);
         assert!(ok, "{out}{err}");
         assert_eq!(
             std::fs::read_to_string(&log).expect("asked"),
-            "help acaffiene\nacaffiene startup off\nacaffiene quit own\n--version\n"
+            "help acaffeine\nacaffeine startup off\nacaffeine quit own\n--version\n"
         );
         assert!(!scoped.exists(), "{out}");
         assert!(
-            support.join("acaffiene.state").exists(),
+            support.join("acaffeine.state").exists(),
             "the staying aterm's: {out}"
         );
         assert_eq!(out.contains("cannot quit only its own mug"), old, "{out}");
@@ -2678,7 +2678,7 @@ fn a_scoped_uninstall_quits_only_its_own_mug() {
 
 #[test]
 fn a_decline_left_for_a_kept_bundle_goes_with_it() {
-    let a = Account::new("acaffiene-decline");
+    let a = Account::new("acaffeine-decline");
     let home = a.home().to_path_buf();
     let support = home.join("Library/Application Support/aterm");
     let app = home.join("Applications/aterm.app");
@@ -2689,14 +2689,14 @@ fn a_decline_left_for_a_kept_bundle_goes_with_it() {
     let aterm = app.join("Contents/MacOS/aterm");
     exe(
         &aterm,
-        "#!/bin/sh\n[ \"$*\" = 'acaffiene quit' ] && exit 1\nexit 0\n",
+        "#!/bin/sh\n[ \"$*\" = 'acaffeine quit' ] && exit 1\nexit 0\n",
     );
-    write(&support.join("acaffiene.state"), "mode=off\n");
-    write(&support.join("acaffiene.lock"), "");
+    write(&support.join("acaffeine.state"), "mode=off\n");
+    write(&support.join("acaffeine.lock"), "");
     let decline = support.join("pkg/declined");
     let (ok, out, err) = a.sweep(None, false);
     assert!(!ok, "{out}{err}");
-    assert!(app.exists(), "kept for its acaffiene quit: {out}");
+    assert!(app.exists(), "kept for its acaffeine quit: {out}");
     assert!(
         decline.is_file(),
         "the sweep's decline stays with its aterm"

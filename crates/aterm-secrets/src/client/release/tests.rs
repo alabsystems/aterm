@@ -202,6 +202,16 @@ impl Script {
         paths: &Paths,
         developer_dir: &dyn Fn() -> Option<PathBuf>,
     ) -> Step {
+        self.with_tools(developer_dir, |tools| {
+            rounds.step(paths, &configured(paths), tools)
+        })
+    }
+
+    fn with_tools<T>(
+        &self,
+        developer_dir: &dyn Fn() -> Option<PathBuf>,
+        run: impl FnOnce(&mut Tools<'_>) -> T,
+    ) -> T {
         let mut history = || {
             self.histories.set(self.histories.get() + 1);
             self.answers
@@ -223,7 +233,7 @@ impl Script {
             history: &mut history,
             store: &mut store,
         };
-        rounds.step(paths, &configured(paths), &mut tools)
+        run(&mut tools)
     }
 
     /// The runs of notarytool so far: history checks plus stores.
@@ -251,11 +261,10 @@ fn parser_binds_required_fields_and_rejects_bad_input() {
 }
 
 /// On a release host with the developer tools, a new entry is stored once and live-checked;
-/// the same entry again runs nothing, in this subscriber or the next one, and a changed entry
-/// runs notarytool again.
-/// NEGATIVE CONTROL: a round without the digest check runs notarytool on every apply.
+/// the same entry reuses that check in this subscriber, and a changed entry runs notarytool
+/// again. A new subscriber always revalidates the profile.
 #[test]
-fn an_entry_becomes_the_profile_once_and_an_unchanged_one_runs_nothing() {
+fn an_entry_reuses_only_this_subscribers_recent_successful_check() {
     let (_root, paths) = lab(&[(ENTRY, ENTRY_TEXT)]);
     ring(&paths, &["m22"], &[]);
     let script = Script::answering(vec![Ok(false), Ok(true)]);
@@ -271,10 +280,15 @@ fn an_entry_becomes_the_profile_once_and_an_unchanged_one_runs_nothing() {
     );
     assert_eq!(script.histories.get(), 2);
 
-    for mut rounds in [rounds, NotaryRounds::default()] {
-        assert_eq!(script.step(&mut rounds, &paths, &clt), Step::Quiet);
-    }
+    assert_eq!(script.step(&mut rounds, &paths, &clt), Step::Quiet);
     assert_eq!(script.runs(), 3, "an unchanged entry runs nothing");
+
+    let restarted = Script::answering(vec![Ok(true)]);
+    assert_eq!(
+        restarted.step(&mut NotaryRounds::default(), &paths, &clt),
+        Step::Ran(Ok("notary profile already authenticates"))
+    );
+    assert!(restarted.stored.borrow().is_empty());
 
     publish(&paths, ENTRY, CHANGED_TEXT);
     let script = Script::answering(vec![Ok(true)]);
@@ -285,6 +299,149 @@ fn an_entry_becomes_the_profile_once_and_an_unchanged_one_runs_nothing() {
     );
     assert_eq!(script.step(&mut rounds, &paths, &clt), Step::Quiet);
     assert_eq!(script.runs(), 1, "a changed entry is checked once");
+}
+
+#[test]
+fn a_saved_digest_does_not_hide_a_missing_profile_after_restart() {
+    let (_root, paths) = lab(&[(ENTRY, ENTRY_TEXT)]);
+    ring(&paths, &["m22"], &[]);
+    let first = Script::answering(vec![Ok(false), Ok(true)]);
+    assert!(matches!(
+        first.step(&mut NotaryRounds::default(), &paths, &clt),
+        Step::Ran(Ok(_))
+    ));
+    // A marker retained from an older build is evidence of a past success only.
+    fsx::write_atomic(
+        &paths.dir.join("release-notary.applied"),
+        materialize::digest_hex(ENTRY_TEXT.as_bytes()).as_bytes(),
+        0o600,
+    )
+    .unwrap();
+    let restarted = Script::answering(vec![Ok(false), Ok(true)]);
+    assert!(matches!(
+        restarted.step(&mut NotaryRounds::default(), &paths, &clt),
+        Step::Ran(Ok(_))
+    ));
+    assert_eq!(restarted.stored.borrow().len(), 1);
+}
+
+#[test]
+fn an_expired_successful_check_recovers_a_missing_profile_without_restart() {
+    let (_root, paths) = lab(&[(ENTRY, ENTRY_TEXT)]);
+    ring(&paths, &["m22"], &[]);
+    let script = Script::answering(vec![Ok(true), Ok(false), Ok(true)]);
+    let mut rounds = NotaryRounds::default();
+    assert!(matches!(
+        script.step(&mut rounds, &paths, &clt),
+        Step::Ran(Ok(_))
+    ));
+    let expired = rounds.checked.as_ref().unwrap().1 + NOTARY_RECHECK;
+    assert!(matches!(
+        script.with_tools(&clt, |tools| rounds
+            .step_with_clock(&paths, tools, || expired)),
+        Step::Ran(Ok(_))
+    ));
+    assert_eq!(script.stored.borrow().len(), 1);
+}
+
+#[test]
+fn a_failed_rotation_does_not_reuse_an_earlier_success() {
+    let (_root, paths) = lab(&[(ENTRY, ENTRY_TEXT)]);
+    ring(&paths, &["m22"], &[]);
+    let script = Script::answering(vec![Ok(true), Ok(false), Ok(false), Ok(true)]);
+    let mut rounds = NotaryRounds::default();
+    assert!(matches!(
+        script.step(&mut rounds, &paths, &clt),
+        Step::Ran(Ok(_))
+    ));
+    publish(&paths, ENTRY, CHANGED_TEXT);
+    assert!(matches!(
+        script.step(&mut rounds, &paths, &clt),
+        Step::Ran(Err(_))
+    ));
+    publish(&paths, ENTRY, ENTRY_TEXT);
+    assert!(matches!(
+        script.step(&mut rounds, &paths, &clt),
+        Step::Ran(Ok(_))
+    ));
+    assert_eq!(script.histories.get(), 4);
+}
+
+#[test]
+fn explicit_notary_sync_uses_only_an_authorized_verified_entry() {
+    let (_root, paths) = lab(&[(ENTRY, ENTRY_TEXT)]);
+    let none = Script::answering(Vec::new());
+    assert!(
+        none.with_tools(&clt, |tools| sync_notary_with(&paths, tools))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(none.runs(), 0);
+    ring(&paths, &["m22"], &["m22"]);
+    assert!(
+        none.with_tools(&clt, |tools| sync_notary_with(&paths, tools))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(none.runs(), 0);
+    ring(&paths, &["m22"], &[]);
+    assert!(
+        none.with_tools(&no_clt, |tools| sync_notary_with(&paths, tools))
+            .is_err()
+    );
+    assert_eq!(none.runs(), 0);
+
+    let available = Script::answering(vec![Ok(false), Ok(true), Ok(true)]);
+    assert!(
+        available
+            .with_tools(&clt, |tools| sync_notary_with(&paths, tools))
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        available
+            .with_tools(&clt, |tools| sync_notary_with(&paths, tools))
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(available.stored.borrow().len(), 1);
+
+    fsx::write_atomic(
+        &paths.home.join(".secrets/release-notary"),
+        b"untrusted",
+        0o600,
+    )
+    .unwrap();
+    let unread = Script::answering(Vec::new());
+    assert!(matches!(
+        unread.with_tools(&clt, |tools| sync_notary_with(&paths, tools)),
+        Ok(None) | Err(_)
+    ));
+    assert_eq!(unread.runs(), 0);
+}
+
+#[test]
+fn notary_authentication_cannot_install_a_superseded_entry_or_use_revoked_authority() {
+    for revoke in [false, true] {
+        let (_root, paths) = lab(&[(ENTRY, ENTRY_TEXT)]);
+        ring(&paths, &["m22"], &[]);
+        let mut history = || {
+            if revoke {
+                ring(&paths, &["m22"], &["m22"]);
+            } else {
+                publish(&paths, ENTRY, CHANGED_TEXT);
+            }
+            Ok(false)
+        };
+        let mut store = |_: &Notary| panic!("a stale credential was installed");
+        let mut tools = Tools {
+            authorized_ring: &test_authorized_ring,
+            developer_dir: &clt,
+            history: &mut history,
+            store: &mut store,
+        };
+        assert!(sync_notary_with(&paths, &mut tools).is_err());
+    }
 }
 
 /// No developer directory with notarytool, or a Mac that is no release host, runs nothing:
@@ -358,22 +515,21 @@ fn a_failure_never_reads_as_stored_and_retries_after_backoff() {
     assert!(script.stored.borrow().is_empty(), "nothing replaced");
     assert_eq!(script.step(&mut rounds, &paths, &clt), Step::Quiet);
     assert_eq!(script.runs(), 1, "tried once by this subscriber");
-    rounds.tried.as_mut().unwrap().1 = Instant::now() - Duration::from_secs(61);
+    let retried_at = rounds.tried.as_ref().unwrap().1 + Duration::from_secs(61);
     let recovered = Script::answering(vec![Ok(true)]);
     assert!(matches!(
-        recovered.step(&mut rounds, &paths, &clt),
+        recovered.with_tools(&clt, |tools| rounds
+            .step_with_clock(&paths, tools, || retried_at)),
         Step::Ran(Ok(_))
     ));
     assert_eq!(recovered.runs(), 1);
-    std::fs::remove_file(paths.dir.join(APPLIED)).unwrap();
-
     let script = Script::answering(vec![Ok(false), Ok(false)]);
     let mut rounds = NotaryRounds::default();
     assert!(matches!(
         script.step(&mut rounds, &paths, &clt),
         Step::Ran(Err(why)) if why.contains("did not authenticate")
     ));
-    assert_eq!(applied(&paths), None, "no success recorded");
+    assert!(rounds.checked.is_none(), "no success recorded");
 }
 
 /// The subscriber's live round never accepts a fixture's master as a release anchor; it says

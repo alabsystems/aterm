@@ -8430,6 +8430,7 @@ fn a_program_is_ready_for_its_prompt_once_its_input_is_read_too() {
             ms: 60_000,
             held: Some(pending.clone()),
             last: pending.clone(),
+            capture: None,
         },
         "claude",
     );
@@ -8447,6 +8448,73 @@ fn a_program_is_ready_for_its_prompt_once_its_input_is_read_too() {
     );
     assert_eq!(screen_only, Ok(ComposerWait::Ready));
     assert_eq!(clock.get(), 0);
+}
+
+/// EACH CHAIN'S CLAUDE CODE WRITES A DEBUG LOG OF ITS OWN, AND `down` FINDS EVERY ONE: one script
+/// served every chain, so a debug log named in it would hold every tab's start interleaved. Each
+/// chain's script now puts `--debug-file <scratch>/claude-debug-<chain>.log` before the lab's
+/// own arguments; the shared script (a switch's, autopilot-captures') names none. The listing
+/// `down` keeps from finds each chain's log and nothing else of the scratch: not
+/// `claude --debug-log`'s one log, a name with no chain, another extension, or a folder.
+#[test]
+fn each_chain_s_claude_code_writes_a_debug_log_of_its_own() {
+    let top = aterm_tempfile::Builder::new()
+        .prefix("lab-chain-debug-")
+        .tempdir()
+        .unwrap();
+    let root = std::fs::canonicalize(top.path()).unwrap();
+    let run = Run {
+        tag: "t".into(),
+        run: root.clone(),
+        w: root.join("scratch"),
+        port: "5".into(),
+        proxy: "http://127.0.0.1:6".into(),
+        claude_bin: "/a/claude".into(),
+        ..Run::default()
+    };
+    std::fs::create_dir_all(&run.w).unwrap();
+    let launch = Launcher::Claude(crate::lab::Launch {
+        args: vec!["--model".into(), "x".into()],
+        ..crate::lab::Launch::default()
+    });
+    let text = |p: &Path| std::fs::read_to_string(p).unwrap();
+    let log = |chain: &str| run.w.join(format!("claude-debug-{chain}.log"));
+    let (land, off) = (
+        launch.of_chain(&run, Chain::LandN).unwrap(),
+        launch.of_chain(&run, Chain::Off).unwrap(),
+    );
+    assert_eq!(land, root.join("forever-claude-land-n.sh"));
+    for (script, chain) in [(&land, "land-n"), (&off, "off")] {
+        let s = text(script);
+        let tail = format!(
+            "  /a/claude --debug-file {} --model x\n",
+            crate::util::shell_quote(&log(chain).to_string_lossy())
+        );
+        assert!(s.ends_with(&tail), "{s}");
+        assert_eq!(s.matches("--debug-file").count(), 1, "{s}");
+    }
+    let shared = text(&launch.shared(&run).unwrap());
+    assert!(
+        shared.ends_with("  /a/claude --model x\n") && !shared.contains("--debug-file"),
+        "{shared}"
+    );
+    for name in [
+        "claude-debug.log",
+        "claude-debug-off.log",
+        "claude-debug-land-n.log",
+        "claude-debug-.log",
+        "claude-debug-land-n.txt",
+    ] {
+        std::fs::write(run.w.join(name), "x\n").unwrap();
+    }
+    std::fs::create_dir(run.w.join("claude-debug-dir.log")).unwrap();
+    assert_eq!(
+        crate::stats::chain_debug_logs(&run),
+        vec![
+            ("land-n".to_string(), log("land-n")),
+            ("off".to_string(), log("off"))
+        ]
+    );
 }
 
 /// A TAB'S WAIT FOR ITS EMPTY COMPOSER IS A HANG DETECTOR OVER ITS SCREEN, AND A

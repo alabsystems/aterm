@@ -405,7 +405,7 @@ fn timed(tl: &Mutex<SessionTimeline>, batch: &StepBatch) -> (Applied, Vec<(Hold,
         tl,
         Source::Transcript,
         batch,
-        false,
+        (false, None),
         &mut || {
             t += 7;
             t
@@ -805,6 +805,25 @@ fn codex_rig_opened(
     crate::self_claim::RolloutTarget,
     RolloutClaim,
 ) {
+    let (tl, _hand, home, target, claim) = codex_rig_hand(name, agent, build, opened, &[]);
+    (tl, home, target, claim)
+}
+
+/// [`codex_rig_opened`] with its clock's hand, and the acts `early` (`(rule, holder, ms)`)
+/// recorded before its run opened.
+fn codex_rig_hand(
+    name: &str,
+    agent: &str,
+    build: &str,
+    opened: u64,
+    early: &[(&str, &str, u64)],
+) -> (
+    Arc<Mutex<SessionTimeline>>,
+    super::super::tests::Hand,
+    aterm_tempfile::TempDir,
+    crate::self_claim::RolloutTarget,
+    RolloutClaim,
+) {
     let ctx = crate::session_store::test_handle(0xC0DE).ctx;
     let tl = Arc::clone(&ctx.timeline);
     let hand = hand_clock(&tl);
@@ -813,6 +832,13 @@ fn codex_rig_opened(
         let now = g.slog().now();
         g.slog_mut().open_session(None, None, now);
         g.note_root_group(100);
+        for (rule, holder, ms) in early {
+            hand.set(*ms);
+            let now = g.slog().now();
+            g.slog_mut()
+                .self_claim_act(rule, holder, aterm_slog::Actor::Ctl, now)
+                .expect("the act mark");
+        }
     }
     hand.set(opened);
     super::super::tests::with_agent(&tl, agent);
@@ -836,7 +862,7 @@ fn codex_rig_opened(
         home: home.path().to_path_buf(),
     };
     set_rollout_claim(&ctx, &target);
-    (tl, home, target, RolloutClaim(ctx))
+    (tl, hand, home, target, RolloutClaim(ctx))
 }
 
 struct RolloutClaim(Arc<crate::SessionCtx>);
@@ -879,6 +905,7 @@ fn set_rollout_claim(ctx: &crate::SessionCtx, target: &crate::self_claim::Rollou
                 frame: None,
                 initializing: false,
                 goal: None,
+                background_terminals: None,
             }),
             resume: Err("captured-no-resume"),
         }),
@@ -1858,6 +1885,75 @@ fn the_rollout_tap_publishes_the_survey_facts_for_the_claimants_group_whatever_i
     );
 }
 
+/// THE RECORD'S COUNT: the tap publishes the background terminals the claimant's own session
+/// record names (`backgroundTerminals`, read with the goal at every ask) on a slot of its own,
+/// whether or not a rollout is found; a count alone publishes no survey facts, so a tab with no
+/// rollout, task or goal keeps its screen's read. Each ask reads it afresh, a record that shows an
+/// exit names none, and the stop forgets it.
+#[test]
+fn the_rollout_tap_publishes_the_records_count_apart_from_the_survey_facts() {
+    let survey = |tl: &Arc<Mutex<SessionTimeline>>| tl.lock().unwrap().codex_survey().cloned();
+    let terminals = |tl: &Arc<Mutex<SessionTimeline>>| tl.lock().unwrap().codex_terminals();
+    let mut host = Host::default();
+    for rollout in [true, false] {
+        let (tl, home, target, claim) = codex_rig(
+            &format!("terminals-{rollout}"),
+            "codex",
+            "0.164.0-dev.12521+g3d3eb12d8",
+        );
+        if !rollout {
+            std::fs::remove_dir_all(home.path().join("sessions")).expect("no rollout");
+        }
+        let path = aterm_agent::harness::self_claimed::record_path(&target.home, target.pid);
+        std::fs::create_dir_all(path.parent().expect("dir")).expect("alab sessions dir");
+        let record = |tail: &str| {
+            std::fs::write(
+                &path,
+                format!(
+                    r#"{{"v":1,"pid":{},"sessionId":"{}","status":"idle"{tail}}}"#,
+                    target.pid, target.thread
+                ),
+            )
+            .expect("the session record");
+        };
+        let mut ask = || {
+            assert!(
+                host.ask(0xC0DE_0074, &claim.0, target.clone(), MEASURED)
+                    .is_some(),
+                "rollout {rollout}: the claimant is current"
+            );
+        };
+
+        record(r#","backgroundTerminals":2"#);
+        ask();
+        assert_eq!(terminals(&tl), Some(2), "rollout {rollout}");
+        assert_eq!(
+            survey(&tl).is_some(),
+            rollout,
+            "rollout {rollout}: a count alone publishes no survey facts"
+        );
+        record(r#","backgroundTerminals":0"#);
+        ask();
+        assert_eq!(terminals(&tl), Some(0), "rollout {rollout}: read afresh");
+        record(r#","exit":"signal:9","backgroundTerminals":2"#);
+        ask();
+        assert_eq!(
+            terminals(&tl),
+            None,
+            "rollout {rollout}: a record that shows an exit names none"
+        );
+        record(r#","backgroundTerminals":2"#);
+        ask();
+        assert_eq!(terminals(&tl), Some(2), "rollout {rollout}");
+        host.stop(0xC0DE_0074, &claim.0);
+        assert_eq!(
+            terminals(&tl),
+            None,
+            "rollout {rollout}: the stop forgets it"
+        );
+    }
+}
+
 /// The record a test planted under `home` for `pid`, read with no look at the process (the rig's
 /// pid names none): a read-only target's record at its ask.
 fn planted(
@@ -2016,4 +2112,810 @@ fn a_released_claims_process_is_read_on_read_only() {
     let _ = host.ask(0xC0DE_0080, ctx, watched, gone);
     assert_eq!(fields(&tl), "rollout=stale rollout_asks=8");
     assert_eq!(survey(&tl), None, "a process not live keeps no facts");
+}
+
+/// [`rollout_rows`] with its one command's completion (`item_completed`, `exit_code` = `code`)
+/// between the call and its output, as codex-alab's paginated rollout persists it.
+fn rollout_rows_exit(build: &str, code: i64) -> String {
+    let mut out = String::new();
+    for row in rollout_rows(build).lines() {
+        if row.contains("\"function_call_output\"") {
+            out.push_str(&format!(
+                r#"{{"timestamp":"{}","type":"event_msg","payload":{{"type":"item_completed","thread_id":"{THREAD}","turn_id":"turn-1","item":{{"type":"commandExecution","id":"call_r0010","command":["SENTINEL-INPUT"],"aggregated_output":"SENTINEL-RESULT","status":"failed","exit_code":{code}}}}}}}"#,
+                at(1_900)
+            ));
+            out.push('\n');
+        }
+        out.push_str(row);
+        out.push('\n');
+    }
+    out
+}
+
+/// The rig's rollout rewritten to `rows`.
+fn rollout_is(home: &aterm_tempfile::TempDir, rows: &str) {
+    std::fs::write(
+        home.path().join(format!(
+            "sessions/2025/10/20/rollout-2025-10-19T22-03-11-{THREAD}.jsonl"
+        )),
+        rows,
+    )
+    .expect("the rollout");
+}
+
+/// GAP 20, END TO END: on a measured codex-alab build, a command whose completion says it exited
+/// non-zero closes its step `out=error`, and its turn's close counts it. NEGATIVE CONTROL: the
+/// same rows of an upstream build (`0.163.0`, its gate shut) read `out=ok` and count none.
+#[test]
+fn a_codex_alab_failed_command_closes_out_error_and_counts_errs() {
+    for (name, build, failed) in [
+        ("exit-alab", "0.164.0-dev.12521+g3d3eb12d8", true),
+        ("exit-vendor", "0.163.0", false),
+    ] {
+        let (tl, home, target, claim) = codex_rig(name, "codex", build);
+        rollout_is(&home, &rollout_rows_exit(build, 3));
+        let mut host = Host::default();
+        let _ = host.ask(0xC0DE_2001, &claim.0, target, MEASURED);
+        let got = lines_of(&tl);
+        let close = having(&got, " close t1 turn ");
+        assert_eq!(close.len(), 1, "{name}: {got:#?}");
+        if failed {
+            assert_eq!(having(&got, " tool out=error ").len(), 1, "{got:#?}");
+            assert!(having(&got, " tool out=ok ").is_empty(), "{got:#?}");
+            assert!(close[0].contains(" errs=1 "), "{}", close[0]);
+        } else {
+            assert_eq!(having(&got, " tool out=ok ").len(), 1, "{got:#?}");
+            assert!(having(&got, " errs=").is_empty(), "{got:#?}");
+        }
+        for l in &got {
+            assert!(!l.contains("SENTINEL"), "rollout text in the log: {l}");
+        }
+        time_order_holds(&got).unwrap_or_else(|e| panic!("{e}: {got:#?}"));
+    }
+}
+
+fn vref(s: &str) -> aterm_agent::harness::steps::StepId {
+    aterm_agent::harness::steps::StepId::new(s).expect("a step id")
+}
+
+/// The codex-alab claim's holder, as the rig's claim names it.
+const HOLDER: &str = "codex-alab@300";
+
+/// One rollout row of a harness-turn script ([`Ev::Read`]).
+#[derive(Clone, Copy, Debug)]
+enum Row<'a> {
+    /// A turn's `turn_context`: its prompt.
+    Prompt(&'a str),
+    /// Its `alab_autopilot` `task_started`.
+    Harness(&'a str),
+    /// The running turn's `task_complete`.
+    End,
+}
+
+/// How a harness-turn script's run ends ([`Ev::End`]).
+#[derive(Clone, Copy, Debug)]
+enum RunEnd {
+    /// The front goes back to the shell.
+    Shell,
+    /// The run's group names another program.
+    Program,
+    /// The session closes.
+    Session,
+}
+
+/// One thing a harness-turn script does ([`scripted`]), in order; the rig's clock moves to its
+/// test ms first.
+#[derive(Clone, Copy, Debug)]
+enum Ev<'a> {
+    /// `holder` records the act `rule` (`meta set harness_act`).
+    Act(&'a str, &'a str, u64),
+    /// The tap reads the rows `(ms, row)`, short of the rollout's end.
+    Read(u64, &'a [(u64, Row<'a>)]),
+    /// The tap reads to the rollout's end and finds no new row.
+    Idle(u64),
+    /// The loop ticks the session log ([`SessionLog::tick`]).
+    Tick(u64),
+    /// The run ends.
+    End(u64, RunEnd),
+    /// The log's wake ([`SessionLog::wake`]) is then this, in test ms.
+    Wakes(Option<u64>),
+    /// The log's harness read wait ([`SessionLog::harness_wait`]) is then from this, in test ms.
+    Waits(Option<u64>),
+    /// The last batch moved the read wait, or did not ([`Applied::waits`]).
+    Moved(bool),
+}
+
+/// A codex rig whose run opened at `opened` (test ms) after the acts `early` (`(rule, holder,
+/// ms)`), run through `script`: its log's lines and every act mark's seq, in log order.
+fn scripted(
+    name: &str,
+    opened: u64,
+    early: &[(&str, &str, u64)],
+    script: &[Ev<'_>],
+) -> (Vec<String>, Vec<u64>) {
+    let build = "0.164.0-dev.12521+g3d3eb12d8";
+    let (tl, hand, _home, _target, _claim) = codex_rig_hand(name, "codex", build, opened, early);
+    let step = |off: u64, ms: u64, ev: StepEvent| Step {
+        pos: aterm_agent::harness::steps::StepPos {
+            fp: 1,
+            id: None,
+            off,
+            at_ms: WALL0 + ms,
+        },
+        state: StepState::On,
+        ev,
+    };
+    let mut off = 0;
+    let mut last = None::<Applied>;
+    for ev in script {
+        match *ev {
+            Ev::Act(rule, holder, ms) => {
+                hand.set(ms);
+                let mut g = tl.lock().unwrap();
+                let now = g.slog().now();
+                g.slog_mut()
+                    .self_claim_act(rule, holder, aterm_slog::Actor::Ctl, now)
+                    .expect("the act mark");
+            }
+            Ev::Idle(ms) => {
+                hand.set(ms);
+                let applied = apply_batch_timed(
+                    &tl,
+                    Source::Rollout,
+                    &StepBatch::default(),
+                    (true, Some(WALL0 + ms)),
+                    &mut || 0,
+                    &mut |_, _| {},
+                );
+                assert!(!applied.disarm, "{ev:?}: {applied:?}");
+                last = Some(applied);
+            }
+            Ev::Tick(ms) => {
+                hand.set(ms);
+                let _ = tl.lock().unwrap().slog_tick();
+            }
+            Ev::End(ms, how) => {
+                hand.set(ms);
+                let mut g = tl.lock().unwrap();
+                match how {
+                    RunEnd::Shell => assert!(g.note_foreground_group(100)),
+                    RunEnd::Program => {
+                        assert!(g.set_program(300, Some("bash".into())));
+                        let pgid = g.agent().program_pgid;
+                        let _ = g.sweep_slog(
+                            &crate::session_log::BlockRead::default(),
+                            false,
+                            100,
+                            pgid,
+                        );
+                    }
+                    RunEnd::Session => {
+                        let now = g.slog().now();
+                        g.slog_mut().close_session(
+                            aterm_slog::SessionOut::ShellExit,
+                            aterm_slog::Actor::Nobody,
+                            "-",
+                            Some(0),
+                            now,
+                        );
+                    }
+                }
+            }
+            Ev::Wakes(ms) => assert_eq!(tl.lock().unwrap().slog_wake(), ms, "{ev:?}"),
+            Ev::Waits(ms) => {
+                let since = tl
+                    .lock()
+                    .unwrap()
+                    .slog()
+                    .harness_wait()
+                    .map(|(w, _)| w.since - WALL0);
+                assert_eq!(since, ms, "{ev:?}");
+            }
+            Ev::Moved(moved) => assert_eq!(last.map(|a| a.waits), Some(moved), "{ev:?}"),
+            Ev::Read(ms, rows) => {
+                hand.set(ms);
+                let mut steps = Vec::new();
+                if off == 0 {
+                    steps.push(step(0, 0, StepEvent::Bind { len: 0 }));
+                }
+                for (at, row) in rows {
+                    off += 1;
+                    let ev = match row {
+                        Row::Prompt(v) => StepEvent::Prompt { vref: vref(v) },
+                        Row::Harness(v) => StepEvent::HarnessTurn { vref: vref(v) },
+                        Row::End => StepEvent::TurnEnd {
+                            vdur_ms: 1,
+                            tok_in: 0,
+                            tok_out: 0,
+                        },
+                    };
+                    steps.push(step(off, *at, ev));
+                }
+                let batch = StepBatch {
+                    steps,
+                    ..StepBatch::default()
+                };
+                let applied = apply_batch_timed(
+                    &tl,
+                    Source::Rollout,
+                    &batch,
+                    (true, None),
+                    &mut || 0,
+                    &mut |_, _| {},
+                );
+                assert!(!applied.disarm, "{ev:?}: {applied:?}");
+                last = Some(applied);
+            }
+        }
+    }
+    let seqs = tl
+        .lock()
+        .unwrap()
+        .slog()
+        .log()
+        .window()
+        .filter(|r| r.op == aterm_slog::Op::Mark && r.k == aterm_slog::Kind::Act)
+        .map(|r| r.seq)
+        .collect();
+    (lines_of(&tl), seqs)
+}
+
+/// The `turn_by` amend lines of `got`.
+fn harnessed(got: &[String]) -> Vec<String> {
+    having(got, " turn_by=harness ")
+        .into_iter()
+        .cloned()
+        .collect()
+}
+
+/// The `cause=` every amend of `turn` (`t<n>`) in `got` names.
+fn causes(got: &[String], turn: &str) -> Vec<u64> {
+    having(got, &format!(" amend {turn} turn "))
+        .into_iter()
+        .filter_map(|l| {
+            l.split(' ')
+                .find_map(|w| w.strip_prefix("cause="))
+                .and_then(|c| c.parse().ok())
+        })
+        .collect()
+}
+
+/// The rows of one autopilot turn `v` opening at `ms`.
+const fn harness_rows(v: &str, ms: u64) -> [(u64, Row<'_>); 2] {
+    [(ms, Row::Prompt(v)), (ms, Row::Harness(v))]
+}
+
+/// GAP 25 AT THE HOST: a harness turn's step amends its turn `turn_by=harness`, and the act that
+/// typed it (the nearest act within five seconds of the turn's open whose rule types an
+/// Autopilot turn, that no turn names already and that no other turn opened nearer) reaches the
+/// turn on its own amend once a later read settles it. NEGATIVE CONTROLS: an act six seconds
+/// off, an act nearer another turn and an act a turn named already pair with nothing; and the
+/// real tap on a build that showed no `alab_autopilot` (12521) writes no `turn_by=` from such a
+/// row.
+#[test]
+fn a_harness_turn_reaches_the_log_with_the_act_that_began_it() {
+    let t1 = harness_rows("turn-1", 5_000);
+    let end = [(8_000, Row::End)];
+    let (got, seqs) = scripted(
+        "harness-act",
+        0,
+        &[],
+        &[
+            Ev::Act("continue@v1", HOLDER, 5_020),
+            Ev::Read(5_050, &t1),
+            Ev::Read(8_100, &end),
+        ],
+    );
+    let amend = harnessed(&got);
+    assert_eq!(amend.len(), 1, "{got:#?}");
+    assert!(
+        amend[0].contains(" amend t1 turn turn_by=harness by=vendor src=transcript conf=exact"),
+        "{amend:?}"
+    );
+    let caused = having(&got, &format!(" cause={} ", seqs[0]));
+    assert_eq!(caused.len(), 1, "{got:#?}");
+    assert!(
+        caused[0].contains(&format!(
+            " amend t1 turn cause={} cause_k=rec by=vendor src=transcript conf=exact",
+            seqs[0]
+        )),
+        "{caused:?}"
+    );
+    time_order_holds(&got).unwrap_or_else(|e| panic!("{e}: {got:#?}"));
+    let far = harness_rows("turn-1", 7_000);
+    let nearer = [
+        (5_000, Row::Prompt("turn-1")),
+        (9_000, Row::Prompt("turn-2")),
+        (9_000, Row::Harness("turn-2")),
+    ];
+    let late = [(12_000, Row::End)];
+    for (name, script, why) in [
+        (
+            "harness-far",
+            &[
+                Ev::Act("continue@v1", HOLDER, 1_000),
+                Ev::Read(7_050, &far),
+                Ev::Read(12_100, &late),
+            ][..],
+            "an act six seconds off",
+        ),
+        (
+            "harness-nearer",
+            &[
+                Ev::Act("continue@v1", HOLDER, 5_500),
+                Ev::Read(9_050, &nearer),
+                Ev::Read(12_100, &late),
+            ][..],
+            "an act another turn opened nearer",
+        ),
+    ] {
+        let (got, _) = scripted(name, 0, &[], script);
+        assert_eq!(harnessed(&got).len(), 1, "{why}: {got:#?}");
+        assert!(having(&got, " cause=").is_empty(), "{why}: {got:#?}");
+    }
+    let tie = [
+        (5_000, Row::Prompt("turn-1")),
+        (5_000, Row::Harness("turn-1")),
+        (5_600, Row::Prompt("turn-2")),
+        (5_600, Row::Harness("turn-2")),
+    ];
+    let (got, seqs) = scripted(
+        "harness-named",
+        0,
+        &[],
+        &[
+            Ev::Act("continue@v1", HOLDER, 5_300),
+            Ev::Read(5_700, &tie),
+            Ev::Read(8_100, &end),
+        ],
+    );
+    assert_eq!(harnessed(&got).len(), 2, "{got:#?}");
+    assert_eq!(causes(&got, "t1"), [seqs[0]], "{got:#?}");
+    assert!(
+        causes(&got, "t2").is_empty(),
+        "an act a turn named already pairs no other: {got:#?}"
+    );
+    let build = "0.164.0-dev.12521+g3d3eb12d8";
+    let (tl, home, target, claim) = codex_rig("harness-gated", "codex", build);
+    let started = format!(
+        r#"{{"timestamp":"{}","type":"event_msg","payload":{{"type":"task_started","turn_id":"turn-1","turn_attribution":{{"turn_id":"turn-1","turn_trigger":"alab_autopilot"}}}}}}"#,
+        at(1_400)
+    );
+    let rows: String = rollout_rows(build)
+        .lines()
+        .flat_map(|l| {
+            let lead = (l.contains("\"turn_context\"") && l.contains("\"turn-1\""))
+                .then(|| started.clone());
+            lead.into_iter().chain(std::iter::once(l.to_string()))
+        })
+        .map(|l| format!("{l}\n"))
+        .collect();
+    assert!(rows.contains("alab_autopilot"), "the plant took");
+    rollout_is(&home, &rows);
+    let mut host = Host::default();
+    let _ = host.ask(0xC0DE_2502, &claim.0, target, MEASURED);
+    let got = lines_of(&tl);
+    assert_eq!(having(&got, " open t1 turn ").len(), 1, "{got:#?}");
+    assert!(
+        having(&got, " turn_by=").is_empty(),
+        "12521 showed no alab_autopilot: {got:#?}"
+    );
+}
+
+/// A HARNESS TURN'S ACT, WHICHEVER LANDS FIRST (gap 25): codex-alab records its act once its turn
+/// started, and aterm logs it after the act barrier, so the tap's read of the turn's rows can
+/// come before or after the act mark. Either way the turn names that act, once: logged before
+/// the read, logged after it, or held two seconds and paired only once a read passes the time a
+/// nearer turn would have opened. An act logged just before the open waits until the clock
+/// passes as far after it, so a nearer act logged after the read is the one the turn takes.
+#[test]
+fn a_harness_turns_act_is_its_cause_whichever_lands_first() {
+    let t1 = harness_rows("turn-1", 5_000);
+    let end = [(8_000, Row::End)];
+    let person = [(30_000, Row::Prompt("turn-2"))];
+    let (got, seqs) = scripted(
+        "harness-nearer-later",
+        0,
+        &[],
+        &[
+            Ev::Act("continue@v1", HOLDER, 4_700),
+            Ev::Read(5_050, &t1),
+            Ev::Act("continue@v1", HOLDER, 5_150),
+            Ev::Read(8_100, &end),
+        ],
+    );
+    assert_eq!(causes(&got, "t1"), [seqs[1]], "{got:#?}");
+    for (name, script) in [
+        (
+            "harness-act-first",
+            &[
+                Ev::Act("continue@v1", HOLDER, 5_020),
+                Ev::Read(5_050, &t1),
+                Ev::Read(8_100, &end),
+            ][..],
+        ),
+        (
+            "harness-read-first",
+            &[
+                Ev::Read(5_050, &t1),
+                Ev::Act("continue@v1", HOLDER, 5_150),
+                Ev::Read(8_100, &end),
+            ][..],
+        ),
+        (
+            "harness-held",
+            &[
+                Ev::Read(5_050, &t1),
+                Ev::Act("continue@v1", HOLDER, 7_000),
+                Ev::Read(8_100, &end),
+                Ev::Read(30_100, &person),
+            ][..],
+        ),
+    ] {
+        let (got, seqs) = scripted(name, 0, &[], script);
+        assert_eq!(harnessed(&got).len(), 1, "{name}: {got:#?}");
+        assert_eq!(causes(&got, "t1"), [seqs[0]], "{name}: {got:#?}");
+        assert!(causes(&got, "t2").is_empty(), "{name}: {got:#?}");
+        time_order_holds(&got).unwrap_or_else(|e| panic!("{name}: {e}: {got:#?}"));
+    }
+}
+
+/// A LATER TURN KEEPS ITS OWN ACT (gap 25): one read holds two Autopilot turns, and only the
+/// later one's act was logged; that act is the later turn's, which opened nearer it, though the
+/// earlier turn's step is read first. The same holds where the earlier turn was read before the
+/// act landed and the later one after, and where a read between them had not yet reached the
+/// later turn's rows: the earlier turn waits for a read past the time a nearer turn would open.
+#[test]
+fn a_later_turn_in_the_read_keeps_its_own_act() {
+    let both = [
+        (5_000, Row::Prompt("turn-1")),
+        (5_000, Row::Harness("turn-1")),
+        (8_000, Row::End),
+        (9_000, Row::Prompt("turn-2")),
+        (9_000, Row::Harness("turn-2")),
+        (9_600, Row::End),
+    ];
+    let first = harness_rows("turn-1", 5_000);
+    let rest = [
+        (8_000, Row::End),
+        (9_000, Row::Prompt("turn-2")),
+        (9_000, Row::Harness("turn-2")),
+        (9_600, Row::End),
+    ];
+    for (name, script) in [
+        (
+            "harness-batch",
+            &[
+                Ev::Act("continue@v1", HOLDER, 9_150),
+                Ev::Read(9_700, &both),
+            ][..],
+        ),
+        (
+            "harness-across",
+            &[
+                Ev::Read(5_050, &first),
+                Ev::Act("continue@v1", HOLDER, 9_150),
+                Ev::Read(9_700, &rest),
+            ][..],
+        ),
+        (
+            "harness-unread",
+            &[
+                Ev::Read(5_050, &first),
+                Ev::Act("continue@v1", HOLDER, 9_150),
+                Ev::Read(9_200, &rest[..1]),
+                Ev::Read(9_700, &rest[1..]),
+            ][..],
+        ),
+    ] {
+        let (got, seqs) = scripted(name, 0, &[], script);
+        assert_eq!(harnessed(&got).len(), 2, "{name}: {got:#?}");
+        assert_eq!(causes(&got, "t2"), [seqs[0]], "{name}: {got:#?}");
+        assert!(causes(&got, "t1").is_empty(), "{name}: {got:#?}");
+    }
+}
+
+/// ONLY THIS RUN'S HOLDER BEGINS ITS TURNS (gap 25): an act another codex-alab process recorded
+/// (`codex-alab@301`, where the run's group is 300) and one this process recorded before this
+/// run opened pair with none of this run's turns. NEGATIVE CONTROL: the same process's act after
+/// the run opened, though before the turn's open, pairs.
+#[test]
+fn only_the_runs_own_holder_begins_its_turns() {
+    let t1 = harness_rows("turn-1", 5_000);
+    let end = [(8_000, Row::End)];
+    let (got, _) = scripted(
+        "harness-other-pid",
+        0,
+        &[],
+        &[
+            Ev::Act("continue@v1", "codex-alab@301", 5_020),
+            Ev::Read(5_050, &t1),
+            Ev::Read(8_100, &end),
+        ],
+    );
+    assert_eq!(harnessed(&got).len(), 1, "{got:#?}");
+    assert!(having(&got, " cause=").is_empty(), "{got:#?}");
+    let t1 = harness_rows("turn-1", 4_000);
+    let (got, _) = scripted(
+        "harness-before-run",
+        3_000,
+        &[("continue@v1", HOLDER, 2_000)],
+        &[Ev::Read(4_050, &t1), Ev::Read(8_100, &end)],
+    );
+    assert_eq!(harnessed(&got).len(), 1, "{got:#?}");
+    assert!(having(&got, " cause=").is_empty(), "{got:#?}");
+    let (got, seqs) = scripted(
+        "harness-in-run",
+        3_000,
+        &[],
+        &[
+            Ev::Act("continue@v1", HOLDER, 3_500),
+            Ev::Read(4_050, &t1),
+            Ev::Read(8_100, &end),
+        ],
+    );
+    assert_eq!(causes(&got, "t1"), [seqs[0]], "{got:#?}");
+}
+
+/// A BOX'S ANSWER BEGINS NO AUTOPILOT TURN (gap 25): `approve-all@v1` types nothing, and the plan
+/// box's yes (`plan-approve@v2`) starts its implementing turn through codex's TUI as a person's
+/// (`turn_trigger=user`), so neither is the act of an `alab_autopilot` turn.
+#[test]
+fn a_boxs_answer_begins_no_autopilot_turn() {
+    let t1 = harness_rows("turn-1", 5_000);
+    let end = [(8_000, Row::End)];
+    for rule in ["approve-all@v1", "plan-approve@v2"] {
+        let (got, _) = scripted(
+            "harness-box",
+            0,
+            &[],
+            &[
+                Ev::Act(rule, HOLDER, 5_020),
+                Ev::Read(5_050, &t1),
+                Ev::Read(8_100, &end),
+            ],
+        );
+        assert_eq!(harnessed(&got).len(), 1, "{rule}: {got:#?}");
+        assert!(having(&got, " cause=").is_empty(), "{rule}: {got:#?}");
+    }
+}
+
+/// A HARNESS TURN NO LATER ROW FOLLOWS STILL TAKES ITS ACT (gap 25): the act lands two seconds
+/// after the open, the turn ends a second later, and the rollout writes nothing more. The read
+/// that ended the turn leaves it waiting on the read side, from the act's time plus its distance
+/// from the open plus the writer's lag (11 s), and arms no wake, since the clock alone settles
+/// nothing: the read wait goes to the rollout tap's ask. A read to the rollout's end begun then
+/// pairs it; one begun a tenth of a second sooner does not, since a turn stamped up to the act's
+/// time plus that distance could still have been on its way to the file, and it moves the wait
+/// (the ask takes it as new and asks once more). A read that stops short of the end, though begun
+/// after the wait's time, leaves the wait as it was and arms no wake. An act logged after the
+/// turn's last read is waited for on the clock until its window shuts (the open plus five
+/// seconds), and the tick there leaves the turn waiting on the read side. An act just before the
+/// open waits on the clock alone: the loop's tick at its wake pairs it with no read.
+#[test]
+fn a_harness_turn_no_later_row_follows_takes_its_act_at_a_read_to_the_end() {
+    let t1 = harness_rows("turn-1", 5_000);
+    let end = [(8_000, Row::End)];
+    let lead = [
+        Ev::Read(5_050, &t1),
+        Ev::Wakes(Some(10_000)),
+        Ev::Waits(None),
+        Ev::Act("continue@v1", HOLDER, 7_000),
+        Ev::Read(8_100, &end),
+        Ev::Moved(true),
+        Ev::Wakes(None),
+        Ev::Waits(Some(11_000)),
+    ];
+    let (got, _) = scripted(
+        "harness-idle-early",
+        0,
+        &[],
+        &[
+            &lead[..],
+            &[
+                Ev::Idle(10_900),
+                Ev::Moved(true),
+                Ev::Wakes(None),
+                Ev::Waits(Some(11_000)),
+                Ev::Read(11_500, &[]),
+                Ev::Moved(false),
+                Ev::Wakes(None),
+                Ev::Waits(Some(11_000)),
+            ],
+        ]
+        .concat(),
+    );
+    assert_eq!(harnessed(&got).len(), 1, "{got:#?}");
+    assert!(causes(&got, "t1").is_empty(), "{got:#?}");
+    let (got, seqs) = scripted(
+        "harness-idle",
+        0,
+        &[],
+        &[
+            &lead[..],
+            &[
+                Ev::Idle(11_000),
+                Ev::Moved(true),
+                Ev::Wakes(None),
+                Ev::Waits(None),
+            ],
+        ]
+        .concat(),
+    );
+    assert_eq!(causes(&got, "t1"), [seqs[0]], "{got:#?}");
+    let quick = [
+        (5_000, Row::Prompt("turn-1")),
+        (5_000, Row::Harness("turn-1")),
+        (5_100, Row::End),
+    ];
+    let (got, seqs) = scripted(
+        "harness-act-late",
+        0,
+        &[],
+        &[
+            Ev::Read(5_150, &quick),
+            Ev::Act("continue@v1", HOLDER, 6_900),
+            Ev::Wakes(Some(10_000)),
+            Ev::Tick(10_000),
+            Ev::Wakes(None),
+            Ev::Waits(Some(10_800)),
+            Ev::Idle(10_800),
+            Ev::Wakes(None),
+            Ev::Waits(None),
+        ],
+    );
+    assert_eq!(causes(&got, "t1"), [seqs[0]], "{got:#?}");
+    let (got, seqs) = scripted(
+        "harness-clock",
+        0,
+        &[],
+        &[
+            Ev::Act("continue@v1", HOLDER, 4_000),
+            Ev::Read(5_050, &t1),
+            Ev::Wakes(Some(6_000)),
+            Ev::Waits(None),
+            Ev::Tick(6_000),
+            Ev::Wakes(None),
+        ],
+    );
+    assert_eq!(causes(&got, "t1"), [seqs[0]], "{got:#?}");
+    time_order_holds(&got).unwrap_or_else(|e| panic!("{e}: {got:#?}"));
+}
+
+/// A TURN WAITING ON A READ HIDES NO OTHER TURN'S CLOCK (gap 25): two harness turns, the first
+/// (open at 5 s) with its act four and a half seconds before it, which the turn's own read
+/// passed, so it waits on the clock alone until 9.5 s; the second (open at 6 s) with its act half
+/// a second after it, logged after the read, so it waits on a read begun from 9 s. A read short
+/// of the end leaves both: the pair wake at 9.5 s, the read wait from 9 s. A tick before the wake
+/// pairs nothing and keeps it, though the read wait's time passed; the tick at the wake pairs the
+/// first turn, and the read to the end that follows pairs the second.
+#[test]
+fn a_turn_waiting_on_a_read_hides_no_other_turns_clock() {
+    let rows = [
+        &harness_rows("turn-1", 5_000)[..],
+        &[(5_800, Row::End)],
+        &harness_rows("turn-2", 6_000),
+    ]
+    .concat();
+    let (got, seqs) = scripted(
+        "harness-two-waits",
+        0,
+        &[],
+        &[
+            Ev::Act("continue@v1", HOLDER, 500),
+            Ev::Read(6_050, &rows),
+            Ev::Act("continue@v1", HOLDER, 6_500),
+            Ev::Read(7_000, &[]),
+            Ev::Moved(true),
+            Ev::Wakes(Some(9_500)),
+            Ev::Waits(Some(9_000)),
+            Ev::Tick(9_200),
+            Ev::Wakes(Some(9_500)),
+            Ev::Tick(9_500),
+            Ev::Wakes(None),
+            Ev::Waits(Some(9_000)),
+            Ev::Idle(9_600),
+            Ev::Waits(None),
+        ],
+    );
+    assert_eq!(causes(&got, "t1"), [seqs[0]], "{got:#?}");
+    assert_eq!(causes(&got, "t2"), [seqs[1]], "{got:#?}");
+    let at = |what: &str| got.iter().position(|l| l.contains(what));
+    assert!(
+        at(" amend t1 turn cause=") < at(" amend t2 turn cause="),
+        "the clock settled the first before the read settled the second: {got:#?}"
+    );
+}
+
+/// A RUN'S LAST HARNESS TURN TAKES ITS ACT BEFORE THE RUN ENDS (gap 25): an act a second before
+/// the turn's open, whose read side the turn's own rows (stamped at the open, the act's time plus
+/// that second) meet exactly, and the run ends once the log's clock passed the open by as much,
+/// with no tick between, its front back at the shell, its group naming another program, or its
+/// session closing: the cause is written before the run's close. NEGATIVE CONTROL: the run ending
+/// before the clock passed as far after the open leaves the turn with no cause, since a nearer act
+/// could still be logged.
+#[test]
+fn a_runs_last_harness_turn_takes_its_act_before_the_run_ends() {
+    let t1 = harness_rows("turn-1", 5_000);
+    for (ends, caused) in [(6_000, true), (5_500, false)] {
+        for how in [RunEnd::Shell, RunEnd::Program, RunEnd::Session] {
+            let (got, seqs) = scripted(
+                "harness-run-end",
+                0,
+                &[],
+                &[
+                    Ev::Act("continue@v1", HOLDER, 4_000),
+                    Ev::Read(5_050, &t1),
+                    Ev::End(ends, how),
+                    Ev::Wakes(None),
+                ],
+            );
+            let want: &[u64] = if caused { &seqs[..1] } else { &[] };
+            assert_eq!(causes(&got, "t1"), want, "{ends} {how:?}: {got:#?}");
+            if caused {
+                let at = |what: &str| got.iter().position(|l| l.contains(what));
+                let paired = at(&format!(" amend t1 turn cause={} ", seqs[0]));
+                let closed = at(" close r1 ");
+                assert!(
+                    paired.is_some() && closed.is_some() && paired < closed,
+                    "{how:?}: {got:#?}"
+                );
+            }
+        }
+    }
+}
+
+/// A TURN THE RUN'S END CANNOT SETTLE KEEPS NO CAUSE (gap 25): an act three seconds before the
+/// harness turn's open, the turn read at once and again a second later, then a second act two
+/// seconds after the open, which types a turn whose prompt (stamped a tenth of a second on) the
+/// tap has not read when the run ends. The second act is the nearer, and no turn in the log opened
+/// nearer it, but no read passed its time plus its distance from the open, so the unread turn
+/// could be its own: the run's last pairing gives the turn neither act, whichever way the run
+/// ends. NEGATIVE CONTROL: the last pairing with the read side waived pairs the turn with the
+/// second act.
+#[test]
+fn a_turn_the_runs_end_cannot_settle_keeps_no_cause() {
+    let t1 = harness_rows("turn-1", 5_000);
+    for how in [RunEnd::Shell, RunEnd::Program, RunEnd::Session] {
+        let (got, seqs) = scripted(
+            "harness-end-unread",
+            0,
+            &[],
+            &[
+                Ev::Act("continue@v1", HOLDER, 2_000),
+                Ev::Read(5_050, &t1),
+                Ev::Read(6_100, &[]),
+                Ev::Act("continue@v1", HOLDER, 7_000),
+                Ev::End(7_400, how),
+                Ev::Wakes(None),
+            ],
+        );
+        assert_eq!(seqs.len(), 2, "{how:?}: {got:#?}");
+        assert_eq!(harnessed(&got).len(), 1, "{how:?}: {got:#?}");
+        assert!(causes(&got, "t1").is_empty(), "{how:?}: {got:#?}");
+    }
+}
+
+/// THE TAP'S READ TO THE END (gap 25): the real tap's read of the rig's rollout reaches the file's
+/// end, so it raises the run's pairing watermark to the time it began (the log's clock, at 10 s)
+/// less the writer's lag.
+#[test]
+fn a_tap_read_to_the_rollouts_end_raises_the_pairing_watermark() {
+    let build = "0.164.0-dev.12521+g3d3eb12d8";
+    let (tl, _home, target, claim) = codex_rig("harness-eof", "codex", build);
+    let mut host = Host::default();
+    let _ = host.ask(0xC0DE_2503, &claim.0, target, MEASURED);
+    let read = tl
+        .lock()
+        .unwrap()
+        .slog()
+        .agent
+        .as_ref()
+        .map(|a| a.pairs.read_ms);
+    assert_eq!(
+        read,
+        Some(WALL0 + 10_000 - WRITE_LAG_MS),
+        "{:#?}",
+        lines_of(&tl)
+    );
 }

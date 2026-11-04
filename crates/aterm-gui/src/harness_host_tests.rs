@@ -5022,6 +5022,7 @@ fn standing_record() -> self_claimed::Seen {
         draft_empty: None,
         frame: None,
         goal: None,
+        background_terminals: None,
         initializing: false,
     })
 }
@@ -5272,6 +5273,125 @@ fn a_self_supervised_agents_exit_is_decided_by_its_copy_alone() {
     assert_eq!(said.len(), 1, "said once: {said:?}");
     assert!(said[0].contains("launch-path"), "{said:?}");
 }
+
+/// A SELF-CLAIMED CODEX-ALAB'S CRASH RELAUNCH LEAVES A POOL ROW THAT NO LONGER SERVES, AS A COLD
+/// RESTORE'S DOES ([`Acts::codex_cold`], asked of the copy's own line): where the pool names the
+/// serving row's login, the relaunch types that `CODEX_AUTH_PATH` on the copy's conversation, and
+/// the relaunch owed on its back-off and the line recorded as typed carry it too. CONTROL: where
+/// the pool keeps the row it ran on, the copy's line is typed, owed and recorded as it was; an
+/// orderly end asks the pool nothing and relaunches nothing.
+#[test]
+fn a_self_claimed_crash_relaunches_on_the_serving_pool_row() {
+    const SERVING: &str = "/tmp/logins/codex/work/auth.json";
+    let line = vec![
+        "/u/.aterm/agents/codex".to_string(),
+        "resume".to_string(),
+        "0199f2a4-6c1e-7a52-9d3b-2f6c8e1a4b77".to_string(),
+    ];
+    let dead = gone_pid();
+    let run = |sid: &str, seen: self_claimed::Seen, moves: bool| {
+        let a = Arc::new(Acting::default());
+        *a.self_relaunch_steps.lock().unwrap() =
+            std::iter::repeat_n("wait:shell-prompt".to_string(), 64).collect();
+        a.open.lock().unwrap().insert(sid.to_string());
+        a.set(&[(sid, Program::Codex)]);
+        let copy = self_copy(&a, sid, seen, Ok(line.clone()));
+        a.self_copies.lock().unwrap().insert(sid.to_string(), copy);
+        let asked = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+        let typed = Arc::new(Mutex::new(Vec::<(Vec<String>, Option<String>)>::new()));
+        let mut h = a.hooks();
+        let pool = Arc::clone(&asked);
+        h.acts.codex_cold = Arc::new(move |snap| {
+            let resume = snap.codex()?.self_claimed.as_ref()?;
+            pool.lock().unwrap().push(resume.argv.clone());
+            if !moves {
+                return None;
+            }
+            let mut moved = snap.clone();
+            moved.codex_mut()?.self_claimed.as_mut()?.codex_auth_path = Some(SERVING.into());
+            Some(moved)
+        });
+        let relaunch = Arc::clone(&h.acts.self_relaunch);
+        let seen_typed = Arc::clone(&typed);
+        h.acts.self_relaunch = Arc::new(move |sid, grace, snap, resume, cause| {
+            seen_typed
+                .lock()
+                .unwrap()
+                .push((resume.argv.clone(), resume.codex_auth_path.clone()));
+            relaunch(sid, grace, snap, resume, cause)
+        });
+        let host = HostHandle::start(on(), false, false, h);
+        a.attached(&host, sid);
+        until("its snapshot published", || {
+            crate::harness_host::published_snapshot(sid).is_some()
+        });
+        a.claims
+            .lock()
+            .unwrap()
+            .insert(sid.to_string(), format!("codex-alab@{dead}"));
+        a.proven.lock().unwrap().insert(sid.to_string());
+        a.set(&[]);
+        until("the exit decided", || {
+            !a.self_relaunched.lock().unwrap().is_empty()
+                || a.notes
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|n| matches!(n, HostNote::Inform { .. }))
+                || crate::harness_host::published_snapshot(sid).is_none()
+        });
+        let owed = host.pending_restored_for(sid).map(|owed| {
+            let resume = aterm_agent::harness::relaunch::self_claimed_line(&owed.snap)
+                .expect("owed on a self-claimed line");
+            (resume.argv.clone(), resume.codex_auth_path.clone())
+        });
+        let recorded = crate::self_claim::typed_for(sid)
+            .map(|resume| (resume.argv.clone(), resume.codex_auth_path.clone()));
+        host.shutdown_and_join();
+        crate::self_claim::forget(sid);
+        let asked = asked.lock().unwrap().clone();
+        let mut typed = typed.lock().unwrap().clone();
+        typed.dedup();
+        assert_eq!(
+            recorded.as_ref(),
+            typed.last(),
+            "the line typed is the one recorded as typed"
+        );
+        (asked, typed, owed)
+    };
+    let (asked, typed, owed) = run("s-pool-moved", standing_record(), true);
+    assert_eq!(
+        asked,
+        std::slice::from_ref(&line),
+        "the pool is asked of the copy's line, once"
+    );
+    let moved = (line.clone(), Some(SERVING.to_string()));
+    assert_eq!(
+        typed,
+        std::slice::from_ref(&moved),
+        "the relaunch types the serving row's login on the copy's conversation"
+    );
+    assert_eq!(
+        owed,
+        Some(moved),
+        "the owed relaunch carries the moved line"
+    );
+    let (asked, typed, owed) = run("s-pool-kept", standing_record(), false);
+    assert_eq!(asked, std::slice::from_ref(&line));
+    let kept = (line.clone(), None);
+    assert_eq!(
+        typed,
+        std::slice::from_ref(&kept),
+        "CONTROL: a row that still serves keeps the copy's line"
+    );
+    assert_eq!(owed, Some(kept), "CONTROL: owed on the copy's line");
+    let (asked, typed, owed) = run("s-pool-orderly", self_claimed::Seen::Removed, true);
+    assert!(
+        asked.is_empty() && typed.is_empty() && owed.is_none(),
+        "CONTROL: an orderly end asks nothing and relaunches nothing: {asked:?} {typed:?} {owed:?}"
+    );
+}
+
 #[test]
 fn a_self_claimed_relaunch_owed_at_a_commit_carries_its_validated_line() {
     use aterm_agent::harness::relaunch::self_claimed_line;
@@ -9568,6 +9688,7 @@ mod account_session;
 
 #[path = "harness_account_advice_tests.rs"]
 mod account_advice;
+pub(super) use account_advice::{ProgressExecutionFixture, progress_execution_fixture};
 #[path = "harness_account_context_identity_tests.rs"]
 mod account_context_identity;
 #[path = "harness_account_controls_tests.rs"]
@@ -16757,25 +16878,51 @@ fn every_test_host_and_test_instance_gets_the_inert_upkeep() {
         dir.path().join("no.sock").to_string_lossy().into_owned(),
     );
     assert!(inert(&acts.accounts_upkeep), "live_acts in a test binary");
-    for not_own in [
+    let not_owns = [
         "it runs under a private state root, as an isolated aterm instance does",
         "it runs as root",
         "its HOME is not this account's home",
-    ] {
-        assert!(
-            inert(&accounts_upkeep_arm(Some(not_own), false)),
-            "{not_own}"
-        );
+    ];
+    for debug in [false, true] {
+        for not_own in not_owns {
+            assert!(
+                inert(&accounts_upkeep_arm(Some(not_own), false, debug)),
+                "{not_own} (debug {debug})"
+            );
+        }
     }
 
-    assert!(matches!(
-        accounts_upkeep_arm(None, false),
-        AccountsUpkeep::Live
-    ));
-    assert!(matches!(
-        accounts_upkeep_arm(Some("its HOME is not this account's home"), true),
-        AccountsUpkeep::Live
-    ));
+    // The shipped build as its account's own is the one that keeps the accounts.
+    assert!(
+        matches!(
+            accounts_upkeep_arm(None, false, false),
+            AccountsUpkeep::Live
+        ),
+        "a shipped build as its account's own"
+    );
+    // A test binary copied under a name that gives it no scratch root reads as its account's own,
+    // and a debug build's upkeep stays inert even so: that case started real sign-ins.
+    assert!(
+        inert(&accounts_upkeep_arm(None, false, true)),
+        "a debug build"
+    );
+    // This build is a debug one, and its own arm reads it so: NEGATIVE CONTROL, with
+    // `accounts_upkeep_here` passing `false` for `debug`, this goes red.
+    assert!(
+        inert(&accounts_upkeep_here(None, false)),
+        "this (debug) build as its account's own"
+    );
+    for debug in [false, true] {
+        for not_own in [None, Some("its HOME is not this account's home")] {
+            assert!(
+                matches!(
+                    accounts_upkeep_arm(not_own, true, debug),
+                    AccountsUpkeep::Live
+                ),
+                "the admitted seam (debug {debug})"
+            );
+        }
+    }
 }
 
 #[test]
@@ -27946,6 +28093,12 @@ impl RealAgent {
             crate::harness_host::published_snapshot(&self.sid)
                 .is_some_and(|snap| snap.pid == self.upid() && snap.start == self.start)
         });
+        // The worker publishes that snapshot as it attaches, before its loop's first run (its read
+        // waits `INERT_POINT_READ` here, half a second live): a test that counts its runs needs
+        // that run to have come.
+        until("the agent's worker's loop runs", || {
+            a.runs.load(Ordering::SeqCst) >= 1
+        });
         (a, host)
     }
 
@@ -31373,6 +31526,38 @@ fn a_login_signed_back_in_at_the_tab_is_ok_again_for_its_own_account_alone() {
     assert!(due().is_empty(), "{:?}", due());
 }
 
+fn admitted_no_route(
+    roster: &accounts::Roster,
+    logins: &accounts::Logins,
+    label: &str,
+    routes: &str,
+) -> accounts::Logins {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let store = accounts::Store::at(root.path());
+    let path = root.path().join(accounts::ACCOUNTS_FILE);
+    std::fs::write(
+        &path,
+        accounts::append_rows_for(accounts::Cli::Claude, "", &roster.rows).unwrap(),
+    )
+    .unwrap();
+    store.save_logins(logins).unwrap();
+    store
+        .observe_admitted_workflow_for_test(&path, label, ACCT_NOW, |raw, _, logins| {
+            assert_eq!(raw, roster);
+            accounts::note_sign_in_attempt(
+                logins,
+                label,
+                accounts::AttemptOutcome::NoRoute,
+                routes,
+                ACCT_NOW,
+            )
+        })
+        .unwrap();
+    let logins = store.load_logins(ACCT_NOW).unwrap().0;
+    assert!(accounts::current_sign_in_attempt(roster.row(label).unwrap(), &logins).is_some());
+    logins
+}
+
 /// A row whose automatic sign-in found no route, and that has no login to run on, is the
 /// digest's no-sign-in fact with the routes it tried, and a line of the digest stands for it;
 /// once a login is made and bound to the row, it is off that fact.
@@ -31401,17 +31586,19 @@ fn a_row_no_route_signs_in_is_the_digests_fact_until_its_login_is_made() {
     let mut logins = accounts::Logins::default();
     let routes = "profile(none) mailbox(none configured) vault(not a member) \
                   headless-browser(none installed) hosts(none configured)";
-    let _ = accounts::note_sign_in_attempt(
-        &mut logins,
-        "w3",
-        accounts::AttemptOutcome::NoRoute,
-        routes,
-        ACCT_NOW,
+    logins.labels.insert(
+        "w3".into(),
+        accounts::Binding {
+            dir: Some(w3_text.clone()),
+            ..Default::default()
+        },
     );
+    logins = admitted_no_route(&roster, &logins, "w3", routes);
     let no_sign_in = |state: &accounts::State, logins: &accounts::Logins| {
         let bound = accounts::bound(&roster, logins);
         let said = AccountsSaid::listed(
             &bound,
+            &roster,
             state,
             logins,
             ACCT_NOW + 60,
@@ -31459,6 +31646,7 @@ fn a_login_a_tab_signs_in_is_off_the_digests_due_line() {
     let due = || {
         let logins = a.store().load_logins(a.clock()).expect("reads").0;
         match AccountsSaid::listed(
+            &a.roster(),
             &a.roster(),
             &a.state(),
             &logins,
@@ -31528,6 +31716,7 @@ fn a_tabs_sign_in_ends_when_a_move_relaunches_it_onto_another_login() {
         );
         let logins = a.store().load_logins(a.clock()).expect("reads").0;
         let now = AccountsSaid::listed(
+            &a.roster(),
             &a.roster(),
             &a.state(),
             &logins,
@@ -42471,19 +42660,33 @@ fn agy_limit_until_reads_quota_without_a_session_and_parks_only_when_rotation_is
 /// CONTROL: with no working login the fact stands, and no asking happens for no failing row.
 #[test]
 fn a_row_no_route_signs_in_is_no_fact_while_claude_works() {
+    let root = aterm_tempfile::tempdir().unwrap();
     let roster = accounts::Roster {
         rows: vec![accounts::Row {
             label: "w3".to_string(),
-            dir: Some("/nonexistent/w3".to_string()),
+            dir: Some(
+                root.path()
+                    .join("nonexistent-w3")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
             email: Some("w3@example.test".to_string()),
             ..accounts::Row::default()
         }],
     };
     let state = accounts::State::default();
     let mut logins = accounts::Logins::default();
+    logins.labels.insert(
+        "w3".into(),
+        accounts::Binding {
+            dir: roster.row("w3").unwrap().dir.clone(),
+            ..Default::default()
+        },
+    );
     let looked = std::cell::Cell::new(0);
     let no_sign_in = |logins: &accounts::Logins, works: bool| {
         let said = AccountsSaid::listed(
+            &roster,
             &roster,
             &state,
             logins,
@@ -42508,6 +42711,17 @@ fn a_row_no_route_signs_in_is_no_fact_while_claude_works() {
         "profile(none)",
         ACCT_NOW,
     );
+    assert_eq!(
+        no_sign_in(&logins, false),
+        0,
+        "unadmitted history is not a current failure"
+    );
+    assert_eq!(
+        looked.get(),
+        0,
+        "historical guidance does not probe the profile"
+    );
+    logins = admitted_no_route(&roster, &logins, "w3", "profile(none)");
     assert_eq!(
         no_sign_in(&logins, false),
         1,
@@ -42538,7 +42752,17 @@ fn the_clock_record_is_the_digests_line_while_it_counts() {
         clock: Some(clock.clone()),
         ..accounts::State::default()
     };
-    let at = |now| AccountsSaid::listed(&roster, &state, &logins, now, &BTreeSet::new(), &|| false);
+    let at = |now| {
+        AccountsSaid::listed(
+            &roster,
+            &roster,
+            &state,
+            &logins,
+            now,
+            &BTreeSet::new(),
+            &|| false,
+        )
+    };
     let live = at(ACCT_NOW + 60);
     assert!(
         matches!(
@@ -42557,6 +42781,7 @@ fn the_clock_record_is_the_digests_line_while_it_counts() {
     };
     assert_eq!(
         AccountsSaid::listed(
+            &roster,
             &roster,
             &renewed,
             &logins,

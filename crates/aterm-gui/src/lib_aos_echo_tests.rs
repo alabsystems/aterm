@@ -16,6 +16,7 @@ use aterm_effects::aos_momentum::{MomentumCode, MomentumEvent, MomentumSchema, M
 use aterm_models_aos::aos_key_hold_model;
 use aterm_spec::derive::Model;
 use aterm_spec::interp::{self, State};
+use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
 
 use super::aos_repair_tests::{
     WID, detached_for, exported_log, glyph, leave_prompt, momentum_app, press, status, type_keys,
@@ -38,12 +39,42 @@ fn ns(d: Duration) -> i128 {
 /// The fixture at a program that reads raw (no prompt in front, its tty mode unreadable), with a
 /// recording attached at `t0`.
 fn raw_app(t0: Instant) -> App {
+    raw_app_after(t0, b"")
+}
+
+/// [`raw_app`] with the program on the alternate screen, where Shift-Enter types a new line into
+/// a composer.
+fn raw_alt_app(t0: Instant) -> App {
+    raw_app_after(t0, b"\x1b[?1049h")
+}
+
+/// [`raw_app`], the program having printed `output` before the attach.
+fn raw_app_after(t0: Instant, output: &[u8]) -> App {
     let mut app = momentum_app(false);
     app.redraw_window_at(WID, t0);
     leave_prompt(&app);
+    if !output.is_empty() {
+        feed(&app, output);
+    }
     app.aos_attach_at(MomentumCode::Shipped, t0)
         .expect("attaches");
     app
+}
+
+/// A press of `key` with `mods`, as the keyboard sends it.
+fn pressed(key: Key, mods: Modifiers) -> InputEvent {
+    InputEvent::Key {
+        key,
+        mods,
+        base_layout: None,
+        layout_text: None,
+        event_type: KeyEventType::Press,
+    }
+}
+
+/// Shift-Enter: on the alternate screen, a new line typed into a composer, which carries no text.
+fn shift_enter() -> InputEvent {
+    pressed(Key::Named(NamedKey::Enter), Modifiers::SHIFT)
 }
 
 /// The person types `c` at `at`.
@@ -142,19 +173,42 @@ fn a_raw_key_the_program_echoes_in_place_is_recorded_at_its_echo() {
 #[test]
 fn nothing_is_logged_while_a_key_waits_for_its_echo() {
     let t0 = Instant::now();
-    for (what, off, mask) in [
-        ("no echo", false, false),
-        ("'*' feedback", false, true),
-        ("negative control: the hold off", true, false),
+    // A hidden field answers each key without showing it: by moving its cursor, by advancing it
+    // over blanks, or by a redraw of another row. None of them is the key's own echo.
+    for (what, off, output) in [
+        ("no echo", false, ""),
+        ("'*' feedback", false, "*"),
+        (
+            "the cursor advanced past the press over blanks",
+            false,
+            "  ",
+        ),
+        (
+            "a status row redrawn, the cursor parked on it",
+            false,
+            "\x1b[5;1Hstatus 12:00",
+        ),
+        (
+            "an unrelated row redrawn, the cursor back at the press",
+            false,
+            "\x1b7\x1b[3;1Hlog line\x1b8",
+        ),
+        ("negative control: the hold off", true, ""),
+        (
+            "negative control: the program echoes 'pw' in place",
+            false,
+            "pw",
+        ),
     ] {
         ECHO_HOLD_OFF.with(|o| o.set(off));
         let mut app = raw_app(t0);
         app.redraw_window_at(WID, t0 + ms(50));
         let before = status(&app).log_len;
         let t = t0 + ms(100);
-        key(&mut app, 'x', t);
-        if mask {
-            feed(&app, b"*");
+        key(&mut app, 'p', t);
+        key(&mut app, 'w', t + ms(1));
+        if !output.is_empty() {
+            feed(&app, output.as_bytes());
         }
         let mut lens = Vec::new();
         for d in [5, 10, 20] {
@@ -164,10 +218,18 @@ fn nothing_is_logged_while_a_key_waits_for_its_echo() {
         ECHO_HOLD_OFF.with(|o| o.set(false));
         if off {
             assert!(lens[0] > before, "{what}: logged at the press");
-            assert_eq!(key_times(&app, t0), [ns(ms(100))], "{what}");
+            assert_eq!(key_times(&app, t0), [ns(ms(100)), ns(ms(101))], "{what}");
             continue;
         }
-        if mask {
+        if output == "pw" {
+            assert_eq!(
+                key_times(&app, t0),
+                [ns(ms(105)), ns(ms(105))],
+                "{what}: released at the first frame"
+            );
+            continue;
+        }
+        if output == "*" {
             assert!(!status(&app).attached, "{what}: refuted at the first frame");
             assert!(detached_for(&app, "raw_key"), "{what}");
             continue;
@@ -179,7 +241,7 @@ fn nothing_is_logged_while_a_key_waits_for_its_echo() {
         assert!(status(&app).attached, "{what}: the recording waits");
         app.redraw_window_at(WID, t + ECHO_PROOF_BOUND - ms(1));
         assert!(status(&app).attached, "{what}: just under the bound");
-        assert_eq!(status(&app).log_len, before);
+        assert_eq!(status(&app).log_len, before, "{what}");
         app.redraw_window_at(WID, t + ECHO_PROOF_BOUND);
         assert!(!status(&app).attached, "{what}: refuted at the bound");
         assert!(detached_for(&app, "raw_key"), "{what}");
@@ -232,6 +294,92 @@ fn a_frame_that_cannot_read_the_terminal_leaves_a_held_key_to_the_watcher() {
     app.aos_watch_via(None::<fn(Worked)>, bound + frame);
     assert!(!status(&app).attached, "the watcher refuted the hold");
     assert!(detached_for(&app, "raw_key"), "{:?}", app.aos_ls_now());
+}
+
+#[test]
+fn a_key_that_carries_no_text_never_stops_a_raw_recording() {
+    let t0 = Instant::now();
+    let named = |key| pressed(Key::Named(key), Modifiers::empty());
+    let chorded = |c, mods| pressed(Key::Character(c), mods);
+    for (what, keys) in [
+        (
+            "arrows, Tab, Escape, F5, Ctrl-F and Alt-b (Option as Meta)",
+            vec![
+                named(NamedKey::ArrowDown),
+                named(NamedKey::ArrowUp),
+                named(NamedKey::Tab),
+                named(NamedKey::Escape),
+                named(NamedKey::F5),
+                chorded('f', Modifiers::CTRL),
+                chorded('b', Modifiers::ALT),
+            ],
+        ),
+        ("negative control: an unechoed 'j'", vec![glyph('j')]),
+    ] {
+        let mut app = raw_app(t0);
+        let t = t0 + ms(100);
+        for (i, ev) in (0u32..).zip(keys) {
+            press(&mut app, ev, t + ms(20) * i);
+        }
+        let held = held_keys(&app.windows[&WID].aos);
+        app.redraw_window_at(WID, t + ECHO_PROOF_BOUND + ms(200));
+        if held > 0 {
+            assert!(what.starts_with("negative control"), "{what}: held");
+            assert!(!status(&app).attached, "{what}: refuted at the bound");
+            assert!(detached_for(&app, "raw_key"), "{what}");
+            continue;
+        }
+        assert!(!what.starts_with("negative control"), "{what}: never held");
+        assert!(status(&app).attached, "{what}: still recording");
+        assert!(
+            key_times(&app, t0).is_empty(),
+            "{what}: never logged as keys"
+        );
+    }
+}
+
+#[test]
+fn an_alternate_screen_shift_enter_is_logged_only_with_nothing_held() {
+    let t0 = Instant::now();
+    let mut app = raw_alt_app(t0);
+    let at = type_echoed(&mut app, "ab", same, t0 + ms(100), ms(30), ms(5));
+    assert_eq!(key_times(&app, t0).len(), 2, "'ab' released");
+    let enter = at + ms(30);
+    press(&mut app, shift_enter(), enter);
+    assert!(
+        status(&app).attached,
+        "it carries no text, so it is not private"
+    );
+    assert_eq!(
+        key_times(&app, t0).last(),
+        Some(&ns(enter - t0)),
+        "logged at its press"
+    );
+    assert_eq!(key_times(&app, t0).len(), 3);
+
+    let x = enter + ms(30);
+    key(&mut app, 'x', x);
+    assert_eq!(
+        held_keys(&app.windows[&WID].aos),
+        1,
+        "an unechoed 'x' waits"
+    );
+    press(&mut app, shift_enter(), x + ms(20));
+    assert!(
+        !status(&app).attached,
+        "with 'x' held it joins nothing and stops the recording"
+    );
+    assert!(detached_for(&app, "raw_key"));
+
+    let mut app = raw_app(t0);
+    let at = type_echoed(&mut app, "ab", same, t0 + ms(100), ms(30), ms(5));
+    press(&mut app, shift_enter(), at + ms(30));
+    assert_eq!(
+        key_times(&app, t0).len(),
+        2,
+        "contrast: on the primary screen Shift-Enter never reaches the verdict and logs nothing"
+    );
+    assert!(status(&app).attached);
 }
 
 #[test]
@@ -435,6 +583,70 @@ fn a_paste_while_a_key_waits_detaches() {
     }
 }
 
+/// A `[key_sequences]` chord's bytes, as `forward_literal_press` hands them to the press path.
+fn chord(bytes: &[u8]) -> InputEvent {
+    InputEvent::KeySequence(bytes.to_vec())
+}
+
+#[test]
+fn a_chord_that_types_text_is_held_for_its_echo_like_a_typed_key() {
+    let t0 = Instant::now();
+    for (what, sent, echo) in [
+        ("'*' feedback", "#", Some("*")),
+        ("no echo", "#", None),
+        ("echoed with the next key", "#", Some("#S")),
+        (
+            "negative control: a Meta chord (ESC, then '#') sends a command",
+            "\x1b#",
+            Some("*"),
+        ),
+    ] {
+        let mut app = raw_app(t0);
+        app.redraw_window_at(WID, t0 + ms(50));
+        let before = status(&app).log_len;
+        let t = t0 + ms(100);
+        press(&mut app, chord(sent.as_bytes()), t);
+        if echo == Some("#S") {
+            key(&mut app, 'S', t + ms(40));
+        }
+        assert_eq!(status(&app).log_len, before, "{what}: nothing at the press");
+        if let Some(echo) = echo {
+            feed(&app, echo.as_bytes());
+        }
+        let frame = t + ms(48);
+        app.redraw_window_at(WID, frame);
+        if sent.starts_with('\x1b') {
+            assert!(status(&app).attached, "{what}: stops nothing");
+            assert!(
+                status(&app).log_len > before,
+                "{what}: the next frame's tick logs its instant, as it did a text chord's"
+            );
+            continue;
+        }
+        match echo {
+            Some("*") => {
+                assert!(!status(&app).attached, "{what}: refuted at the first frame");
+                assert!(detached_for(&app, "raw_key"), "{what}");
+            }
+            Some(_) => {
+                assert!(status(&app).attached, "{what}");
+                assert_eq!(
+                    key_times(&app, t0),
+                    [ns(frame - t0), ns(frame - t0)],
+                    "{what}: both at the frame that proved '#S', never at their presses"
+                );
+            }
+            None => {
+                assert!(status(&app).attached, "{what}: the recording waits");
+                assert_eq!(status(&app).log_len, before, "{what}: no key or tick");
+                app.redraw_window_at(WID, t + ECHO_PROOF_BOUND);
+                assert!(!status(&app).attached, "{what}: refuted at the bound");
+                assert!(detached_for(&app, "raw_key"), "{what}");
+            }
+        }
+    }
+}
+
 #[test]
 fn aterms_own_predicted_echo_never_proves_a_key() {
     let t0 = Instant::now();
@@ -538,7 +750,9 @@ fn an_attach_or_detach_while_a_key_waits_starts_the_next_glow_from_rest() {
 
 /// The claim-2 binding (`OnlyEchoedKeysLogged`): random GUI moves, each followed by the model
 /// admitting the projected step in at most two actions. The harness computes `echoed` from the
-/// bytes it fed, never from the code; `unproven` is a logged key the harness never echoed.
+/// bytes it fed, never from the code; `unproven` is a logged key the harness never echoed. The
+/// fixture is on the alternate screen, where Shift-Enter (`Bare`) carries no text: a press the log
+/// gains one key at, with nothing held, is the model's `Key`.
 mod claim2 {
     use super::*;
 
@@ -553,10 +767,11 @@ mod claim2 {
         Newline,
         Attach,
         Detach,
+        Bare,
     }
 
     /// The moves, weighted so a walk often gets as far as a proven pair.
-    const MOVES: [Move; 15] = [
+    const MOVES: [Move; 16] = [
         Move::Type,
         Move::Type,
         Move::Type,
@@ -572,6 +787,7 @@ mod claim2 {
         Move::Attach,
         Move::Attach,
         Move::Detach,
+        Move::Bare,
     ];
 
     /// A key the harness saw held: its press, and whether the harness fed its echo in place.
@@ -597,7 +813,7 @@ mod claim2 {
         fn new(seed: u64) -> Self {
             let t0 = Instant::now();
             Self {
-                app: raw_app(t0),
+                app: raw_alt_app(t0),
                 now: t0,
                 epoch: t0,
                 queue: Vec::new(),
@@ -711,26 +927,48 @@ mod claim2 {
                         let _ = self.app.aos_detach_now(now).expect("detaches");
                     }
                 }
+                Move::Bare => press(&mut self.app, shift_enter(), now),
             }
             let held = held_keys(&self.app.windows[&WID].aos);
             let attached = self.attached();
             let mut seen = Vec::new();
             let typed = matches!(m, Move::Type) && self.pending.len() > self.queue.len();
+            let bare = matches!(m, Move::Bare);
+            // Logged at its own press: the log gained one key, with nothing held before or after.
+            let at_press = (typed || bare)
+                && was_attached
+                && attached
+                && held_before == 0
+                && held == 0
+                && self.keys_logged() == logged_before + 1;
             if typed && held == held_before + 1 {
                 self.queue.push(HeldKey {
                     at: now,
                     echoed: false,
                 });
                 seen.push("Hold");
-            } else if typed {
-                self.pending.pop();
+            } else if at_press {
+                if typed {
+                    // The harness feeds an echo only after a press: this key had none.
+                    self.pending.pop();
+                    self.unproven = 1;
+                }
+                seen.push("Key");
+            } else if typed || (bare && was_attached) {
+                if typed {
+                    self.pending.pop();
+                }
                 seen.push("Private");
+            } else if bare {
+                seen.push("Key");
             }
             if matches!(m, Move::Echo) && echoed_before < self.echoed_prefix() {
                 seen.push("Echo");
             }
             if was_attached && attached && !matches!(m, Move::Attach) {
-                let released = self.keys_logged().saturating_sub(logged_before);
+                let released = self
+                    .keys_logged()
+                    .saturating_sub(logged_before + usize::from(at_press));
                 for k in self.queue.drain(..released.min(self.queue.len())) {
                     if !k.echoed {
                         self.unproven = 1;
@@ -795,7 +1033,7 @@ mod claim2 {
             fired.extend(walk(&model, seed, 40));
         }
         for action in [
-            "Attach", "Detach", "Private", "Hold", "Echo", "Release", "Refute",
+            "Attach", "Detach", "Key", "Private", "Hold", "Echo", "Release", "Refute",
         ] {
             assert!(
                 fired.contains(action),
@@ -826,6 +1064,31 @@ mod claim2 {
             take(&mutant, &prev, &seen),
             Some(got.clone()),
             "Buggy 2 takes it"
+        );
+        assert!(!mutant.check_invariant("OnlyEchoedKeysLogged", &got));
+    }
+
+    #[test]
+    fn negative_control_a_text_key_logged_at_its_press() {
+        let model = aos_key_hold_model();
+        let mutant = interp::with_buggy(&model, 5);
+        let mut gui = Gui::new(1);
+        let prev = gui.project();
+        ECHO_HOLD_OFF.with(|off| off.set(true));
+        let seen = gui.act(Move::Type);
+        ECHO_HOLD_OFF.with(|off| off.set(false));
+        let got = gui.project();
+        assert_eq!(seen, ["Key"], "the log gained the key at its own press");
+        assert_eq!(got["unproven"], 1, "the harness never fed its echo");
+        assert_ne!(
+            take(&model, &prev, &seen),
+            Some(got.clone()),
+            "the healthy model's Key logs only a key that needs no echo"
+        );
+        assert_eq!(
+            take(&mutant, &prev, &seen),
+            Some(got.clone()),
+            "Buggy 5 takes it"
         );
         assert!(!mutant.check_invariant("OnlyEchoedKeysLogged", &got));
     }

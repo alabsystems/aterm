@@ -3,6 +3,19 @@
 
 use super::*;
 
+// File descriptors belong to the process, not the test thread. A concurrent
+// spawn may temporarily inherit another fixture's locked description before
+// exec closes it, so each kernel fixture owns the process's descriptor table
+// through its final close and child reap. Child fixtures exec a fresh test
+// process and therefore have their own guard.
+#[cfg(unix)]
+pub(crate) static KERNEL_FIXTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(unix)]
+pub(crate) fn kernel_fixture() -> std::sync::MutexGuard<'static, ()> {
+    KERNEL_FIXTURE.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[test]
 fn records_round_trip_and_refuse_unbounded_or_ambiguous_input() {
     for birth in [None, Some(0), Some(u64::MAX)] {
@@ -34,17 +47,6 @@ mod unix {
     use std::time::{Duration, Instant};
 
     use super::*;
-
-    // File descriptors belong to the process, not the test thread. A concurrent
-    // spawn may temporarily inherit another fixture's locked description before
-    // exec closes it, so each kernel fixture owns the process's descriptor table
-    // through its final close and child reap. Child fixtures exec a fresh test
-    // process and therefore have their own guard.
-    static KERNEL_FIXTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn kernel_fixture() -> std::sync::MutexGuard<'static, ()> {
-        KERNEL_FIXTURE.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
 
     fn width(value: u32) -> NonZeroU32 {
         NonZeroU32::new(value).unwrap()

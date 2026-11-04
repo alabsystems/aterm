@@ -21,6 +21,22 @@ const ROOT_TOOLS: &[&str] = &[
 const AGENT_PATH: &str = "aterm_machines::agent";
 const INSTALLER_PROBE: &str = "crates/aterm-gui/src/clt_install/probe.rs";
 
+/// The admitted-name rule's two paths (`aterm_machines::root_steps`), as aterm-types holds them so
+/// the window can stat them with no root and no dependency on aterm-machines: data, each the
+/// whole of one `pub const` line, never an argv.
+const RULE_PATHS: (&str, [&str; 2]) = (
+    "crates/aterm-types/src/macos_setup.rs",
+    [
+        r#"pubconstADMITTED_NAME_RULE:&str="/private/etc/sudoers.d/aterm-admitted-name";"#,
+        r#"pubconstADMITTED_NAME_RULE_REFUSED:&str="/private/etc/sudoers.d/.aterm-admitted-name.refused";"#,
+    ],
+);
+
+/// `lab mac nux --sudo-asks`' guest rule (`crates/aterm-lab/src/mac_nux.rs`): a script that
+/// replaces a tart guest's own NOPASSWD rule, run in that guest through `tart exec`, never on
+/// this Mac. Only inside that one function's body.
+const LANE_GUEST_RULE: (&str, &str) = ("crates/aterm-lab/src/mac_nux.rs", "sudo_asks_script");
+
 const ROSETTA_INSTALL: (&str, &str, &str) = (
     "crates/atpkg/src/platform/unix.rs",
     "/usr/sbin/softwareupdate",
@@ -38,7 +54,10 @@ pub(super) const MACHINES_ROOT_DOOR: Rule = Rule {
           [\"/usr/sbin/softwareupdate\", \"--install-rosetta\", \"--agree-to-license\"] in \
           crates/atpkg/src/platform/unix.rs, which installs as the user with no administrator. \
           The GUI installer probe may only compare softwareupdate's and installer's executable \
-          identities in a closed boolean helper, without binding or executing either path",
+          identities in a closed boolean helper, without binding or executing either path. \
+          aterm-types may hold the admitted-name rule's two paths as whole `pub const` lines, \
+          which the window stats and never runs, and the mac lab lane's `sudo_asks_script` may \
+          name visudo and /etc/sudoers.d in the tart guest's script it builds",
     scope: &[MACHINES_CRATE],
     check: machines_root_door,
 };
@@ -55,6 +74,8 @@ fn machines_root_door(tree: &Tree<'_>, out: &mut Vec<Finding>) {
             if let Some(tool) = ROOT_TOOLS.iter().find(|t| line.text.contains(*t))
                 && !is_rosetta_install(file, &line, tool)
                 && !is_installer_identity(file, &line, tool)
+                && !is_rule_path(file, &line, tool)
+                && !is_lane_guest_rule(file, &line, tool)
             {
                 let why = format!(
                     "names `{tool}`, a root tool only aterm-machines' agent runs{}",
@@ -76,6 +97,34 @@ fn machines_root_door(tree: &Tree<'_>, out: &mut Vec<Finding>) {
             }
         }
     }
+}
+
+/// One of [`RULE_PATHS`]' lines, whole.
+fn is_rule_path(file: &SourceFile, line: &Line<'_>, tool: &str) -> bool {
+    let (rel, lines) = RULE_PATHS;
+    file.rel == rel && tool == "/etc/sudoers.d" && lines.contains(&squeeze(line.text).as_str())
+}
+
+/// A line inside the body of [`LANE_GUEST_RULE`]'s function, naming visudo or /etc/sudoers.d.
+fn is_lane_guest_rule(file: &SourceFile, line: &Line<'_>, tool: &str) -> bool {
+    let (rel, func) = LANE_GUEST_RULE;
+    if file.rel != rel || !matches!(tool, "/usr/sbin/visudo" | "/etc/sudoers.d") {
+        return false;
+    }
+    let lexed = file.lexed();
+    let line_at: usize = lexed
+        .code
+        .split_inclusive('\n')
+        .take(line.no - 1)
+        .map(str::len)
+        .sum();
+    let definition = format!("fn {func}");
+    hits(&lexed.code, &definition, Bound::Word).any(|at| {
+        let Some(open) = lexed.code[at..].find('{').map(|offset| at + offset) else {
+            return false;
+        };
+        brace_close(&lexed.code, open).is_some_and(|close| open < line_at && line_at < close)
+    })
 }
 
 fn is_installer_identity(file: &SourceFile, line: &Line<'_>, tool: &str) -> bool {
@@ -248,6 +297,38 @@ mod tests {
                 "crates/aterm-cli/src/lib.rs:6",
                 "crates/aterm-cli/src/lib.rs:8",
                 "crates/aterm-machines-extra/src/lib.rs:1",
+            ],
+            "{found:#?}"
+        );
+    }
+
+    /// The admitted-name rule's two whole path lines in aterm-types, and the lab lane's guest rule
+    /// inside `sudo_asks_script` alone. NEGATIVE CONTROLS: the same path in another aterm-types
+    /// line or another file, and the lane's tools outside that function, are findings.
+    #[test]
+    fn the_rule_paths_and_the_lanes_guest_rule_alone_name_sudoers() {
+        let types = "pub const ADMITTED_NAME_RULE: &str = \"/private/etc/sudoers.d/aterm-admitted-name\";\n\
+                     pub const ADMITTED_NAME_RULE_REFUSED: &str =\n    \"/private/etc/sudoers.d/.aterm-admitted-name.refused\";\n\
+                     pub const OTHER: &str = \"/private/etc/sudoers.d/other\";\n";
+        let lane = "fn sudo_asks_script() -> String {\n    \"f=/private/etc/sudoers.d/.x; /usr/sbin/visudo -c -f $f\".to_owned()\n}\n\
+                    fn other() { let v = \"/usr/sbin/visudo\"; }\n";
+        let found = run(
+            &MACHINES_ROOT_DOOR,
+            &[
+                (RULE_PATHS.0, types),
+                (LANE_GUEST_RULE.0, lane),
+                ("crates/aterm-gui/src/clt_install.rs", types),
+            ],
+        );
+        assert_eq!(
+            spots(&found),
+            [
+                "crates/aterm-gui/src/clt_install.rs:1",
+                "crates/aterm-gui/src/clt_install.rs:3",
+                "crates/aterm-gui/src/clt_install.rs:4",
+                "crates/aterm-lab/src/mac_nux.rs:4",
+                "crates/aterm-types/src/macos_setup.rs:3",
+                "crates/aterm-types/src/macos_setup.rs:4",
             ],
             "{found:#?}"
         );

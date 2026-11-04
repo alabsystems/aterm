@@ -86,6 +86,6 @@ pub use screen::{
     combining_cap_clamp, combining_len_within_cap, dec_special_graphic, emit_ops, fold,
     is_combining_mark, is_vs16_emoji_capable, is_wide_char, screen_clamp_dim,
     screen_coord_in_bounds, vs_cursor_advance_clamp, vs_width_clamp, vs_width_valid,
-    wide_cell_width_clamp, wide_spacer_col_clamp, Cell, Charset, Color, Folder, Screen,
-    MAX_COMBINING, MAX_OSC_CWD_BYTES, MAX_OSC_TITLE_BYTES,
+    wide_cell_width_clamp, wide_spacer_col_clamp, Cell, Charset, Color, Folder, Screen, Underline,
+    MAX_COMBINING, MAX_OSC_CWD_BYTES, MAX_OSC_TITLE_BYTES, WIRE_UNDERLINE,
 };

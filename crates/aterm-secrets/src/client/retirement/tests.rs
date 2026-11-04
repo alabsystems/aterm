@@ -10,7 +10,12 @@ use crate::commons::{binding::Pending, node::Edit, roster::Role};
 /// unstamped envelope after already making the retirement durable.
 #[test]
 fn a_revoke_that_cannot_fit_its_cascade_refuses_before_retirement() {
-    use crate::membership_log::{Body, MAX_HELD_RECORDS};
+    crate::crossing::fixture::LEGACY.within(revoke_at_a_full_held_store);
+}
+
+fn revoke_at_a_full_held_store() {
+    use crate::crossing::fixture::LEGACY;
+    use crate::membership_log::Body;
 
     let lab = Lab::new(true, Custody::Founded);
     let paths = &lab.paths[0];
@@ -44,7 +49,7 @@ fn a_revoke_that_cannot_fit_its_cascade_refuses_before_retirement() {
         crate::client::log_entries::draft_retire_in_log(paths, &store, &[target], &excludes)
             .unwrap();
     assert!(!retirement.is_empty());
-    let room = MAX_HELD_RECORDS.checked_sub(retirement.len()).unwrap();
+    let room = LEGACY.held.checked_sub(retirement.len()).unwrap();
     let request = owner.request().unwrap();
     owner.device().with_seed(|seed| {
         while store.log().unwrap().held_count() < room {
@@ -81,7 +86,7 @@ fn a_revoke_that_cannot_fit_its_cascade_refuses_before_retirement() {
     );
     assert_eq!(
         load_records(&preview).unwrap().log().unwrap().held_count(),
-        MAX_HELD_RECORDS
+        LEGACY.held
     );
     assert!(
         crate::client::log_entries::draft_document_diff(

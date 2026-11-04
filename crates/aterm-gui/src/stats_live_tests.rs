@@ -1218,9 +1218,9 @@ fn scale_could_go(head: &HeaderPlan, strip: Strip, m: &FaceMetrics) -> Option<St
     None
 }
 
-/// T-G4's widths, both faces, both forms: wherever the header carries the time label, a scale
-/// says how far back the strip reaches, each tick at its age from now under the middle of its
-/// words, clear of the now marker at the strip's left end. With now at the left every deck
+/// Every third point of T-G4's range, both faces, both forms: wherever the header carries the time
+/// label, a scale says how far back the strip reaches, each tick at its age from now under the
+/// middle of its words, clear of the now marker at the strip's left end. With now at the left every deck
 /// width's strip holds the label over its old end and a tick, so none needs the label beside
 /// it (that placement is pinned on a strip too short for both, below); the scale is missing
 /// only where every placement would cost the key "over max" ([`scale_could_go`]),

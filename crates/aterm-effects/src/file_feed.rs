@@ -304,23 +304,19 @@ pub fn fingerprint_bounded_regular_utf8(path: &Path, max_bytes: usize) -> io::Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
-    fn fixture_dir(label: &str) -> std::path::PathBuf {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let serial = NEXT.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "aterm-visual-feed-{label}-{}-{serial}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&path).expect("create visual-feed fixture directory");
-        path
+    fn fixture_dir(label: &str) -> aterm_tempfile::TempDir {
+        aterm_tempfile::Builder::new()
+            .prefix(&format!("at-feed-{label}-"))
+            .suffix(".noindex")
+            .tempdir()
+            .expect("create visual-feed fixture directory")
     }
 
     #[test]
     fn regular_file_round_trips_and_fingerprints_content() {
-        let root = fixture_dir("regular");
-        let path = root.join("feed.toml");
+        let dir = fixture_dir("regular");
+        let path = dir.path().join("feed.toml");
         std::fs::write(&path, "snowcat 😺\n").expect("write regular feed");
         let admitted = read_bounded_regular_utf8(&path, 64).expect("regular feed reads");
         assert_eq!(admitted, "snowcat 😺\n");
@@ -339,14 +335,14 @@ mod tests {
             before,
             fingerprint_bounded_regular_utf8(&path, 64).expect("fingerprint edited feed")
         );
-        std::fs::remove_dir_all(root).expect("remove regular fixtures");
     }
 
     #[test]
     fn oversize_directory_and_invalid_utf8_are_rejected_by_read_and_hash() {
-        let root = fixture_dir("invalid");
+        let dir = fixture_dir("invalid");
+        let root = dir.path();
         assert_eq!(
-            read_bounded_regular_utf8(&root, 8)
+            read_bounded_regular_utf8(root, 8)
                 .expect_err("directory is not a feed")
                 .kind(),
             io::ErrorKind::InvalidInput
@@ -376,7 +372,6 @@ mod tests {
                 .kind(),
             io::ErrorKind::InvalidData
         );
-        std::fs::remove_dir_all(root).expect("remove invalid fixtures");
     }
 
     #[cfg(unix)]
@@ -384,7 +379,8 @@ mod tests {
     fn writerless_fifo_and_final_symlink_are_rejected_at_open() {
         use std::os::unix::ffi::OsStrExt as _;
 
-        let root = fixture_dir("special");
+        let dir = fixture_dir("special");
+        let root = dir.path();
         let fifo = root.join("feed.fifo");
         let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("FIFO path");
         // SAFETY: `fifo_c` is a live NUL-terminated pathname and mkfifo retains
@@ -402,6 +398,5 @@ mod tests {
             read_bounded_regular_utf8(&linked, 64).is_err(),
             "final-component links are not admitted"
         );
-        std::fs::remove_dir_all(root).expect("remove special fixtures");
     }
 }

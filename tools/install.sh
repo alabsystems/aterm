@@ -1320,7 +1320,7 @@ account_processes() { # <uid>
 # The aterm.app whose window <uid> runs, on stdout (empty when none): a
 # process whose command line is a bundle's executable alone, or with
 # --window. Helpers run from the same executable with a verb of their own
-# (`acaffiene serve`, the login item that stays when every window is closed;
+# (`acaffeine serve`, the login item that stays when every window is closed;
 # `__tether`; `ctl`): they are no window, and pgrep -f matched them, and any
 # account's aterm, so a run said aterm was running and left it closed. ps
 # joins argv with spaces, so `vim /Applications/aterm.app/Contents/MacOS/aterm`

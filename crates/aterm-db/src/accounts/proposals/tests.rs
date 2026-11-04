@@ -759,6 +759,30 @@ fn cli_exposes_shared_values_receipts_and_reverts_without_an_explicit_directory(
 }
 
 #[test]
+fn cli_rejects_unknown_collections_without_mistaking_them_for_empty_data() {
+    let lab = Lab::new(&[Role::Writer]);
+    command::run_at("accounts-init", Default::default(), lab.paths[0].clone()).unwrap();
+    let empty = command::run_at(
+        "accounts-scan",
+        std::collections::BTreeMap::from([("--collection", "mailboxes")]),
+        lab.paths[0].clone(),
+    )
+    .unwrap();
+    assert!(empty["rows"].as_array().unwrap().is_empty());
+
+    for verb in ["accounts-scan", "accounts-get"] {
+        let mut options = std::collections::BTreeMap::from([("--collection", "machines")]);
+        if verb == "accounts-get" {
+            options.insert("--key", "one");
+        }
+        assert!(
+            command::run_at(verb, options, lab.paths[0].clone()).is_err(),
+            "{verb} must refuse a collection outside the proposal schema"
+        );
+    }
+}
+
+#[test]
 fn a_late_remote_request_conflict_cannot_blame_an_honest_reverter() {
     let lab = Lab::new(&[Role::Writer, Role::Writer]);
     let a = app(&lab, 0);

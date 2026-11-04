@@ -67,7 +67,6 @@ fn walled(kind: WallKind, message: &str) -> TurnEndReading {
         login_back: false,
         auto_continue: None,
         since_limit: None,
-        background: false,
         served_in_transcript: false,
         chosen_in_transcript: None,
         conversation: crate::supervise::policy::turn_end::Conversation::Hostless,

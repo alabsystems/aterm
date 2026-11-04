@@ -361,6 +361,13 @@ fn dispatch_node(forwarded: &[OsString]) -> ExitCode {
             );
             return ExitCode::from(2);
         }
+        // Every thread the job starts runs at utility, as the `Standard` launchd job it ran in
+        // clamped it, but per thread, so the fleet book's lock lifts its holder to the default
+        // class while it holds it (`node_service::node_plist_text`'s `Interactive` job caps no
+        // thread). Unlike that clamp, the hold leaves a child started outside a role's
+        // `qos::command` (its Bonjour advert) at the default class, and a dispatch worker's item
+        // at its queue's class. First, as a thread started earlier keeps the default class.
+        aterm_gui::hold_process_as_background_work();
         aterm_gui::install_session_log();
         // The job's automatic LAN uses go only while `[swarm] enabled` leaves sharing on.
         if let Some(home) = aterm_types::dirs::home_dir() {
@@ -741,9 +748,9 @@ fn front_door_main() -> ExitCode {
         return aterm_gui::run_reopen_after(rest.get(1..).unwrap_or(&[]));
     }
 
-    // aCaffiene's name before 0.145.0: an old login job runs `caffeine serve` at every login.
-    if first == aterm_acaffiene::legacy::VERB {
-        return aterm_acaffiene::legacy::main_entry(rest.get(1..).unwrap_or(&[]));
+    // aCaffeine's name before 0.145.0: an old login job runs `caffeine serve` at every login.
+    if first == aterm_acaffeine::legacy::VERB {
+        return aterm_acaffeine::legacy::main_entry(rest.get(1..).unwrap_or(&[]));
     }
 
     #[cfg(unix)]
@@ -896,9 +903,9 @@ fn front_door_main() -> ExitCode {
             aterm_cli::Verb::Keeper => {
                 aterm_keeper::cli::main_entry(forwarded, aterm_types::version::app_version())
             }
-            aterm_cli::Verb::Acaffiene => {
+            aterm_cli::Verb::Acaffeine => {
                 aterm_gui::install_session_log();
-                aterm_acaffiene::cli::main_entry(forwarded, aterm_types::version::app_version())
+                aterm_acaffeine::cli::main_entry(forwarded, aterm_types::version::app_version())
             }
             aterm_cli::Verb::Agents => {
                 let _ = aterm_cli::parse_args(rest);
@@ -1420,7 +1427,7 @@ fn run_window(args: Vec<OsString>, host: WindowHost, handoff: &[OsString]) -> Ex
     let ordinary = ordinary_window(&args);
     // A command line the window's parser answers (`--list-fonts`) or refuses (a word no verb or
     // other front-door route took, which a launch without a terminal brings here) ends in this
-    // check, before the Commons runtime and, on macOS, aCaffiene's watch, which starts the mug
+    // check, before the Commons runtime and, on macOS, aCaffeine's watch, which starts the mug
     // that keeps the Mac awake unless the person turned it off.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     if ordinary {
@@ -1449,7 +1456,7 @@ fn run_window(args: Vec<OsString>, host: WindowHost, handoff: &[OsString]) -> Ex
     }
     #[cfg(target_os = "macos")]
     if ordinary {
-        spawn_acaffiene_watch();
+        spawn_acaffeine_watch();
     }
     #[cfg(target_os = "macos")]
     if runs_step && let Some(config) = aterm_types::dirs::aterm_config_path() {
@@ -1474,7 +1481,7 @@ fn run_window(args: Vec<OsString>, host: WindowHost, handoff: &[OsString]) -> Ex
 /// a `--control-sock` with a socket of its own: with no value, or one other than `0` and `off`
 /// (no socket, as `--no-control-sock`) and the empty one (the default socket)
 /// ([`aterm_types::control_socket::socket_directive`]). A launch with one starts no Commons
-/// runtime, aCaffiene or network source. [`run_window`] lets the window's parser end a one-shot
+/// runtime, aCaffeine or network source. [`run_window`] lets the window's parser end a one-shot
 /// or refused one of the rest first.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn ordinary_window(args: &[OsString]) -> bool {
@@ -1541,36 +1548,36 @@ fn warn_when_logging(line: String) {
     }
 }
 
-/// How often an ordinary window makes sure aCaffiene keeps this Mac awake.
+/// How often an ordinary window makes sure aCaffeine keeps this Mac awake.
 #[cfg(target_os = "macos")]
-const ACAFFIENE_WATCH: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+const ACAFFEINE_WATCH: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 /// Keep this Mac awake beside an ordinary window, at launch, once the window has set up its
-/// logging ([`EARLY_LOG_WAIT`]), and every [`ACAFFIENE_WATCH`]
-/// ([`aterm_acaffiene::cli::keep_awake_watch`]): at launch, what the old `aterm caffeine` name
-/// left retired ([`aterm_acaffiene::legacy::tidy`]) and the temporaries cut-short writes left
-/// removed ([`aterm_acaffiene::state::sweep_temps`],
-/// [`aterm_acaffiene::launchd::sweep_plist_temps`]); each pass, the installed app's Enable at
+/// logging ([`EARLY_LOG_WAIT`]), and every [`ACAFFEINE_WATCH`]
+/// ([`aterm_acaffeine::cli::keep_awake_watch`]): at launch, what the old `aterm caffeine` name
+/// left retired ([`aterm_acaffeine::legacy::tidy`]) and the temporaries cut-short writes left
+/// removed ([`aterm_acaffeine::state::sweep_temps`],
+/// [`aterm_acaffeine::launchd::sweep_plist_temps`]); each pass, the installed app's Enable at
 /// Startup turned on and the mug started, each unless the person turned it off, whose off is
 /// never overwritten. A trouble that lasts is an exceptions entry
 /// ([`aterm_gui::note_keep_awake_failing`]), raised again only when its why changes, and
-/// cleared on each pass with none ([`aterm_acaffiene::cli::EntryWatch`]), so one an earlier
+/// cleared on each pass with none ([`aterm_acaffeine::cli::EntryWatch`]), so one an earlier
 /// window raised before a relaunch goes too.
 #[cfg(target_os = "macos")]
-fn spawn_acaffiene_watch() {
+fn spawn_acaffeine_watch() {
     let watch = || {
-        use aterm_acaffiene::cli::{EntryWatch, EntryWord, Kept};
+        use aterm_acaffeine::cli::{EntryWatch, EntryWord, Kept};
         // The window installs its logger in main_entry_with_network, after this thread starts;
         // a line the first pass logs before that would be dropped.
         let _ = aterm_log::wait_for_logger(EARLY_LOG_WAIT);
         let mut entry = EntryWatch::default();
         loop {
-            let (kept, lasting) = aterm_acaffiene::cli::keep_awake_watch();
+            let (kept, lasting) = aterm_acaffeine::cli::keep_awake_watch();
             match &kept {
                 Kept::Failed(why) => {
-                    aterm_log::warn!("acaffiene: could not keep this Mac awake: {why}");
+                    aterm_log::warn!("acaffeine: could not keep this Mac awake: {why}");
                 }
-                kept if !entry.raised() => aterm_log::debug!("acaffiene: {}", kept.line()),
+                kept if !entry.raised() => aterm_log::debug!("acaffeine: {}", kept.line()),
                 _ => {}
             }
             match entry.step(&kept, lasting) {
@@ -1578,14 +1585,14 @@ fn spawn_acaffiene_watch() {
                 Some(EntryWord::Clear) => aterm_gui::clear_keep_awake_failing(),
                 None => {}
             }
-            std::thread::sleep(ACAFFIENE_WATCH);
+            std::thread::sleep(ACAFFEINE_WATCH);
         }
     };
     if let Err(error) = std::thread::Builder::new()
-        .name("aterm-acaffiene-watch".into())
+        .name("aterm-acaffeine-watch".into())
         .spawn(watch)
     {
-        warn_when_logging(format!("acaffiene: could not start with aterm: {error}"));
+        warn_when_logging(format!("acaffeine: could not start with aterm: {error}"));
     }
 }
 
@@ -3093,15 +3100,6 @@ trait SetupStartup {
         false
     }
     fn admission(&mut self) -> Result<Option<SetupAdmission>, String>;
-    /// Offer the plan of `admission`, the run this startup resumes, back to System State without
-    /// waiting for its answer (design §3.3, §6): the page answers it by itself as it answers the
-    /// first launch's offer, and that answer, taken as "go on with this revision" (nothing new
-    /// admitted, the page's receipt accepted at once), is the window's own admission of the
-    /// plan, which the debugger's step needs and an earlier process's yes never gives. Every
-    /// startup offers it, a launch's, an update successor's, a heal's or a Restore's alike: the
-    /// page answers only with a person at this Mac, and lets the offer go when the window holds
-    /// its own admission of the plan in force already.
-    fn offer_resume(&mut self, _admission: &SetupAdmission) {}
     fn initial(&mut self) -> Result<aterm_types::macos_setup::Plan, String>;
     fn offer(
         &mut self,
@@ -3155,156 +3153,6 @@ struct LiveSetupStartup<F> {
     retry_seen: u64,
     /// This bound review repaired corrupt records and retired without adopting them.
     recovered: bool,
-}
-
-/// What the offer of a resumed run's plan reads and waits on ([`run_resume_offer`]): the live
-/// records and System State's channel in aterm ([`LiveResumeOffer`]), a script in a test.
-#[cfg(any(target_os = "macos", test))]
-trait ResumeOfferReach {
-    /// Whether the resumed run is still the one admitted, unfinished and unstopped; `None` while
-    /// the records cannot be read (a write under way, say).
-    fn current(&mut self) -> Option<bool>;
-    /// Whether a choice of the page's waits for the setup claim
-    /// ([`SetupStartup::choice_awaits_claim`]): the page's own choice goes first.
-    fn choice_awaits_claim(&mut self) -> bool;
-    /// Offer `plan` on System State and wait for the answer, which the offer's going
-    /// ([`Self::current`] false, or a choice waiting for the claim) withdraws as `Unavailable`.
-    fn answer(&mut self, plan: aterm_types::macos_setup::Plan) -> aterm_gui::SetupAnswer;
-    /// Wait up to `limit`, or until a setup wake.
-    fn back_off(&mut self, limit: std::time::Duration);
-}
-
-/// How the offer of a resumed run's plan ended ([`run_resume_offer`]).
-#[cfg(any(target_os = "macos", test))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ResumeOffer {
-    /// The page's automatic answer of the plan as offered, its receipt accepted: the window's own
-    /// admission of the resumed revision.
-    Admitted,
-    /// The offer went unanswered, or its answer was let go.
-    LetGo,
-}
-
-/// Offer `plan`, the plan of the run a startup resumes, back until the page answers it
-/// ([`SetupStartup::offer_resume`]). The page's automatic answer of that same plan is taken as
-/// "go on": nothing is written, and its receipt is accepted while the run is still the one
-/// admitted, unfinished and unstopped, so the window's own admission names that revision. Any
-/// other answer, or one that comes after the run went, is let go. An offer no window could show
-/// is made again once one can, each time only while the run is still current and no choice of the
-/// page's waits for the claim, so a stale offer never reaches a page whose person chose since.
-#[cfg(any(target_os = "macos", test))]
-fn run_resume_offer(
-    reach: &mut impl ResumeOfferReach,
-    plan: &aterm_types::macos_setup::Plan,
-) -> ResumeOffer {
-    use aterm_gui::WorkstationSetupDecision;
-    loop {
-        if reach.choice_awaits_claim() || reach.current() == Some(false) {
-            return ResumeOffer::LetGo;
-        }
-        let mut answer = reach.answer(plan.clone());
-        match answer.decision {
-            WorkstationSetupDecision::Begin(ref answered) => {
-                let Some(receipt) = answer.receipt.take() else {
-                    return ResumeOffer::LetGo;
-                };
-                let as_offered = answered == plan
-                    && receipt.admission() == aterm_gui::InitialSetupAdmission::Automatic
-                    && !answer.chosen
-                    && !answer.vault_typed
-                    && answer.changed.is_none();
-                if !as_offered {
-                    return ResumeOffer::LetGo;
-                }
-                // A read that met a write is tried again for a moment; a receipt let go refuses
-                // the answer, and the page reads the records again.
-                let mut reads = 0;
-                let still = loop {
-                    match reach.current() {
-                        Some(still) => break still,
-                        None if reads < 8 => {
-                            reads += 1;
-                            reach.back_off(std::time::Duration::from_millis(250));
-                        }
-                        None => break false,
-                    }
-                };
-                if !still {
-                    return ResumeOffer::LetGo;
-                }
-                receipt.accept();
-                return ResumeOffer::Admitted;
-            }
-            WorkstationSetupDecision::Unavailable => reach.back_off(SETUP_RETRY_WAIT),
-        }
-    }
-}
-
-/// The live [`ResumeOfferReach`] of the run of `revision`, whose startup's admission number is
-/// `sent` (a Stop pressed since covers it).
-#[cfg(target_os = "macos")]
-struct LiveResumeOffer {
-    revision: u64,
-    sent: u64,
-    seen: u64,
-}
-
-#[cfg(target_os = "macos")]
-impl LiveResumeOffer {
-    fn current_of(revision: u64, sent: u64) -> Option<bool> {
-        if stop_covers(sent) {
-            return Some(false);
-        }
-        aterm_cli::macos_doctor::initial_setup_admission()
-            .ok()
-            .map(|admission| {
-                admission
-                    .is_some_and(|admission| admission.revision == revision && !admission.completed)
-            })
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl ResumeOfferReach for LiveResumeOffer {
-    fn current(&mut self) -> Option<bool> {
-        Self::current_of(self.revision, self.sent)
-    }
-
-    fn choice_awaits_claim(&mut self) -> bool {
-        choice_awaits_claim()
-    }
-
-    fn answer(&mut self, plan: aterm_types::macos_setup::Plan) -> aterm_gui::SetupAnswer {
-        let (revision, sent) = (self.revision, self.sent);
-        aterm_gui::await_resume_answer_while(plan, move || {
-            choice_awaits_claim() || Self::current_of(revision, sent) == Some(false)
-        })
-    }
-
-    fn back_off(&mut self, limit: std::time::Duration) {
-        SETUP_WAKES.back_off(&mut self.seen, limit);
-    }
-}
-
-/// Offer `plan`, the run of `revision` a startup resumes, back to System State on a thread of its
-/// own ([`run_resume_offer`]), so the run never waits for the answer.
-#[cfg(target_os = "macos")]
-fn offer_resumed_plan(plan: aterm_types::macos_setup::Plan, revision: u64, sent: u64) {
-    let spawned = std::thread::Builder::new()
-        .name("aterm-setup-resume-offer".into())
-        .spawn(move || {
-            let mut reach = LiveResumeOffer {
-                revision,
-                sent,
-                seen: SETUP_WAKES.count(),
-            };
-            if run_resume_offer(&mut reach, &plan) == ResumeOffer::Admitted {
-                aterm_log::info!("initial setup: the window admitted resumed revision {revision}");
-            }
-        });
-    if let Err(why) = spawned {
-        aterm_log::warn!("initial setup: the resumed plan's offer could not start: {why}");
-    }
 }
 
 #[cfg(target_os = "macos")]
@@ -3460,10 +3308,6 @@ impl<F: FnMut(aterm_types::macos_setup::Plan, StartupHandoff) -> aterm_gui::Setu
             .offer_scoped()?;
         self.offered = Some((plan.clone(), provisional));
         Ok(plan)
-    }
-
-    fn offer_resume(&mut self, admission: &SetupAdmission) {
-        offer_resumed_plan(admission.plan.clone(), admission.revision, self.sent.sent);
     }
 
     fn offer(
@@ -3835,17 +3679,7 @@ fn prepare_setup<H: SetupStartup>(host: &mut H) -> Result<PreparedSetup<H::Claim
             Ok(BeforeOffer::Initial(initial)) => initial,
             Ok(BeforeOffer::Resume(admission)) => {
                 // A startup that resumes a run an earlier process admitted (Quit & Reopen's or an
-                // update's relaunch, say) may find its window with no admission of its own, so
-                // the plan is offered back for the page's automatic answer, while the run goes
-                // on; a window that holds its own admission lets the offer go. Only a plan with
-                // aterm's own permissions needs that admission (§6).
-                if admission
-                    .plan
-                    .selection
-                    .contains(aterm_types::macos_setup::Setting::Permissions)
-                {
-                    host.offer_resume(&admission);
-                }
+                // update's relaunch, say) goes on with it at once, with nothing offered again.
                 return Ok(PreparedSetup::Authorized {
                     claim,
                     revision: admission.revision,
@@ -6238,7 +6072,7 @@ impl Drop for InitialSetupBusy {
 }
 
 /// How long the startup coordinator waits before it tries a failed read or write again.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const SETUP_RETRY_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Automatic claims this process's startup coordinator holds, or is asking
@@ -7163,7 +6997,7 @@ fn access_step_recorded(
     access_fact_observed(access, outcome);
 }
 
-/// Apple's Command Line Tools are installed, as System State's Command Line Tools tab said or the
+/// Apple's Command Line Tools are installed, as System State's Mac Setup tab said or the
 /// window found them ([`aterm_gui::InitialSetupHandlers::tools_installed`]): the GitHub
 /// repositories row is read again at once, and a run parked on them wakes to go on (System State
 /// design §3.3).
@@ -14534,142 +14368,6 @@ mod tests {
         }
     }
 
-    /// The offer of a resumed run's plan ([`super::run_resume_offer`]) on a scripted reach.
-    mod resume_offer {
-        use super::super::{ResumeOffer, ResumeOfferReach, run_resume_offer};
-        use aterm_gui::{
-            InitialSetupAdmission, InitialSetupApplyReceipt, SetupAnswer, WorkstationSetupDecision,
-        };
-        use aterm_types::macos_setup::{Plan, Selection};
-        use std::collections::VecDeque;
-        use std::sync::mpsc::Receiver;
-
-        #[derive(Default)]
-        struct Script {
-            /// What each read of the run says, in order; once spent, the run is current.
-            currents: VecDeque<Option<bool>>,
-            /// The answers the page gives, one per offer.
-            answers: VecDeque<SetupAnswer>,
-            offers: usize,
-            back_offs: usize,
-        }
-
-        impl ResumeOfferReach for Script {
-            fn current(&mut self) -> Option<bool> {
-                self.currents.pop_front().unwrap_or(Some(true))
-            }
-
-            fn choice_awaits_claim(&mut self) -> bool {
-                false
-            }
-
-            fn answer(&mut self, _plan: Plan) -> SetupAnswer {
-                self.offers += 1;
-                self.answers
-                    .pop_front()
-                    .expect("an offer the script has no answer for")
-            }
-
-            fn back_off(&mut self, _limit: std::time::Duration) {
-                self.back_offs += 1;
-            }
-        }
-
-        fn resumed() -> Plan {
-            Plan::from(Selection::all())
-        }
-
-        /// The page's automatic answer of `plan` as offered, and its receipt's answer.
-        fn automatic(plan: Plan) -> (SetupAnswer, Receiver<bool>) {
-            let (receipt, accepted) =
-                InitialSetupApplyReceipt::detached_as(InitialSetupAdmission::Automatic, false);
-            let mut answer = SetupAnswer::from(WorkstationSetupDecision::Begin(plan));
-            answer.receipt = Some(receipt);
-            (answer, accepted)
-        }
-
-        /// The page's automatic answer of the plan as offered, while the run is current, is the
-        /// window's own admission: its receipt is accepted. Negative controls: the run gone by
-        /// the answer, an answer that changed the plan, and a person's press each let it go.
-        #[test]
-        fn the_pages_automatic_answer_of_the_resumed_plan_is_accepted() {
-            let (answer, accepted) = automatic(resumed());
-            let mut reach = Script {
-                answers: [answer].into(),
-                ..Script::default()
-            };
-            assert_eq!(
-                run_resume_offer(&mut reach, &resumed()),
-                ResumeOffer::Admitted
-            );
-            assert_eq!(accepted.try_recv(), Ok(true), "the receipt accepted");
-
-            let (answer, accepted) = automatic(resumed());
-            let mut reach = Script {
-                currents: [Some(true), None, Some(false)].into(),
-                answers: [answer].into(),
-                ..Script::default()
-            };
-            assert_eq!(run_resume_offer(&mut reach, &resumed()), ResumeOffer::LetGo);
-            assert_eq!(accepted.try_recv(), Ok(false), "the run went first");
-            assert_eq!(reach.back_offs, 1, "an unread record is read again");
-
-            let (answer, accepted) = automatic(Plan::from(Selection::none()));
-            let mut reach = Script {
-                answers: [answer].into(),
-                ..Script::default()
-            };
-            assert_eq!(run_resume_offer(&mut reach, &resumed()), ResumeOffer::LetGo);
-            assert_eq!(accepted.try_recv(), Ok(false), "another plan");
-
-            let (receipt, accepted) = InitialSetupApplyReceipt::detached(false);
-            let mut answer = SetupAnswer::from(WorkstationSetupDecision::Begin(resumed()));
-            answer.receipt = Some(receipt);
-            let mut reach = Script {
-                answers: [answer].into(),
-                ..Script::default()
-            };
-            assert_eq!(run_resume_offer(&mut reach, &resumed()), ResumeOffer::LetGo);
-            assert_eq!(accepted.try_recv(), Ok(false), "a press answers for itself");
-        }
-
-        /// An offer no window could show is made again after a back-off, but only while the run
-        /// is still current: a run that went meanwhile (a person's Set up now admitted another
-        /// revision) gets no stale offer, whose answer would wipe that person's admission.
-        #[test]
-        fn an_offer_no_window_showed_is_made_again_only_for_a_current_run() {
-            let (answer, accepted) = automatic(resumed());
-            let mut reach = Script {
-                answers: [WorkstationSetupDecision::Unavailable.into(), answer].into(),
-                ..Script::default()
-            };
-            assert_eq!(
-                run_resume_offer(&mut reach, &resumed()),
-                ResumeOffer::Admitted
-            );
-            assert_eq!((reach.offers, reach.back_offs), (2, 1));
-            assert_eq!(accepted.try_recv(), Ok(true));
-
-            // Current at the first offer, gone by the time the back-off ends.
-            let mut reach = Script {
-                currents: [Some(true), Some(false)].into(),
-                answers: [WorkstationSetupDecision::Unavailable.into()].into(),
-                ..Script::default()
-            };
-            assert_eq!(run_resume_offer(&mut reach, &resumed()), ResumeOffer::LetGo);
-            assert_eq!((reach.offers, reach.back_offs), (1, 1), "no second offer");
-
-            // A page that let the offer go (closed, or holding its own admission already)
-            // answers it with no receipt: the offer ends for this launch.
-            let mut reach = Script {
-                answers: [WorkstationSetupDecision::Begin(resumed()).into()].into(),
-                ..Script::default()
-            };
-            assert_eq!(run_resume_offer(&mut reach, &resumed()), ResumeOffer::LetGo);
-            assert_eq!(reach.offers, 1);
-        }
-    }
-
     mod setup_startup {
         use super::super::{PreparedSetup, SetupAdmission, SetupStartup, prepare_setup};
         use aterm_gui::WorkstationSetupDecision::{self, Begin, Unavailable};
@@ -14719,17 +14417,10 @@ mod tests {
             /// Waits before a retried write of the page's answer, each holding
             /// the claim.
             retry_waits: usize,
-            /// The admitted runs whose plan the startup offered back as it resumed them.
-            resumed: Vec<SetupAdmission>,
         }
 
         impl SetupStartup for Host {
             type Claim = Claim;
-
-            fn offer_resume(&mut self, admission: &SetupAdmission) {
-                assert_eq!(self.active.get(), 1, "the resumed run keeps its claim");
-                self.resumed.push(admission.clone());
-            }
 
             fn choice_awaits_claim(&mut self) -> bool {
                 self.choice_awaits.pop_front().unwrap_or(false)
@@ -14974,10 +14665,8 @@ mod tests {
         }
 
         /// A startup that resumes a run an earlier process admitted (Quit & Reopen's relaunch
-        /// mid-setup) offers nothing for review and writes no admission: it offers the admitted
-        /// plan back for the window's own answer, without waiting for it, so the page's automatic
-        /// answer gives this window the admission the debugger's step needs (design §3.3, §6).
-        /// A plan without aterm's own permissions resumes with no such offer.
+        /// mid-setup) offers nothing, for review or otherwise, and writes no admission: the run
+        /// goes on under its own revision, with aterm's own permissions in its plan or not.
         #[test]
         fn an_admitted_pending_run_resumes_without_another_offer() {
             let mut selected = Plan {
@@ -14987,7 +14676,7 @@ mod tests {
             selected.selection.set(Setting::Permissions, true);
             let mut unpermitted = selected.clone();
             unpermitted.selection.set(Setting::Permissions, false);
-            for (plan, offered_back) in [(selected.clone(), true), (unpermitted, false)] {
+            for plan in [selected.clone(), unpermitted] {
                 let admitted = SetupAdmission {
                     plan: plan.clone(),
                     revision: 7,
@@ -14997,7 +14686,7 @@ mod tests {
                     revisions: [Ok(7), Ok(7)].into(),
                     claims: [Ok(true)].into(),
                     finished: [Ok(false), Ok(false)].into(),
-                    known_admissions: [Ok(Some(admitted.clone()))].into(),
+                    known_admissions: [Ok(Some(admitted))].into(),
                     initial: [Ok(plan.clone())].into(),
                     offers: [Begin(plan.clone())].into(),
                     ..Host::default()
@@ -15015,16 +14704,6 @@ mod tests {
                     result,
                     PreparedSetup::Authorized { revision: 7, .. }
                 ));
-                assert_eq!(
-                    host.resumed,
-                    if offered_back {
-                        vec![admitted]
-                    } else {
-                        Vec::new()
-                    },
-                    "plan {:?}",
-                    plan.selection
-                );
                 assert_eq!(host.initial, [Ok(plan)]);
                 assert_eq!(host.active.get(), 1);
                 drop(result);
@@ -16830,7 +16509,7 @@ mod tests {
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
-    fn only_an_ordinary_window_autostarts_acaffiene() {
+    fn only_an_ordinary_window_autostarts_acaffeine() {
         let osv = |list: &[&str]| -> Vec<OsString> { list.iter().map(OsString::from).collect() };
         for args in [
             osv(&[]),

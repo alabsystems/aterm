@@ -725,7 +725,8 @@ impl Running {
     /// This holds the normal write fences, without installing a Store or refreshing a file.
     ///
     /// # Errors
-    /// The append and fallback rewrite cannot persist the accepted records.
+    /// The snapshot's file has changed, or the append and fallback rewrite cannot persist
+    /// the accepted records.
     #[cfg(any(test, debug_assertions))]
     #[doc(hidden)]
     pub fn test_persist_records(
@@ -781,6 +782,25 @@ pub fn start_with_join_change_gap(
         options,
         Tuning {
             join_change_gap: gap,
+            ..Tuning::default()
+        },
+    )
+}
+
+/// [`start`] with `budget` for each pull from a current peer in place of `PEER_PULL_BUDGET`
+/// ([`Running::pull_from_peers`]): a test whose own peer must answer passes its hang detector.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub fn start_with_peer_pull(
+    listener: std::net::TcpListener,
+    options: &Options,
+    budget: Duration,
+) -> crate::Result<Running> {
+    launch(
+        listener,
+        options,
+        Tuning {
+            peer_pull: budget,
             ..Tuning::default()
         },
     )
@@ -1370,6 +1390,38 @@ impl Shared {
     /// Store `name`'s crossed mark, before this server takes a record of a crossed log or holds
     /// more than [`crate::membership_log::LEGACY_RECORDS`]: a `500` where it cannot, and the
     /// caller then takes nothing.
+    #[cfg_attr(
+        all(unix, any(test, debug_assertions)),
+        aterm_spec_anchor::refines(
+            machine = "SwarmRecordsCapacity",
+            action = "CrossedPost",
+            project = "aterm_secrets::server::crossing_tests::records_capacity_crossing"
+        )
+    )]
+    #[cfg_attr(
+        all(unix, any(test, debug_assertions)),
+        aterm_spec_anchor::refines(
+            machine = "SwarmRecordsCapacity",
+            action = "CrossedPostDies",
+            project = "aterm_secrets::server::crossing_tests::records_capacity_crossing"
+        )
+    )]
+    #[cfg_attr(
+        all(unix, any(test, debug_assertions)),
+        aterm_spec_anchor::refines(
+            machine = "SwarmRecordsCapacity",
+            action = "Grow",
+            project = "aterm_secrets::server::crossing_tests::records_capacity_crossing"
+        )
+    )]
+    #[cfg_attr(
+        all(unix, any(test, debug_assertions)),
+        aterm_spec_anchor::refines(
+            machine = "SwarmRecordsCapacity",
+            action = "GrowDies",
+            project = "aterm_secrets::server::crossing_tests::records_capacity_crossing"
+        )
+    )]
     fn mark_crossed(&self, name: &str) -> Result<(), Reply> {
         if let Err(e) = self.crossing_mark(name).store() {
             note(&format!("{name}: could not store the crossed mark: {e}"));
@@ -2559,6 +2611,22 @@ fn fenced() -> Reply {
 }
 
 /// Refuse incompatible capacities before any record is exposed or retained.
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::refines(
+        machine = "SwarmRecordsCapacity",
+        action = "LegacyGet",
+        project = "aterm_secrets::server::crossing_tests::records_capacity_crossing"
+    )
+)]
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::refines(
+        machine = "SwarmRecordsCapacity",
+        action = "LegacyPost",
+        project = "aterm_secrets::server::crossing_tests::records_capacity_crossing"
+    )
+)]
 fn records_fence(crossed: bool, peer: Option<crate::crossing::RecordsBound>) -> Option<Reply> {
     let own = crate::crossing::RecordsBound::here(crossed);
     match peer {
@@ -3597,6 +3665,20 @@ fn get_records(shared: &Shared, stream: &TcpStream, name: &str, get: &RecordsGet
     }
     match shared.crossed(&mut state, name) {
         Ok(crossed) => {
+            // MUTANT (`crate::crossing::Faults::capped_prefix`): a crossed log's first records,
+            // capped at the legacy bound, for a client that states no bound.
+            #[cfg(test)]
+            if crossed
+                && stated.is_none()
+                && crate::crossing::faults(shared.crossing_mark(name).path()).capped_prefix
+            {
+                let mut first = state
+                    .records
+                    .get(name)
+                    .map_or_else(Vec::new, |slot| slot.store.missing(&have));
+                first.truncate(crate::membership_log::LEGACY_RECORDS);
+                return records_reply(first, false);
+            }
             if let Some(reply) = records_fence(crossed, stated) {
                 return reply;
             }
@@ -3789,7 +3871,7 @@ impl Write for PrefixWriter<'_> {
 
 struct PersistFailure {
     error: Error,
-    attempted: Option<AppendAttempt>,
+    append_left: Option<fsx::FileStamp>,
 }
 
 /// Persist only the accepted Store's complete prefix. The caller owns record_writes and
@@ -3806,12 +3888,16 @@ fn persist_records(
         let large = accepted
             .log()
             .is_some_and(|log| crate::crossing::past_legacy(log.held_count()));
-        crate::records_storage::write_path(&shared.records_path(name), crossed || large)
+        crate::records_storage::write_path_if_unchanged(
+            &shared.records_path(name),
+            crossed || large,
+            stamp,
+        )
     })()
     .map_err(|error| {
         Box::new(PersistFailure {
             error,
-            attempted: None,
+            append_left: None,
         })
     })?;
     let tail = match (on_file, stamp) {
@@ -3821,7 +3907,7 @@ fn persist_records(
             len: accepted.held_len_from(from).map_err(|error| {
                 Box::new(PersistFailure {
                     error: Error::new(error.to_string()),
-                    attempted: None,
+                    append_left: None,
                 })
             })?,
         }),
@@ -3833,10 +3919,16 @@ fn persist_records(
     match appended {
         Some(left) => Ok(Some(left)),
         None => shared.write_records(&path, accepted).map_err(|error| {
-            Box::new(PersistFailure {
-                error,
-                attempted: tail,
-            })
+            // Observe a torn append before releasing the shared writer lock. A successor
+            // may change this same inode as soon as the failed persistence returns.
+            let append_left = tail.and_then(|attempted| {
+                fsx::stamp(&path).filter(|now| {
+                    (now.dev, now.ino) == (attempted.stamp.dev, attempted.stamp.ino)
+                        && now.len > attempted.stamp.len
+                        && now.len <= attempted.stamp.len.saturating_add(attempted.len as u64)
+                })
+            });
+            Box::new(PersistFailure { error, append_left })
         }),
     }
 }
@@ -3856,6 +3948,9 @@ fn persist_records(
 /// ([`RecordSlot::writing`]). When both writes fail the answer is 500 and the slot's records are
 /// unchanged, so a retry adds the records again and writes them; an append cut short gives the
 /// slot the file's stamp, so no look takes the part it left.
+/// The snapshot's file stamp is checked under the process-shared writer lock before any
+/// layout change or write. A retired server's in-flight POST therefore cannot overwrite a
+/// successor's newer history; a changed file returns 500 so a retry reads and merges it.
 ///
 /// The body is strictly framed and verified before this function refreshes a file or changes
 /// a slot. Invalid input therefore returns 400 before a concurrent file or post-body admission
@@ -4079,7 +4174,6 @@ fn apply_records(
     if past_legacy && let Err(reply) = mark_before_take(shared, name) {
         return reply;
     }
-    let path = shared.records_path(name);
     let _writing = Writing::mark(shared, name);
     let written = match persist_records(shared, name, &copy, stamp, on_file) {
         Ok(left) => left,
@@ -4089,21 +4183,13 @@ fn apply_records(
                 failure.error
             ));
             // An append cut short left part of its records on the end of the file, never
-            // flushed: the slot takes the file's stamp so no look takes them in (a POST of
-            // them would answer 204 while they are not durable), and the next growth writes
-            // the file whole. A file another writer put there keeps the slot's stamp, so a
-            // look reads it.
-            let now = crate::records_storage::data_path(&path)
-                .ok()
-                .and_then(|path| fsx::stamp(&path));
+            // flushed: the slot takes the stamp captured under the writer lock so no look
+            // takes them in (a POST of them would answer 204 while they are not durable), and
+            // the next growth writes the file whole. A file another writer put there differs
+            // from that stamp, so a look reads it.
             let mut state = shared.lock_server_state();
-            if let (Some(attempted), Some(now), Some(slot)) =
-                (failure.attempted, now, state.records.get_mut(name))
-                && (now.dev, now.ino) == (attempted.stamp.dev, attempted.stamp.ino)
-                && now.len > attempted.stamp.len
-                && now.len <= attempted.stamp.len.saturating_add(attempted.len as u64)
-            {
-                slot.stamp = Some(now);
+            if let (Some(left), Some(slot)) = (failure.append_left, state.records.get_mut(name)) {
+                slot.stamp = Some(left);
                 slot.on_file = None;
             }
             return Reply::text(500, "the server could not write to its store");
@@ -6354,6 +6440,37 @@ impl Drop for Children {
 )]
 #[doc(hidden)]
 pub fn records_file_environment() {}
+
+/// Host for `SwarmRecordsCapacity`'s environment markers, so `spec_xref_closure` accounts for
+/// every model action: its first action picks which of the three it is (a member's log under
+/// its budgets, a vault server holding a log at the legacy line, or a Mac holding one), as a
+/// test's fixture does.
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "SwarmRecordsCapacity",
+        action = "Budgets",
+        reason = "Environment: a member's log as the genesis, a Node record and an Admit leave it"
+    )
+)]
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "SwarmRecordsCapacity",
+        action = "Crossing",
+        reason = "Environment: a vault server holding a log three records short of the legacy bound"
+    )
+)]
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "SwarmRecordsCapacity",
+        action = "Mac",
+        reason = "Environment: a Mac whose records file holds a log three records short of the legacy bound"
+    )
+)]
+#[doc(hidden)]
+pub fn records_capacity_environment() {}
 
 #[cfg(test)]
 mod tests {
@@ -12515,76 +12632,74 @@ mod tests {
 
     #[test]
     fn expanded_server_custody_fences_old_writers_and_reopens_for_append() {
-        use crate::crossing::{RecordsBound, fixture::RAISED};
+        use crate::crossing::RecordsBound;
         use crate::membership_log::{LEGACY_RECORDS, encode_records};
-        RAISED.within(|| {
-            let root = aterm_tempfile::tempdir().unwrap();
-            let options = team_options(root.path());
-            let running = run(&options);
-            let mut founded = Founded::new();
-            let mut base = vec![founded.genesis.clone()];
-            for n in 1..LEGACY_RECORDS {
-                base.push(founded.mint(10_000 + n as u64, &format!("fence-{n}")));
-            }
-            assert_eq!(
-                post_records_stating(
-                    &running.shared,
-                    "team",
-                    &encode_records(&base),
-                    false,
-                    Some(RecordsBound::here(false))
-                )
-                .status,
-                204
-            );
-            let legacy = root.path().join("team.records");
-            let earlier = std::fs::read(&legacy).unwrap();
-            let extra = founded.mint(20_000, "crossed");
-            assert_eq!(
-                post_records_stating(
-                    &running.shared,
-                    "team",
-                    extra.bytes(),
-                    false,
-                    Some(RecordsBound::here(true))
-                )
-                .status,
-                204
-            );
-            assert!(fsx::write_atomic(&legacy, &earlier, 0o600).is_err());
-            assert!(fsx::read_owned(&legacy, crate::membership_log::MAX_RECORDS_STREAM).is_err());
-            let current = crate::records_storage::data_path(&legacy).unwrap();
-            let inode = fsx::stamp(&current).unwrap().ino;
-            let later = founded.mint(20_001, "after-fence");
-            assert_eq!(
-                post_records_stating(
-                    &running.shared,
-                    "team",
-                    later.bytes(),
-                    false,
-                    Some(RecordsBound::here(true))
-                )
-                .status,
-                204
-            );
-            assert_eq!(
-                fsx::stamp(&current).unwrap().ino,
-                inode,
-                "later writes append to current"
-            );
-            let expected = running.stored_records("team").complete_inventory();
-            assert_eq!(expected.len(), LEGACY_RECORDS + 2);
-            running.stop();
-            let reopened = run(&options);
-            let actual = reopened.stored_records("team").complete_inventory();
-            assert!(
-                actual == expected,
-                "reopened {} of {} records",
-                actual.len(),
-                expected.len()
-            );
-            reopened.stop();
-        });
+        let root = aterm_tempfile::tempdir().unwrap();
+        let options = team_options(root.path());
+        let running = run(&options);
+        let mut founded = Founded::new();
+        let mut base = vec![founded.genesis.clone()];
+        for n in 1..LEGACY_RECORDS {
+            base.push(founded.mint(10_000 + n as u64, &format!("fence-{n}")));
+        }
+        assert_eq!(
+            post_records_stating(
+                &running.shared,
+                "team",
+                &encode_records(&base),
+                false,
+                Some(RecordsBound::here(false))
+            )
+            .status,
+            204
+        );
+        let legacy = root.path().join("team.records");
+        let earlier = std::fs::read(&legacy).unwrap();
+        let extra = founded.mint(20_000, "crossed");
+        assert_eq!(
+            post_records_stating(
+                &running.shared,
+                "team",
+                extra.bytes(),
+                false,
+                Some(RecordsBound::here(true))
+            )
+            .status,
+            204
+        );
+        assert!(fsx::write_atomic(&legacy, &earlier, 0o600).is_err());
+        assert!(fsx::read_owned(&legacy, crate::membership_log::MAX_RECORDS_STREAM).is_err());
+        let current = crate::records_storage::data_path(&legacy).unwrap();
+        let inode = fsx::stamp(&current).unwrap().ino;
+        let later = founded.mint(20_001, "after-fence");
+        assert_eq!(
+            post_records_stating(
+                &running.shared,
+                "team",
+                later.bytes(),
+                false,
+                Some(RecordsBound::here(true))
+            )
+            .status,
+            204
+        );
+        assert_eq!(
+            fsx::stamp(&current).unwrap().ino,
+            inode,
+            "later writes append to current"
+        );
+        let expected = running.stored_records("team").complete_inventory();
+        assert_eq!(expected.len(), LEGACY_RECORDS + 2);
+        running.stop();
+        let reopened = run(&options);
+        let actual = reopened.stored_records("team").complete_inventory();
+        assert!(
+            actual == expected,
+            "reopened {} of {} records",
+            actual.len(),
+            expected.len()
+        );
+        reopened.stop();
     }
 
     #[test]
@@ -12749,7 +12864,15 @@ mod tests {
     /// the bytes on every look, failed an earlier form of the test with left 84.
     #[test]
     fn parked_subscribers_on_a_full_store_read_the_file_once() {
-        use crate::membership_log::{MAX_HELD_RECORDS, encode_records};
+        crate::membership_log::RecordBudgets {
+            held: crate::membership_log::MAX_WAITING,
+            ..crate::membership_log::RecordBudgets::PRODUCTION
+        }
+        .within(parked_subscribers_at_a_full_held_store);
+    }
+
+    fn parked_subscribers_at_a_full_held_store() {
+        use crate::membership_log::{MAX_WAITING, encode_records};
 
         const LOOKS: usize = 30;
         let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -12762,7 +12885,7 @@ mod tests {
         let running = run_tuned(&opts, tuning);
         let founded = Founded::new();
         let full: Vec<_> = std::iter::once(founded.genesis.clone())
-            .chain((0..MAX_HELD_RECORDS - 1).map(|i| founded.waiting(i)))
+            .chain((0..MAX_WAITING - 1).map(|i| founded.waiting(i)))
             .collect();
         assert_eq!(
             post_records(&running.shared, "team", &encode_records(&full), false).status,
@@ -12868,17 +12991,25 @@ mod tests {
     /// wrote the records file whole" (another inode), as main before F23 did.
     #[test]
     fn a_complete_record_at_a_full_store_appends_only_itself() {
-        use crate::membership_log::{Body, Evidence, MAX_HELD_RECORDS, encode_records};
+        crate::membership_log::RecordBudgets {
+            held: crate::membership_log::MAX_WAITING,
+            ..crate::membership_log::RecordBudgets::PRODUCTION
+        }
+        .within(complete_record_at_a_full_held_store);
+    }
+
+    fn complete_record_at_a_full_held_store() {
+        use crate::membership_log::{Body, Evidence, MAX_WAITING, encode_records};
 
         let root = aterm_tempfile::tempdir().expect("tempdir");
         let running = run(&team_options(root.path()));
         let founded = Founded::new();
         let full: Vec<_> = std::iter::once(founded.genesis.clone())
-            .chain((0..MAX_HELD_RECORDS - 1).map(|i| founded.waiting(i)))
+            .chain((0..MAX_WAITING - 1).map(|i| founded.waiting(i)))
             .collect();
         let post = |body: &[u8]| post_records(&running.shared, "team", body, false).status;
         assert_eq!(post(&encode_records(&full)), 204);
-        assert_eq!(running.stored_records("team").len(), MAX_HELD_RECORDS);
+        assert_eq!(running.stored_records("team").len(), MAX_WAITING);
         let path = root.path().join("team.records");
         let before = file_stamp(&path);
         let admit = founded
@@ -12917,7 +13048,15 @@ mod tests {
     /// fix did) fails "the full store lost the waiting child its parent's POST brought".
     #[test]
     fn a_waiting_child_posted_with_its_parent_lands_at_a_full_store() {
-        use crate::membership_log::{MAX_HELD_RECORDS, encode_records};
+        crate::membership_log::RecordBudgets {
+            held: crate::membership_log::MAX_WAITING,
+            ..crate::membership_log::RecordBudgets::PRODUCTION
+        }
+        .within(waiting_child_at_a_full_held_store);
+    }
+
+    fn waiting_child_at_a_full_held_store() {
+        use crate::membership_log::{MAX_WAITING, encode_records};
 
         let root = aterm_tempfile::tempdir().expect("tempdir");
         let running = run(&team_options(root.path()));
@@ -12941,14 +13080,14 @@ mod tests {
                 (0..)
                     .map(|i| founded.waiting(i))
                     .filter(|w| w.id() < child.id())
-                    .take(MAX_HELD_RECORDS - 2),
+                    .take(MAX_WAITING - 2),
             )
             .collect();
         let post = |body: &[u8]| post_records(&running.shared, "team", body, false).status;
         assert_eq!(post(&encode_records(&full)), 204);
         assert_eq!(post(child.bytes()), 204);
         let store = running.stored_records("team");
-        assert_eq!(store.len(), MAX_HELD_RECORDS, "the store is full");
+        assert_eq!(store.len(), MAX_WAITING, "the store is full");
         assert!(store.uncomplete(child.id()).is_some(), "the child waits");
         assert_eq!(post(&encode_records([&first, &parent, &child])), 204);
         let held = running
@@ -13203,6 +13342,93 @@ mod tests {
                 .into_iter()
                 .collect()
         );
+    }
+
+    #[test]
+    fn a_stale_server_snapshot_cannot_replace_another_writers_history() {
+        use crate::membership_log::{Store, encode_records};
+
+        for (existing, fenced, replace) in [
+            (false, false, false),
+            (true, false, false),
+            (true, false, true),
+            (true, true, false),
+            (true, true, true),
+        ] {
+            let root = aterm_tempfile::tempdir().unwrap();
+            let options = team_options(root.path());
+            let first = run(&options);
+            let founded = Founded::new();
+            let stale = founded.named(&founded.log, 5_000, "stale");
+            let newer = founded.named(&founded.log, 6_000, "newer");
+            let entry = first.shared.records_path("team");
+            if existing {
+                assert_eq!(
+                    post_records(&first.shared, "team", founded.genesis.bytes(), false).status,
+                    204
+                );
+            }
+            if fenced {
+                drop(crate::records_storage::write_path(&entry, true).unwrap());
+            }
+            // An in-flight POST keeps the retired server's state while stop releases its
+            // listener and lifetime lock. The successor can then commit before it persists.
+            let old = Arc::clone(&first.shared);
+            let writing = old.record_writes.lock().unwrap();
+            let (mut copy, stamp, on_file) = {
+                let mut state = old.lock_server_state();
+                look_for_records(&old, &mut state, "team").unwrap();
+                match state.records.get("team") {
+                    Some(slot) => (slot.store.clone(), slot.stamp, slot.on_file),
+                    None => (Store::for_vault("team").unwrap(), None, None),
+                }
+            };
+            copy.ingest(&encode_records([&founded.genesis, &stale]))
+                .unwrap();
+            let marking = Writing::mark(&old, "team");
+            first.stop();
+            let second = run(&options);
+            second.shared.appends_fail.store(replace, Ordering::SeqCst);
+            assert_eq!(
+                post_records(
+                    &second.shared,
+                    "team",
+                    &encode_records([&founded.genesis, &newer]),
+                    false
+                )
+                .status,
+                204
+            );
+            let path = crate::records_storage::data_path(&entry).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            let before_stamp = file_stamp(&path);
+            let result = persist_records(&old, "team", &copy, stamp, on_file);
+            assert!(
+                std::fs::read(&path).unwrap() == before,
+                "a stale writer replaced newer history: existing={existing}, fenced={fenced}, replace={replace}"
+            );
+            assert_eq!(file_stamp(&path), before_stamp);
+            assert!(result.is_err(), "the stale snapshot was accepted");
+            drop(marking);
+            drop(writing);
+
+            assert_eq!(
+                post_records(
+                    &second.shared,
+                    "team",
+                    &encode_records([&founded.genesis, &stale]),
+                    false
+                )
+                .status,
+                204
+            );
+            second.stop();
+            let reopened = reloaded(root.path());
+            assert_eq!(
+                reopened.complete_inventory(),
+                [*founded.genesis.id(), *stale.id(), *newer.id()].into()
+            );
+        }
     }
 
     /// F23 (rule 4.7, failure case 4): when the append fails, the POST writes the file whole: a

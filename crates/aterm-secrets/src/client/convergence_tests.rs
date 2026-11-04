@@ -411,51 +411,56 @@ fn a_prefix<'a>(chain: &'a [Record], r: &[Recipient]) -> &'a [Record] {
     held
 }
 
-/// An audience can remain due while a newly arrived epoch changes its settledness.
-/// Authoring must reconsider the scheduling observation before minting.
-///
-/// NEGATIVE CONTROL: the scheduling observation permits the `[everyone]` mint and the audience
-/// is still due under the lock, so a look that signed from that observation would mint; with
-/// `remove::STALE_AUTHORING` (the signing look checks no rank, grace or settledness and
-/// re-keys every audience still due) the same look mints `[everyone]` over the prefix.
-#[test]
-fn authoring_rechecks_a_new_prefix_after_the_scheduling_observation() {
+/// The m4 shape's two removals, before X takes any of A's batch ([`m4_shape_with`]).
+struct M4 {
+    lab: Six,
+    /// The recipients, in order.
+    r: Vec<Recipient>,
+    /// X's place in the lab (`r0`'s Mac).
+    x: usize,
+    /// A's removal batch.
+    chain: Vec<Record>,
+    /// S, where the lab let a Mac with no seat in.
+    seatless: Option<Recipient>,
+}
+
+/// [`M4`]: of six Macs in recipient order `r0..r5`, where `seatless` first m22 (an admin) lets a
+/// `[machines]`-only key S into `[everyone]`, which sorts above every lab Mac; then `r0`'s Mac X
+/// removes `r1`'s and `r5`'s Mac A removes `r4`'s, each on its own side, and A's batch wraps S
+/// last.
+fn m4_lab(seatless: bool) -> M4 {
     let lab = six();
     let (r, order) = in_order(&lab);
+    let seatless = seatless.then(|| {
+        let key = key_above(&r[5]).recipient();
+        let admin = admin_open(&lab.all[0]).expect("m22 is an admin");
+        let mut doc = admin.doc.clone();
+        doc.add_machine("m99", &key.to_bech32()).unwrap();
+        admin_publish_approved(&lab.all[0], &admin, &doc, &[key.to_bech32()])
+            .expect("m22 lets S in");
+        carry(&lab.all, 0);
+        key
+    });
     let (x, a) = (&lab.all[order[0]], &lab.all[order[5]]);
-    test_remove_unposted(x, &join_code(&r[1])).unwrap();
+    test_remove_unposted(x, &join_code(&r[1])).expect("X removes r1");
     let chain = a_removes_r4(a, &r);
-    save_records(x, &encode_records(&chain[..1])).unwrap();
-    let me = member_key(x).1;
-    let t0 = aterm_time::unix_millis().unwrap();
-    let (first, _) = ready_rekeys(&log_of(x), &me, &TendMark::default(), t0);
-    let now = t0 + 100 * GAP_STEP_MS;
-    let (mark, ready) = ready_rekeys(&log_of(x), &me, &first, now);
-    assert!(
-        ready.contains(&EpochAudience::Everyone),
-        "the old observation permits a mint"
-    );
-
-    // The transaction sees a new head with only part of its minter's Wrap batch.
-    save_records(x, &encode_records(a_prefix(&chain, &r))).unwrap();
-    assert!(
-        log_of(x)
-            .rekey_dues()
+    if let Some(key) = &seatless {
+        let epoch = chain
             .iter()
-            .any(|due| due.audience == EpochAudience::Everyone)
-    );
-    let identity = read_identity(x).unwrap().unwrap();
-    let minted = tend_ready_epochs(x, now, &identity, &mark).unwrap();
-    assert!(!epochs_by_audience(&minted).contains_key(&EpochAudience::Everyone));
-
-    STALE_AUTHORING.with(|cell| cell.set(true));
-    let stale = tend_ready_epochs(x, now, &identity, &mark);
-    STALE_AUTHORING.with(|cell| cell.set(false));
-    assert!(
-        epochs_by_audience(&stale.unwrap()).contains_key(&EpochAudience::Everyone),
-        "CONTROL: trusting the scheduling observation mints over the prefix"
-    );
-    lab.macs.server.stop();
+            .find(|record| matches!(record.body(), Body::Epoch { .. }))
+            .unwrap();
+        assert!(
+            wrapped_by(&log_of(a), epoch.id()).contains(key),
+            "CONTROL: A's batch wraps S"
+        );
+    }
+    M4 {
+        x: order[0],
+        lab,
+        r,
+        chain,
+        seatless,
+    }
 }
 
 /// The m4 shape. Of six Macs in recipient order `r0..r5`, `r0`'s Mac X removes `r1`'s and
@@ -482,31 +487,14 @@ fn m4_shape_with(
     Vec<Recipient>,
     Option<Recipient>,
 ) {
-    let lab = six();
-    let (r, order) = in_order(&lab);
-    let seatless = seatless.then(|| {
-        let key = key_above(&r[5]).recipient();
-        let admin = admin_open(&lab.all[0]).expect("m22 is an admin");
-        let mut doc = admin.doc.clone();
-        doc.add_machine("m99", &key.to_bech32()).unwrap();
-        admin_publish_approved(&lab.all[0], &admin, &doc, &[key.to_bech32()])
-            .expect("m22 lets S in");
-        carry(&lab.all, 0);
-        key
-    });
-    let (x, a) = (&lab.all[order[0]], &lab.all[order[5]]);
-    test_remove_unposted(x, &join_code(&r[1])).expect("X removes r1");
-    let chain = a_removes_r4(a, &r);
-    if let Some(key) = &seatless {
-        let epoch = chain
-            .iter()
-            .find(|record| matches!(record.body(), Body::Epoch { .. }))
-            .unwrap();
-        assert!(
-            wrapped_by(&log_of(a), epoch.id()).contains(key),
-            "CONTROL: A's batch wraps S"
-        );
-    }
+    let M4 {
+        lab,
+        r,
+        x,
+        chain,
+        seatless,
+    } = m4_lab(seatless);
+    let x = &lab.all[x];
     save_records(x, &encode_records(a_prefix(&chain, &r))).unwrap();
     let t0 = aterm_time::unix_millis().unwrap_or(0);
     let mut first = None;
@@ -1979,4 +1967,654 @@ fn a_host_list_rekey_waits_for_the_everyone_batch_that_decides_a_mac_with_no_sea
         !blind.contains(&seatless) && !kept,
         "CONTROL: S is out of the ring for good"
     );
+}
+
+/// The homes [`six`] makes, in its order.
+const SIX: [&str; 6] = ["m22", "m7", "m40", "m41", "m42", "m43"];
+
+/// How many [`GAP_STEP_MS`] steps past its first look at A's `Remove` X's `Recheck` runs: past
+/// every removal grace and rank.
+const RECHECK_STEPS: u64 = 100;
+
+/// The audiences `EpochConvergence`'s shape `sc` starts due: what its `mn` counts over.
+fn convergence_due(sc: i64) -> BTreeSet<EpochAudience> {
+    if sc == 3 {
+        BTreeSet::from([EpochAudience::Commons])
+    } else {
+        BTreeSet::from([EpochAudience::Everyone, EpochAudience::Commons])
+    }
+}
+
+/// `EpochConvergence`'s four shapes, each built once: the homes a replay copies, what its
+/// actions bring, and the injected clock's first sight, taken once every shape was built.
+struct ConvergenceShapes {
+    /// `Rotation` ([`withheld`]'s): m22 removes m41, m7 holds the whole batch and m40 (B) its
+    /// `Remove` alone; the seated Macs are m22, m7 and m40.
+    rotation: TwoMacs,
+    /// m22's removal batch.
+    rotation_chain: Vec<Record>,
+    /// `Prefix` ([`m4_lab`]'s with S, a Mac with no seat): X removes `r1` and holds
+    /// [`a_prefix`] of A's removal of `r4`, which wraps S last.
+    prefix: Six,
+    /// X's home.
+    prefix_x: &'static str,
+    /// A's removal batch.
+    prefix_chain: Vec<Record>,
+    /// `Settled` ([`settled_head`]'s): B, a carrier ranked `rank` >= 1, holds two of three
+    /// concurrent Commons re-keys.
+    settled: Six,
+    /// B's home.
+    settled_b: &'static str,
+    /// The third re-key, which arrives settled.
+    third: Vec<Record>,
+    /// B's rank for the covering re-key.
+    rank: usize,
+    /// `Recheck` ([`m4_lab`]'s with no S): X removes `r1` and holds A's `Remove` alone.
+    recheck: Six,
+    /// X's home.
+    recheck_x: &'static str,
+    /// What `Arrive` brings X: [`a_prefix`] of A's removal batch.
+    recheck_prefix: Vec<Record>,
+    /// X's first look at A's `Remove`, at `t0`.
+    recheck_first: TendMark,
+    t0: u64,
+}
+
+impl ConvergenceShapes {
+    fn build() -> Self {
+        let rotation = two_macs(&[(Audience::Everyone, "shared", b"v1".as_slice())]);
+        let (m40, _, _) = let_in_by(&rotation, &rotation.m7, "m40", "m40");
+        let (m41, _, rec41) = let_in_by(&rotation, &rotation.m7, "m41", "m41");
+        let all = vec![rotation.m22.clone(), rotation.m7.clone(), m40, m41];
+        carry(&all, 1);
+        let base = ids(&all[0]);
+        test_remove_unposted(&all[0], &join_code(&rec41)).expect("m22 removes m41");
+        let rotation_chain = signed_since(&all[0], &base);
+        save_records(&all[1], &encode_records(&rotation_chain)).unwrap();
+        save_records(&all[2], &encode_records(&rotation_chain[..1])).unwrap();
+        let dues = |paths: &Paths| -> BTreeSet<EpochAudience> {
+            log_of(paths)
+                .rekey_dues()
+                .into_iter()
+                .map(|due| due.audience)
+                .collect()
+        };
+        assert_eq!(dues(&all[2]), convergence_due(1), "CONTROL: B's dues");
+
+        let M4 {
+            lab: prefix,
+            r,
+            x,
+            chain: prefix_chain,
+            seatless,
+        } = m4_lab(true);
+        let seatless = seatless.expect("S");
+        save_records(&prefix.all[x], &encode_records(a_prefix(&prefix_chain, &r))).unwrap();
+        assert!(
+            log_of(&prefix.all[x])
+                .undecided(&EpochAudience::Everyone, &r[0])
+                .contains(&seatless),
+            "CONTROL: X's prefix may still decide S"
+        );
+        assert_eq!(
+            dues(&prefix.all[x]),
+            convergence_due(2),
+            "CONTROL: X's dues"
+        );
+        let prefix_x = SIX[x];
+
+        let settled = six();
+        let third = rekey(&settled.all[2], &EpochAudience::Commons, |_| true);
+        let first = rekey(&settled.all[0], &EpochAudience::Commons, |_| true);
+        let left_out = settled.recipients[5];
+        let second = rekey(&settled.all[1], &EpochAudience::Commons, |r| *r != left_out);
+        let turn_of = |log: &Log, actor: &MemberId| {
+            log.rekey_dues()
+                .into_iter()
+                .find(|due| due.audience == EpochAudience::Commons)
+                .and_then(|due| due.turn(&log.membership(), actor))
+        };
+        let mut probe = log_of(&settled.all[3]);
+        for record in first.iter().chain(&second) {
+            probe.insert(record.clone()).unwrap();
+        }
+        let (b, turn) = [3, 4]
+            .into_iter()
+            .find_map(|i| {
+                turn_of(&probe, &settled.actors[i])
+                    .filter(|turn| turn.rank >= 1 && !turn.after_grace)
+                    .map(|turn| (i, turn))
+            })
+            .expect("a carrier ranked after the first, with no grace");
+        for record in &third {
+            probe.insert(record.clone()).unwrap();
+        }
+        assert_eq!(
+            turn_of(&probe, &settled.actors[b]),
+            Some(turn),
+            "CONTROL: the third head keeps B's rank"
+        );
+        let rank = turn.rank;
+        save_records(
+            &settled.all[b],
+            &encode_records(first.iter().chain(&second)),
+        )
+        .unwrap();
+        assert_eq!(
+            dues(&settled.all[b]),
+            convergence_due(3),
+            "CONTROL: B's dues"
+        );
+
+        let M4 {
+            lab: recheck,
+            r,
+            x: rx,
+            chain: recheck_chain,
+            ..
+        } = m4_lab(false);
+        let x = &recheck.all[rx];
+        save_records(x, &encode_records(&recheck_chain[..1])).unwrap();
+        assert_eq!(dues(x), convergence_due(4), "CONTROL: X's dues");
+        let recheck_prefix = a_prefix(&recheck_chain, &r).to_vec();
+
+        let t0 = aterm_time::unix_millis().unwrap_or(0);
+        let (recheck_first, _) =
+            ready_rekeys(&log_of(x), &member_key(x).1, &TendMark::default(), t0);
+        Self {
+            rotation,
+            rotation_chain,
+            prefix_x,
+            prefix,
+            prefix_chain,
+            settled_b: SIX[b],
+            settled,
+            third,
+            rank,
+            recheck_x: SIX[rx],
+            recheck,
+            recheck_prefix,
+            recheck_first,
+            t0,
+        }
+    }
+
+    fn stop(self) {
+        self.rotation.server.stop();
+        self.prefix.macs.server.stop();
+        self.settled.macs.server.stop();
+        self.recheck.macs.server.stop();
+    }
+}
+
+/// One replay of `EpochConvergence` on copies of a shape's homes, and what the harness counts:
+/// `t` the windows run, `fast` whether B took A's batch within the grace, `head` when the third
+/// head came, `before` the epochs minted before the heal by audience, `after` whether a pass
+/// after the heal signed anything, for `Prefix` and `Recheck` what X held of A's batch when it
+/// first minted `[everyone]` (`mab`) and in which window (`mt`), and for `Recheck` the mark X's
+/// scheduling look left (`look`) and whether it authored since.
+#[derive(Clone)]
+struct ConvergenceRun<'a> {
+    shapes: &'a ConvergenceShapes,
+    dir: PathBuf,
+    sc: i64,
+    t: i64,
+    fast: bool,
+    healed: bool,
+    head: i64,
+    before: BTreeMap<EpochAudience, usize>,
+    after: bool,
+    mab: i64,
+    mt: i64,
+    look: Option<TendMark>,
+    authored: bool,
+}
+
+impl<'a> ConvergenceRun<'a> {
+    /// The shape `selector` picks, its homes copied into `dir`.
+    fn start(shapes: &'a ConvergenceShapes, selector: &str, dir: &Path) -> Self {
+        let sc = match selector {
+            "Rotation" => 1,
+            "Prefix" => 2,
+            "Settled" => 3,
+            "Recheck" => 4,
+            other => panic!("not a shape: {other}"),
+        };
+        let run = Self {
+            shapes,
+            dir: dir.to_path_buf(),
+            sc,
+            t: 0,
+            fast: false,
+            healed: false,
+            head: 0,
+            before: BTreeMap::new(),
+            after: false,
+            mab: 0,
+            mt: 0,
+            look: None,
+            authored: false,
+        };
+        let template = match sc {
+            1 => shapes.rotation.root.path(),
+            2 => shapes.prefix.macs.root.path(),
+            3 => shapes.settled.macs.root.path(),
+            _ => shapes.recheck.macs.root.path(),
+        };
+        for home in run.homes() {
+            copy_private_tree(&template.join(home), &dir.join(home));
+        }
+        run
+    }
+
+    /// This run as it stands, its homes copied into `dir`.
+    fn fork(&self, dir: &Path) -> Self {
+        for home in self.homes() {
+            copy_private_tree(&self.dir.join(home), &dir.join(home));
+        }
+        Self {
+            dir: dir.to_path_buf(),
+            ..self.clone()
+        }
+    }
+
+    /// The homes its passes run in: the seated Macs (B last), X, B, or X.
+    fn homes(&self) -> Vec<&'static str> {
+        match self.sc {
+            1 => vec!["m22", "m7", "m40"],
+            2 => vec![self.shapes.prefix_x],
+            3 => vec![self.shapes.settled_b],
+            _ => vec![self.shapes.recheck_x],
+        }
+    }
+
+    fn all(&self) -> Vec<Paths> {
+        self.homes()
+            .into_iter()
+            .map(|home| Paths::for_home(&self.dir.join(home)))
+            .collect()
+    }
+
+    /// The Mac whose view the shape turns on: B, X, B, or X.
+    fn mac(&self) -> Paths {
+        self.all().pop().expect("a home")
+    }
+
+    /// Whether that Mac holds every record of `chain`.
+    fn holds(&self, chain: &[Record]) -> bool {
+        let held = ids(&self.mac());
+        chain.iter().all(|record| held.contains(record.id()))
+    }
+
+    /// What X holds of A's batch, as the model's `ab` counts it.
+    fn x_holds(&self) -> i64 {
+        match self.sc {
+            2 if self.holds(&self.shapes.prefix_chain) => 3,
+            2 => 2,
+            4 if self.holds(&self.shapes.recheck_prefix) => 2,
+            _ => 1,
+        }
+    }
+
+    /// The epochs among `signed`, minted before the heal, counted by audience; for `Prefix` and
+    /// `Recheck`, X's first `[everyone]` mint notes what X held of A's batch (`held`) and when.
+    fn count(&mut self, signed: &[Record], held: i64) {
+        for (audience, n) in epochs_by_audience(signed) {
+            if matches!(self.sc, 2 | 4)
+                && audience == EpochAudience::Everyone
+                && !self.before.contains_key(&audience)
+            {
+                self.mab = held;
+                self.mt = self.t;
+            }
+            *self.before.entry(audience).or_default() += n;
+        }
+    }
+
+    /// The clock readings of window `t`'s passes, from the shapes' first sight.
+    fn window(&self) -> Vec<u64> {
+        let step = |k: u64| self.shapes.t0 + k * GAP_STEP_MS;
+        let remover = REMOVER_GRACE_MS / GAP_STEP_MS;
+        let settle = log_entries::SETTLE_GRACE_MS / GAP_STEP_MS;
+        let rank = u64::try_from(self.shapes.rank).expect("a rank");
+        match (self.sc, self.t) {
+            (1, 0) => (0..remover).map(step).collect(),
+            (1, 1) => (remover..remover + 6).map(step).collect(),
+            (1, _) => (remover + 6..remover + 22).map(step).collect(),
+            (2, 0) => (0..settle).map(step).collect(),
+            (2, _) => (settle..settle + 6).map(step).collect(),
+            (_, 0) => vec![self.shapes.t0],
+            (_, 1) => vec![self.shapes.t0 + 30_000],
+            (_, _) => (1..=rank).map(step).collect(),
+        }
+    }
+
+    fn apply(&mut self, action: &str) {
+        let now = self.shapes.t0 + RECHECK_STEPS * GAP_STEP_MS;
+        match action {
+            "Deliver" => {
+                save_records(&self.mac(), &encode_records(&self.shapes.rotation_chain)).unwrap();
+                self.fast = true;
+            }
+            "Heal" => {
+                let all = self.all();
+                for i in 0..all.len() {
+                    carry(&all, i);
+                }
+                self.healed = true;
+            }
+            "Rest" => {
+                save_records(&self.mac(), &encode_records(&self.shapes.prefix_chain)).unwrap();
+            }
+            "Head" => {
+                save_records(&self.mac(), &encode_records(&self.shapes.third)).unwrap();
+                self.head = self.t + 1;
+            }
+            "Arrive" => {
+                save_records(&self.mac(), &encode_records(&self.shapes.recheck_prefix)).unwrap();
+            }
+            "Observe" => {
+                let x = self.mac();
+                let (mark, ready) = ready_rekeys(
+                    &log_of(&x),
+                    &member_key(&x).1,
+                    &self.shapes.recheck_first,
+                    now,
+                );
+                if !ready.is_empty() {
+                    self.look = Some(mark);
+                }
+            }
+            "Author" => {
+                let x = self.mac();
+                let held = self.x_holds();
+                let identity = read_identity(&x).unwrap().unwrap();
+                let look = self.look.clone().expect("a look found a re-key ready");
+                let signed = tend_ready_epochs(&x, now, &identity, &look).unwrap();
+                self.count(&signed, held);
+                self.authored = true;
+            }
+            "RotationPasses" | "PrefixPasses" | "SettledPasses" => {
+                let all = self.all();
+                for at in self.window() {
+                    for (i, paths) in all.iter().enumerate() {
+                        let held = if self.sc == 2 { self.x_holds() } else { 0 };
+                        let signed = vault_pass_at(paths, at).unwrap();
+                        if self.healed {
+                            self.after |= !signed.is_empty();
+                            if !signed.is_empty() {
+                                carry(&all, i);
+                            }
+                        } else {
+                            self.count(&signed, held);
+                        }
+                    }
+                }
+                self.t += 1;
+            }
+            other => panic!("not an EpochConvergence action: {other}"),
+        }
+    }
+}
+
+/// `EpochConvergence`'s variables, read off a replay: what the Mac the shape turns on holds of
+/// the batch it waits on (`ab`), the most and fewest epochs one due audience was minted before
+/// the heal (`mb`, `mn`), whether anything was signed after it (`cc`), and the harness's clock.
+fn epoch_convergence_transition(run: &ConvergenceRun<'_>) -> aterm_spec::interp::State {
+    let count = |n: usize| i64::try_from(n).expect("a count");
+    let ab = match run.sc {
+        1 if run.holds(&run.shapes.rotation_chain) => 3,
+        1 => 1,
+        2 | 4 => run.x_holds(),
+        _ => 0,
+    };
+    let past = match run.sc {
+        3 => run.t >= 3,
+        4 => false,
+        _ => run.t >= 2,
+    };
+    let most = run.before.values().copied().max().unwrap_or(0);
+    let fewest = convergence_due(run.sc)
+        .iter()
+        .map(|audience| run.before.get(audience).copied().unwrap_or(0))
+        .min()
+        .unwrap_or(0);
+    let rd = if run.authored {
+        2
+    } else {
+        i64::from(run.look.is_some())
+    };
+    aterm_spec::interp::State::from([
+        ("sc", run.sc),
+        ("t", run.t),
+        ("ab", ab),
+        ("fast", i64::from(run.fast)),
+        ("mb", count(most)),
+        ("mn", count(fewest)),
+        ("cc", i64::from(run.after)),
+        ("healed", i64::from(run.healed)),
+        ("past", i64::from(past)),
+        ("mab", run.mab),
+        ("mt", run.mt),
+        ("head", run.head),
+        ("rd", rd),
+    ])
+}
+
+/// `path` from `EpochConvergence`'s first state on the shapes' homes, copied into `dir`.
+fn convergence_replay<'a>(
+    shapes: &'a ConvergenceShapes,
+    dir: &Path,
+    path: &[&str],
+) -> ConvergenceRun<'a> {
+    let mut run = ConvergenceRun::start(shapes, path[0], dir);
+    for action in &path[1..] {
+        run.apply(action);
+    }
+    run
+}
+
+/// The state `EpochConvergence` reaches by `path` (each of its actions has one successor).
+fn convergence_state(
+    model: &aterm_spec::derive::Model,
+    path: &[&str],
+) -> aterm_spec::interp::State {
+    path.iter().fold(model.init_state(), |state, action| {
+        let next = model.successors(action, &state);
+        assert_eq!(next.len(), 1, "{action} from {state:?}");
+        next[0].clone()
+    })
+}
+
+/// S8: `EpochConvergence` holds its laws, each of its mutants breaks the law it stands for, and
+/// the tender refines it: from every state the model reaches, every action it enables, run on a
+/// copy of the homes that realize that state (each lab shape built once, every state's homes
+/// forked from the state the walk first found it from), gives exactly the model's successor.
+/// Each `…Passes` action is the shape's Macs' vault passes ([`vault_pass_at`]: the gap closer,
+/// then [`tend_epochs_at`]) at each step of its window on the injected clock; `Recheck`'s
+/// `Observe` is the tender's scheduling look ([`ready_rekeys`]) and its `Author` the signing
+/// under the author lock from that look's mark ([`tend_ready_epochs`]). Mints are counted by
+/// audience, every one the shape starts due.
+///
+/// NEGATIVE CONTROLS, each the real tender down the mutant's path:
+/// - `remove::UNRANKED`: B mints its own rotation at its first pass, which is no successor; A's
+///   batch then reaching B within the grace breaks `OneMintWhenFast`.
+/// - `remove::HEADS_MOVE_RANKS`: the third head, come after B's first pass, puts B's step past
+///   its window, which is no successor and breaks `HoldEnds`.
+/// - `UNSETTLED_OK`: X mints from the prefix of A's batch within the settle grace, which is no
+///   successor and breaks `NoMintFromUnsettled`.
+/// - `TWINS_DUE`: the heal's two rotations are due a coalesce and one follows, which is no
+///   successor and breaks `AtMostTwoMints`.
+/// - `remove::STALE_AUTHORING`: a prefix of A's batch that arrives between X's look and its
+///   signing gets a `[everyone]` mint within its settle grace, which is no successor and breaks
+///   `NoMintFromUnsettled`.
+/// - `remove::UNDECIDED_HOLDS`: past the settle grace S, which X's prefix may still decide,
+///   holds `[everyone]`'s re-key, and X re-keys Commons alone, which is no successor and breaks
+///   `HoldEnds`.
+#[test]
+fn the_tender_conforms_to_the_epoch_convergence_model() {
+    use aterm_spec::interp::{violated_invariants, with_buggy};
+
+    let model = aterm_models_swarm::epoch_convergence_model();
+    aterm_spec::interp::prove_and_catch(&model);
+    let fired = aterm_spec::interp::fired_actions(&model);
+    assert_eq!(fired.len(), model.actions.len(), "fired actions: {fired:?}");
+    let faults = aterm_spec::verify::sweep_faults(std::slice::from_ref(&model));
+    assert!(faults.is_empty(), "{faults:?}");
+    for (buggy, law) in [
+        (1, "OneMintWhenFast"),
+        (2, "HoldEnds"),
+        (3, "NoMintFromUnsettled"),
+        (4, "AtMostTwoMints"),
+        (5, "NoMintFromUnsettled"),
+        (6, "HoldEnds"),
+    ] {
+        assert!(
+            violated_invariants(&with_buggy(&model, buggy)).contains(law),
+            "mutant {buggy} breaks {law}"
+        );
+    }
+
+    let shapes = ConvergenceShapes::build();
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let init = model.init_state();
+    let mut order = vec![init.clone()];
+    let mut realized: BTreeMap<aterm_spec::interp::State, ConvergenceRun<'_>> = BTreeMap::new();
+    let mut runs = 0usize;
+    let mut next = 0;
+    while let Some(state) = order.get(next).cloned() {
+        next += 1;
+        for action in &model.actions {
+            if !model.action_enabled(action.name, &state) {
+                continue;
+            }
+            runs += 1;
+            let dir = root.path().join(format!("r{runs}"));
+            let run = match realized.get(&state) {
+                Some(from) => {
+                    let mut run = from.fork(&dir);
+                    run.apply(action.name);
+                    run
+                }
+                None => {
+                    assert_eq!(state, init, "every later state is realized");
+                    ConvergenceRun::start(&shapes, action.name, &dir)
+                }
+            };
+            let observed = epoch_convergence_transition(&run);
+            assert_eq!(
+                model.successors(action.name, &state),
+                vec![observed.clone()],
+                "{} from {state:?}",
+                action.name
+            );
+            if !order.contains(&observed) {
+                order.push(observed.clone());
+                realized.insert(observed, run);
+            }
+        }
+    }
+    assert_eq!(
+        order.len(),
+        aterm_spec::interp::reachable_states(&model).len()
+    );
+    eprintln!(
+        "EpochConvergence: {} states, {runs} transitions judged (B's rank {})",
+        order.len(),
+        shapes.rank
+    );
+    drop(realized);
+
+    let control = |switch: &'static std::thread::LocalKey<std::cell::Cell<bool>>,
+                   name: &str,
+                   path: &[&str]| {
+        switch.with(|cell| cell.set(true));
+        let run = convergence_replay(&shapes, &root.path().join(name), path);
+        switch.with(|cell| cell.set(false));
+        let observed = epoch_convergence_transition(&run);
+        let (last, before) = path.split_last().expect("a path");
+        let from = convergence_state(&model, before);
+        assert!(
+            !model.successors(last, &from).contains(&observed),
+            "{name}: {observed:?} is a successor of {last}"
+        );
+        (run, observed)
+    };
+
+    let (mut unranked, observed) = control(
+        &remove::UNRANKED,
+        "unranked",
+        &["Rotation", "RotationPasses"],
+    );
+    assert_eq!(observed["mb"], 1, "unranked, B mints at its first pass");
+    unranked.apply("Deliver");
+    let delivered = epoch_convergence_transition(&unranked);
+    assert!(!model.check_invariant("OneMintWhenFast", &delivered));
+
+    let (_, observed) = control(
+        &remove::HEADS_MOVE_RANKS,
+        "heads-move",
+        &[
+            "Settled",
+            "SettledPasses",
+            "Head",
+            "SettledPasses",
+            "SettledPasses",
+        ],
+    );
+    assert_eq!(observed["mb"], 0, "the moved step lies past B's window");
+    assert!(!model.check_invariant("HoldEnds", &observed));
+
+    let (_, observed) = control(&UNSETTLED_OK, "unsettled-ok", &["Prefix", "PrefixPasses"]);
+    assert_eq!(
+        (
+            observed["mb"],
+            observed["mn"],
+            observed["mab"],
+            observed["mt"]
+        ),
+        (1, 0, 2, 0),
+        "X mints [everyone] from the prefix within the grace, while S holds Commons"
+    );
+    assert!(!model.check_invariant("NoMintFromUnsettled", &observed));
+
+    let (_, observed) = control(
+        &TWINS_DUE,
+        "twins-due",
+        &[
+            "Rotation",
+            "RotationPasses",
+            "RotationPasses",
+            "Heal",
+            "RotationPasses",
+        ],
+    );
+    assert_eq!(observed["cc"], 1, "a coalesce follows the heal");
+    assert!(!model.check_invariant("AtMostTwoMints", &observed));
+
+    let (_, observed) = control(
+        &remove::STALE_AUTHORING,
+        "stale-authoring",
+        &["Recheck", "Observe", "Arrive", "Author"],
+    );
+    assert_eq!(
+        (observed["mn"], observed["mab"], observed["mt"]),
+        (1, 2, 0),
+        "trusting the look mints [everyone] over the prefix"
+    );
+    assert!(!model.check_invariant("NoMintFromUnsettled", &observed));
+
+    let (_, observed) = control(
+        &remove::UNDECIDED_HOLDS,
+        "undecided-holds",
+        &["Prefix", "PrefixPasses", "PrefixPasses"],
+    );
+    assert_eq!(
+        (observed["mb"], observed["mn"], observed["past"]),
+        (1, 0, 1),
+        "S holds [everyone] past the grace, and Commons is re-keyed alone"
+    );
+    assert!(!model.check_invariant("HoldEnds", &observed));
+
+    shapes.stop();
 }

@@ -1582,10 +1582,9 @@ fn run<S: Read + Write + ?Sized>(
             && let Some(paths) = &paths
         {
             let store = client::load_records(paths)?;
-            if !reader.can_take(client::records_bound(paths, &store)?) {
-                return Err(Error::new(
-                    "the joining device cannot receive this membership history",
-                ));
+            let source = client::records_bound(paths, &store)?;
+            if !reader.can_take(source) {
+                return Err(Error::new(reader.refusal(source)));
             }
         }
         // `ack=1`: the new Mac acknowledges the bundle it opened ([`Delivered::Acknowledged`]).
@@ -1853,6 +1852,52 @@ mod lan_tests {
         ] {
             assert!(reader(&Line::parse(bad)).is_err(), "{bad}");
         }
+    }
+
+    /// A member's refusal of a history its reader cannot take, and a new Mac's of a member's
+    /// bundle, name the Mac whose aterm is short.
+    ///
+    /// NEGATIVE CONTROL (in the test): histories both sides take carry no refusal.
+    #[test]
+    fn a_capacity_refusal_names_the_mac_whose_aterm_is_short() {
+        use super::super::bundle::source_refusal;
+        use crate::crossing::RecordsBound;
+        let (legacy, larger) = (RecordsBound::of(4096, false), RecordsBound::of(8192, false));
+        let (crossed, larger_crossed) =
+            (RecordsBound::of(4096, true), RecordsBound::of(8192, true));
+        for (reader, source, update) in [
+            (Reader::Files, legacy, "on the new Mac"),
+            (Reader::LegacyLog, crossed, "on the new Mac"),
+            (Reader::BoundedLog(legacy), larger_crossed, "on the new Mac"),
+            (
+                Reader::BoundedLog(larger_crossed),
+                legacy,
+                "on the allowing Mac",
+            ),
+        ] {
+            assert!(!reader.can_take(source), "{reader:?} {source:?}");
+            let why = reader.refusal(source);
+            assert!(why.contains(&format!("update aterm {update}")), "{why}");
+        }
+        assert!(
+            Reader::LegacyLog
+                .refusal(crossed)
+                .contains("an older aterm")
+        );
+        for (local, source, update) in [
+            (legacy, Some(larger_crossed), "on this Mac"),
+            (larger_crossed, Some(legacy), "on the allowing Mac"),
+            (crossed, None, "on the allowing Mac"),
+        ] {
+            let why = source_refusal(local, source).expect("refused");
+            assert!(why.contains(&format!("update aterm {update}")), "{why}");
+        }
+        // Control: histories both sides hold.
+        assert!(Reader::LegacyLog.can_take(larger));
+        assert!(Reader::BoundedLog(larger_crossed).can_take(larger_crossed));
+        assert_eq!(source_refusal(larger, Some(legacy)), None);
+        assert_eq!(source_refusal(legacy, None), None);
+        assert_eq!(source_refusal(larger_crossed, Some(larger_crossed)), None);
     }
 
     const TRUST: Trust = Trust {

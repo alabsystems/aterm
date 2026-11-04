@@ -954,26 +954,32 @@ mod tests {
         assert_eq!(b.len(), 4, "four distinct keys ⇒ four slots");
     }
 
-    /// The `host_id` handed to the shared atlas is stable and key-separating.
+    /// `host_id` is a pure function of the key and lives in the high half (`bit 63 == 1`).
     #[test]
-    fn host_ids_are_stable_and_distinct() {
-        let a = key(1);
-        let b = key(2);
-        assert_eq!(a.host_id(), key(1).host_id(), "same key ⇒ same host id");
-        assert_ne!(
-            a.host_id(),
-            b.host_id(),
-            "distinct keys ⇒ distinct host ids"
-        );
-        assert_ne!(
-            a.host_id(),
-            PetBakeKey { w: 49, ..a }.host_id(),
-            "size participates in the host id"
-        );
-        assert!(
-            (a.host_id() >> 63) == 1,
-            "pet host ids live in the high half"
-        );
+    fn host_ids_are_stable_and_namespaced() {
+        for &pose_id in PET_GLYPH_IDS {
+            for coat in 0..16u8 {
+                let k = PetBakeKey {
+                    pose: pose_id,
+                    coat,
+                    iris: coat & 7,
+                    colors: CatColorKey::default(),
+                    w: 48 + u16::from(coat),
+                    h: 28 + u16::from(coat & 3),
+                };
+                let expected = host_tile_id(&[
+                    k.pose as u64,
+                    k.coat as u64,
+                    k.iris as u64,
+                    k.colors.accent as u64,
+                    k.colors.background as u64,
+                    k.w as u64,
+                    k.h as u64,
+                ]);
+                assert_eq!(k.host_id(), expected, "same key ⇒ same host id");
+                assert_eq!(k.host_id() >> 63, 1, "pet host ids live in the high half");
+            }
+        }
     }
 
     /// At the 1.5× ship size (36 px), for every pose on both grounds, every authored eye subpath

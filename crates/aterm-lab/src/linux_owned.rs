@@ -49,7 +49,7 @@ fn read_record(path: &Path) -> Result<Option<String>, String> {
             path.display()
         ));
     }
-    let mut text = String::new();
+    let mut text = String::with_capacity(usize::try_from(m.len()).unwrap_or(0).saturating_add(1));
     std::io::Read::by_ref(&mut file)
         .take(RECORD_MAX + 1)
         .read_to_string(&mut text)

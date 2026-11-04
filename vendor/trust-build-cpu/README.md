@@ -40,3 +40,23 @@ slot is available regardless of its stale metadata. A held slot's owner is
 reported metadata, not independently authenticated ownership or proof
 authority. Other platforms currently expose only the record types; the
 native pool implementation is Unix-only.
+
+`RetainedPool` is a separate mechanism for an explicitly new private domain,
+before any host-wide migration. `create_private` requires an absent path and
+places a regular-file fence at the legacy pool name before publishing the
+retained backend. It neither changes the account default nor permits two
+global CPU budgets. Its physical root, fence, manifest and slot identities are
+validated on use; incomplete or malformed state fails closed.
+
+Acquiring a `RetainedLease` syncs retained debt before returning its controller.
+The controller cannot be cloned or exported as a writable descriptor. Drop
+and process death leave the debt recorded, even after the kernel lock is gone.
+No API recovers release authority from a path, PID or decoded record.
+
+The caller must establish that **all work backed by the credit has ended**
+before calling `settle(self)`. Settlement consumes the original controller,
+checks its identity and claim, and writes and syncs an explicit Free record.
+Successful settlement confirms durable Free. An error or crash once writing
+starts can leave Retained, malformed or Free state, so an error does not promise
+continued debt. The library does not establish descendant completion or supply
+a production host scheduler, global migration, or post-crash recovery policy.

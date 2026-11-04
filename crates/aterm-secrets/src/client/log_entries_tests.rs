@@ -1294,6 +1294,8 @@ fn a_parented_edit_survives_the_automatic_log_mirror() {
 }
 
 fn no_seat_edit_survives_mirror(parented: bool) {
+    // Every server it reads is its own on loopback, which answers.
+    let _answering = ServersAnswering::set();
     let macs = two_macs(&[(Audience::Everyone, "shared", b"v1".as_slice())]);
     let (m22, m7) = (&macs.m22, &macs.m7);
 
@@ -3543,11 +3545,14 @@ fn join_reader_capacity_is_checked_before_and_after_admission() {
                 },
             )
         };
+        // Each refusal names the Mac to update: the new Mac, an older aterm or one whose bound
+        // is short of the admission's crossed history.
+        let update = |why: &str| assert!(why.contains("update aterm on the new Mac"), "{why}");
         for reader in [
             Reader::LegacyLog,
             Reader::BoundedLog(RecordsBound::of(4096, false)),
         ] {
-            assert!(hand_to(reader).is_err());
+            update(&hand_to(reader).err().expect("refused").to_string());
             assert!(
                 std::fs::read(member.records_file()).unwrap() == before,
                 "a refused phrase admission must not change records"
@@ -3573,10 +3578,10 @@ fn join_reader_capacity_is_checked_before_and_after_admission() {
                 "a refused proof admission must not change records"
             );
             assert!(!records_marked_crossed(member).unwrap());
-            assert!(matches!(
-                proof_result,
-                Ok(crate::client::Readmit::Refused(_))
-            ));
+            let Ok(crate::client::Readmit::Refused(why)) = proof_result else {
+                panic!("a refused proof admission");
+            };
+            update(&why);
         }
         let proven = crate::client::Proven {
             request: &request,
@@ -3607,7 +3612,12 @@ fn join_reader_capacity_is_checked_before_and_after_admission() {
         assert_eq!(source, Some(RecordsBound::here(true)));
         assert!(records_marked_crossed(member).unwrap());
         let after = std::fs::read(member.records_data_file().unwrap()).unwrap();
-        assert!(hand_to(Reader::LegacyLog).is_err());
+        let refused = hand_to(Reader::LegacyLog)
+            .err()
+            .expect("refused")
+            .to_string();
+        assert!(refused.contains("an older aterm"), "{refused}");
+        update(&refused);
         assert_eq!(
             std::fs::read(member.records_data_file().unwrap()).unwrap(),
             after
@@ -5634,9 +5644,14 @@ fn excluding_member_from_commons_control_rotates_commons_epoch_and_keeps_it_out_
         .unwrap()
         .unwrap();
     let req11 = dev11.request(trust.network, trust.authority).unwrap();
-    let (_, dev7, inc7) = log_entries::open_local_member_signer(m7, &pre_removal_log7)
-        .unwrap()
-        .unwrap();
+    assert!(!matches!(
+        log_entries::open_local_member_signer(m7, &pre_removal_log7),
+        Ok(Some(_))
+    ));
+    // The attacker still holds its old key; the authorized signer API must refuse it.
+    let dev7 = crate::commons::bootstrap::Device::open_existing(m7).unwrap();
+    let req7 = dev7.request(trust.network, trust.authority).unwrap();
+    let inc7 = *req7.binding().incarnation();
     let cut_off_admit = dev7
         .with_seed(|seed| {
             pre_removal_log7
@@ -6385,6 +6400,8 @@ fn a_0_145_member_heard_in_14_days_keeps_the_mirror_on() {
     fn clock() -> u64 {
         CLOCK.load(Ordering::SeqCst)
     }
+    // Every server it reads is its own on loopback, which answers.
+    let _answering = ServersAnswering::set();
     let macs = two_macs_at(
         &[(Audience::Everyone, "shared", b"v1".as_slice())],
         false,

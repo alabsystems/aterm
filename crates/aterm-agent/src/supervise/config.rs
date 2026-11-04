@@ -1156,10 +1156,32 @@ impl SupervisorConfig {
     /// [`Self::from_aterm_toml`] over the file at `path`: no path or no file is the defaults.
     #[must_use]
     pub fn from_path(path: Option<&Path>) -> (Self, Vec<String>) {
+        use std::io::Read as _;
+        const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
         let Some(path) = path else {
             return (Self::default(), Vec::new());
         };
-        match std::fs::read(path) {
+        let read_result = aterm_uds::regular_file::open(path).and_then(|(file, meta)| {
+            if meta.len() > MAX_CONFIG_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "config file exceeds size limit",
+                ));
+            }
+            let cap = usize::try_from(meta.len().min(MAX_CONFIG_BYTES))
+                .unwrap_or(0)
+                .saturating_add(1);
+            let mut bytes = Vec::with_capacity(cap);
+            file.take(MAX_CONFIG_BYTES + 1).read_to_end(&mut bytes)?;
+            if bytes.len() as u64 > MAX_CONFIG_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "config file exceeds size limit",
+                ));
+            }
+            Ok(bytes)
+        });
+        match read_result {
             Ok(bytes) => Self::from_aterm_toml(&String::from_utf8_lossy(&bytes)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Self::default(), Vec::new()),
             Err(e) => (
@@ -3923,9 +3945,7 @@ trust_dialog = false
 
     #[test]
     fn from_path_reads_the_file_and_a_missing_one_is_the_defaults() {
-        let dir = std::env::temp_dir().join(format!("aterm-harness-cfg-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("dir");
+        let dir = crate::supervise::ScratchDir::new("harness-cfg", "from-path");
         let toml = dir.join("aterm.toml");
         assert_eq!(
             SupervisorConfig::from_path(Some(&toml)),
@@ -3944,7 +3964,6 @@ trust_dialog = false
         let (c, notes) = SupervisorConfig::from_path(Some(&dir));
         assert_eq!(c, SupervisorConfig::default());
         assert!(!notes.is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

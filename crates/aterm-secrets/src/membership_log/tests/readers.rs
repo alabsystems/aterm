@@ -397,7 +397,7 @@ fn a_carried_weighing_keeps_only_what_its_quorums_read() {
     assert_eq!(*lab.weighing(), eval::weigh(lab.history()));
 }
 
-/// The most candidates a log within today's record bound can hold apart, weighed in full: the
+/// The most candidates a log within its weighed budget can hold apart, weighed in full: the
 /// genesis binds A, B, C and D, D signs 2,047 `Name`s, and A and B each remove D at every one of
 /// them, so 4,095 records are weighed (the genesis and 4,094 `Remove`s) and 2,047 candidates
 /// hold apart, every one active in the relations. Their 2,047-wide relations fit the payload
@@ -405,9 +405,9 @@ fn a_carried_weighing_keeps_only_what_its_quorums_read() {
 /// out. Each candidate voids only D's `Name`s, which no weighed record reads, so all weigh in
 /// one authorization pass, at four members' re-check per cutoff.
 ///
-/// The fixture holds 6,142 records, more than `MAX_HELD_RECORDS` lets a log hold today, so it is
-/// signed into a record list and evaluated through the evaluator's seam. Its weighed records
-/// stay within `MAX_WEIGHED_RECORDS`, the bound that sizes the relations.
+/// The fixture holds 6,142 records, signed into a record list and evaluated through the
+/// evaluator's seam. Its weighed records stay within `MAX_WEIGHED_RECORDS`, the bound that sizes
+/// the relations.
 #[test]
 fn the_widest_candidate_set_a_held_log_can_weigh_fits_the_relations_budget() {
     const CUTOFFS: usize = (MAX_WEIGHED_RECORDS - 1) / 2;

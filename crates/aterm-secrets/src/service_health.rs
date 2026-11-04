@@ -166,8 +166,29 @@ pub fn subscriber(
 /// # Errors
 /// Transport, signature, vault identity or frontier verification failed.
 pub fn server(url: &str, health: &HealthRequirement) -> Result<()> {
-    let crate::transport::Fetched::Body(bytes) =
-        crate::transport::fetch_within(url, None, std::time::Duration::from_secs(5))?
+    server_reads_within(url, health, std::time::Duration::from_secs(5))
+}
+
+/// [`server`] with each of its two reads bounded by `within`: a test whose own server must
+/// answer passes its hang detector (`aterm_spec::wait::MUST_HAPPEN`).
+/// # Errors
+/// As [`server`].
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub fn server_within(
+    url: &str,
+    health: &HealthRequirement,
+    within: std::time::Duration,
+) -> Result<()> {
+    server_reads_within(url, health, within)
+}
+
+fn server_reads_within(
+    url: &str,
+    health: &HealthRequirement,
+    within: std::time::Duration,
+) -> Result<()> {
+    let crate::transport::Fetched::Body(bytes) = crate::transport::fetch_within(url, None, within)?
     else {
         return Err(Error::new("server did not supply its signed vault"));
     };
@@ -179,8 +200,7 @@ pub fn server(url: &str, health: &HealthRequirement) -> Result<()> {
     {
         return Err(Error::new("server vault identity or sequence mismatch"));
     }
-    let bytes =
-        crate::transport::fetch_records(url, &[], None, std::time::Duration::from_secs(5), None)?;
+    let bytes = crate::transport::fetch_records(url, &[], None, within, None)?;
     let mut store = crate::membership_log::Store::for_vault(&health.vault)?;
     store.ingest(&bytes)?;
     let inventory = store.complete_inventory();

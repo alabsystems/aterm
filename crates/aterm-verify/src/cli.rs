@@ -321,7 +321,8 @@ Checks:
 Options:
   -p, --package <crate>   narrow lint/test/doc/cells to a crate (repeatable)
       --all               the whole workspace (default: the change cone)
-      --base <ref>        the cone's base (origin/main, else main; no fetch)
+      --base <ref>        the cone's base (origin/main, else main; no fetch);
+                          cannot combine with -p or --all, which replace the cone
       --app <APP>         the release bundle `measure` judges
       --fix               with fmt alone: rewrite the files it finds unformatted
       --cell <name>       the forge cell `cells` checks (repeatable; any cell)

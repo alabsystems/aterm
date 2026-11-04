@@ -31,6 +31,8 @@ fn advance_history(source: &Source, seed: &[u8; 32], mut bytes: Vec<u8>) -> Vec<
 
 #[test]
 fn an_admin_reconciles_beyond_the_parent_window_before_a_reader_catches_up() {
+    // Every server it reads is its own on loopback, which answers.
+    let _answering = ServersAnswering::set();
     let lab = log_entries_tests::two_macs(&[(Audience::Everyone, "shared", b"before")]);
     let second = log_entries_tests::start_loopback_server(&lab.root.path().join("second"));
     let second_url = format!("http://{}/v1/alab", second.addr);

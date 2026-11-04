@@ -343,12 +343,18 @@ const MAX_TOOLCHAIN_FILE_BYTES: u64 = 64 * 1024;
 
 fn read_toolchain_file(path: &Path) -> Option<String> {
     use std::io::Read as _;
-    let file = crate::fs_restricted::open_regular_nonblock(path).ok()?;
-    let open_meta = file.metadata().ok()?;
-    if !open_meta.is_file() || open_meta.len() > MAX_TOOLCHAIN_FILE_BYTES {
+    let (file, open_meta) = crate::fs_restricted::open_regular_nonblock_with_meta(path).ok()?;
+    if open_meta.len() > MAX_TOOLCHAIN_FILE_BYTES {
         return None;
     }
-    let mut bytes = Vec::new();
+    let cap = usize::try_from(
+        open_meta
+            .len()
+            .min(MAX_TOOLCHAIN_FILE_BYTES)
+            .saturating_add(1),
+    )
+    .unwrap_or(0);
+    let mut bytes = Vec::with_capacity(cap);
     file.take(MAX_TOOLCHAIN_FILE_BYTES + 1)
         .read_to_end(&mut bytes)
         .ok()?;

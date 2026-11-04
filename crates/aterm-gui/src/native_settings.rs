@@ -5799,18 +5799,9 @@ impl SettingsApp {
                             let mut quiet =
                                 view.owner_quiet.lock().unwrap_or_else(|p| p.into_inner());
                             quiet.debugger_confirmed = true;
-                            quiet.note_debugger_answered();
                             String::new()
                         }
-                        answer => {
-                            if answer == OwnerAnswer::No {
-                                view.owner_quiet
-                                    .lock()
-                                    .unwrap_or_else(|p| p.into_inner())
-                                    .note_debugger_answered();
-                            }
-                            answer.refusal("Nothing was changed.").to_string()
-                        }
+                        answer => answer.refusal("Nothing was changed.").to_string(),
                     }
                 };
                 view.feedback = (!said.is_empty()).then_some(said);
@@ -29601,21 +29592,6 @@ impl ConsentGestures {
         (self.run_devtools)(job)
     }
 
-    /// The inert arms with a stand-in alert and a stand-in worker start.
-    #[cfg(all(test, target_os = "macos"))]
-    pub(crate) const fn for_test_with(
-        confirm: fn(&str, &str, &str) -> Option<bool>,
-        run_devtools: fn(
-            crate::debugger_access::DevtoolsJob,
-        ) -> crate::debugger_access::DevtoolsSpawn,
-    ) -> Self {
-        Self {
-            confirm: ConfirmArm::StandIn(confirm),
-            run_devtools,
-            ..Self::inert()
-        }
-    }
-
     /// `live()` for a windowed instance, `inert()` for a headless one.
     pub(crate) const fn for_instance(headless: bool) -> Self {
         if headless {
@@ -30644,8 +30620,7 @@ const fn debugger_alert_safe(hardening: aterm_containment::consent::SelfHardenin
 }
 
 /// aterm's own alert before a debugger-access change pressed on Settings ▸ Security (debugger
-/// design §3.4 step 1): only that press raises it; System State's debugger step raises none of
-/// aterm's own. Two lines: what the change does (with what stays safe), then macOS's password
+/// design §3.4 step 1): only that press raises it. Two lines: what the change does (with what stays safe), then macOS's password
 /// dialog (with the undo, for On). Returns `(title, body, proceed)`.
 pub(crate) fn debugger_access_alert(
     change: aterm_containment::consent::DebuggerChange,
@@ -30867,7 +30842,6 @@ pub(crate) struct OwnerQuiet {
     retire_confirmed: bool,
     debugger_confirmed: bool,
     askpass_confirmed: bool,
-    debugger_answered: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -30935,21 +30909,6 @@ impl OwnerQuiet {
         self.declined(QuietStamp::now());
     }
 
-    /// Whether a gesture asked now would be quieted (a recent decline).
-    pub(crate) fn quiet_now(&self) -> bool {
-        self.quiet_at(QuietStamp::now())
-    }
-
-    /// The owner answered a debugger-access alert, yes or no.
-    pub(crate) const fn note_debugger_answered(&mut self) {
-        self.debugger_answered = true;
-    }
-
-    /// Whether the owner answered a debugger-access alert in this process.
-    pub(crate) const fn debugger_answered(&self) -> bool {
-        self.debugger_answered
-    }
-
     /// The park has taken up every confirmed gesture (started it, or said why not).
     pub(crate) const fn settle_confirmed(&mut self) {
         self.warmup_confirmed = false;
@@ -30981,8 +30940,7 @@ impl OwnerQuiet {
     }
 }
 
-/// The owner's yes ([`OwnerYes`]), its doors ([`owner_confirms_with`], `OwnerYes::from_admitted`)
-/// and the alert's arm ([`ConfirmArm`]) live in a leaf module whose private field nothing else
+/// The owner's yes ([`OwnerYes`]), its door ([`owner_confirms_with`]) and the alert's arm ([`ConfirmArm`]) live in a leaf module whose private field nothing else
 /// in the crate can reach (the aterm-census guard `devtools-door` holds the leaf to that shape).
 #[path = "native_settings_owner_yes.rs"]
 mod owner_yes;

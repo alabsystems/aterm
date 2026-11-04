@@ -112,7 +112,7 @@ const ROWS: [(&str, &str, &str, &str); 15] = [
         "awake:",
         "base.machine.awake",
         "machine",
-        "aCaffiene keeping this Mac awake",
+        "aCaffeine keeping this Mac awake",
     ),
     (
         "conpty:",

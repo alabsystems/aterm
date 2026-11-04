@@ -980,6 +980,10 @@ pub const END_WORDS: &[&str] = &[
 /// Closed `cause_k=` cause kind vocabulary.
 pub const CAUSE_WORDS: &[&str] = &["mail", "rec", "unknown"];
 
+/// Closed `turn_by=` vocabulary (gap 25): the role a vendor's own row names as a turn's starter,
+/// beside an open whose `by=` names nobody; never an actor.
+pub const TURN_BY_WORDS: &[&str] = &["harness"];
+
 /// Closed `dur=` duration clock basis vocabulary.
 pub const DUR_WORDS: &[&str] = &["mono", "wall", "unknown"];
 

@@ -1447,11 +1447,13 @@ pub fn stored_login_file(c: &Connector, home: &std::path::Path) -> Option<std::p
 /// [`Home::default`], or the refresh aterm journals beside one
 /// ([`crate::harness::codex_app_login::JOURNAL_SUFFIX`]), or any file under the root where an
 /// account pool keeps its rows' logins (`Store::logins_dir`: `~/.aterm/logins/<cli>`, and
-/// Claude Code's under aterm's state directory where that is in the home). Matched without
-/// case, as macOS's file system matches names. The vault refuses these as entries, the shipped
-/// executable registering this as it starts (`aterm_secrets::text::on_cli_login`): each holds a
-/// refresh token that is single-use and rotates, so a copy on another machine signs one of them
-/// out.
+/// Claude Code's under aterm's state directory where that is in the home). Matched with `\`
+/// read as `/` (the separator a row's file is joined with on Windows), by path components (so a
+/// doubled separator names the file it names), and without case, as macOS's file system matches
+/// names. The vault refuses these as
+/// entries, the shipped executable registering this as it starts
+/// (`aterm_secrets::text::on_cli_login`): each holds a refresh token that is single-use and
+/// rotates, so a copy on another machine signs one of them out.
 #[must_use]
 pub fn login_file(name: &str) -> Option<&'static str> {
     use std::path::{Path, PathBuf};
@@ -1460,6 +1462,8 @@ pub fn login_file(name: &str) -> Option<&'static str> {
         .or_else(|| name.strip_prefix("~\\"))?;
     let fold = |s: &str| s.replace('\\', "/").to_ascii_lowercase();
     let fold_path = |path: &Path| fold(&path.to_string_lossy());
+    // Compared by component, so a doubled or trailing separator names the file it names.
+    let same = |a: &str, b: &str| Path::new(a).components().eq(Path::new(b).components());
     let wanted = fold(rest);
     let journal = crate::harness::codex_app_login::JOURNAL_SUFFIX;
     let unjournaled = wanted.strip_suffix(journal).unwrap_or(&wanted);
@@ -1470,7 +1474,7 @@ pub fn login_file(name: &str) -> Option<&'static str> {
         .find(|row| {
             row.stores.iter().any(|store| {
                 let file = fold_path(&Path::new(row.home.default).join(store));
-                wanted == file || unjournaled == file
+                same(&wanted, &file) || same(unjournaled, &file)
             }) || (row.id == "kimi" && {
                 let creds_dir = fold_path(&Path::new(row.home.default).join("credentials"));
                 [wanted.as_str(), unjournaled].into_iter().any(|candidate| {

@@ -529,7 +529,7 @@ fn a_process_launchd_started_reads_as_launchd_s_through_both_readers() {
             );
         }
     }
-    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let dir = crate::test_scratch_dir("launchd");
     let written = dir.path().join("pid");
     let job = Job(format!(
         "aterm.test.launchd-started.{}",
@@ -600,7 +600,7 @@ fn a_process_launchd_started_reads_as_launchd_s_through_both_readers() {
 /// test binary reads as one.
 #[test]
 fn a_graph_entry_naming_a_program_that_is_no_aterm_proves_no_writer() {
-    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let dir = crate::test_scratch_dir("writer");
     let me = std::process::id();
     assert!(!super::graph_writer(dir.path(), me), "no graph folder");
     std::fs::create_dir(dir.path().join("graph")).expect("graph folder");

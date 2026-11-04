@@ -304,12 +304,31 @@ pub(super) fn member_is_denied_in_roster(
     roster.is_member_denied(member)
 }
 
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "VaultCachedPublication",
+        action = "Read",
+        project = "aterm_secrets::client::peer_selection_tests::cached_publication_transition"
+    )
+)]
 pub fn local_recipient_denied_in_roster(paths: &Paths) -> bool {
+    // Noncurrent membership must still consult authenticated denial evidence.
     match load_state(paths) {
         Ok(state) => match state.membership {
-            Stored::None | Stored::Pending | Stored::Plain => return false,
             Stored::Revoked => return true,
-            Stored::In => {}
+            Stored::None | Stored::Pending | Stored::Plain
+                if state.digest.is_none()
+                    && state.records_digest.is_none()
+                    && matches!(fsx::kind(&paths.cache_file()), Ok(fsx::Kind::Missing))
+                    && matches!(fsx::kind(&paths.records_file()), Ok(fsx::Kind::Missing)) =>
+            {
+                // Missing data is unseeded only without crossing or layout witnesses.
+                // Observe that absence without repairing the materialization lock.
+                return !(matches!(fsx::kind(&paths.crossed_file()), Ok(fsx::Kind::Missing))
+                    && crate::records_storage::absent(&paths.records_file()).unwrap_or(false));
+            }
+            Stored::None | Stored::Pending | Stored::Plain | Stored::In => {}
         },
         Err(_) => return true,
     }
@@ -321,7 +340,7 @@ pub fn local_recipient_denied_in_roster(paths: &Paths) -> bool {
         Ok(StateObservation::Absent) => match config(paths) {
             Ok(None) => false,
             Ok(Some(config)) if config.signer.is_none() => false,
-            Ok(Some(_)) => load_state(paths).map_or(true, |state| state.membership == Stored::In),
+            Ok(Some(_)) => true,
             Err(_) => true,
         },
         Ok(StateObservation::Busy) | Err(_) => true,
@@ -333,7 +352,7 @@ pub(super) fn local_recipient_denied_in_roster_held(paths: &Paths, lock: &StateL
 }
 
 pub(crate) fn local_recipient_denial_held(paths: &Paths, lock: &StateLock) -> crate::Result<bool> {
-    local_recipient_denied_with(paths, || roster::swarm_roster_held(paths, lock))
+    local_recipient_denied_with(paths, || roster::swarm_roster_for_denial_held(paths, lock))
 }
 
 fn local_recipient_denied_with(
@@ -346,17 +365,18 @@ fn local_recipient_denied_with(
     let my_rec = identity.recipient();
     let recipient = my_rec.to_bech32();
     let cfg = super::config(paths)?;
+    let state = load_state(paths)?;
     let local_log = cfg
         .as_ref()
-        .map(|c| super::log_entries::trusted_local_log(paths, c))
+        .map(|c| super::log_entries::authenticated_custody(paths, c, &state))
         .transpose()?
-        .flatten();
+        .flatten()
+        .map(|(log, _)| log);
     if let (Some(c), Some(log)) = (&cfg, &local_log) {
         if log.removes(&my_rec) {
             return Ok(true);
         }
-        let state = load_state(paths)?;
-        let behind = super::read_held_copy(paths, c, &state)?
+        let behind = super::read_verified_cached_envelope(paths, c, &state)?
             .and_then(|bytes| envelope::parse(&bytes).ok())
             .is_some_and(|env| {
                 super::log_entries::log_base(Some(log), &env, &identity).ok()
@@ -525,6 +545,16 @@ pub(crate) struct AlabRoleContext {
     recipient: [u8; 32],
 }
 
+#[cfg(test)]
+impl AlabRoleContext {
+    pub(crate) fn for_role_test(tag: u8) -> Self {
+        Self {
+            configuration: [tag; 32],
+            recipient: [77; 32],
+        }
+    }
+}
+
 /// A missing role is not permission to become an unscoped ALab server.
 pub(crate) enum AlabRoleObservation {
     /// No configured source: an explicitly named standalone server may bootstrap.
@@ -548,7 +578,17 @@ pub(crate) fn observe_alab_role(paths: &Paths) -> AlabRoleObservation {
 }
 
 fn observe_alab_role_with(paths: &Paths, before_recheck: impl FnOnce()) -> AlabRoleObservation {
-    let observed = observe_alab_role_inner(paths);
+    observe_alab_member_with(paths, true, before_recheck)
+}
+
+// Both process roles and automatic installation require the same current membership
+// evidence. Only an explicitly running server may synthesize a discovery-only name.
+fn observe_alab_member_with(
+    paths: &Paths,
+    allow_bootstrap_label: bool,
+    before_recheck: impl FnOnce(),
+) -> AlabRoleObservation {
+    let observed = observe_alab_role_inner(paths, allow_bootstrap_label);
     let context = match &observed {
         AlabRoleObservation::Allowed { context, .. }
         | AlabRoleObservation::Unavailable(Some(context)) => context,
@@ -571,7 +611,7 @@ fn observe_alab_role_with(paths: &Paths, before_recheck: impl FnOnce()) -> AlabR
     }
 }
 
-fn observe_alab_role_inner(paths: &Paths) -> AlabRoleObservation {
+fn observe_alab_role_inner(paths: &Paths, allow_bootstrap_label: bool) -> AlabRoleObservation {
     use AlabRoleObservation::{Allowed, Denied, Missing, NotApplicable, Unavailable};
     let config = match super::config(paths) {
         Ok(Some(config)) => config,
@@ -602,63 +642,48 @@ fn observe_alab_role_inner(paths: &Paths) -> AlabRoleObservation {
         recipient: identity.recipient().0,
     };
     let unavailable = || Unavailable(Some(context.clone()));
-    // This verifier binds the log's genesis to the configured root without assuming the
-    // local materialization finished. It is used here only to honor negative authority.
-    let configured_log = super::log_entries::trusted_configured_log(paths, &config);
-    let log = configured_log
-        .as_ref()
-        .ok()
-        .and_then(|l| l.as_ref())
-        .map(|l| &l.log);
-    if log.is_some_and(|log| {
-        log.recipient_is_removed(&identity.recipient())
-            || log.audience_left_out_recipient(
-                &crate::membership_log::EpochAudience::Everyone,
-                &identity.recipient(),
-            )
-            || log_entries::recipient_denied_by_roster_or_log(None, log, &identity.recipient())
-    }) {
-        return Denied;
-    }
-    // The cached envelope still has to match its signed digest/source. Reading public
-    // denial metadata during a pending apply does not grant access or admit publication.
-    let observed_roster = (|| -> crate::Result<Option<crate::swarm_roster::SwarmRoster>> {
-        if let Ok(state) = &state
-            && let Some(bytes) = super::verified_cached_envelope(paths, &config, state)
-        {
-            let envelope = envelope::parse(&bytes)?;
-            return log_entries::roster_preferring_log(paths, &config, &envelope, &identity)?
-                .0
-                .into_roster();
+    let denial_or_unavailable = |denial: crate::Result<bool>| {
+        // Even corrupt state cannot hide an explicit configured-lineage removal.
+        let denied = denial.unwrap_or_else(|_| {
+            log_entries::trusted_configured_log(paths, &config)
+                .ok()
+                .flatten()
+                .is_some_and(|held| {
+                    held.log.removes(&identity.recipient())
+                        || log_entries::recipient_denied_by_roster_or_log(
+                            None,
+                            &held.log,
+                            &identity.recipient(),
+                        )
+                })
+        });
+        if denied { Denied } else { unavailable() }
+    };
+    // Keep one shared observation through label resolution. Contention with an apply
+    // is unavailable evidence, not an authenticated reason to withdraw a retained role.
+    let role_lock = match StateLock::observe_classified(paths) {
+        Ok(StateObservation::Held(lock)) => lock,
+        Ok(StateObservation::Absent | StateObservation::Busy) | Err(_) => {
+            // Negative evidence remains useful during contention. Its absence or an
+            // unreadable snapshot grants no new authority and preserves only a held role.
+            return denial_or_unavailable(local_recipient_denied_with(paths, || {
+                roster::swarm_roster_for_denial_snapshot(paths)
+            }));
         }
-        if let Some(log) = log {
-            return log_entries::roster_from_log(log, &identity)?.into_roster();
-        }
-        Ok(None)
-    })();
-    if observed_roster
+    };
+    let state = load_state(paths);
+    if state
         .as_ref()
-        .ok()
-        .and_then(|r| r.as_ref())
-        .is_some_and(|roster| {
-            roster_denies_local(
-                paths,
-                roster,
-                Some(&config),
-                &identity.recipient().to_bech32(),
-            ) || log.is_some_and(|log| {
-                log_entries::recipient_denied_by_roster_or_log(
-                    Some(roster),
-                    log,
-                    &identity.recipient(),
-                )
-            })
-        })
+        .is_ok_and(|state| state.membership == Stored::Revoked)
     {
         return Denied;
     }
-    if configured_log.is_err() || observed_roster.is_err() {
-        return unavailable();
+    // Use the same handoff-aware, causally ordered denial view as admission. This is
+    // independent of successful materialization and therefore precedes its health gates.
+    match local_recipient_denial_held(paths, &role_lock) {
+        Ok(true) => return Denied,
+        Ok(false) => {}
+        Err(error) => return denial_or_unavailable(Err(error)),
     }
     let Ok(state) = state else {
         return unavailable();
@@ -673,25 +698,18 @@ fn observe_alab_role_inner(paths: &Paths) -> AlabRoleObservation {
     {
         return unavailable();
     }
-    if local_recipient_denied_in_roster(paths) {
-        return Denied;
-    }
-    if let Some(identity) = read_identity(paths).ok().flatten()
-        && let Some(log) = super::log_entries::trusted_local_log(paths, &config)
-            .ok()
-            .flatten()
-        && (log.recipient_is_removed(&identity.recipient())
-            || log.audience_left_out_recipient(
-                &crate::membership_log::EpochAudience::Everyone,
-                &identity.recipient(),
-            ))
-    {
-        return Denied;
+    let Ok(custody) = log_entries::authenticated_custody(paths, &config, &state) else {
+        return unavailable();
+    };
+    if !log_entries::applied_log_available(&state, custody.as_ref()) {
+        // Missing applied records cannot establish a new role from an older envelope.
+        // ServeRole may retain its existing role only under this unchanged context.
+        return unavailable();
     }
     let Ok(mut own_label) = resolve_member_own_label(paths, &config) else {
         return unavailable();
     };
-    if own_label.is_none() && config.host == crate::alab_advertised() {
+    if allow_bootstrap_label && own_label.is_none() && config.host == crate::alab_advertised() {
         // Legacy first holders can have the reserved alias as their configured host and no
         // roster yet. Give this already admitted recipient a stable discovery-only name;
         // never rewrite its configuration or bypass the alias watcher's election.
@@ -998,50 +1016,23 @@ pub(super) fn check_standby_eligibility(
                 .to_owned(),
         ));
     }
-    let Some(identity) = read_identity(paths)? else {
-        return Ok(Err(
-            "this Mac has applied no copy of the vault yet".to_owned()
-        ));
-    };
-    let state = load_state(paths)?;
-    let log_intact = state.seq == 0 && super::log_only_intact(paths, &config, &state);
-    if !log_intact && fsx::kind(&paths.cache_file())? == fsx::Kind::Missing {
-        return Ok(Err(
-            "this Mac has applied no copy of the vault yet".to_owned()
-        ));
+    // Bind the source/opt-out policy above to the observation below. A concurrent
+    // reconfiguration must not use the old URL policy with a new member's authority.
+    match observe_alab_member_with(paths, false, || {}) {
+        AlabRoleObservation::Allowed { context, own_label }
+            if context.configuration
+                == super::network_observation::configuration_binding(&config) =>
+        {
+            Ok(own_label.ok_or_else(|| "this member has no valid DNS host label yet".to_owned()))
+        }
+        AlabRoleObservation::Unavailable(_) => Ok(Err(
+            "this Mac's ALab membership evidence is unavailable; waiting for local vault recovery"
+                .to_owned(),
+        )),
+        _ => Ok(Err(
+            "this Mac is not an active member of the configured ALab vault".to_owned(),
+        )),
     }
-    if state.membership != Stored::In
-        || state.failed
-        || !state.pending.is_empty()
-        || !pin_admitted(&config, None)
-        || (state.seq < 1 && !log_intact)
-        || ((!source_bound(&config, &state) || held_copy(paths, &config, &state).is_none())
-            && !log_intact)
-    {
-        return Ok(Err(
-            "this Mac is not an active member of the ALab vault".to_owned()
-        ));
-    }
-    if local_recipient_denied_in_roster(paths) {
-        return Ok(Err(
-            "this Mac is not an active member of the ALab vault".to_owned()
-        ));
-    }
-    if let Some(log) = super::log_entries::trusted_local_log(paths, &config)?
-        && (log.recipient_is_removed(&identity.recipient())
-            || log.audience_left_out_recipient(
-                &crate::membership_log::EpochAudience::Everyone,
-                &identity.recipient(),
-            ))
-    {
-        return Ok(Err(
-            "this Mac is not an active member of the ALab vault".to_owned()
-        ));
-    }
-    let Some(own_label) = resolve_member_own_label(paths, &config)? else {
-        return Ok(Err("this member has no valid DNS host label yet".to_owned()));
-    };
-    Ok(Ok(own_label))
 }
 
 /// How long a held server moved onto this aterm has to serve its store's ALab vault before it
@@ -1181,7 +1172,8 @@ pub(crate) fn steward_standby_server_check_with(
 /// (`sync.steward.server.standby` probe, `DESIGN-fluid-swarm` §4.1 F6 & §4.3 step 1).
 ///
 /// # Errors
-/// Local vault state or service state cannot be read.
+/// Vault configuration or service state cannot be read. Unavailable membership evidence
+/// returns [`StewardStandbyServer::Idle`] until a later observation can verify it.
 pub fn steward_standby_server_check(
     paths: &Paths,
     observed_network_id: Option<&str>,

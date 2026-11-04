@@ -220,9 +220,6 @@ fn read_park(turn_said: &str, tail: &str) -> Option<Park> {
         .iter()
         .map(|(s, code, prior_clause)| Unit::clause(s, false, code, *prior_clause))
         .collect();
-    if kept(Part::Outward) && units.iter().any(planned) {
-        return None;
-    }
     let mut park: Option<(Option<usize>, Unit, Option<String>)> = None;
     let mut others = false;
     let mut room = false;
@@ -287,6 +284,9 @@ fn read_park(turn_said: &str, tail: &str) -> Option<Park> {
         }
     }
     let (at, unit, token) = park?;
+    if kept(Part::Outward) && units.iter().any(planned) {
+        return None;
+    }
     // A word another need or sentence asks for an act the go-ahead does not cover is never said:
     // the answer quotes the park instead.
     let token = token
@@ -688,6 +688,11 @@ fn words_of(lower: &str) -> Vec<(usize, String)> {
 fn inflects(word: &str, base: &str) -> bool {
     if word == base {
         return true;
+    }
+    // Every form below opens as `base` opens, no base being under two bytes, and most words open
+    // otherwise.
+    if word.as_bytes().first() != base.as_bytes().first() {
+        return false;
     }
     if let Some(stem) = base.strip_suffix("write")
         && word == format!("{stem}wrote")
@@ -1960,6 +1965,17 @@ const OUTWARD_INFLECTED: &[&str] = &[
 /// The words whose every form is outward work (`deployment`, `published`, `releases`).
 const OUTWARD_PREFIXES: &[&str] = &["deploy", "publish", "release"];
 
+/// [`DESTRUCTIVE_WORDS`] as the runs of words [`outward`] looks for, a flag's dashes dropped: all
+/// but `push -f`, which [`force_push`] reads, and `drop`, which takes an object.
+static DESTRUCTIVE_RUNS: std::sync::LazyLock<Vec<Vec<&'static str>>> =
+    std::sync::LazyLock::new(|| {
+        DESTRUCTIVE_WORDS
+            .iter()
+            .filter(|d| !matches!(**d, "push -f" | "drop"))
+            .map(|d| d.split(' ').map(|p| p.trim_start_matches('-')).collect())
+            .collect()
+    });
+
 /// Outward or irreversible work: [`DESTRUCTIVE_WORDS`], [`GIT_DESTROYS`] and what leaves the
 /// machine or ends a process (`kill`, `aterm ctl end`); the allow list's own cleanup is the only
 /// exception.
@@ -2040,18 +2056,12 @@ fn outward(unit: &Unit, says_at: Option<usize>) -> bool {
             return false;
         }
         let w = unit.word(i);
-        let destructive = DESTRUCTIVE_WORDS.iter().any(|d| {
-            let want: Vec<&str> = d.split(' ').map(|p| p.trim_start_matches('-')).collect();
-            if want == ["push", "f"] {
-                return false;
-            }
-            if want == ["drop"] {
-                return inflects(w, "drop") && dropped_object(unit.word(i + 1));
-            }
-            want.iter()
-                .enumerate()
-                .all(|(k, base)| inflects(unit.word(i + k), base))
-        });
+        let destructive = (inflects(w, "drop") && dropped_object(unit.word(i + 1)))
+            || DESTRUCTIVE_RUNS.iter().any(|want| {
+                want.iter()
+                    .enumerate()
+                    .all(|(k, base)| inflects(unit.word(i + k), base))
+            });
         destructive
             || inflects_any(w, OUTWARD_INFLECTED)
             || WORDS.contains(&w)

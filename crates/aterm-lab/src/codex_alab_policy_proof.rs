@@ -201,7 +201,16 @@ pub(super) fn legs(proof: &mut Proof, package: &Path) -> Result<(), Fail> {
             && crate::util::read_regular_text(&leg.home.join("config.toml"))
                 .ok()
                 .as_deref()
-                == Some(codex_config(proof.port, &leg.proj, &leg.home, CONFIG_EXTRA).as_str())
+                == Some(
+                    codex_config(
+                        proof.port,
+                        &leg.proj,
+                        &leg.home,
+                        proof.sandbox,
+                        CONFIG_EXTRA,
+                    )
+                    .as_str(),
+                )
             && rows
                 .first()
                 .and_then(|row| row.get("model"))

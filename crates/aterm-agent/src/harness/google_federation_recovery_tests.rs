@@ -125,6 +125,21 @@ impl Fixture {
             .capture(&request, Some(&pending), &self.home)
             .unwrap();
     }
+    fn save_expired_pool(&self, stage: &Path) {
+        let request = self.request(stage, 4);
+        let mut journal = Journal::open(&request, &self.home).unwrap().unwrap();
+        drop(kimi_pending_proof_fixture(
+            stage,
+            Region::Global,
+            "person@example.com",
+            true,
+        ));
+        expire_kimi_pending(stage, Region::Global).unwrap();
+        let pending = self.pending(&journal);
+        journal
+            .capture(&request, Some(&pending), &self.home)
+            .unwrap();
+    }
     fn no_cookies(&self) {
         let identity = self.identity();
         let claim = identity.claim(&self.state).unwrap();
@@ -144,6 +159,438 @@ fn outcome() -> login_drive::Outcome {
 }
 fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(60)
+}
+
+#[test]
+fn admitted_pool_resume_renews_retained_completion_and_keeps_proof_custody_until_publication() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let f = Fixture::at(root.path());
+    let first = f.stage("first");
+    f.save_expired_pool(&first);
+    let old_record = std::fs::read(f.record()).unwrap();
+    std::fs::remove_dir_all(first).unwrap();
+    let stage = f.stage("pool-resumed");
+    let admission =
+        login_drive::RecoveryAdmission::pool(login_drive::RecoveryKey([4; 32]), |_| Ok(()));
+    assert!(!admission.is_shared_root());
+    {
+        let req = login_drive::Request {
+            admission: Some(&admission),
+            ..f.request(&stage, 4)
+        };
+        let mut journal = Journal::open(&req, &f.home).unwrap().unwrap();
+        assert!(
+            journal.candidate.is_some(),
+            "a current pooled capability must preserve its old pool namespace"
+        );
+        let pending = journal.resume_using(&req, &f.home, deadline(), |scope, now| {
+            f.no_cookies();
+            let (_, restored) = kimi_pending_files(&stage, scope.region).unwrap();
+            assert!(kimi_pending_expiry(restored.as_slice()).unwrap() <= now);
+            let path = kimi_credential_path(&stage, scope.region);
+            aterm_secrets::fsx::write_atomic(&path, br#"{"access_token":"rotated","refresh_token":"rotated-refresh","token_type":"Bearer","expires_at":4000000001}"#, 0o600).unwrap();
+            Ok(Some(kimi_pending_proof_fixture(&stage, scope.region, &scope.expected, false)))
+        }).unwrap().unwrap();
+        assert!(journal.resumed);
+        assert_ne!(std::fs::read(f.record()).unwrap(), old_record);
+        pending
+            .complete(&req, &outcome(), deadline(), Some(&journal))
+            .unwrap();
+        assert!(
+            admission
+                .kimi_principal(&stage, Region::Global, "person@example.com")
+                .unwrap()
+                .is_some()
+        );
+    }
+    assert!(
+        crate::harness::browser_window::ProfileLock::claim(&stage).is_err(),
+        "publication capability must retain the native claim after the driver returns"
+    );
+    aterm_secrets::fsx::write_atomic(
+        &kimi_credential_path(&stage, Region::Global),
+        b"another-writer",
+        0o600,
+    )
+    .unwrap();
+    assert!(
+        admission
+            .kimi_principal(&stage, Region::Global, "person@example.com")
+            .is_err()
+    );
+    drop(admission);
+    assert!(crate::harness::browser_window::ProfileLock::claim(&stage).is_ok());
+}
+
+#[test]
+fn pooled_expired_recovery_preserves_rotation_across_outage_and_never_restores_revoked_grants() {
+    for rejected in [false, true] {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let f = Fixture::at(root.path());
+        let first = f.stage("first");
+        f.save_expired_pool(&first);
+        let before = std::fs::read(f.record()).unwrap();
+        std::fs::remove_dir_all(first).unwrap();
+        let admission =
+            login_drive::RecoveryAdmission::pool(login_drive::RecoveryKey([4; 32]), |_| Ok(()));
+        let stage = f.stage("resumed");
+        let rotated = br#"{"access_token":"rotated-access","refresh_token":"rotated-refresh","token_type":"Bearer","expires_at":4000000001}"#;
+        {
+            let req = login_drive::Request {
+                admission: Some(&admission),
+                ..f.request(&stage, 4)
+            };
+            let mut journal = Journal::open(&req, &f.home).unwrap().unwrap();
+            struct Recover<'a> {
+                journal: &'a mut Journal,
+                home: &'a Path,
+                rotated: &'a [u8],
+                rejected: bool,
+                calls: usize,
+            }
+            impl login_drive::Approver for Recover<'_> {
+                fn resume(
+                    &mut self,
+                    req: &login_drive::Request<'_>,
+                    deadline: Instant,
+                ) -> Result<login_drive::Resume, String> {
+                    self.journal.resume_using(req, self.home, deadline, |scope, now| {
+                        self.calls += 1;
+                        let (_, restored) = kimi_pending_files(req.staging, scope.region).unwrap();
+                        assert!(kimi_pending_expiry(restored.as_slice()).unwrap() <= now);
+                        aterm_secrets::fsx::write_atomic(
+                            &kimi_credential_path(req.staging, scope.region),
+                            if self.rejected {
+                                br#"{"access_token":"","refresh_token":"","token_type":"Bearer","expires_at":0,"expires_in":0}"#
+                            } else {
+                                self.rotated
+                            },
+                            0o600,
+                        ).unwrap();
+                        Err(if self.rejected { KimiNativeError::RefreshRejected } else { KimiNativeError::Temporary })
+                    })?;
+                    panic!("unverified renewal was treated as a native login seed")
+                }
+                fn begin(&mut self, _: &login_drive::Request<'_>) -> Result<(), String> {
+                    panic!("renewal failure repeated native authentication")
+                }
+                fn approve(&mut self, _: &Handoff<'_>) -> Approval {
+                    panic!("renewal failure requested browser approval")
+                }
+            }
+            let mut recover = Recover {
+                journal: &mut journal,
+                home: &f.home,
+                rotated,
+                rejected,
+                calls: 0,
+            };
+            let result = login_drive::sign_in_with(
+                &req,
+                (Path::new("/missing-native-kimi"), &[]),
+                None,
+                None,
+                &|_| None,
+                &mut recover,
+                Duration::from_secs(60),
+            );
+            assert!(matches!(
+                result.outcome,
+                login_drive::Outcome::Unverified(_)
+            ));
+            assert_eq!(recover.calls, 1);
+            assert!(!journal.resumed);
+            assert!(
+                admission
+                    .kimi_principal(&stage, Region::Global, "person@example.com")
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert_ne!(std::fs::read(f.record()).unwrap(), before);
+        f.no_cookies();
+        // A new process may have a new staging directory. Its only surviving
+        // refresh authority is the encrypted checkpoint, never the old seed.
+        std::fs::remove_dir_all(&stage).unwrap();
+        let stage = f.stage("after-restart");
+        let req = login_drive::Request {
+            admission: Some(&admission),
+            ..f.request(&stage, 4)
+        };
+        let mut journal = Journal::open(&req, &f.home).unwrap().unwrap();
+        let pending = journal
+            .resume_using(&req, &f.home, deadline(), |scope, _| {
+                assert!(
+                    !rejected,
+                    "a rejected grant must never reach another exchange"
+                );
+                assert_eq!(
+                    std::fs::read(kimi_credential_path(&stage, scope.region)).unwrap(),
+                    rotated
+                );
+                Ok(Some(kimi_pending_proof_fixture(
+                    &stage,
+                    scope.region,
+                    &scope.expected,
+                    false,
+                )))
+            })
+            .unwrap();
+        if rejected {
+            assert!(pending.is_none());
+            assert!(!kimi_credential_path(&stage, Region::Global).exists());
+            f.no_cookies();
+        } else {
+            pending
+                .unwrap()
+                .complete(&req, &outcome(), deadline(), Some(&journal))
+                .unwrap();
+            assert!(
+                admission
+                    .kimi_principal(&stage, Region::Global, "person@example.com")
+                    .unwrap()
+                    .is_some()
+            );
+            let identity = f.identity();
+            let claim = identity.claim(&f.state).unwrap();
+            assert_eq!(
+                google_browser_store::load(&f.home, &identity, &claim)
+                    .unwrap()
+                    .unwrap()
+                    .as_slice(),
+                COOKIES
+            );
+        }
+    }
+}
+
+#[test]
+fn pooled_capability_cannot_read_a_shared_root_completion() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let f = Fixture::at(root.path());
+    f.save_root(&f.stage("root"));
+    let retained = std::fs::read(f.record()).unwrap();
+    let stage = f.stage("pool");
+    let admission =
+        login_drive::RecoveryAdmission::pool(login_drive::RecoveryKey([4; 32]), |_| Ok(()));
+    let req = login_drive::Request {
+        admission: Some(&admission),
+        ..f.request(&stage, 4)
+    };
+    let mut journal = Journal::open(&req, &f.home).unwrap().unwrap();
+    assert!(
+        journal
+            .resume_using(&req, &f.home, deadline(), |_, _| panic!(
+                "shared-root completion crossed into pooled recovery"
+            ))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(std::fs::read(f.record()).unwrap(), retained);
+    assert!(!kimi_credential_path(&stage, Region::Global).exists());
+    f.no_cookies();
+}
+
+#[test]
+fn root_renewal_restores_only_its_exact_predecessor_and_rechecks_canonical_identity() {
+    use crate::harness::cli::shared_provider::ObservationError;
+    for case in 0..6 {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let f = Fixture::at(root.path());
+        let stage = f.stage("retained");
+        f.save_root(&stage);
+        let credential = kimi_credential_path(&stage, Region::Global);
+        let predecessor = std::fs::read(&credential).unwrap();
+        let admission =
+            login_drive::RecoveryAdmission::new(login_drive::RecoveryKey([4; 32]), false, |_| {
+                Ok(())
+            });
+        let req = login_drive::Request {
+            admission: Some(&admission),
+            ..f.request(&stage, 4)
+        };
+        let renewed = br#"{"access_token":"renewed-access","refresh_token":"renewed-refresh","token_type":"Bearer","expires_at":4000000001}"#;
+        {
+            let mut journal = Journal::open(&req, &f.home).unwrap().unwrap();
+            aterm_secrets::fsx::write_atomic(&credential, renewed, 0o600).unwrap();
+            let pending = f.pending(&journal);
+            journal.capture(&req, Some(&pending), &f.home).unwrap();
+        }
+        // Simulate a native credential rename lost at the crash boundary after
+        // the encrypted replacement and its predecessor digest became durable.
+        aterm_secrets::fsx::write_atomic(&credential, &predecessor, 0o600).unwrap();
+        if case == 2 {
+            aterm_secrets::fsx::write_atomic(&credential, b"unrelated-writer", 0o600).unwrap();
+        }
+        if case == 3 {
+            aterm_secrets::fsx::write_atomic(
+                &stage.join("config.toml"),
+                b"different-config",
+                0o600,
+            )
+            .unwrap();
+        }
+        let live = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let authority = live.clone();
+        let checked = login_drive::RecoveryAdmission::new(
+            login_drive::RecoveryKey([if case == 5 { 5 } else { 4 }; 32]),
+            false,
+            move |_| {
+                if !authority.load(std::sync::atomic::Ordering::SeqCst) {
+                    Err("authority withdrawn".into())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        let req = login_drive::Request {
+            admission: Some(&checked),
+            recovery: Some(login_drive::RecoveryKey(
+                [if case == 5 { 5 } else { 4 }; 32],
+            )),
+            ..req
+        };
+        let mut journal = Journal::open(&req, &f.home).unwrap().unwrap();
+        if case == 4 {
+            live.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+        let calls = Cell::new(0);
+        let observed = journal.observe_existing_using(&req, &f.home, deadline(), |scope, _| {
+            calls.set(calls.get() + 1);
+            assert_eq!(std::fs::read(&credential).unwrap(), renewed);
+            if case == 1 {
+                Err(KimiNativeError::Temporary)
+            } else {
+                Ok(Some(kimi_pending_proof_fixture(
+                    &stage,
+                    scope.region,
+                    &scope.expected,
+                    false,
+                )))
+            }
+        });
+        match case {
+            0 => {
+                observed.unwrap().unwrap().check_current().unwrap();
+            }
+            1 => assert!(matches!(observed, Err(ObservationError::Unavailable(_)))),
+            4 => assert!(matches!(observed, Err(ObservationError::Unavailable(_)))),
+            _ => assert!(observed.unwrap().is_none()),
+        }
+        assert_eq!(calls.get(), i32::from(case < 2));
+        if case != 0 {
+            f.no_cookies();
+        } else {
+            let identity = f.identity();
+            let claim = identity.claim(&f.state).unwrap();
+            assert_eq!(
+                google_browser_store::load(&f.home, &identity, &claim)
+                    .unwrap()
+                    .unwrap()
+                    .as_slice(),
+                COOKIES
+            );
+        }
+        if case >= 3 {
+            assert_eq!(std::fs::read(&credential).unwrap(), predecessor);
+        }
+        if case == 2 {
+            assert_eq!(std::fs::read(&credential).unwrap(), b"unrelated-writer");
+        }
+    }
+}
+
+#[test]
+fn legacy_completion_has_no_authority_to_replace_an_existing_credential() {
+    let scope = [8; 32];
+    let key = login_drive::RecoveryKey([4; 32]);
+    let mut bytes = PREFIX.to_vec();
+    bytes.extend_from_slice(&scope);
+    bytes.extend_from_slice(&key.0);
+    bytes.push(0);
+    for field in [b"config".as_slice(), b"credential", b"cookies"] {
+        bytes.extend_from_slice(&(field.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(field);
+    }
+    let candidate = decode(&bytes, scope, key).unwrap().unwrap();
+    assert!(candidate.predecessor.is_none());
+    bytes.push(1);
+    assert!(decode(&bytes, scope, key).is_err());
+}
+
+#[test]
+fn renewed_grant_and_quarantined_cookies_survive_outage_but_revocation_never_restores_old_grant() {
+    use crate::harness::cli::shared_provider::ObservationError;
+    for case in 0..3 {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let f = Fixture::at(root.path());
+        let stage = f.stage("retained");
+        f.save_root(&stage);
+        let admission =
+            login_drive::RecoveryAdmission::new(login_drive::RecoveryKey([4; 32]), false, |_| {
+                Ok(())
+            });
+        let req = login_drive::Request {
+            admission: Some(&admission),
+            ..f.request(&stage, 4)
+        };
+        let credential = kimi_credential_path(&stage, Region::Global);
+        let rotated = br#"{"access_token":"rotated-access","refresh_token":"rotated-refresh","token_type":"Bearer","expires_at":4000000001}"#;
+        let mut journal = Journal::open(&req, &f.home).unwrap().unwrap();
+        let result = journal.observe_existing_using(&req, &f.home, deadline(), |scope, _| {
+            if case == 2 {
+                aterm_secrets::fsx::write_atomic(&credential, br#"{"access_token":"","refresh_token":"","token_type":"Bearer","expires_at":0,"expires_in":0,"scope":""}"#, 0o600).unwrap();
+                return Err(KimiNativeError::RefreshRejected);
+            }
+            aterm_secrets::fsx::write_atomic(&credential, rotated, 0o600).unwrap();
+            if case == 1 { Err(KimiNativeError::Temporary) }
+            else { Ok(Some(kimi_pending_proof_fixture(&stage, scope.region, &scope.expected, false))) }
+        });
+        match case {
+            0 => {
+                result.unwrap().unwrap().check_current().unwrap();
+            }
+            1 => assert!(matches!(result, Err(ObservationError::Unavailable(_)))),
+            _ => assert!(matches!(result, Err(ObservationError::RecoveryRequired(_)))),
+        }
+        drop(journal);
+        if case != 0 {
+            f.no_cookies();
+        }
+        std::fs::remove_file(&credential).unwrap();
+        let mut journal = Journal::open(&req, &f.home).unwrap().unwrap();
+        let proof = journal
+            .observe_existing_using(&req, &f.home, deadline(), |scope, _| {
+                assert_ne!(
+                    case, 2,
+                    "a terminal checkpoint must never restore the old native seed"
+                );
+                assert_eq!(std::fs::read(&credential).unwrap(), rotated);
+                Ok(Some(kimi_pending_proof_fixture(
+                    &stage,
+                    scope.region,
+                    &scope.expected,
+                    false,
+                )))
+            })
+            .unwrap();
+        if case == 2 {
+            assert!(proof.is_none());
+            assert!(!credential.exists());
+            f.no_cookies();
+        } else {
+            proof.unwrap().check_current().unwrap();
+            let identity = f.identity();
+            let claim = identity.claim(&f.state).unwrap();
+            assert_eq!(
+                google_browser_store::load(&f.home, &identity, &claim)
+                    .unwrap()
+                    .unwrap()
+                    .as_slice(),
+                COOKIES
+            );
+        }
+    }
 }
 
 #[test]
@@ -789,4 +1236,55 @@ fn root_completion_cannot_be_recovered_as_an_unguarded_pool_completion() {
             .unwrap()
             .is_some()
     );
+}
+
+#[test]
+fn durable_rejection_before_native_write_prevents_seed_restoration_after_profile_loss() {
+    for shared_root in [false, true] {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let f = Fixture::at(root.path());
+        let stage = f.stage("retained");
+        f.save_for(&stage, shared_root);
+        let key = login_drive::RecoveryKey([4; 32]);
+        let admission = if shared_root {
+            login_drive::RecoveryAdmission::new(key, false, |_| Ok(()))
+        } else {
+            login_drive::RecoveryAdmission::pool(key, |_| Ok(()))
+        };
+        let req = login_drive::Request {
+            admission: Some(&admission),
+            ..f.request(&stage, 4)
+        };
+        let config = stage.join("config.toml");
+        let credential = kimi_credential_path(&stage, Region::Global);
+        let before = std::fs::read(&credential).unwrap();
+        {
+            let mut journal = Journal::open(&req, &f.home).unwrap().unwrap();
+            let result =
+                journal.observe_existing_with(&req, &f.home, deadline(), |journal, _, _| {
+                    journal.checkpoint_rejected(&req).unwrap();
+                    assert_eq!(std::fs::read(&credential).unwrap(), before);
+                    let mut rewritten = before.clone();
+                    rewritten.push(b'\n');
+                    aterm_secrets::fsx::write_atomic(&credential, &rewritten, 0o600).unwrap();
+                    // The process can stop after the encrypted record commits but
+                    // before publishing the native tombstone or returning rejection.
+                    Err(KimiNativeError::Temporary)
+                });
+            assert!(result.is_err());
+        }
+        std::fs::remove_file(config).unwrap();
+        std::fs::remove_file(&credential).unwrap();
+        let mut journal = Journal::open(&req, &f.home).unwrap().unwrap();
+        assert!(
+            journal
+                .observe_existing_using(&req, &f.home, deadline(), |_, _| {
+                    panic!("a confirmed rejected seed was restored for another exchange")
+                })
+                .unwrap()
+                .is_none()
+        );
+        assert!(!credential.exists());
+        f.no_cookies();
+    }
 }

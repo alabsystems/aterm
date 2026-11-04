@@ -2,7 +2,7 @@
 name: supervise-agent
 description: Run other Claude Code, codex-alab, agy or Muse Code sessions in aterm tabs as workers — start each on a task, wait for them in the background, read each one's result and check it against ground truth (tests, diff, exit codes) — or oversee another program (a codex-alab, a REPL, a long build) in an aterm session. Use when asked to hand work to other sessions or windows, run work in parallel in aterm, say what every aterm session or machine is doing, manage or babysit another agent, or act as a lead over workers.
 ---
-<!-- aterm skill v27 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
+<!-- aterm skill v28 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
 
 # Workers: other aterm sessions doing the work
 
@@ -229,6 +229,9 @@ reads its output. For a hand-driven agent:
   truth before acting. `await log close=turn` answers at a codex-alab turn's end, a quick
   one too, but a flap past its bucket or a turn before aterm first reads the program can
   go unlogged, so give it a `timeout=`.
+- A codex-alab tab's `brief` lists its boxes as `p<n> approval other …` and
+  `p<n> question …` steps, and its turns count `appr` and `questions`. These are claims
+  (`[?]`): check a live box with `status` or `survey` before acting on it.
 - To watch sessions live instead, `aterm ctl subscribe @s-x,@s-y events` pushes a codex's
   moves as `EVENT <local> program state=<w> [kind=<k>] rev=<id>` (a flap past 20 at once,
   then one a second, folded into its newest state) and the acts its codex-alab records as

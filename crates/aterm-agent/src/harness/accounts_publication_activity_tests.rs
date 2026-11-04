@@ -384,6 +384,21 @@ fn vendor_completion_clears_only_the_successful_accounts_captured_retry() {
         for outcome in [Renewal::Renewed, Renewal::AuthFailed, Renewal::Busy] {
             let root = aterm_tempfile::TempDir::new().unwrap();
             let store = accounts::Store::at_for(root.path(), cli, &root.path().join("home"));
+            let path = root.path().join(cli.accounts().roster_file);
+            let raw = Row {
+                label: "account".into(),
+                vendor: accounts::Vendor {
+                    region: (cli == Cli::Kimi).then_some(Region::Global),
+                    ..accounts::Vendor::default()
+                },
+                ..Row::default()
+            };
+            fs::write(
+                &path,
+                accounts::append_rows_for(cli, "", std::slice::from_ref(&raw)).unwrap(),
+            )
+            .unwrap();
+            let observed = store.load_logins(NOW).unwrap().0;
             let guard = std::sync::Arc::new(std::sync::Mutex::new(AutoRenewGuard::default()));
             super::recovery_policy_tests::hold_retry(
                 &guard,
@@ -400,6 +415,7 @@ fn vendor_completion_clears_only_the_successful_accounts_captured_retry() {
                 &store,
                 cli,
                 ("vendor:account", "account"),
+                (&path, &raw, &observed),
                 outcome,
             );
             let held = guard.lock().unwrap();

@@ -270,7 +270,7 @@ fn read_regular_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>, std::io:
             "not a bounded regular file",
         ));
     }
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
     file.take(max_bytes + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > max_bytes {
         return Err(std::io::Error::new(

@@ -12,6 +12,9 @@ pub mod custody;
 #[cfg(any(test, debug_assertions))]
 mod custody_environment;
 pub mod facts;
+pub mod facts_offer;
+#[cfg(any(test, debug_assertions))]
+mod facts_offer_environment;
 pub(crate) mod fx;
 pub mod ladder;
 pub use aterm_phase::{phase, prompt};
@@ -37,6 +40,8 @@ pub use config::{Autopilot, LandAt, Occupancy, SupervisorConfig};
 #[cfg(any(test, debug_assertions))]
 pub use custody_environment::line_custody_environment;
 pub use facts::{Fact, FactsReading, HeldCall, HeldReading};
+#[cfg(any(test, debug_assertions))]
+pub use facts_offer_environment::self_claim_fact_environment;
 pub use journal::{Journal, read_journal};
 pub use ledger::{
     ANCHOR_REMOVED, Format as LedgerFormat, LedgerHost, LedgerOpts, gather, parse_since,
@@ -60,13 +65,36 @@ pub use run::{
 };
 pub use transport::{Endpoint, RelayCtl};
 
+#[cfg(test)]
+fn short_scratch_stem(kind: &str, tag: &str) -> String {
+    fn head_utf8(s: &str, max: usize) -> &str {
+        if s.len() <= max {
+            return s;
+        }
+        let mut end = max;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        &s[..end]
+    }
+    format!("at-{}-{}-", head_utf8(kind, 8), head_utf8(tag, 16))
+}
+
 /// A scratch path of one call's own, for a test.
 #[cfg(test)]
 pub(crate) fn test_scratch_path(kind: &str, tag: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("aterm-{kind}-{tag}-{}-{n}", std::process::id()))
+    #[cfg(unix)]
+    let base = aterm_tempfile::quiet_in(std::path::Path::new("/tmp"));
+    #[cfg(not(unix))]
+    let base = aterm_tempfile::quiet_in(&std::env::temp_dir());
+    base.join(format!(
+        "{}{}-{n}.noindex",
+        short_scratch_stem(kind, tag),
+        std::process::id()
+    ))
 }
 
 /// `path` canonicalized, for a test: every link resolved, as the policy's probes see it.
@@ -95,7 +123,8 @@ impl ScratchDir {
         let base = std::env::temp_dir();
         Self(
             aterm_tempfile::Builder::new()
-                .prefix(&format!("aterm-{kind}-{tag}-"))
+                .prefix(&short_scratch_stem(kind, tag))
+                .suffix(".noindex")
                 .tempdir_in(base)
                 .expect("scratch dir"),
         )
@@ -114,5 +143,44 @@ impl std::ops::Deref for ScratchDir {
 impl AsRef<std::path::Path> for ScratchDir {
     fn as_ref(&self) -> &std::path::Path {
         self.0.path()
+    }
+}
+
+#[cfg(test)]
+mod scratch_tests {
+    use super::*;
+
+    /// NEGATIVE CONTROL: an uncapped `kind`/`tag` prefix plus `aterm_tempfile`'s
+    /// `{pid}_{16-hex}_{count}.noindex` suffix overruns macOS's 104-byte `sun_path` limit when a
+    /// fixture binds a Unix control socket inside `ScratchDir`; `short_scratch_stem` bounds both
+    /// UTF-8 prefixes on char boundaries so socket binds stay below `SUN_LEN`.
+    #[test]
+    fn scratch_dir_stays_under_unix_sun_len_even_for_long_tags() {
+        let long_kind = "supervise-kind-overflow-ééé";
+        let long_tag = "first-move-onto-a-build-found-exiting-with-extra-prose-ééé";
+        let dir = ScratchDir::new(long_kind, long_tag);
+        assert!(
+            dir.to_string_lossy().ends_with(".noindex"),
+            "Spotlight exclusion suffix missing: {}",
+            dir.display()
+        );
+        let raw_path = test_scratch_path(long_kind, long_tag);
+        assert!(
+            raw_path.to_string_lossy().ends_with(".noindex"),
+            "Spotlight exclusion suffix missing: {}",
+            raw_path.display()
+        );
+        #[cfg(unix)]
+        {
+            let sock = dir.join("aterm-9999999.sock");
+            assert!(
+                sock.as_os_str().len() < 103,
+                "socket path {} ({} bytes) must fit inside BSD sun_path",
+                sock.display(),
+                sock.as_os_str().len()
+            );
+            let _listener = std::os::unix::net::UnixListener::bind(&sock)
+                .expect("bounded ScratchDir path must bind UnixListener");
+        }
     }
 }

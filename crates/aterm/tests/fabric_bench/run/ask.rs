@@ -629,7 +629,7 @@ fn busy_pingpong(
             ),
         );
         // A task from a node outside `--accept-from` is delivered as a note
-        // (`bridge.rs` `DEMOTE_UNLESS_ACCEPTED`); its sender waited as for a task.
+        // (astream's `WakeClass::classify_for_sender`); its sender waited as for a task.
         let (woke, t_a_seen) = await_kinds(ctl, s.clock, &s.a, *a_since, "task,note")
             .unwrap_or_else(|e| panic!("`{pong_text}`: {e}"));
         s.one_row(ctl, &s.a, a_since, woke, &pong_text);

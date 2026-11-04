@@ -46,10 +46,14 @@ fn is_pending_stub(path: &Path) -> bool {
     let Ok(file) = options.open(path) else {
         return false;
     };
-    if !file.metadata().is_ok_and(|m| m.is_file()) {
+    let Ok(meta) = file.metadata() else {
+        return false;
+    };
+    if !meta.is_file() {
         return false;
     }
-    let mut head = Vec::new();
+    let cap = usize::try_from(meta.len().min(HEAD).saturating_add(1)).unwrap_or(0);
+    let mut head = Vec::with_capacity(cap);
     if file.take(HEAD).read_to_end(&mut head).is_err() {
         return false;
     }
@@ -205,10 +209,15 @@ fn read_bounded_text(path: &Path, max_bytes: usize) -> Option<String> {
         options.custom_flags(libc::O_NONBLOCK);
     }
     let file = options.open(path).ok()?;
-    if !file.metadata().is_ok_and(|m| m.is_file()) {
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.len() > u64::try_from(max_bytes).ok()? {
         return None;
     }
-    let mut buf = Vec::new();
+    let cap = usize::try_from(meta.len())
+        .unwrap_or(0)
+        .min(max_bytes)
+        .saturating_add(1);
+    let mut buf = Vec::with_capacity(cap);
     file.take(sentinel).read_to_end(&mut buf).ok()?;
     if buf.len() > max_bytes {
         return None;

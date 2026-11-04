@@ -714,8 +714,9 @@ fn sweep_copies(
 
 /// The end of `down`, once its logs are kept: the copies that may go, the scratch among them
 /// ([`sweep_copies`]), the run directory's own files, its tabs' launch records
-/// ([`crate::verbs::record_launch`], which `down` keeps in its logs) and its bus keys
-/// ([`drop_bus_keys`]), then the directory.
+/// ([`crate::verbs::record_launch`]) and input-hold captures ([`crate::forever::input_hold`]),
+/// both of which `down` keeps in its logs, and its bus keys ([`drop_bus_keys`]), then the
+/// directory.
 fn clear_run_dir(
     run_dir: &Path,
     relay_ran: bool,
@@ -746,6 +747,7 @@ fn clear_run_dir(
         }
     }
     let _ = fs::remove_dir_all(run_dir.join(LAUNCHES));
+    let _ = fs::remove_dir_all(run_dir.join(crate::forever::input_hold::DIR));
     drop_bus_keys(run_dir);
     let _ = fs::remove_dir(run_dir);
 }
@@ -2221,6 +2223,15 @@ pub fn down(tag: &str, keep_dumps: bool) -> Result<PathBuf, Fail> {
     ] {
         keep_file(&r.w.join(f), &keep.join(to));
     }
+    for (_, log) in crate::stats::chain_debug_logs(&r) {
+        if let Some(name) = log.file_name() {
+            keep_file(&log, &keep.join(name));
+        }
+    }
+    keep_tree(
+        &crate::forever::input_hold::dir_of(&r),
+        &keep.join(crate::forever::input_hold::DIR),
+    );
     let projects = r.w.join("home/.claude/projects");
     let mut transcripts = Vec::new();
     crate::util::walk_files(&projects, &mut transcripts);
@@ -2472,7 +2483,7 @@ pub const PROXY_KEYS: [&str; 6] = [
 ];
 
 /// How `claude` launches.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Launch {
     /// Replace the private interactive shell, so job control cannot reclaim a held TUI.
     pub replace_shell: bool,

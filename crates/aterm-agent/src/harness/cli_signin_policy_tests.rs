@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::ai::connector::{Flow, Region};
+use crate::harness::accounts_overlay::model_provider;
 use crate::harness::login_drive::{Drove, Outcome, Request};
 use std::cell::{Cell, RefCell};
 
@@ -459,15 +460,6 @@ impl AccountsHost for PolicyHost<'_> {
     }
 }
 
-fn provider(index: i64) -> Cli {
-    match index {
-        1 => Cli::Codex,
-        2 => Cli::Grok,
-        3 => Cli::Kimi,
-        _ => unreachable!(),
-    }
-}
-
 pub(crate) fn policy_transition(
     state: &aterm_spec::interp::State,
     action: &str,
@@ -497,7 +489,7 @@ pub(crate) fn policy_transition(
             next.insert("phase", 1);
         }
         "Publish" => {
-            let world = World::new(provider(state["provider"]));
+            let world = World::new(model_provider(state["provider"]));
             let host = PolicyHost::new(
                 &world,
                 state["case"],
@@ -538,7 +530,7 @@ fn vendor_login_and_renewal_policy_conform_with_independent_edits_allowed() {
     for state in aterm_spec::interp::reachable_states(&model) {
         for action in &model.actions {
             if model.action_enabled(action.name, &state) {
-                if action.name == "Publish" && !signs_in_here(provider(state["provider"])) {
+                if action.name == "Publish" && !links_here(model_provider(state["provider"])) {
                     continue;
                 }
                 let next = policy_transition(&state, action.name);
@@ -709,23 +701,172 @@ fn run_observation(world: &World, host: &ObservationHost<'_>) -> bool {
 #[test]
 fn failed_login_observations_never_publish_without_their_history() {
     for cli in [Cli::Codex, Cli::Grok, Cli::Kimi] {
-        if !signs_in_here(cli) {
+        if !links_here(cli) {
             continue;
         }
         for operation in 1..=3 {
             let world = World::new(cli);
-            let before = world.records();
             let host = observation_host(&world, operation, 2);
             assert!(!run_observation(&world, &host));
+            let admitted = host.base.after.borrow().clone().unwrap();
             host.repair();
-            assert_eq!(world.records(), before, "{cli:?}, operation {operation}");
+            assert_eq!(world.records(), admitted, "{cli:?}, operation {operation}");
         }
     }
 }
 
+#[test]
+fn unscoped_legacy_guidance_is_history_until_its_own_fresh_observation() {
+    let world = World::new(Cli::Kimi);
+    let host = observation_host(&world, 2, 1);
+    assert!(run_observation(&world, &host));
+    assert!(host.base.called.get());
+    let captured = world
+        .store
+        .read_account_records(Some(&world.path), NOW)
+        .unwrap();
+    let row = captured.raw_roster.row("main").unwrap();
+    let task = accounts::current_sign_in_task(row, &captured.logins).unwrap();
+    assert_eq!(task.action, accounts::SignInAction::Browser);
+    let parent = accounts::RenewalParent::capture(&captured.logins, "main");
+    accounts_observe_signin(
+        &world.store,
+        &world.path,
+        NOW,
+        &mut Vec::new(),
+        |raw, _, logins| {
+            parent.require_current(logins, "main")?;
+            signin_policy_matches(&world.raw.rows[0], raw, world.raw.rows[0].dir.as_deref())?;
+            accounts::admit_workflow(logins, "main")?;
+            Ok(accounts::note_sign_in_attempt(
+                logins,
+                "main",
+                accounts::AttemptOutcome::NoRoute,
+                "fixture route",
+                NOW,
+            ))
+        },
+    )
+    .unwrap();
+    let scoped = world
+        .store
+        .read_account_records(Some(&world.path), NOW + 1)
+        .unwrap();
+    assert_eq!(
+        accounts::current_sign_in_task(scoped.raw_roster.row("main").unwrap(), &scoped.logins),
+        Some(task)
+    );
+    assert!(
+        accounts::current_sign_in_attempt(scoped.raw_roster.row("main").unwrap(), &scoped.logins)
+            .is_some()
+    );
+    let original_roster = std::fs::read(&world.path).unwrap();
+    let binding = scoped.logins.get("main").unwrap().clone();
+    let credential = Path::new(binding.dir.as_ref().unwrap()).join(world.cli.connector().stores[0]);
+    std::fs::create_dir_all(credential.parent().unwrap()).unwrap();
+    std::fs::write(&credential, b"retained owned fixture credential").unwrap();
+    let credential_before = std::fs::read(&credential).unwrap();
+
+    // This is exactly the old wire shape, not a fresh grant of the old findings:
+    // keep every task/attempt/account fact while omitting only workflow metadata.
+    let mut wire: Value = aterm_json::from_str(&scoped.logins.to_json()).unwrap();
+    let object = wire.as_object_mut().unwrap();
+    object.remove("workflow_clock");
+    object.remove("workflows");
+    std::fs::write(world.store.logins_file(), wire.to_string()).unwrap();
+    let mut legacy_lines = Vec::new();
+    for event in world.store.tail_validated(100).unwrap() {
+        let mut wire: Value = aterm_json::from_str(&event.to_json_line()).unwrap();
+        wire.as_object_mut().unwrap().remove("workflow");
+        legacy_lines.push(wire.to_string());
+    }
+    std::fs::write(
+        world.store.ledger_path(),
+        format!("{}\n", legacy_lines.join("\n")),
+    )
+    .unwrap();
+    let historical = world.records();
+    let prose = [
+        accounts::Event::new(NOW, accounts::Kind::SignIn, "main").because("ordinary sign-in text"),
+        accounts::Event::new(NOW, accounts::Kind::SignIn, "main")
+            .because("kimi window done session-kept"),
+    ];
+    let mut decisions = Vec::new();
+    for case in [1, 2, 8, 1] {
+        std::fs::write(&world.path, &original_roster).unwrap();
+        world.change(case);
+        let records = world
+            .store
+            .read_account_records(Some(&world.path), NOW + 2)
+            .unwrap();
+        let raw = accounts::Roster::load_for(world.cli, &world.path).unwrap();
+        let row = raw.row("main").unwrap();
+        assert_eq!(records.logins.get("main"), Some(&binding));
+        assert_eq!(
+            world.records(),
+            historical,
+            "reading policy must retain history"
+        );
+        assert_eq!(std::fs::read(&credential).unwrap(), credential_before);
+        decisions.push((
+            case,
+            accounts::current_sign_in_task(row, &records.logins).is_some(),
+            accounts::current_sign_in_attempt(row, &records.logins).is_some(),
+            prose
+                .iter()
+                .any(|event| accounts::workflow_event_matches(row, &records.logins, event)),
+            crate::harness::accounts_sync::unaddressed_sign_in_task_at(
+                &world.store,
+                &records.logins,
+                row,
+            )
+            .is_some(),
+        ));
+    }
+    // A newly admitted producer can publish its own different task, but cannot
+    // turn the unchanged legacy attempt or old browser prose into new evidence.
+    std::fs::write(&world.path, &original_roster).unwrap();
+    let fresh = observation_host(&world, 3, 1);
+    assert!(run_observation(&world, &fresh));
+    let records = world
+        .store
+        .read_account_records(Some(&world.path), NOW + 3)
+        .unwrap();
+    let row = world.raw.row("main").unwrap();
+    let fresh_action = accounts::current_sign_in_task(row, &records.logins).map(|task| task.action);
+    let old_attempt_current = accounts::current_sign_in_attempt(row, &records.logins).is_some();
+    let old_prose_current = prose
+        .iter()
+        .any(|event| accounts::workflow_event_matches(row, &records.logins, event));
+    assert_eq!(
+        records.logins.get("main").unwrap().sign_in_attempt,
+        binding.sign_in_attempt
+    );
+    assert!(
+        std::fs::read(world.store.ledger_path())
+            .unwrap()
+            .starts_with(historical[2].as_ref().unwrap())
+    );
+    assert_eq!(std::fs::read(&credential).unwrap(), credential_before);
+    assert_eq!(
+        decisions,
+        vec![
+            (1, false, false, false, false),
+            (2, false, false, false, false),
+            (8, false, false, false, false),
+            (1, false, false, false, false)
+        ]
+    );
+    assert_eq!(fresh_action, Some(accounts::SignInAction::Login));
+    assert!(
+        !old_attempt_current && !old_prose_current,
+        "fresh work cannot adopt legacy findings"
+    );
+}
+
 fn observation_case(cli: Cli, operation: i64, fault: i64) -> [bool; 6] {
     let world = World::new(cli);
-    let before = world.records();
+    let initial = world.records();
     let state_before = world.store.load(NOW).unwrap().0;
     let mut expected = world.store.load_logins(NOW).unwrap().0;
     let roster_before = std::fs::read(&world.path).unwrap();
@@ -733,6 +874,19 @@ fn observation_case(cli: Cli, operation: i64, fault: i64) -> [bool; 6] {
         .join(cli.connector().stores[0]);
     std::fs::create_dir_all(old_login.parent().unwrap()).unwrap();
     std::fs::write(&old_login, b"existing private credential").unwrap();
+    let host = observation_host(&world, operation, fault);
+    let accepted = run_observation(&world, &host);
+    let before = host.base.after.borrow().clone().unwrap_or(initial);
+    expected = accounts::Logins::from_json(
+        std::str::from_utf8(before[1].as_ref().unwrap()).unwrap(),
+        NOW,
+    )
+    .unwrap();
+    let expected_before = expected.clone();
+    accounts::begin_workflow_projection_for_test(&world.raw, &mut expected);
+    if operation != 4 {
+        accounts::admit_workflow(&mut expected, "main").unwrap();
+    }
     let kind = match operation {
         1 => {
             accounts::note_wrong_account(&mut expected, "main", NOW);
@@ -754,8 +908,14 @@ fn observation_case(cli: Cli, operation: i64, fault: i64) -> [bool; 6] {
         4 => accounts::Kind::SignIn,
         _ => unreachable!(),
     };
-    let host = observation_host(&world, operation, fault);
-    let accepted = run_observation(&world, &host);
+    let mut expected_events = [accounts::Event::new(NOW, kind, "main")];
+    accounts::finish_workflow_projection_for_test(
+        &expected_before,
+        &world.raw,
+        &mut expected,
+        &mut expected_events,
+    )
+    .unwrap();
     let pending = matches!(fault, 3 | 4);
     let readable = world.store.load(NOW).is_ok() && world.store.load_logins(NOW).is_ok();
     let mut guarded = readable != pending;
@@ -815,7 +975,7 @@ pub(crate) fn observation_commit_transition(
         }
         "Observe" => {
             let observed = observation_case(
-                provider(state["provider"]),
+                model_provider(state["provider"]),
                 state["operation"],
                 state["fault"],
             );
@@ -849,7 +1009,7 @@ fn signin_observations_conform_to_durable_publication() {
             if model.action_enabled(action.name, &state) {
                 if action.name == "Observe"
                     && state["operation"] != 4
-                    && !signs_in_here(provider(state["provider"]))
+                    && !links_here(model_provider(state["provider"]))
                 {
                     continue;
                 }

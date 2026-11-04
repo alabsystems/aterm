@@ -4,8 +4,8 @@
 //! Shared screen-state projection for `aterm` and `astream-term` oracle comparison.
 
 use astream_term::Record;
-use astream_term::screen::{Color, Folder, MAX_COMBINING, attr};
-use aterm_core::grid::{CellFlags, Grid};
+use astream_term::screen::{Color, Folder, MAX_COMBINING, Underline, attr};
+use aterm_core::grid::{Cell, CellFlags, Grid};
 use aterm_core::terminal::Terminal;
 use std::fmt::Write as _;
 
@@ -36,7 +36,10 @@ pub struct Ink {
     pub fg: Paint,
     pub bg: Paint,
     pub bold: bool,
-    pub underline: bool,
+    /// The underline's style.
+    pub underline: Underline,
+    /// The underline's colour, [`Paint::Default`] for the foreground's.
+    pub ul: Paint,
     pub reverse: bool,
     pub italic: bool,
     /// Blinking, slow or rapid alike.
@@ -57,7 +60,8 @@ impl Ink {
         fg: Paint::Default,
         bg: Paint::Default,
         bold: false,
-        underline: false,
+        underline: Underline::None,
+        ul: Paint::Default,
         reverse: false,
         italic: false,
         blink: false,
@@ -248,7 +252,8 @@ impl Astream {
                         fg: paint_of(cell.fg, cell.fg_rgb),
                         bg: paint_of(cell.bg, cell.bg_rgb),
                         bold: cell.attrs & attr::BOLD != 0,
-                        underline: cell.attrs & attr::UNDERLINE != 0,
+                        underline: cell.underline,
+                        ul: paint_of(cell.ul, cell.ul_rgb),
                         reverse: cell.attrs & attr::REVERSE != 0,
                         italic: cell.attrs & attr::ITALIC != 0,
                         blink: cell.attrs & attr::BLINK != 0,
@@ -277,24 +282,54 @@ impl Astream {
     }
 }
 
-/// The fold's attribute bits [`Ink`] names; any other (FAINT) lands in `extra`.
-const ASTREAM_MODELLED: u8 = attr::BOLD
-    | attr::UNDERLINE
-    | attr::REVERSE
-    | attr::ITALIC
-    | attr::BLINK
-    | attr::STRIKE
-    | attr::CONCEAL;
+/// The fold's attribute bits [`Ink`] names; any other (FAINT, and bit 1, which the
+/// fold's encodings use for an underline and no cell holds) lands in `extra`.
+const ASTREAM_MODELLED: u8 =
+    attr::BOLD | attr::REVERSE | attr::ITALIC | attr::BLINK | attr::STRIKE | attr::CONCEAL;
 
-const UNDERLINE_BITS: u16 =
-    CellFlags::UNDERLINE.0 | CellFlags::DOUBLE_UNDERLINE.0 | CellFlags::CURLY_UNDERLINE.0;
+/// aterm's flags [`Ink`] names apart from the underline, which [`aterm_underline`] decodes.
 const MODELLED_BITS: u16 = CellFlags::BOLD.0
     | CellFlags::INVERSE.0
     | CellFlags::ITALIC.0
     | CellFlags::BLINK.0
     | CellFlags::STRIKETHROUGH.0
-    | CellFlags::HIDDEN.0
-    | UNDERLINE_BITS;
+    | CellFlags::HIDDEN.0;
+
+/// aterm's underline style, read off its three underline bits (`aterm-grid`'s `cell_flags`:
+/// UNDERLINE, DOUBLE and CURLY alone, dotted as UNDERLINE | CURLY and dashed as
+/// DOUBLE | CURLY), and the bits it read. A combination that names no style is read as none
+/// and its bits are left to `extra`, where the comparison sees them.
+const fn aterm_underline(flags: u16) -> (Underline, u16) {
+    let bits = flags & CellFlags::ALL_UNDERLINES.0;
+    let style = if bits == CellFlags::UNDERLINE.0 {
+        Underline::Single
+    } else if bits == CellFlags::DOUBLE_UNDERLINE.0 {
+        Underline::Double
+    } else if bits == CellFlags::CURLY_UNDERLINE.0 {
+        Underline::Curly
+    } else if bits == CellFlags::DOTTED_UNDERLINE.0 {
+        Underline::Dotted
+    } else if bits == CellFlags::DASHED_UNDERLINE.0 {
+        Underline::Dashed
+    } else {
+        return (Underline::None, 0);
+    };
+    (style, bits)
+}
+
+/// aterm's underline colour for a cell, as its renderer looks it up: the palette index or the
+/// 24-bit colour in the cell's extras (`0x02_0000nn` or `0x01_RRGGBB` packed).
+fn aterm_ul(grid: &Grid, r: u16, c: u16, cell: Cell) -> Paint {
+    let packed = grid
+        .cell_render_data(r, c, cell)
+        .cell_extra()
+        .and_then(|e| e.underline_color_u32());
+    match packed {
+        None => Paint::Default,
+        Some(p) if p >> 24 == 0x01 => Paint::Rgb((p >> 16) as u8, (p >> 8) as u8, p as u8),
+        Some(p) => Paint::Indexed(p as u8),
+    }
+}
 
 /// Where the cursor stands for a mark: see [`Aterm::mark_placement`].
 #[derive(Clone, Copy, Debug)]
@@ -361,6 +396,7 @@ fn aterm_cell(grid: &Grid, r: u16, c: u16) -> CellView {
             })
     };
     let flags = cell.flags().0;
+    let (underline, underline_bits) = aterm_underline(flags);
     // Bit 10 is a spacer's role bit (WIDE_CONTINUATION) only on a spacer; on any other cell it
     // is PROTECTED, which stays in `extra`. COMPLEX (bit 15) says only that the cell's text lives in
     // its extras, as an emoji's or a cluster's does: `resolved_char` reads it, so it is no rendition.
@@ -386,14 +422,15 @@ fn aterm_cell(grid: &Grid, r: u16, c: u16) -> CellView {
             fg,
             bg,
             bold: flags & CellFlags::BOLD.0 != 0,
-            underline: flags & UNDERLINE_BITS != 0,
+            underline,
+            ul: aterm_ul(grid, r, c, *cell),
             reverse: flags & CellFlags::INVERSE.0 != 0,
             italic: flags & CellFlags::ITALIC.0 != 0,
             blink: flags & CellFlags::BLINK.0 != 0,
             strike: flags & CellFlags::STRIKETHROUGH.0 != 0,
             conceal: flags & CellFlags::HIDDEN.0 != 0,
             half,
-            extra: flags & !(MODELLED_BITS | role | CellFlags::COMPLEX.0),
+            extra: flags & !(MODELLED_BITS | underline_bits | role | CellFlags::COMPLEX.0),
         },
     }
 }
@@ -458,20 +495,6 @@ impl Aterm {
                 aterm_cell(after, r, c) != clipped
             })
         })
-    }
-
-    /// The colour the underline of the cell at `(row, col)` draws in, a palette index resolved.
-    pub fn underline_colour(&self, row: usize, col: usize) -> Option<[u8; 3]> {
-        self.term
-            .render_row(row)
-            .get(col)
-            .and_then(|c| c.underline_color)
-    }
-
-    /// Palette colour `n`, as an underline resolves it.
-    pub fn palette(&self, n: u8) -> [u8; 3] {
-        let c = self.term.color_palette().get(n);
-        [c.r, c.g, c.b]
     }
 
     /// Where a mark fed now would land, in the terms the placements speak of.

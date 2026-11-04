@@ -80,7 +80,7 @@ impl MemoryTape {
         let bytes = self.sink.bytes();
         let first = self.sink.taken().writes.first().copied().unwrap_or(0);
         let mut out = MAGIC.to_vec();
-        out.extend(frame_bytes(Kind::Header, 0, header.as_bytes()));
+        out.extend(frame_bytes(Kind::Header, 0, header.as_bytes()).expect("a header frame"));
         out.extend_from_slice(&bytes[first..]);
         out
     }

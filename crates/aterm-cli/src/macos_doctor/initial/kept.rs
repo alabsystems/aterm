@@ -365,7 +365,7 @@ pub(in crate::macos_doctor) fn forget_at(
 /// Whether the record in `root` names a later `format` than this build writes, whether or not
 /// the rest of it reads: a newer aterm's, which this build never writes over.
 fn newer_at(root: &Path) -> bool {
-    std::fs::read(root.join(KEPT_RECORD))
+    crate::macos_doctor::read_record_bytes(&root.join(KEPT_RECORD))
         .ok()
         .and_then(|bytes| aterm_json::from_slice::<Value>(&bytes).ok())
         .is_some_and(|record| {

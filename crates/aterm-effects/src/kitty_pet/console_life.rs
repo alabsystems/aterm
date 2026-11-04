@@ -10516,8 +10516,12 @@ mod tests {
         cell: (u16, u16),
         /// The console's columns and rows.
         grid: (u16, u16),
-        /// The console as the shell last left it, read once a write ([`Self::write`]).
-        seen: Option<(aterm_core::render::RenderInput, PetWorldFacts)>,
+        /// The console's cells, filled as the shipped redraw fills them ([`redraw_fill`]): reused
+        /// while current, else a damage-consuming refill. A tick over the same cells keeps the
+        /// pet's reading ([`PetFill`]).
+        scratch: aterm_core::render::RenderInput,
+        /// The console's facts as the shell last left them, read once a write ([`Self::write`]).
+        seen: Option<PetWorldFacts>,
         /// What the last tick drew ([`drawn`]).
         last_key: Vec<i64>,
     }
@@ -10578,6 +10582,7 @@ mod tests {
                 now: start,
                 cell,
                 grid,
+                scratch: aterm_core::render::RenderInput::default(),
                 seen: None,
                 last_key: Vec::new(),
             }
@@ -10633,13 +10638,18 @@ mod tests {
 
         fn tick(&mut self) -> PetFrame {
             let ((cell_w, cell_h), (cols, rows)) = (self.cell, self.grid);
-            let (input, facts) = self.seen.get_or_insert_with(|| {
-                (
-                    self.term.cell_frame(usize::from(rows), usize::from(cols)),
-                    PetWorldFacts::read(&self.term, 7),
-                )
-            });
-            self.pet.observe_console(input, facts, PetPane::full(input));
+            let fill = redraw_fill(&mut self.term, &mut self.scratch, Host::Reuse);
+            let term = &self.term;
+            let facts = self
+                .seen
+                .get_or_insert_with(|| PetWorldFacts::read(term, 7));
+            self.pet.observe_console_with_reserve(
+                &self.scratch,
+                facts,
+                PetPane::full(&self.scratch),
+                PetReserve::protected(&[]),
+                fill,
+            );
             self.pet.set_console_presentable(true);
             let c = self.term.cursor();
             let frame = self.pet.tick(PetSense {
@@ -11186,6 +11196,13 @@ mod tests {
     /// mid-doze, a dozing pet ticked at its offers draws, at every moment of its breath window,
     /// what a host that ticks every [`DENSE`] between them draws ([`dense_case`]): no edge the
     /// offers miss changes the body or a mote, the console's verdict on a hidden z among them.
+    /// Each host reads the console as the shipped redraw does ([`Dozing::tick`]), keeping its
+    /// reading between writes; [`a_kept_console_reading_draws_what_a_fresh_one_does`] holds that
+    /// reading to a fresh one, for a pet already ticked when it first observes. These pets first
+    /// observe before their first tick, and there a kept reading leaves `row_changed` all `None`
+    /// where a fresh read stamps it, so [`PetBrain::rows_settled`] stays false until the next read
+    /// not kept. That is shipped behaviour: these hosts match the shipped keep path, and that test
+    /// does not see this difference.
     #[test]
     fn a_dozing_pet_draws_what_a_dense_host_draws() {
         let start = Instant::now();
@@ -11217,7 +11234,8 @@ mod tests {
     /// keys, rides a rhythm run's lead ([`PetBrain::carrying_run`]) and is left to settle, sit,
     /// loaf and fall asleep draws, ticked at its offers, what a host that ticks every [`DENSE`]
     /// between them draws ([`dense_case`]), and rests on the pixel its home draws at, or on its
-    /// front seat.
+    /// front seat. Each host reads the console as the shipped redraw does ([`Dozing::tick`]), each
+    /// edit refilling what it damaged.
     ///
     /// The claim is over these seeds. Two hosts whose ticks differ round the body's column apart
     /// by a last f32 bit now and then, and a choice made on a threshold can fall either side of

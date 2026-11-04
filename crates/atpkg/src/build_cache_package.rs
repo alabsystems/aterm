@@ -1223,11 +1223,13 @@ fn compatible_on(home: &Path, driver: &Path, registrar: Option<&Path>, in_proces
     let Some(before) = executable_stamp(&driver) else {
         return false;
     };
-    let Ok(file) = crate::metadata_io::open_regular(&driver) else {
+    let Ok((file, meta)) = crate::metadata_io::open_regular_with_meta(&driver) else {
         return false;
     };
-    let mut head = Vec::new();
-    if file.take((64 << 10) + 1).read_to_end(&mut head).is_err() {
+    let max = (64 << 10) + 1;
+    let mut head =
+        Vec::with_capacity(usize::try_from(meta.len().min(max).saturating_add(1)).unwrap_or(0));
+    if file.take(max).read_to_end(&mut head).is_err() {
         return false;
     }
     let raw = head.starts_with(b"\x7fELF")

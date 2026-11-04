@@ -908,14 +908,19 @@ fn read_existing_cap(
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
-    if !file.metadata()?.is_file() {
+    let meta = file.metadata()?;
+    if !meta.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "not a regular file",
         ));
     }
     let cap = u64::try_from(expected_len.saturating_add(1)).unwrap_or(u64::MAX);
-    let mut bytes = Vec::with_capacity(expected_len.min(4096));
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(meta.len().min(cap).saturating_add(1))
+            .unwrap_or(0)
+            .min(4097),
+    );
     (&file).take(cap).read_to_end(&mut bytes)?;
     Ok(Some((file, bytes)))
 }

@@ -169,6 +169,13 @@ pub(crate) struct SessionMeta {
     /// apart from them, with that claim's proof: kept and lapsing exactly as [`Self::claim_held`]
     /// is, and read only while that claim stands ([`Self::self_needs`]).
     pub(crate) claim_needs: Option<(crate::self_claim::Proven, crate::needs::ToldNeeds)>,
+    /// THE FACTS A PROVEN SELF-CLAIM'S ACTS MAY CARRY (`harness fact`, gap 23): which of the
+    /// session's measured facts its standing proven codex-alab claim was offered, to which of its
+    /// readers, and which it was told. Session-scoped, so it lasts across claims, while each offer
+    /// is bound to its own claim's proof; never serialized, so a successor process seeds it again
+    /// from the session ledger.
+    pub(crate) self_facts:
+        aterm_agent::supervise::facts_offer::SelfClaimFacts<crate::self_claim::Proven>,
     pub questions: Option<String>,
     pub autopilot: Option<String>,
     pub(crate) land_at: Option<i64>,
@@ -194,6 +201,7 @@ impl PartialEq for SessionMeta {
             claim_held: _,
             claim_land: _,
             claim_needs: _,
+            self_facts: _,
             questions,
             autopilot,
             land_at,
@@ -322,6 +330,7 @@ impl SessionMeta {
             claim_held: None,
             claim_land: None,
             claim_needs: None,
+            self_facts: aterm_agent::supervise::facts_offer::SelfClaimFacts::default(),
             questions: self.presentation_value("questions"),
             autopilot,
             land_at,
@@ -3374,6 +3383,9 @@ pub(crate) struct SessionTimeline {
     worker_installing: bool,
     claude_excerpts: Option<(i32, crate::survey::ClaudeExcerpts)>,
     codex_survey: Option<(i32, crate::survey::CodexSurvey)>,
+    /// The background terminals codex-alab's own record counts for the codex process in group `.0`
+    /// ([`Self::set_codex_terminals`]).
+    codex_terminals: Option<(i32, u32)>,
     /// Where the agent in group `.0` works, as the harness host last read it ([`Self::set_work`]).
     work: Option<(i32, aterm_agent::harness::work_record::WorkRecord)>,
     program_shown: Option<ShownProgram>,
@@ -3489,7 +3501,8 @@ pub(crate) struct RegistryDrift {
     pub(crate) reported: String,
 }
 
-/// What an identified agent's screen counts.
+/// What an identified agent's screen counts ([`SessionTimeline::gauges`] adds codex-alab's own claim
+/// where no screen count stands).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct AgentGauges {
     pub(crate) ctx_pct: Option<u8>,
@@ -3865,7 +3878,8 @@ impl SessionTimeline {
 
     /// A move of what the program in front says about itself: `shown` and the engine's sequence
     /// where that report began (`ProgramStateReport::began`), a new episode
-    /// ([`ShownProgram::seq`]).
+    /// ([`ShownProgram::seq`]) and, on a codex run, its box's identity
+    /// ([`crate::session_log::SessionLog::observe_program`]).
     pub(crate) fn note_program_state(
         &mut self,
         shown: Option<aterm_core::terminal::program_state::ProgramState>,
@@ -3876,7 +3890,7 @@ impl SessionTimeline {
         self.program_shown = shown.map(|state| ShownProgram::now(state, seq, report));
         self.program_moved_ms = now_ms();
         let at = self.slog.now();
-        self.slog.observe_program(shown, at);
+        self.slog.observe_program(shown, report, at);
         self.record(PROGRAM_STATE);
     }
 
@@ -5355,9 +5369,11 @@ impl SessionTimeline {
         true
     }
 
-    /// Forget the rollout tap's facts when its tap goes. Returns whether any were cleared.
+    /// Forget the rollout tap's facts and the background terminals it read off the record: its
+    /// tap went. Returns whether any were cleared.
     pub(crate) fn clear_codex_survey(&mut self) -> bool {
-        self.codex_survey.take().is_some()
+        let facts = self.codex_survey.take().is_some();
+        self.codex_terminals.take().is_some() || facts
     }
 
     /// The codex facts the survey shows, or `None` when the program in front is not the one they
@@ -5397,6 +5413,26 @@ impl SessionTimeline {
             .map(|(_, record)| record)
     }
 
+    /// The background terminals codex-alab's own record counts for the codex process in group
+    /// `pgid` ([`crate::codex_rollout_tap`]), taken only while that group is in front: whether it
+    /// was. Apart from [`Self::codex_survey`]: a count alone
+    /// publishes no survey facts, so a tab with no rollout keeps its screen's `cmd=` and `rows=`.
+    pub(crate) fn set_codex_terminals(&mut self, pgid: i32, count: Option<u32>) -> bool {
+        if self.agent.program_pgid != pgid {
+            return false;
+        }
+        self.codex_terminals = count.map(|n| (pgid, n));
+        true
+    }
+
+    /// The count [`Self::set_codex_terminals`] took, or `None` when the program in front is not the
+    /// one it was read for.
+    pub(crate) fn codex_terminals(&self) -> Option<u32> {
+        self.codex_terminals
+            .filter(|(pgid, _)| *pgid == self.agent.program_pgid)
+            .map(|(_, n)| n)
+    }
+
     /// The footer resolver's side for `pgid`, applied only while that group is in front.
     pub(crate) fn set_claude_side(
         &mut self,
@@ -5423,12 +5459,19 @@ impl SessionTimeline {
         self.gauges = gauges;
     }
 
-    /// The gauges as last read; none while no identified agent is in front.
+    /// The gauges as last read while an identified agent is in front (none otherwise), with
+    /// codex-alab's own count of its background terminals ([`Self::codex_terminals`], taken only
+    /// while its group is in front, identified or not, as [`Self::goal`] reads the codex slot)
+    /// where the screen gave none.
     pub(crate) fn gauges(&self) -> AgentGauges {
-        if self.agent.reader.is_some() {
+        let screen = if self.agent.reader.is_some() {
             self.gauges
         } else {
             AgentGauges::default()
+        };
+        AgentGauges {
+            shells: screen.shells.or_else(|| self.codex_terminals()),
+            ..screen
         }
     }
 

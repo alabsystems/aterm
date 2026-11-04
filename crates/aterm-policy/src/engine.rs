@@ -100,6 +100,85 @@ impl PolicyEngine {
         &self.policy
     }
 
+    /// The heap bytes this engine holds past its own size, as a clone's allocations ask for them: its policy's rules and limits, the compiled selectors, the decision buckets and the limiters. A rate-limit id is an `Arc` every clone shares, so only its slot counts.
+    #[must_use]
+    pub fn heap_bytes(&self) -> usize {
+        use std::mem::size_of;
+        const _: () = assert!(
+            !std::mem::needs_drop::<(u32, crate::Profile, crate::Defaults, OriginTag, Response)>(),
+            "a field counted as holding nothing has drop glue: count it"
+        );
+        let Self {
+            policy,
+            compiled,
+            buckets,
+            wildcard_bucket,
+            rate_limit_ids,
+            limiters,
+        } = self;
+        let Policy {
+            schema_version: _,
+            profile: _,
+            defaults: _,
+            rules,
+            rate_limits,
+        } = policy;
+        let rules_heap = rules.iter().fold(
+            rules.capacity().saturating_mul(size_of::<crate::Rule>()),
+            |sum, rule| {
+                let crate::Rule {
+                    sequence,
+                    origin_min: _,
+                    response: _,
+                    rate_limit,
+                    prompt_id,
+                } = rule;
+                sum.saturating_add(sequence.capacity())
+                    .saturating_add(rate_limit.as_ref().map_or(0, String::capacity))
+                    .saturating_add(prompt_id.as_ref().map_or(0, String::capacity))
+            },
+        );
+        let limits_heap = rate_limits.iter().fold(
+            rate_limits
+                .capacity()
+                .saturating_mul(size_of::<RateLimit>()),
+            |sum, limit| {
+                let RateLimit {
+                    id,
+                    capacity_bytes: _,
+                    refill_per_second: _,
+                    per_sequence_max: _,
+                } = limit;
+                sum.saturating_add(id.capacity())
+            },
+        );
+        let compiled_heap = compiled.iter().flatten().fold(
+            compiled
+                .capacity()
+                .saturating_mul(size_of::<Option<SequenceSelector>>()),
+            |sum, sel| sum.saturating_add(sel.heap_bytes()),
+        );
+        let buckets_heap = buckets.values().fold(
+            aterm_alloc::heap::table_bytes::<(BucketKey, Vec<usize>)>(buckets.capacity()),
+            |sum, rules| sum.saturating_add(rules.capacity().saturating_mul(size_of::<usize>())),
+        );
+        rules_heap
+            .saturating_add(limits_heap)
+            .saturating_add(compiled_heap)
+            .saturating_add(buckets_heap)
+            .saturating_add(
+                wildcard_bucket
+                    .capacity()
+                    .saturating_mul(size_of::<usize>()),
+            )
+            .saturating_add(
+                rate_limit_ids
+                    .capacity()
+                    .saturating_mul(size_of::<Option<Arc<str>>>()),
+            )
+            .saturating_add(limiters.heap_bytes())
+    }
+
     /// Evaluate the policy against a dispatched sequence and its origin.
     #[must_use]
     pub fn evaluate(&self, sequence: &DispatchedSequence, origin: OriginTag) -> Decision {

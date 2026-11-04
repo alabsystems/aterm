@@ -275,7 +275,11 @@ fn serve_deciding(
 }
 
 /// How long one `vault-join` dial and exchange may take.
+#[cfg(not(test))]
 pub const VAULT_JOIN_WITHIN: Duration = Duration::from_secs(20);
+/// A unit test's loopback member must answer, so its dial and exchange wait on the hang detector.
+#[cfg(test)]
+pub const VAULT_JOIN_WITHIN: Duration = aterm_spec::wait::MUST_HAPPEN;
 
 /// How a proof reaches the member at an address, its dial (connect and handshake) within the
 /// time given ([`dial_until`]).

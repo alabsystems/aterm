@@ -216,7 +216,7 @@ fn read_count(dir: &Path, file: &str) -> io::Result<usize> {
     use std::io::Read as _;
 
     let path = dir.join(file);
-    let (count_file, _) = aterm_uds::regular_file::open(&path).map_err(|error| {
+    let (count_file, meta) = aterm_uds::regular_file::open(&path).map_err(|error| {
         io::Error::new(
             error.kind(),
             format!(
@@ -225,7 +225,11 @@ fn read_count(dir: &Path, file: &str) -> io::Result<usize> {
             ),
         )
     })?;
-    let mut raw = String::new();
+    let mut raw = String::with_capacity(
+        usize::try_from(meta.len().min(65))
+            .unwrap_or(0)
+            .saturating_add(1),
+    );
     count_file.take(65).read_to_string(&mut raw)?;
     if raw.len() > 64 {
         return Err(io::Error::new(

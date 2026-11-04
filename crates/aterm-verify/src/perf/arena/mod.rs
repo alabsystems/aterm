@@ -609,6 +609,30 @@ pub(crate) fn without_aterm_env(cmd: &mut Command) -> &mut Command {
     cmd
 }
 
+/// [`without_aterm_env`] for an aterm under test whose HOME is `home`, a scratch world: the
+/// world's marker ([`aterm_types::world::MARKER`] at [`aterm_types::world::state_home`]), set
+/// after the strip so it is the world's. A release build reads no development seam, and the
+/// lanes that reach the local network (its `_alab._tcp` browse, its converge runner) read the
+/// marker raw. The folder is where a release build keeps its state under that HOME anyway.
+/// # Errors
+/// This platform keeps no aterm state under a HOME.
+pub(crate) fn in_scratch_world<'c>(
+    cmd: &'c mut Command,
+    home: &Path,
+) -> Result<&'c mut Command, String> {
+    let state = aterm_types::world::state_home(home)
+        .ok_or_else(|| "this platform keeps no aterm state under a world's HOME".to_owned())?;
+    Ok(without_aterm_env(cmd).env(aterm_types::world::MARKER, state))
+}
+
+/// A scratch world's `aterm.toml`: `head`'s root keys, then the tables that turn the world's
+/// automatic lanes off ([`aterm_types::world::LANES_OFF`]). They act for the login's account
+/// (update, packages, the keeper, the swarm's local-network uses), which no run under test is,
+/// and are the same in every run and every lane, so no comparison turns on them.
+pub(crate) fn scratch_config(head: &str) -> String {
+    format!("{head}\n{}", aterm_types::world::LANES_OFF)
+}
+
 fn deadline_after(wait: Duration) -> Instant {
     let now = Instant::now();
     now.checked_add(wait)

@@ -1634,6 +1634,76 @@ fn a_carry_sheds_a_cmd_detail_amend_with_its_open() {
     );
 }
 
+/// T7 (GAP 26): a codex run's standing claimed box rides the tracker's carry line (`claim=`,
+/// `claim_under=`, `claim_what=`), and the successor's tracker holds it with its began unknown,
+/// so the next report of its kind, whatever its began, adopts it: no second open across the
+/// update. A Claude screen box's carry line holds its step's keys and no claim key. Neither
+/// assertion pins the rest of the line, which other carry state writes.
+#[test]
+fn a_standing_claim_box_rides_the_carry() {
+    use aterm_slog::{Claimed, ClaimedBox, ClaimedReport};
+    let mut log = Log::new(1);
+    let run = agent_session(&mut log, 0);
+    let mut tr = TurnTracker::new(run);
+    let _ = tr.claim(&mut log, Claimed::Working, at(100));
+    let boxed = |began| ClaimedReport {
+        boxed: Some(ClaimedBox::Approval),
+        began,
+    };
+    let _ = tr.claim_box(&mut log, boxed(7), at(200));
+    let p1 = tr.claim_node().expect("the box");
+    let line = tr.carry_line(at(300));
+    assert!(
+        line.starts_with(&format!(
+            "tracker run={run} turn=t1 word=unknown interrupted=0 "
+        )) && line.contains(" claim=p1 claim_under=1 claim_what=approval"),
+        "the claim's three keys: {line}"
+    );
+    let now = Stamp::new(WALL0 + 400, 50);
+    let mut carried = TurnTracker::from_carry_line(&line, now).expect("the tracker reads");
+    assert_eq!(
+        carried.claim_view().held,
+        Some((p1, ClaimedBox::Approval, None, true))
+    );
+    let _ = carried.claim_box(&mut log, boxed(42), Stamp::new(WALL0 + 500, 150));
+    assert_eq!(
+        carried.claim_view().held,
+        Some((p1, ClaimedBox::Approval, Some(42), true)),
+        "the next report of its kind adopts it"
+    );
+    let opens = log
+        .window()
+        .filter(|r| r.op == aterm_slog::Op::Open && r.k == Kind::Approval)
+        .count();
+    assert_eq!(opens, 1, "no second open across the update");
+    let older = line.split(" claim=").next().expect("the line").to_string();
+    let back = TurnTracker::from_carry_line(&older, now).expect("an older line reads");
+    assert_eq!(
+        back.claim_view().held,
+        None,
+        "a line without the keys holds none"
+    );
+
+    let mut log = Log::new(1);
+    let run = agent_session(&mut log, 0);
+    let mut tr = TurnTracker::new(run);
+    tr.observe(&mut log, Verdict::Busy, None, at(100));
+    tr.observe(
+        &mut log,
+        Verdict::Prompt(BoxWord::from_detail("edit")),
+        None,
+        at(200),
+    );
+    let line = tr.carry_line(at(300));
+    assert!(
+        line.starts_with(&format!(
+            "tracker run={run} turn=t1 word=prompt interrupted=0 "
+        )) && line.contains(" box=edit step=p1 step_under=1 step_what=approval step_box=edit")
+            && !line.contains(" claim="),
+        "a Claude box's carry line, its step's keys and no claim: {line}"
+    );
+}
+
 #[test]
 fn carry_and_cursor_parsers_reject_plus_prefixed_numbers_and_bound_step_detail() {
     assert_eq!(aterm_slog::BusCursor::parse("+1:2:3"), None);

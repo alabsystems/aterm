@@ -72,6 +72,32 @@ fn same_owed(before: &J, after: &J) -> bool {
             })
 }
 
+/// The tags the continue leg's stub gives a continuation's requests (`model::answerer`): the
+/// first continuation's own request, answered with its one failing command (`continue:fail`),
+/// and every other, the request after that command included, answered done
+/// (`continue:continue`).
+const CONTINUATION_TAGS: [&str; 2] = ["continue:fail", "continue:continue"];
+
+/// Whether `tags` hold a continuation's request ([`CONTINUATION_TAGS`]).
+fn continued(tags: &[String]) -> bool {
+    tags.iter()
+        .any(|tag| CONTINUATION_TAGS.contains(&tag.as_str()))
+}
+
+/// The requests of `rows` that deliver a continuation: tagged as one ([`CONTINUATION_TAGS`]) and
+/// ending in its user text, with no tool's output. The request after the failing command carries
+/// that command's output and delivers nothing, so one row is one delivery of the act.
+fn carried_requests(rows: Vec<J>) -> Vec<J> {
+    rows.into_iter()
+        .filter(|row| {
+            row.get("tag")
+                .and_then(J::as_str)
+                .is_some_and(|tag| CONTINUATION_TAGS.contains(&tag))
+                && row.get("tool_output").and_then(J::as_str) == Some("null")
+        })
+        .collect()
+}
+
 fn one_carried_request(rows: &[J], owed: &J, not_before: i64) -> bool {
     rows.len() == 1
         && rows[0]
@@ -221,10 +247,7 @@ fn handoff(
                 .as_ref()
                 .and_then(|after| after.get("owed"))
                 .is_some_and(|after| same_owed(owed, after))
-            && proof
-                .tags(leg.name)
-                .iter()
-                .all(|tag| tag != "continue:continue"),
+            && !continued(&proof.tags(leg.name)),
     );
     let mut not_before = after
         .as_ref()
@@ -253,10 +276,7 @@ fn handoff(
             not_before = at;
             deadline_record = Some(record);
         }
-        proof
-            .tags(leg.name)
-            .iter()
-            .any(|tag| tag == "continue:continue")
+        !carried_requests(proof.requests(leg.name)).is_empty()
     })?;
     if let Some(record) = &deadline_record {
         let path = proof.s.join("upgrade-deadline-record.json");
@@ -277,11 +297,7 @@ fn handoff(
                     == Some(DEFEND)
         })
     })?;
-    let rows: Vec<J> = proof
-        .requests(leg.name)
-        .into_iter()
-        .filter(|row| row.get("tag").and_then(J::as_str) == Some("continue:continue"))
-        .collect();
+    let rows = carried_requests(proof.requests(leg.name));
     proof.check(
         &format!("upgrade-only: the carried continuation ran exactly once at or after {not_before}, and its reply completed"),
         acted && completed && one_carried_request(&rows, owed, not_before)
@@ -589,10 +605,7 @@ pub(super) fn raw_legs(proof: &mut Proof, old: &Path, new: &Path) -> Result<(), 
             .and_then(|owed| owed.get("notBefore"))
             .and_then(J::as_i64)
             .is_some_and(|deadline| crate::util::now_ms() < deadline)
-        && proof
-            .tags(leg.name)
-            .iter()
-            .all(|tag| tag != "continue:continue");
+        && !continued(&proof.tags(leg.name));
     proof.check("raw: crash repair resumed the same conversation and owed act without shortening its deadline", carried);
     if !repaired || !recovered_launch || !carried {
         proof.diagnose(&[&leg]);
@@ -783,5 +796,49 @@ mod tests {
             ("u_full", J::s(full)),
         ]);
         assert!(one_carried_request(&[row], &owed, 1_792_998_984_055));
+    }
+
+    /// THE CARRIED CONTINUATION IS ITS OWN REQUEST: the stub answers it with a failing command
+    /// (`continue:fail`) and the request after that command, which carries its output, done
+    /// (`continue:continue`). The lane times and counts the continuation's own request: one typed
+    /// before its deadline is early whatever ran after it, and a second delivery that lands
+    /// while the command runs (the request after it then ends in the owed text, no output) is a
+    /// second request. NEGATIVE CONTROL: delivered once at its deadline, it passes.
+    #[test]
+    fn the_carried_continuation_is_timed_and_counted_by_its_own_request() {
+        let text = aterm_agent::supervise::config::CONTINUE_TEXT;
+        let owed = J::obj([("text", J::s(text))]);
+        let row = |tag: &str, t: i64, tool: &str| {
+            J::obj([
+                ("t", J::Int(t)),
+                ("tag", J::s(tag)),
+                ("u_full", J::s(text)),
+                ("tool_output", J::s(tool)),
+            ])
+        };
+        let person = row("continue:person", 10, "null");
+        let ran = |t| row("continue:continue", t, "Process exited with code 3");
+        let early = carried_requests(vec![
+            person.clone(),
+            row("continue:fail", 100, "null"),
+            ran(200),
+        ]);
+        assert_eq!(early.len(), 1, "{early:?}");
+        assert!(
+            !one_carried_request(&early, &owed, 150),
+            "the act ran before its deadline, though the request after its command ran after it"
+        );
+        let twice = carried_requests(vec![
+            row("continue:fail", 200, "null"),
+            row("continue:continue", 300, "null"),
+        ]);
+        assert!(!one_carried_request(&twice, &owed, 150), "delivered twice");
+        let once = carried_requests(vec![person, row("continue:fail", 200, "null"), ran(300)]);
+        assert!(one_carried_request(&once, &owed, 150), "{once:?}");
+        assert!(continued(&[
+            "continue:person".to_string(),
+            "continue:fail".to_string()
+        ]));
+        assert!(!continued(&["continue:person".to_string()]));
     }
 }

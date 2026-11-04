@@ -10,7 +10,7 @@ use crate::provision::{AskWords, Audited, Finding};
 use crate::release::{
     AfterCut, Answer, Artifact, Backend, Built, Candidate, CutState, EngineNow, EngineRows, Facts,
     JOURNAL_FILE, Journal, Prover, RUNNING_CHILD_FILE, RUNNING_FILE, Ran, Refusal, ReleaseOptions,
-    Reservation, Step, run_with,
+    Reservation, StageTarget, Step, run_with,
 };
 use crate::release_steps::Real;
 
@@ -101,6 +101,7 @@ struct World {
     free: u64,
     /// The cut's read-only pre-claim gates' refusals.
     cut_gate_refusals: Vec<Refusal>,
+    publisher_lease_held: bool,
     /// The receipt judges cannot answer.
     judge_down: bool,
     /// The engine sync after the stage fails.
@@ -206,6 +207,7 @@ impl World {
             undelivered: 0,
             free: 500,
             cut_gate_refusals: Vec::new(),
+            publisher_lease_held: false,
             judge_down: false,
             stage_sync_fails: false,
             signal: None,
@@ -577,9 +579,18 @@ impl Backend for World {
         );
         self.blocks.clone()
     }
-    fn cut_gates(&mut self, _c: &Candidate, _creds: &Path) -> Vec<Refusal> {
+    fn cut_gates(
+        &mut self,
+        _c: &Candidate,
+        _creds: &Path,
+        kind: crate::publish::CutKind,
+    ) -> Vec<Refusal> {
         self.calls.push("cut-gates".into());
-        self.cut_gate_refusals.clone()
+        let mut refusals = self.cut_gate_refusals.clone();
+        if self.publisher_lease_held && kind == crate::publish::CutKind::Real {
+            refusals.push(lease_held());
+        }
+        refusals
     }
     fn stage_fixtures(
         &mut self,
@@ -716,10 +727,20 @@ impl Backend for World {
         }
         Ok(ran(self.verify_code))
     }
-    fn stage(&mut self, c: &Candidate, _p: &Prover) -> Result<Ran, Refusal> {
-        self.calls.push("stage".into());
+    fn stage(&mut self, c: &Candidate, _p: &Prover, target: StageTarget) -> Result<Ran, Refusal> {
+        self.calls.push(
+            if target == StageTarget::Local {
+                "qualify"
+            } else {
+                "stage"
+            }
+            .into(),
+        );
         assert!(!self.stage_panics, "a bug in the release");
         if self.stage_stages {
+            if target == StageTarget::Local {
+                return Ok(ran(0));
+            }
             self.attested = Some(c.commit.clone());
             self.staged_by = Some(self.engine.clone());
             self.candidate_missing = false;
@@ -2129,6 +2150,7 @@ fn forget_takes_no_flag_it_would_ignore() {
         &["release", "--forget", "--commit", "origin/main"],
         &["release", "--forget", "--mac-only"],
         &["release", "--forget", "--prepare"],
+        &["release", "--forget", "--qualify"],
     ] {
         assert!(parse(bad).is_err(), "{bad:?}");
     }
@@ -2157,6 +2179,234 @@ fn explicit_credentials_reach_preflight_and_publish_audits() {
             "{dry}: {:?}",
             w.audited_profiles
         );
+    }
+}
+
+#[test]
+fn private_qualification_preserves_a_live_publishers_lease() {
+    let mut w = World::new();
+    w.versions.insert(TIP.into(), "0.6.0".into());
+    w.publisher_lease_held = true;
+    let options = ReleaseOptions {
+        commit: Some(TIP.into()),
+        ..mac()
+    };
+    let (code, last) = w.run(ReleaseOptions {
+        qualify: true,
+        ..options.clone()
+    });
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert!(w.publisher_lease_held);
+    assert_eq!(w.count("qualify"), 1);
+    for never in ["stage", "publish", "cut"] {
+        assert_eq!(w.count(never), 0, "{never}: {:?}", w.calls);
+    }
+    w.calls.clear();
+    let (code, last) = w.run(options);
+    assert_ne!(code, 0, "{last}\n{:#?}", w.out);
+    assert!(
+        w.out
+            .iter()
+            .any(|line| line.contains("release lock is held")),
+        "{last}\n{:#?}",
+        w.out
+    );
+    assert_eq!(w.count("stage"), 0);
+    assert!(w.publisher_lease_held);
+
+    let mut invalid = World::new();
+    invalid.versions.insert(TIP.into(), "0.6.0".into());
+    invalid.publisher_lease_held = true;
+    invalid.cut_gate_refusals.push(Refusal::new(
+        "signing roster floor mismatch",
+        "restore the current roster",
+    ));
+    let (code, last) = invalid.run(ReleaseOptions {
+        qualify: true,
+        commit: Some(TIP.into()),
+        ..mac()
+    });
+    assert_ne!(code, 0, "{last}");
+    assert!(
+        invalid
+            .out
+            .iter()
+            .any(|line| line.contains("signing roster floor mismatch")),
+        "{last}\n{:#?}",
+        invalid.out
+    );
+    assert_eq!(invalid.count("build"), 0);
+    assert!(invalid.publisher_lease_held);
+}
+
+#[test]
+fn private_qualification_keeps_the_verified_bundle_and_a_later_release_still_stages() {
+    let mut w = World::new();
+    w.versions.insert(TIP.into(), "0.6.0".into());
+    let options = ReleaseOptions {
+        qualify: true,
+        commit: Some(TIP.into()),
+        ..mac()
+    };
+    let (code, last) = w.run(options.clone());
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert!(last.starts_with("QUALIFIED aterm 0.6.0"), "{last}");
+    for work in ["qualify", "reserve", "build", "verify"] {
+        assert_eq!(w.count(work), 1, "{work}: {:?}", w.calls);
+    }
+    for never in ["stage", "bump", "publish", "cut"] {
+        assert_eq!(w.count(never), 0, "{never}: {:?}", w.calls);
+    }
+    let journal = w.journal().unwrap();
+    assert!(journal.has(crate::release::COMMIT_GATES));
+    assert!(journal.artifact.is_some());
+    assert!(journal.reserved.is_some());
+    assert!(journal.prepared.is_none());
+    assert!(w.attested.is_none());
+    assert!(w.published.is_empty());
+    assert!(w.cut.is_none());
+    assert!(!w.release_dir().join(RUNNING_FILE).exists());
+
+    w.calls.clear();
+    let (code, last) = w.run(options);
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert_eq!(w.count("qualify"), 1, "recheck the full local export");
+    assert_eq!(w.count("build"), 0, "keep the exact verified bytes");
+    assert_eq!(w.count("verify"), 0, "reuse only a matching verification");
+
+    w.calls.clear();
+    let (code, last) = w.run(ReleaseOptions {
+        commit: Some(TIP.into()),
+        ..mac()
+    });
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert_eq!(
+        w.count("stage"),
+        1,
+        "local qualification cannot attest remote staging"
+    );
+    let stage = w.calls.iter().position(|c| c == "stage").unwrap();
+    let publish = w.calls.iter().position(|c| c == "publish").unwrap();
+    assert!(stage < publish);
+    assert_eq!(w.count("build"), 0);
+    assert_eq!(w.count("verify"), 0);
+}
+
+#[test]
+fn private_qualification_refuses_failed_exports_and_a_dry_run_builds_nothing() {
+    for dry in [false, true] {
+        let mut w = World::new();
+        w.versions.insert(TIP.into(), "0.6.0".into());
+        w.stage_stages = false;
+        let (code, last) = w.run(ReleaseOptions {
+            qualify: true,
+            dry_run: dry,
+            commit: Some(TIP.into()),
+            ..mac()
+        });
+        if dry {
+            assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+            assert!(last.starts_with("DRY RUN"), "{last}");
+            assert!(w.journal().is_none());
+            assert_eq!(w.count("qualify"), 0);
+        } else {
+            assert_eq!(code, 1, "{last}\n{:#?}", w.out);
+            assert!(
+                last.contains("private export qualification failed"),
+                "{last}"
+            );
+            assert!(w.journal().unwrap().artifact.is_none());
+            assert_eq!(w.count("qualify"), 1);
+        }
+        for never in ["reserve", "build", "verify", "stage", "publish", "cut"] {
+            assert_eq!(w.count(never), 0, "{dry}: {never}: {:?}", w.calls);
+        }
+    }
+}
+
+#[test]
+fn private_qualification_cannot_select_a_publishing_or_withdrawal_mode() {
+    for incompatible in ["--bump", "--prepare", "--forget", "--abandon"] {
+        let mut args = vec![
+            "release".to_string(),
+            "--qualify".into(),
+            incompatible.into(),
+        ];
+        if incompatible == "--abandon" {
+            args.push("v0.6.0".into());
+        }
+        assert!(crate::cli::parse(&args).is_err(), "{args:?}");
+    }
+    let args = [
+        "release",
+        "--qualify",
+        "--dry-run",
+        "--commit",
+        TIP,
+        "--mac-only",
+    ]
+    .map(str::to_string);
+    assert!(
+        matches!(crate::cli::parse(&args), Ok(crate::cli::Cmd::Release(options)) if options.qualify && options.dry_run)
+    );
+}
+
+#[test]
+fn private_qualification_reports_unavailable_prerequisites_without_asking() {
+    for dry in [false, true] {
+        for state in [
+            Audited::Gap {
+                what: "notary unavailable".into(),
+                fix: "restore it".into(),
+                owner: true,
+            },
+            Audited::CouldNotRun("notary unavailable".into()),
+        ] {
+            let mut w = World::new();
+            w.versions.insert(TIP.into(), "0.6.0".into());
+            w.audits.push_back(vec![Finding {
+                label: "notary",
+                state,
+            }]);
+            let (code, last) = w.run(ReleaseOptions {
+                qualify: true,
+                dry_run: dry,
+                commit: Some(TIP.into()),
+                ..mac()
+            });
+            assert_ne!(code, 0, "{last}\n{:#?}", w.out);
+            assert!(w.asks.is_empty());
+            for never in ["stage", "qualify", "build", "verify", "publish", "cut"] {
+                assert_eq!(w.count(never), 0, "{dry}: {never}: {:?}", w.calls);
+            }
+        }
+    }
+}
+
+#[test]
+fn private_qualification_never_restages_an_earlier_preparation() {
+    let mut w = World::new();
+    w.versions.insert(TIP.into(), "0.6.0".into());
+    let options = ReleaseOptions {
+        commit: Some(TIP.into()),
+        ..mac()
+    };
+    let (code, last) = w.run(ReleaseOptions {
+        prepare: true,
+        ..options.clone()
+    });
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    w.engine = "f1f1f1f1f1".into();
+    w.candidate_missing = true;
+    w.calls.clear();
+    let (code, last) = w.run(ReleaseOptions {
+        qualify: true,
+        ..options
+    });
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert_eq!(w.count("qualify"), 1);
+    for never in ["stage", "publish", "cut"] {
+        assert_eq!(w.count(never), 0, "{never}: {:?}", w.calls);
     }
 }
 

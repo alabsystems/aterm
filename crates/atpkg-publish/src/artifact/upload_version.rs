@@ -14,9 +14,17 @@ const RECORD_BYTES: usize = MAGIC.len() + 4 + VERSION_BYTES;
 const MANIFEST_BYTES: usize = 16 * 1024 * 1024;
 
 fn bounded(path: &Path, maximum: usize) -> Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    crate::identity::open_regular_nonblock(path)
-        .and_then(|(file, _)| file.take(maximum as u64 + 1).read_to_end(&mut bytes))
+    let (file, meta) = crate::identity::open_regular_nonblock(path)
+        .map_err(|error| Error::io(format!("read {}", path.display()), &error))?;
+    if meta.len() > maximum as u64 {
+        return Err(Error::refused(format!(
+            "{} exceeds its {maximum}-byte bound",
+            path.display()
+        )));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
+    file.take(maximum as u64 + 1)
+        .read_to_end(&mut bytes)
         .map_err(|error| Error::io(format!("read {}", path.display()), &error))?;
     if bytes.len() > maximum {
         return Err(Error::refused(format!(

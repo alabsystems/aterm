@@ -13,6 +13,8 @@ use aterm_secrets::{
     },
 };
 
+use std::collections::BTreeSet;
+
 const OPERATION: [u8; 32] = [78; 32];
 
 fn cutoff(lab: &Lab, fact: Fact) {
@@ -62,7 +64,8 @@ struct Fixture {
     _lab: Lab,
     a: Resources,
     b: Resources,
-    invoked: Invoked,
+    /// The adapter's finished call, which the one `Record` step on this world spends.
+    invoked: Option<Invoked>,
     before: Snapshot,
     actors: [astream_wire::sync::Actor; 2],
 }
@@ -152,13 +155,16 @@ fn fixture(mode: i64) -> Fixture {
         _lab: lab,
         a,
         b,
-        invoked,
+        invoked: Some(invoked),
         before,
         actors,
     }
 }
 
-pub(crate) fn retirement_transition(
+/// One model step on `world`, whose mode the action names at stage 0 and the state names after.
+/// The refinement anchors on `Store::commit_liability` project through this function by name.
+fn retirement_transition(
+    world: &mut Fixture,
     state: &aterm_spec::interp::State,
     action: &str,
 ) -> aterm_spec::interp::State {
@@ -182,7 +188,7 @@ pub(crate) fn retirement_transition(
         invoked,
         before,
         actors,
-    } = fixture(mode);
+    } = world;
     let mut next = state.clone();
     next.insert("mode", mode);
     next.insert("stage", state["stage"] + 1);
@@ -220,7 +226,7 @@ pub(crate) fn retirement_transition(
                 )
             }
             "Record" => {
-                let result = a.record(invoked);
+                let result = a.record(invoked.take().expect("one Record per world"));
                 if let Ok(Some(original)) = &original {
                     assert_eq!(result.receipt, original.receipt);
                 }
@@ -253,13 +259,13 @@ pub(crate) fn retirement_transition(
         Ok(snapshot) => snapshot,
         Err(_) => {
             assert_eq!(mode, 6, "only unresolved evidence denies a balance");
-            before
+            before.clone()
         }
     };
     next.insert("a", snapshot.used[&actors[0]] as i64);
     next.insert("b", snapshot.used[&actors[1]] as i64);
     if state["stage"] > 0 && !matches!(mode, 2 | 6) {
-        rounds(&lab);
+        rounds(lab);
         assert_eq!(a.snapshot().unwrap(), b.snapshot().unwrap());
     }
     next
@@ -269,27 +275,68 @@ pub(crate) fn retirement_transition(
 fn retirement_appends_conform_and_catalog_negative_control_is_detected() {
     let model = aterm_models_db::resource_retirement_model();
     assert!(aterm_spec::interp::prove_and_catch(&model) > 1);
-    let steps: Vec<_> = aterm_spec::interp::reachable_states(&model)
+    let enabled = |state: &aterm_spec::interp::State| {
+        model
+            .actions
+            .iter()
+            .filter(|action| model.action_enabled(action.name, state))
+            .map(|action| action.name)
+            .collect::<Vec<_>>()
+    };
+    let sole = |action: &str, state: &aterm_spec::interp::State| {
+        model.successors(action, state).into_iter().next().unwrap()
+    };
+    let init = model.init_state();
+    let environments: Vec<_> = enabled(&init)
+        .into_iter()
+        .map(|environment| (environment, sole(environment, &init)))
+        .collect();
+    // The walk below is two levels deep and takes each action's first successor. Every step the
+    // model reaches must be one of its steps, so a new action, a deeper one or a second successor
+    // fails here, not silently.
+    let steps: BTreeSet<_> = aterm_spec::interp::reachable_states(&model)
         .iter()
         .flat_map(|state| {
-            model
-                .actions
-                .iter()
-                .filter(|action| model.action_enabled(action.name, state))
-                .map(|action| (state.clone(), action.name))
-                .collect::<Vec<_>>()
+            enabled(state)
+                .into_iter()
+                .map(|action| (state.clone(), action))
         })
         .collect();
-    // Each step builds its own Lab in its own temporary home, on the lane's places.
-    aterm_spec::fs_lane::each(&steps, |(state, action)| {
-        let next = retirement_transition(state, action);
-        assert!(
-            model.successors(action, state).contains(&next),
-            "{action}: {state:?} -> {next:?}"
-        );
+    let walked: BTreeSet<_> = environments
+        .iter()
+        .flat_map(|(environment, seeded)| {
+            enabled(seeded)
+                .into_iter()
+                .map(|action| (seeded.clone(), action))
+                .chain([(init.clone(), *environment)])
+        })
+        .collect();
+    assert_eq!(walked, steps);
+    assert_eq!(steps.len(), 24, "6 environments, 3 appends in each");
+    // Each environment builds its own Lab in its own temporary home, on the lane's places, and a
+    // step reads the world it runs on. An accepted append changes that world, so each later append
+    // of modes 1-4 gets a fresh one; modes 5 and 6 refuse all three on one world, so a refusal
+    // that latched could stand in for a later one's.
+    aterm_spec::fs_lane::each(&environments, |(environment, seeded)| {
+        let mode = seeded["mode"];
+        let check = |world: &mut Fixture, state: &aterm_spec::interp::State, action: &str| {
+            let next = retirement_transition(world, state, action);
+            assert!(
+                model.successors(action, state).contains(&next),
+                "{action}: {state:?} -> {next:?}"
+            );
+        };
+        let mut world = fixture(mode);
+        check(&mut world, &init, environment);
+        for (n, action) in enabled(seeded).into_iter().enumerate() {
+            if n > 0 && mode <= 4 {
+                world = fixture(mode);
+            }
+            check(&mut world, seeded, action);
+        }
     });
-    let seeded = retirement_transition(&model.init_state(), "LegacyPeer");
-    let mut blocked = retirement_transition(&seeded, "Reserve");
+    // Conformance is the walk's; this asks only the model.
+    let mut blocked = sole("Reserve", &sole("LegacyPeer", &init));
     blocked.insert("accepted", 0);
     assert!(!model.check_invariant("EligibleProgress", &blocked));
 }

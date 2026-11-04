@@ -249,7 +249,8 @@ impl Host for RealHost {
                 path.display()
             ));
         }
-        let mut out = String::new();
+        let mut out =
+            String::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
         let read = file
             .take(MAX_HOST_READ_BYTES + 1)
             .read_to_string(&mut out)

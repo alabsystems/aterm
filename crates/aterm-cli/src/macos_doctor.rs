@@ -1865,10 +1865,15 @@ impl HeldLock {
             .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
             .open(root.join("profile.lock"))
             .ok()?;
-        if !file.metadata().ok()?.file_type().is_file() {
+        let meta = file.metadata().ok()?;
+        if !meta.file_type().is_file() {
             return None;
         }
-        let mut text = String::new();
+        let mut text = String::with_capacity(
+            usize::try_from(meta.len().min(64))
+                .unwrap_or(0)
+                .saturating_add(1),
+        );
         file.take(64).read_to_string(&mut text).ok()?;
         let trimmed = text.trim();
         if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {

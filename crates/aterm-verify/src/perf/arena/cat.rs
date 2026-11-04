@@ -11,7 +11,7 @@ use aterm_uds::spawnfd::{Stdio, command};
 
 use super::{
     Aterm, COOLDOWN, Ghostty, Group, Halt, Inbox, Ledger, Scratch, arena_dir, build_aterm,
-    ghostty_tip, live, macos_version, pins, preflight, private, without_aterm_env,
+    ghostty_tip, in_scratch_world, live, macos_version, pins, preflight, private,
 };
 use crate::perf::stats::median;
 use crate::perf::trend::utc_date;
@@ -125,10 +125,10 @@ pub(crate) const fn order(trial: u32) -> [Term; 2] {
 }
 
 /// A private HOME and XDG tree under `root` for one aterm under test, its
-/// `aterm.toml` the start lane's (no restored session, no update or package
-/// lane, the bell off): the caller's config, accounts, fleet and sessions
-/// never reach the run, which runs shipping defaults (rule zero §4), and
-/// nothing it writes reaches them.
+/// `aterm.toml` the start lane's (no restored session, the bell off, the
+/// scratch world's lanes off): the caller's config, accounts, fleet and
+/// sessions never reach the run, which runs shipping defaults but for those
+/// lanes (rule zero §4), and nothing it writes reaches them.
 pub(crate) fn private_root(root: &Path) -> Result<Vec<(&'static str, PathBuf)>, String> {
     let env = vec![
         ("HOME", root.join("home")),
@@ -144,7 +144,7 @@ pub(crate) fn private_root(root: &Path) -> Result<Vec<(&'static str, PathBuf)>, 
         std::fs::create_dir_all(d).map_err(|e| format!("could not create {}: {e}", d.display()))?;
         private(d)?;
     }
-    std::fs::write(config.join("aterm.toml"), super::start::CONFIG)
+    std::fs::write(config.join("aterm.toml"), super::start::config())
         .map_err(|e| format!("could not write the config: {e}"))?;
     Ok(env)
 }
@@ -170,7 +170,7 @@ pub(crate) fn run_in(
             let sockets = Scratch::sockets()?;
             let env = private_root(root.path())?;
             let mut cmd = command(&aterm.bin);
-            without_aterm_env(&mut cmd)
+            in_scratch_world(&mut cmd, &root.path().join("home"))?
                 .envs(env)
                 .arg("--window")
                 .arg("--control-sock")
@@ -378,7 +378,7 @@ mod tests {
         }
         assert_eq!(
             std::fs::read_to_string(root.path().join("config/aterm/aterm.toml")).expect("config"),
-            super::super::start::CONFIG
+            super::super::start::config()
         );
     }
 

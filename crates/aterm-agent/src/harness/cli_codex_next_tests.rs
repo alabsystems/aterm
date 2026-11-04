@@ -10,6 +10,11 @@
 use super::*;
 use std::time::Duration;
 
+#[path = "accounts_step_law_tests.rs"]
+mod step_law;
+#[path = "accounts_walk_tests.rs"]
+mod walk;
+
 /// A host whose one answer is the Codex program a worker aterm starts types here.
 struct CodexProgram(Option<PathBuf>);
 
@@ -984,7 +989,9 @@ fn under_a_keyring_login_the_rotation_off_line_names_the_store_not_the_mode() {
 /// `main` (this machine's own login, which nothing runs on) usable it takes `main`, and the
 /// report names it, never calling `main` the account in use; with `main` walled, `work`; with
 /// `work` walled, `main`; with `work` active and walled (not fresh, so a launch takes the next
-/// row), `main`. The JSON's `to` is the line's, its `not` the text's.
+/// row), `main`. The JSON's `to` is the line's, its `not` the text's. Where aterm makes no
+/// overlay home (off Unix, `accounts_overlay::links_here`), a launch that would take Kimi's
+/// `work` is refused for it, and `next:` says none with that refusal.
 #[test]
 fn with_no_row_active_next_is_the_row_a_launch_takes() {
     let cases: [Case; 4] = [
@@ -1001,9 +1008,6 @@ fn with_no_row_active_next_is_the_row_a_launch_takes() {
         }),
     ];
     for cli in [Cli::Codex, Cli::Grok, Cli::Kimi] {
-        if !signs_in_here(cli) {
-            continue;
-        }
         let programs: &[bool] = if cli == Cli::Codex {
             &[false, true]
         } else {
@@ -1016,10 +1020,17 @@ fn with_no_row_active_next_is_the_row_a_launch_takes() {
                 let program = known.then(|| pool.new.clone());
                 let at = format!("{} on {program:?}, {case}", cli.id());
                 let (text, doc) = pool.report(program.as_deref());
-                let launch = pool
-                    .launch_on(program.as_deref())
-                    .unwrap_or_else(|why| panic!("{at}: {why}"))
-                    .unwrap_or_else(|| panic!("{at}: a launch takes a row"));
+                let launch = match pool.launch_on(program.as_deref()) {
+                    Ok(Some(row)) => row,
+                    Err(why) if !links_here(cli) => {
+                        assert_eq!(why, accounts_overlay::NO_LINKS, "{at}");
+                        let none = doc["next"]["none"].as_str().expect("why no row is next");
+                        assert_eq!(next_line(&text), format!("next: none ({none})"), "{at}");
+                        assert!(none.contains(&why), "{at}: {none}");
+                        continue;
+                    }
+                    other => panic!("{at}: a launch takes a row: {other:?}"),
+                };
                 assert_eq!(next_line(&text), format!("next: {launch}"), "{at}: {text}");
                 assert_eq!(doc["next"]["to"], Value::from(launch), "{at}: {doc}");
                 assert!(
@@ -1279,9 +1290,6 @@ fn every_codex_judge_reads_the_program_a_launch_runs() {
 #[test]
 fn under_a_pin_a_launch_takes_next_is_the_pinned_row() {
     for cli in [Cli::Codex, Cli::Grok, Cli::Kimi] {
-        if !signs_in_here(cli) {
-            continue;
-        }
         let programs: &[bool] = if cli == Cli::Codex {
             &[false, true]
         } else {
@@ -1305,15 +1313,26 @@ fn under_a_pin_a_launch_takes_next_is_the_pinned_row() {
                 state.accounts.remove("work");
             });
             pool.pin("work");
-            assert_eq!(
-                pool.launch_on(program.as_deref()),
-                Ok(Some("work".to_string())),
-                "{at}: PRECONDITION: a launch takes the pin"
-            );
             let (text, doc) = pool.report(program.as_deref());
-            assert_eq!(next_line(&text), "next: work", "{at}: {text}");
-            assert_eq!(doc["next"]["to"], Value::from("work"), "{at}: {doc}");
-            assert!(!not_next(&text).contains_key("work"), "{at}: {text}");
+            if links_here(cli) {
+                assert_eq!(
+                    pool.launch_on(program.as_deref()),
+                    Ok(Some("work".to_string())),
+                    "{at}: PRECONDITION: a launch takes the pin"
+                );
+                assert_eq!(next_line(&text), "next: work", "{at}: {text}");
+                assert_eq!(doc["next"]["to"], Value::from("work"), "{at}: {doc}");
+                assert!(!not_next(&text).contains_key("work"), "{at}: {text}");
+            } else {
+                assert_eq!(
+                    pool.launch_on(program.as_deref()),
+                    Err(accounts_overlay::NO_LINKS.to_string()),
+                    "{at}: PRECONDITION: a launch refuses the pin's overlay home"
+                );
+                let none = doc["next"]["none"].as_str().expect("why no row is next");
+                assert_eq!(next_line(&text), format!("next: none ({none})"), "{at}");
+                assert!(none.contains(accounts_overlay::NO_LINKS), "{at}: {none}");
+            }
             assert_eq!(
                 not_next_json(&doc),
                 not_next(&text),
@@ -1583,7 +1602,7 @@ fn without_no_worker(refused: &str) -> &str {
 /// and no refusal.
 #[test]
 fn on_an_old_codex_a_pin_on_a_row_of_its_own_records_the_launchs_refusal() {
-    use crate::harness::codex_alab::UNPIN_FIX;
+    use crate::harness::codex_alab::unpin_fix;
     for mode in ["early", "off"] {
         let pool = Pool::new("use-old-own");
         pool.mode(mode);
@@ -1593,7 +1612,7 @@ fn on_an_old_codex_a_pin_on_a_row_of_its_own_records_the_launchs_refusal() {
             .expect_err("PRECONDITION: a launch under the pin is refused");
         let refused = without_no_worker(&refused);
         assert!(said.ends_with(refused), "{mode}: {said}");
-        for back in [UNPIN_FIX, "aterm pkg update codex"] {
+        for back in [unpin_fix().as_str(), "aterm pkg update codex"] {
             assert!(
                 said.contains(&format!("`{back}`")),
                 "{mode}: {back}: {said}"
@@ -1692,26 +1711,34 @@ fn under_a_keyring_login_accounts_use_records_that_a_worker_takes_no_row() {
 /// CODE'S SUPERVISOR DOES: the pin, which a launch takes (`accounts_pool::launch_env_for`), under
 /// rotation and rotation off; and `use --auto`'s end of it, the row a launch takes then (with
 /// rotation, the pool's pick; with rotation off, no row, so the login a plain launch runs on),
-/// each with none of Claude Code's words.
+/// each with none of Claude Code's words. Where aterm makes no overlay home (off Unix,
+/// `accounts_overlay::links_here`), a launch under Kimi's pin is refused for it, and the line
+/// carries that refusal.
 #[test]
 fn for_grok_and_kimi_accounts_use_says_what_a_launch_does() {
     for cli in [Cli::Grok, Cli::Kimi] {
-        if !signs_in_here(cli) {
-            continue;
-        }
         for mode in ["early", "off"] {
             let at = format!("{} under {mode}", cli.id());
             let pool = Pool::of(cli, "use-grok-kimi");
             pool.mode(mode);
             let host = CodexProgram(None);
             let said = pool.recorded("work", &host);
-            assert_eq!(
-                pool.launch_on(None),
-                Ok(Some("work".to_string())),
-                "{at}: PRECONDITION: a launch takes the pin"
-            );
-            assert!(said.contains("`work`"), "{at}: {said}");
-            assert!(said.contains(cli.connector().product), "{at}: {said}");
+            if links_here(cli) {
+                assert_eq!(
+                    pool.launch_on(None),
+                    Ok(Some("work".to_string())),
+                    "{at}: PRECONDITION: a launch takes the pin"
+                );
+                assert!(said.contains("`work`"), "{at}: {said}");
+                assert!(said.contains(cli.connector().product), "{at}: {said}");
+            } else {
+                assert_eq!(
+                    pool.launch_on(None),
+                    Err(accounts_overlay::NO_LINKS.to_string()),
+                    "{at}: PRECONDITION: a launch refuses the pin's overlay home"
+                );
+                assert!(said.contains(accounts_overlay::NO_LINKS), "{at}: {said}");
+            }
             no_claude_words(&at, &said);
             let auto = pool.recorded("--auto", &host);
             match pool.launch_on(None) {
@@ -1768,14 +1795,13 @@ fn not_ours_cases() -> [NotOurs; 3] {
 /// is refused, the line carries that refusal, and where the pin's end ends the refusal it names
 /// that way back (`accounts_pool::unpin_line`), else it says what `use --auto` says. Codex (on a
 /// build that keeps `CODEX_AUTH_PATH`'s login), Grok Build and Kimi Code CLI, under rotation and
-/// rotation off. CONTROL: with none of it, a launch takes the pin and the line names it.
+/// rotation off. CONTROL: with none of it, a launch takes the pin and the line names it, or,
+/// where aterm makes no overlay home (off Unix, `accounts_overlay::links_here`), a launch under
+/// Kimi's pin is refused for it and the line carries that refusal.
 #[test]
 fn a_pin_on_a_row_this_mac_may_not_use_records_what_a_launch_does_instead() {
     use crate::harness::accounts_pool::unpin_line;
     for cli in [Cli::Codex, Cli::Grok, Cli::Kimi] {
-        if !signs_in_here(cli) {
-            continue;
-        }
         for mode in ["early", "off"] {
             for (case, not_ours) in not_ours_cases() {
                 let at = format!("{} under {mode}, {case}", cli.id());
@@ -1784,12 +1810,22 @@ fn a_pin_on_a_row_this_mac_may_not_use_records_what_a_launch_does_instead() {
                 let program = (cli == Cli::Codex).then(|| pool.new.clone());
                 let host = CodexProgram(program.clone());
                 let control = pool.recorded("work", &host);
-                assert_eq!(
-                    pool.launch_on(program.as_deref()),
-                    Ok(Some("work".to_string())),
-                    "{at}: CONTROL: PRECONDITION: a launch takes the pin"
-                );
-                assert!(control.contains("`work`"), "{at}: CONTROL: {control}");
+                if links_here(cli) {
+                    assert_eq!(
+                        pool.launch_on(program.as_deref()),
+                        Ok(Some("work".to_string())),
+                        "{at}: CONTROL: PRECONDITION: a launch takes the pin"
+                    );
+                    assert!(control.contains("`work`"), "{at}: CONTROL: {control}");
+                } else {
+                    assert_eq!(
+                        pool.launch_on(program.as_deref()),
+                        Err(accounts_overlay::NO_LINKS.to_string()),
+                        "{at}: CONTROL: PRECONDITION: a launch refuses the pin's overlay home"
+                    );
+                    let no_links = accounts_overlay::NO_LINKS;
+                    assert!(control.contains(no_links), "{at}: CONTROL: {control}");
+                }
                 let why = not_ours(&pool);
                 let said = pool.recorded("work", &host);
                 let launched = pool.launch_on(program.as_deref());
@@ -1904,6 +1940,10 @@ fn next_is_the_row_a_launch_takes_as_accounts_use_says() {
         }),
     ];
     for cli in [Cli::Codex, Cli::Grok, Cli::Kimi] {
+        // A launch takes a Kimi row of its own only where aterm makes its overlay home.
+        if !links_here(cli) {
+            continue;
+        }
         for (case, set) in cases {
             for n in 0..programs(cli) {
                 let pool = Pool::of(cli, "next-use");
@@ -2010,6 +2050,10 @@ fn a_pin_this_mac_may_not_use_is_not_next_for_what_keeps_it_from_this_mac() {
 #[test]
 fn a_low_pin_a_launch_takes_is_next_and_not_also_not_next() {
     for cli in [Cli::Codex, Cli::Grok, Cli::Kimi] {
+        // A launch takes a Kimi row of its own only where aterm makes its overlay home.
+        if !links_here(cli) {
+            continue;
+        }
         for n in 0..programs(cli) {
             let pool = Pool::of(cli, "next-low-pin");
             let program = program_of(&pool, n);
@@ -2062,6 +2106,10 @@ fn a_low_pin_a_launch_takes_is_next_and_not_also_not_next() {
 fn under_rotation_off_a_pin_held_for_another_macs_warm_set_is_refused() {
     use crate::harness::accounts_pool::unpin_line;
     for cli in [Cli::Codex, Cli::Grok, Cli::Kimi] {
+        // A launch takes a Kimi row of its own only where aterm makes its overlay home.
+        if !links_here(cli) {
+            continue;
+        }
         for n in 0..programs(cli) {
             let pool = Pool::of(cli, "off-held");
             pool.mode("off");
@@ -2144,6 +2192,10 @@ impl AccountsHost for PooledLaunch {
 #[test]
 fn with_no_grok_or_kimi_a_launch_can_start_use_and_next_say_not_installed() {
     for cli in [Cli::Grok, Cli::Kimi] {
+        // A launch takes a Kimi row of its own only where aterm makes its overlay home.
+        if !links_here(cli) {
+            continue;
+        }
         let at = cli.id();
         let pool = Pool::of(cli, "pooled-uninstalled");
         let prefix = pool.tmp.path().join("pkg");
@@ -2198,7 +2250,7 @@ fn with_no_grok_or_kimi_a_launch_can_start_use_and_next_say_not_installed() {
 /// (`main`) are each refused with that row's sign-in at a terminal, in the verb `accounts add`
 /// names for it (`Cli::sign_in_verb`), and a label the roster does not list with `accounts add`.
 /// On a Codex build that keeps no row's login its own, the row on this machine's own login is
-/// signed in by Codex's own sign-in (`codex_alab::DEFAULT_SIGN_IN`), which `accounts login|renew`
+/// signed in by Codex's own sign-in (`codex_alab::default_sign_in`), which `accounts login|renew`
 /// refuses there. CONTROL: before `main` is signed out, its pin is recorded.
 #[test]
 fn accounts_use_names_the_sign_in_that_ends_its_refusal() {
@@ -2230,7 +2282,7 @@ fn accounts_use_names_the_sign_in_that_ends_its_refusal() {
         assert!(err.contains(&renew), "{id}: {err}");
         if cli == Cli::Codex {
             let err = refused("main", &CodexProgram(Some(pool.old.clone())));
-            let own = format!("`{}`", crate::harness::codex_alab::DEFAULT_SIGN_IN);
+            let own = format!("`{}`", crate::harness::codex_alab::default_sign_in());
             assert!(err.contains(&own), "{id}: {err}");
             assert!(!err.contains(&renew), "{id}: {err}");
         }
@@ -2339,6 +2391,10 @@ fn the_active_line_says_when_a_launch_takes_another_row() {
     };
     let plain = "active: work, 0 of 0 sessions on it";
     for cli in [Cli::Codex, Cli::Grok, Cli::Kimi] {
+        // A launch takes a Kimi row of its own only where aterm makes its overlay home.
+        if !links_here(cli) {
+            continue;
+        }
         let at = cli.id();
         let pool = Pool::of(cli, "active-line");
         let program = (cli == Cli::Codex).then(|| pool.new.clone());
@@ -2761,7 +2817,7 @@ impl Pool {
             .expect("a store")
             .transact_logins(now, &mut None, |state, logins| {
                 *state = accounts::State::default();
-                *logins = accounts::Logins::default();
+                logins.labels.clear();
                 for (label, login) in [("main", Some(world.main)), ("work", world.work)] {
                     match login {
                         Some(LawLogin::SignedOut) => {
@@ -2877,12 +2933,7 @@ impl Pool {
     /// What `aterm ai review` and the doctor say of a launch on the records as they stand: the
     /// review runs under the row `decided` names, on this machine's own login where it names none,
     /// and runs nothing where it is refused; the doctor's row says it is refused just then.
-    fn law_review(
-        &self,
-        host: &LawHost,
-        decided: &LawSays,
-        records: &accounts::AccountRecords,
-    ) -> Vec<String> {
+    fn law_fact(&self, host: &LawHost) -> crate::ai::facts::Facts {
         let (cli, now) = (self.cli, self.env.now);
         let home = self.env.home.clone().expect("a home");
         let shown = home.display().to_string();
@@ -2913,7 +2964,18 @@ impl Pool {
             accounts_mode,
             config: self.env.config.clone(),
         };
-        let mut fact = crate::ai::facts::gather(&machine, cli.connector());
+        crate::ai::facts::gather(&machine, cli.connector())
+    }
+
+    /// Whether the doctor and a review agree with what `launch_now` decided.
+    fn law_review(
+        &self,
+        host: &LawHost,
+        decided: &LawSays,
+        records: &accounts::AccountRecords,
+    ) -> Vec<String> {
+        let now = self.env.now;
+        let mut fact = self.law_fact(host);
         let doctor = fact
             .login_pool()
             .is_some_and(|pool| pool.launch_refused.is_some());
@@ -3068,6 +3130,14 @@ impl Pool {
         let mut reader = LawReader {
             answers: BTreeMap::new(),
         };
+        let default_login = accounts::default_login_address(Cli::Codex, home);
+        // A provider names one account for the row on the default login and its twin.
+        let twin = accounts::default_login_twin(&records.roster, default_login.as_deref())
+            .map(|(own, twin)| (own.label.clone(), twin.label.clone()));
+        let account_of = |label: &str| match &twin {
+            Some((own, twin)) if twin == label => own.clone(),
+            _ => label.to_owned(),
+        };
         for row in &records.roster.rows {
             let auth = auth_of(row);
             if !auth.is_file() {
@@ -3075,20 +3145,17 @@ impl Pool {
             }
             // What the record says of the login is what a provider's read of it would: the
             // moved login keeps naming the account it moved to.
-            let moved = accounts::default_login_moved_off(
-                &records.roster,
-                crate::harness::accounts::default_login_address(Cli::Codex, home).as_deref(),
-            )
-            .is_some_and(|moved| moved.label == row.label);
-            law_auth(&auth, &row.label, moved.then_some(LAW_MOVED_TO));
-            reader
-                .answers
-                .insert(auth, (row.label.clone(), row.label == label));
+            let moved =
+                accounts::default_login_moved_off(&records.roster, default_login.as_deref())
+                    .is_some_and(|moved| moved.label == row.label);
+            let account = account_of(&row.label);
+            law_auth(&auth, &account, moved.then_some(LAW_MOVED_TO));
+            reader.answers.insert(auth, (account, row.label == label));
         }
         let proposal = crate::harness::codex_rotation::prepare(
             &self.seat(),
             session,
-            &Identity::from_native(label, "user"),
+            &Identity::from_native(&account_of(label), "user"),
             &reader,
             Duration::from_secs(60),
         );
@@ -3578,7 +3645,7 @@ fn the_launch_surfaces_agree_and_no_launch_does_what_it_must_refuse() {
     let runs: Vec<(usize, Vec<(String, String)>)> = std::thread::scope(|scope| {
         let threads: Vec<_> = builds
             .into_iter()
-            .filter(|build| signs_in_here(build.cli()))
+            .filter(|build| links_here(build.cli()))
             .flat_map(|build| {
                 let worlds = law_worlds(build);
                 worlds
@@ -3608,11 +3675,11 @@ fn the_launch_surfaces_agree_and_no_launch_does_what_it_must_refuse() {
     // The matrix's size, so a build or a share that quietly runs nothing is a failure.
     let matrix: usize = builds
         .into_iter()
-        .filter(|build| signs_in_here(build.cli()))
+        .filter(|build| links_here(build.cli()))
         .map(|build| law_worlds(build).len())
         .sum();
     assert_eq!(worlds, matrix, "every world of the matrix runs");
-    if builds.iter().all(|build| signs_in_here(build.cli())) {
+    if builds.iter().all(|build| links_here(build.cli())) {
         assert!(matrix >= 1994, "the matrix shrank: {matrix} worlds");
     }
     assert_eq!(
@@ -3703,7 +3770,7 @@ impl Pool {
 #[test]
 fn a_lone_default_row_at_its_wall_is_next_as_a_launch_runs_on_it() {
     for cli in [Cli::Codex, Cli::Grok, Cli::Kimi] {
-        if !signs_in_here(cli) {
+        if !links_here(cli) {
             continue;
         }
         let at = cli.id();
@@ -3748,7 +3815,7 @@ fn use_offers_no_sign_in_of_a_row_the_build_never_runs() {
     let err = pool.use_refused("work", &CodexProgram(Some(pool.old.clone())));
     assert!(!err.contains(login), "{err}");
     assert!(
-        err.contains(crate::harness::codex_alab::BUILD_SERVED),
+        err.contains(&crate::harness::codex_alab::build_served()),
         "{err}"
     );
     let err = pool.use_refused("work", &CodexProgram(Some(pool.new.clone())));
@@ -3761,7 +3828,7 @@ fn use_offers_no_sign_in_of_a_row_the_build_never_runs() {
 #[test]
 fn a_row_held_for_another_mac_is_signed_in_by_that_mac() {
     for cli in [Cli::Codex, Cli::Grok, Cli::Kimi] {
-        if !signs_in_here(cli) {
+        if !links_here(cli) {
             continue;
         }
         let at = cli.id();
@@ -3885,15 +3952,22 @@ fn use_of_a_row_with_a_sign_in_task_names_the_reports_step() {
     assert!(!err.contains("accounts browser work"), "CONTROL: {err}");
     let store = pool.env.accounts_store_for(Cli::Codex).expect("a store");
     store
-        .transact_logins(pool.env.now, &mut None, |_, logins| {
-            accounts::note_sign_in_task(
-                logins,
-                "work",
-                accounts::SignInAction::Browser,
-                pool.env.now,
-            );
-            Ok(Vec::new())
-        })
+        .transact_pool_logins_within(
+            &accounts::LOCK_LADDER,
+            &pool.env.accounts_roster_for(Cli::Codex).unwrap(),
+            pool.env.now,
+            &mut None,
+            |_, _, logins| {
+                accounts::admit_workflow(logins, "work")?;
+                accounts::note_sign_in_task(
+                    logins,
+                    "work",
+                    accounts::SignInAction::Browser,
+                    pool.env.now,
+                );
+                Ok(Vec::new())
+            },
+        )
         .expect("a task");
     let step = accounts::SignInAction::Browser.next_step(Cli::Codex, "work");
     let err = pool.use_refused("work", &host);
@@ -3907,7 +3981,7 @@ fn use_of_a_row_with_a_sign_in_task_names_the_reports_step() {
 #[test]
 fn with_no_program_a_sign_in_and_use_lead_with_the_install() {
     for cli in [Cli::Grok, Cli::Kimi] {
-        if !signs_in_here(cli) {
+        if !links_here(cli) {
             continue;
         }
         let at = cli.id();
@@ -3960,7 +4034,7 @@ fn a_harness_or_agent_switch_turns_rotation_off_in_the_report_as_in_a_launch() {
         (Cli::Grok, "kimi"),
         (Cli::Kimi, "codex"),
     ] {
-        if !signs_in_here(cli) {
+        if !links_here(cli) {
             continue;
         }
         let at = cli.id();
@@ -4069,7 +4143,7 @@ fn the_report_says_where_a_wall_moves_a_running_session() {
     let (_, doc) = pool.report(Some(&pool.new));
     assert!(moves(&doc).is_empty(), "CONTROL: the OS keyring: {doc}");
     for cli in [Cli::Grok, Cli::Kimi] {
-        if !signs_in_here(cli) {
+        if !links_here(cli) {
             continue;
         }
         let pool = Pool::of(cli, "wall-moves-unmeasured");
@@ -4084,7 +4158,7 @@ fn the_report_says_where_a_wall_moves_a_running_session() {
 #[test]
 fn a_row_with_no_current_login_says_so_in_one_phrase_with_its_own_sign_in() {
     for cli in [Cli::Codex, Cli::Grok, Cli::Kimi] {
-        if !signs_in_here(cli) {
+        if !links_here(cli) {
             continue;
         }
         let at = cli.id();
@@ -4384,7 +4458,7 @@ fn use_and_the_report_say_one_thing_of_a_running_session() {
         ("Kimi Code CLI", Cli::Kimi, LawBuild::Kimi, |_| {}, false),
     ];
     for (world, cli, build, set, moves) in worlds {
-        if !signs_in_here(cli) {
+        if !links_here(cli) {
             continue;
         }
         let pool = Pool::of(cli, "use-and-the-wall");
@@ -4424,7 +4498,7 @@ fn aterm_says_it_signs_a_row_in_by_itself_only_where_it_does() {
         (Cli::Codex, LawBuild::CodexNew, LawBuild::CodexMissing, true),
         (Cli::Kimi, LawBuild::Kimi, LawBuild::KimiMissing, true),
     ] {
-        if !signs_in_here(cli) {
+        if !links_here(cli) {
             continue;
         }
         let at = cli.id();
@@ -4460,7 +4534,7 @@ fn aterm_says_it_signs_a_row_in_by_itself_only_where_it_does() {
             "{at}: the install leads: {text}"
         );
     }
-    if signs_in_here(Cli::Grok) {
+    if links_here(Cli::Grok) {
         let pool = Pool::of(Cli::Grok, "signs-in-grok");
         pool.no_work_login();
         let (text, _) = pool.report_on(&LawBuild::GrokMissing.program(&pool));
@@ -4531,7 +4605,7 @@ fn claudes_report_says_by_itself_only_where_a_route_does_it() {
 /// here, as `accounts renew` does. CONTROL: with the program here, the terminal is what is missing.
 #[test]
 fn a_login_with_no_terminal_says_the_missing_program_first() {
-    if !signs_in_here(Cli::Kimi) {
+    if !links_here(Cli::Kimi) {
         return;
     }
     let pool = Pool::of(Cli::Kimi, "login-no-program");
@@ -4674,7 +4748,8 @@ fn an_uninstalled_codex_is_named_first_by_use_and_by_the_report() {
     pool.no_work_login();
     let gone = LawBuild::CodexMissing.program(&pool);
     let lead = not_installed_words(Cli::Codex);
-    let build = crate::harness::codex_alab::BUILD_SERVED;
+    let build = crate::harness::codex_alab::build_served();
+    let build = build.as_str();
     let err = pool.use_refused("work", &gone);
     assert!(err.contains(&lead), "{err}");
     assert!(!err.contains(build), "{err}");
@@ -4767,8 +4842,8 @@ fn the_report_says_a_row_the_default_login_moved_off() {
 
     default_login_names(&pool, "far@example.com");
     let (text, json_moved) = pool.report_on(&host);
-    let words = "the default login names far@example.com: `aterm harness accounts sync --cli \
-                 codex` moves this row off it or says why it cannot";
+    let words = "the default login names far@example.com: `aterm harness accounts login main \
+                 --cli codex` signs this row in again";
     assert_eq!(
         not_next(&text).get("main").map(String::as_str),
         Some(words),

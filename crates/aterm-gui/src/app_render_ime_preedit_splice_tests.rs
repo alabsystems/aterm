@@ -178,8 +178,8 @@ fn empty_preedit_owns_nothing() {
             &app.windows.get(&wid).unwrap().preedit,
             app.windows.get(&wid).unwrap().preedit_caret,
         ),
-        0,
-        "no composition ⇒ zero repaint term (idle invariant)"
+        None,
+        "no composition ⇒ None repaint term (idle invariant)"
     );
 }
 

@@ -2592,7 +2592,7 @@ pub(crate) struct StatusObserver {
     programs: program::ProgramResolver,
     pub(crate) inputs: crate::input_stall::InputWatches,
     footer_asked: std::collections::HashMap<u64, FooterAsk>,
-    rollout_asked: std::collections::HashMap<u64, crate::codex_rollout_tap::RolloutAsk>,
+    pub(crate) rollout_asked: std::collections::HashMap<u64, crate::codex_rollout_tap::RolloutAsk>,
     pub(crate) slog_wakes: crate::session_log::Wakes,
     pub(crate) slog_memory: crate::session_log::MemorySweep,
     program_states: std::collections::HashMap<u64, crate::program_state::ProgramStateGate>,
@@ -2779,26 +2779,63 @@ impl StatusObserver {
     /// Schedules an off-thread Codex rollout log tap read for `session` when due: the target a
     /// live proven claim names, or, with none, the read-only copy of a released claim's process
     /// while it leads the foreground group `pgid` ([`crate::self_claim::tap_target`]). `at` is the
-    /// sweep's instant and the session's last output ([`crate::codex_rollout_tap::due`]).
+    /// sweep's instant and the session's last output ([`crate::codex_rollout_tap::due`]). The
+    /// sweep's screen `generation` and whether the timeline holds a count codex-alab's record named
+    /// ([`crate::session_timeline::SessionTimeline::codex_terminals`]) are its look
+    /// ([`crate::codex_rollout_tap::Look`]), the timeline read only once a target stands: a screen
+    /// that moved while counted owes a settle read.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the sweep's one call site hands over what it already sampled"
+    )]
     pub(crate) fn request_rollout_if_due(
         &mut self,
         session: u64,
         ctx: &std::sync::Arc<crate::SessionCtx>,
         program: Option<&str>,
         pgid: i32,
+        generation: crate::control::ScreenGen,
         at: (Instant, Option<Instant>),
         wake: &crate::claude_footer::LogWake,
     ) {
-        use crate::codex_rollout_tap::{due, follow_ask};
+        use crate::codex_rollout_tap::{Look, due, follow_ask};
         let target = crate::self_claim::fronts_claimant(program)
             .then(|| crate::self_claim::tap_target(ctx, pgid))
             .flatten();
+        // `due` reads the look only beside a target, so a tab with none takes no timeline lock.
+        let counted = target.is_some()
+            && ctx
+                .timeline
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .codex_terminals()
+                .is_some();
         follow_ask(
-            due(&mut self.rollout_asked, session, target, at),
+            due(
+                &mut self.rollout_asked,
+                session,
+                target,
+                Some(Look {
+                    screen: generation,
+                    counted,
+                }),
+                at,
+            ),
             session,
             ctx,
             wake,
         );
+    }
+
+    /// Hands `session`'s harness pairing read wait (with the instant a read settles it from), or
+    /// none, to its rollout ask ([`crate::codex_rollout_tap::pair_wait`]), which [`Self::next_wake`]
+    /// then carries.
+    pub(crate) fn note_pair_wait(
+        &mut self,
+        session: u64,
+        wait: Option<(crate::session_log::transcript::ReadWait, Instant)>,
+    ) {
+        crate::codex_rollout_tap::pair_wait(&mut self.rollout_asked, session, wait);
     }
 
     /// Returns the published [`crate::input_stall::InputStallFact`] for `session`, if any.
@@ -2984,12 +3021,9 @@ impl StatusObserver {
         let rollout_wake = self
             .rollout_asked
             .iter()
-            .filter(|(_, ask)| ask.owed)
             .filter_map(|(id, ask)| {
                 let slot = self.sessions.get(id)?;
-                ask.at
-                    .checked_add(crate::codex_rollout_tap::RECHECK)
-                    .map(|at| at.max(slot.next_due))
+                ask.wake().map(|at| at.max(slot.next_due))
             })
             .min();
         let owed = self
@@ -3271,6 +3305,8 @@ impl StatusObserver {
             ctx_pct: w.reading.as_ref().and_then(|r| r.context_pct),
             shells: match verdict.program() {
                 Some(aterm_phase::Program::Claude) => aterm_phase::shells_running(&rows),
+                // codex-alab draws no count aterm reads: its record's claim joins at
+                // SessionTimeline::gauges.
                 Some(
                     aterm_phase::Program::Codex
                     | aterm_phase::Program::Grok
@@ -3899,6 +3935,7 @@ impl crate::App {
                     program.as_deref()
                 },
                 pgid,
+                generation,
                 (now, last_output),
                 &footer_wake,
             );

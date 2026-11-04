@@ -200,6 +200,8 @@ fn target(machine: &Machine, node: &NodeIdentity) -> Target {
 
 #[test]
 fn a_fresh_vault_member_joins_the_default_fleet_and_can_be_driven() {
+    // The vault server this thread reads is the test's own on loopback, which answers.
+    let _answering = client::ServersAnswering::within(aterm_spec::wait::MUST_HAPPEN);
     let root = aterm_tempfile::tempdir().unwrap();
     let (issuer, issuer_listener) = Machine::new(root.path(), "issuer");
     let (newcomer, newcomer_listener) = Machine::new(root.path(), "newcomer");

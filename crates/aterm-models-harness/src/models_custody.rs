@@ -107,10 +107,10 @@
 //! where the host named no process carries an input-lost record landed in its asker only where an
 //! ask of that line's restart claimed it (`RestartAsk`, from `Restart::InputLost`'s `line`; the
 //! record's `ask`, `relaunch::its_own`), and makes its own restart of the asker over any other
-//! line's record landed there with no native move in it (`relaunch::supersedes`), so a first ask
-//! deferred before its claim is never answered on its re-ask with such a record's restart; a record
-//! that carries a native move is carried, which ATERM-KI-1101-3 leaves open. The model has no such
-//! word.
+//! line's record landed there (`relaunch::supersedes`), so a first ask deferred before its claim is
+//! never answered on its re-ask with such a record's restart; a record that still carries a native
+//! move is carried, to complete it, and the restart asked over it defers (`wait:native-carried`)
+//! until a re-ask finds the move gone and supersedes it. The model has no such word.
 //! The host types into the agent (`HostTypes`: its carry-on, the disk ask) only into
 //! a composer that reads empty (the carry-on's `wait:draft`,
 //! `relaunch::continuation_composer_empty`; the disk ask's `disk_ask::HeldBy::Draft`), so never

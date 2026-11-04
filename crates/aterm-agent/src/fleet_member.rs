@@ -775,12 +775,18 @@ fn read_code(code_file: Option<&Path>) -> Result<(String, CodeFrom), Failure> {
         if let Some(path) = code_file {
             astream_sys::open_nonblocking(path, astream_sys::Links::Follow)
                 .and_then(|file| {
-                    if !file.metadata()?.is_file() {
+                    let meta = file.metadata()?;
+                    if !meta.is_file() {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidInput,
                             "not a regular file",
                         ));
                     }
+                    text.reserve(
+                        usize::try_from(meta.len().min(CODE_READ_MAX))
+                            .unwrap_or(0)
+                            .saturating_add(1),
+                    );
                     file.take(CODE_READ_MAX).read_to_string(&mut text)
                 })
                 .map_err(|e| failed(format!("the --code-file file: {e}")))?;
@@ -7132,12 +7138,17 @@ fn leave_within_node(
     // and its exit. Recheck absence under node-admin before stopping: a new join may already have
     // started a node for its fleet since this leave released the book.
     if let Some((home, sup)) = node_home.zip(node_supervisor) {
+        use crate::node_service::Removal;
         match crate::node_service::remove_after_fleet_leave_with(home, &places.state, sup) {
-            Ok(Some(unit)) => {
+            Ok(Removal::Removed(unit)) => {
                 out.push_str(&format!("  removed    {} (the node job)\n", unit.display()));
                 left = true;
             }
-            Ok(None) => {}
+            Ok(Removal::Kept { unit, why }) => out.push_str(&format!(
+                "  kept       {} (the node job, not stopped): {why}\n",
+                unit.display()
+            )),
+            Ok(Removal::Nothing) => {}
             Err(e) => {
                 say(&out);
                 return Err(failed(e));

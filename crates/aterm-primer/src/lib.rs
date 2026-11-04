@@ -387,12 +387,18 @@ const NONBLOCK_OPEN_FLAG: i32 = 0x0000_0004;
 /// deleted, `Ok(false)` when there is none or it is the user's (left alone).
 fn sweep_retired_skill(path: &Path) -> Result<bool, String> {
     use std::io::Read as _;
-    let file = match AsRead::open(path) {
-        Ok(Some(file)) => file,
+    let (file, meta) = match AsRead::open(path) {
+        Ok(Some(opened)) => opened,
         Ok(None) => return Ok(false),
         Err(e) => return Err(format!("{}: unreadable: {e}", path.display())),
     };
-    let mut bytes = Vec::new();
+    if meta.len() > MAX_PRIMER_FILE_BYTES {
+        return Err(format!(
+            "{}: unreadable: file exceeds size limit",
+            path.display()
+        ));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
     if let Err(e) = file.take(MAX_PRIMER_FILE_BYTES + 1).read_to_end(&mut bytes) {
         return Err(format!("{}: unreadable: {e}", path.display()));
     }
@@ -571,13 +577,12 @@ fn file_id(_: &std::fs::Metadata) -> FileId {
 impl AsRead {
     fn read(path: &Path) -> std::io::Result<Self> {
         use std::io::Read as _;
-        let Some(file) = Self::open(path)? else {
+        let Some((file, meta)) = Self::open(path)? else {
             return Ok(Self {
                 text: None,
                 file: None,
             });
         };
-        let meta = file.metadata()?;
         if meta.len() > MAX_PRIMER_FILE_BYTES {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -585,7 +590,8 @@ impl AsRead {
             ));
         }
         let id = file_id(&meta);
-        let mut text = String::new();
+        let mut text =
+            String::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
         file.take(MAX_PRIMER_FILE_BYTES + 1)
             .read_to_string(&mut text)?;
         if text.len() as u64 > MAX_PRIMER_FILE_BYTES {
@@ -600,7 +606,7 @@ impl AsRead {
         })
     }
 
-    fn open(path: &Path) -> std::io::Result<Option<std::fs::File>> {
+    fn open(path: &Path) -> std::io::Result<Option<(std::fs::File, std::fs::Metadata)>> {
         let mut opts = std::fs::OpenOptions::new();
         opts.read(true);
         #[cfg(any(
@@ -627,13 +633,14 @@ impl AsRead {
         }
         match opts.open(path) {
             Ok(file) => {
-                if !file.metadata()?.is_file() {
+                let meta = file.metadata()?;
+                if !meta.is_file() {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
                         "not a regular file",
                     ));
                 }
-                Ok(Some(file))
+                Ok(Some((file, meta)))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),
@@ -644,13 +651,12 @@ impl AsRead {
         use std::io::Read as _;
         Ok(match (Self::open(path)?, &self.text) {
             (None, None) => true,
-            (Some(file), Some(text)) => {
-                let meta = file.metadata()?;
+            (Some((file, meta)), Some(text)) => {
                 if meta.len() != text.len() as u64 {
                     return Ok(false);
                 }
                 let id = file_id(&meta);
-                let mut bytes = Vec::with_capacity(text.len());
+                let mut bytes = Vec::with_capacity(text.len().saturating_add(1));
                 file.take(MAX_PRIMER_FILE_BYTES + 1)
                     .read_to_end(&mut bytes)?;
                 self.file == Some(id) && bytes == text.as_bytes()
@@ -737,10 +743,16 @@ fn create_private_temp(tmp: &Path) -> std::io::Result<std::fs::File> {
 
 fn read_bounded_bytes(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
     use std::io::Read as _;
-    let Some(file) = AsRead::open(path)? else {
+    let Some((file, meta)) = AsRead::open(path)? else {
         return Ok(None);
     };
-    let mut bytes = Vec::new();
+    if meta.len() > MAX_PRIMER_FILE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "file exceeds size limit",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
     file.take(MAX_PRIMER_FILE_BYTES + 1)
         .read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_PRIMER_FILE_BYTES {
@@ -1521,7 +1533,8 @@ fn read_compact_state(file: std::fs::File) -> std::io::Result<String> {
             "Claude state exceeds the read budget",
         ));
     }
-    let mut text = String::new();
+    let mut text =
+        String::with_capacity(usize::try_from(metadata.len().saturating_add(1)).unwrap_or(0));
     file.take(CLAUDE_STATE_MAX + 1).read_to_string(&mut text)?;
     if text.len() as u64 > CLAUDE_STATE_MAX {
         return Err(Error::new(

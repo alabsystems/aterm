@@ -4,7 +4,7 @@
 //! What the pinned astream-term models, read off the fold itself.
 
 use astream_term::Record;
-use astream_term::screen::{Color, attr, fold};
+use astream_term::screen::{Color, Underline, attr, fold};
 
 /// The capabilities, probed once per call (each is a fold of a few bytes).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,7 +51,7 @@ pub struct Caps {
     /// one: a wide glyph with one column left wraps and blanks that column.
     pub wide_glyphs: bool,
     /// SGR italic (3/23), blink (5, 6/25), concealed (8/28) and crossed-out (9/29) are
-    /// attributes of their own, and 21 is an underline.
+    /// attributes of their own, and 21 is the underline's double style.
     pub sgr_attrs: bool,
     /// 24-bit colour: `38;2;r;g;b` and `48;2;r;g;b`, and the colon forms with and without a
     /// colour-space id, on the code or on the selector, each channel clamped to 255.
@@ -113,8 +113,8 @@ impl Caps {
                 == Some(attr::ITALIC | attr::BLINK | attr::CONCEAL | attr::STRIKE)
                 && fold(4, 1, &[Record::Out(b"\x1b[21mY".to_vec())])
                     .cell(0, 0)
-                    .map(|c| c.attrs)
-                    == Some(attr::UNDERLINE),
+                    .map(|c| (c.attrs, c.underline))
+                    == Some((0, Underline::Double)),
             truecolour: fold(
                 4,
                 1,

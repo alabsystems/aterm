@@ -2435,6 +2435,151 @@ pub fn claimed_turn_edges_model() -> Model {
     }
 }
 
+/// CLAIMED BOX STEPS (GAP 26, Stage A): what `aterm_slog::TurnTracker::claim_box` makes of two serial boxes of one kind a codex-alab TUI shows in one turn, as its status sweep reads them from the program's OSC 7501 report.
+///
+/// The TUI shows box 1, then box 2 only once box 1 closed (`tui1`, `tui2`: 0 not shown, 1 shown, 2 closed), whoever closed it: a person or a `send` (`PersonAnswer1`, `PersonAnswer2`) or codex-alab (`AlabAnswer1`, `AlabAnswer2`, which also marks its act), since in Stage A no close of the step reads who answered the box. The report `rep` follows the TUI at its own refresh (0 no box, 1 box 1's `began`, 2 box 2's): box 2 shown before the report left box 1 shares its began (`gap` 0, stacked, R9), else it has its own (`gap` 1). The sweep writes the report when it moved (`seen` is the last it wrote; `saw1`, `saw2` say it wrote began 1 or 2 standing): its leave closes the held step (`held`: 0 none, 1 or 2 the step of that began) by the input bound to it (`k1`, `k2`: 0 none, 1 a person's key, 2 a ctl input, 3 a proven actor's `act=approve`, the harness's), `out=approved by=harness` for the proven approve and `out=passed` for any other, and a new began opens that began's step (`s1`, `s2`: 0 none, 1 open, 2 closed; `o1`, `o2`: 0, 1 approved, 2 passed, 3 gone; `by1`, `by2`: 0 nobody, 1 human, 2 ctl, 3 harness). Keys bind only the held step. codex-alab's acts close nothing (`pre` counts its pre-approvals, which come at any time). A screen stall takes the screen's slot, never the claim's (`stall`: 0, 1 standing, 2 ended). The turn (`turn`: 1 open, 2 closed, 3 closed gone) ends at a rest with no box shown, its close the held step's leave first, or goes with the program (`out=gone`); the log's close cascades any other open step `out=gone`. Laws: an approval only from a bound proven approve, written `by=harness` (`ApprovedOnlyByProvenApprove`), `by=ctl` only from a bound ctl input (`NoPersonAsCtl`), a step for each began the sweep wrote standing (`OneStepPerBegan`), and no step left open by its turn's close, nor closed gone unless the turn went (`NoOrphan`). Mutants: Buggy=1, a pre-approval closes the standing step `out=approved by=ctl` (the original D4, `PreActCloses`); Buggy=2, a new began of the kind held adopts the step (identity by words only, `SweepWordsOnly`); Buggy=3, a stall takes the claim's slot (`StallShared`); Buggy=4, the leave writes a person's key as `by=ctl` (`SweepPersonAsCtl`). Stage B adds codex-alab's box act, which closes the box it names by its own actor, and with it a ghost of whether codex-alab approved or declined, which the laws then read.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn claimed_box_steps_model() -> Model {
+    aterm_spec::ty_model! {
+        ClaimedBoxSteps {
+            const Buggy = 0;
+            var tui1 = 0;
+            var tui2 = 0;
+            var gap = 0;
+            var rep = 0;
+            var seen = 0;
+            var saw1 = 0;
+            var saw2 = 0;
+            var held = 0;
+            var s1 = 0;
+            var s2 = 0;
+            var o1 = 0;
+            var o2 = 0;
+            var by1 = 0;
+            var by2 = 0;
+            var k1 = 0;
+            var k2 = 0;
+            var pre = 0;
+            var turn = 1;
+            var stall = 0;
+
+            action Show1 when (turn == 1 && tui1 == 0) {
+                tui1 = 1;
+            }
+            action Show2 when (turn == 1 && tui1 == 2 && tui2 == 0) {
+                tui2 = 1;
+                gap = if rep == 0 { 1 } else { 0 };
+            }
+            action Refresh when ((tui1 == 1 && (rep > 1 || 1 > rep)) || ((tui1 > 1 || 1 > tui1) && tui2 == 1 && gap == 1 && (rep > 2 || 2 > rep)) || ((tui1 > 1 || 1 > tui1) && tui2 == 1 && gap == 0 && (rep > 1 || 1 > rep)) || ((tui1 > 1 || 1 > tui1) && (tui2 > 1 || 1 > tui2) && (rep > 0 || 0 > rep))) {
+                rep = if tui1 == 1 { 1 } else if tui2 == 1 && gap == 1 { 2 } else if tui2 == 1 { 1 } else { 0 };
+            }
+            action PersonAnswer1 when (tui1 == 1) {
+                tui1 = 2;
+            }
+            action AlabAnswer1 when (tui1 == 1) {
+                tui1 = 2;
+            }
+            action PersonAnswer2 when (tui2 == 1) {
+                tui2 = 2;
+            }
+            action AlabAnswer2 when (tui2 == 1) {
+                tui2 = 2;
+            }
+            action PersonKey when ((held == 1 && k1 == 0) || (held == 2 && k2 == 0)) {
+                k1 = if held == 1 { 1 } else { k1 };
+                k2 = if held == 2 { 1 } else { k2 };
+            }
+            action CtlKey when ((held == 1 && k1 == 0) || (held == 2 && k2 == 0)) {
+                k1 = if held == 1 { 2 } else { k1 };
+                k2 = if held == 2 { 2 } else { k2 };
+            }
+            action HarnessKey when ((held == 1 && k1 == 0) || (held == 2 && k2 == 0)) {
+                k1 = if held == 1 { 3 } else { k1 };
+                k2 = if held == 2 { 3 } else { k2 };
+            }
+            action PreAct when (2 > pre) {
+                pre = pre + 1;
+            }
+            action Sweep when (turn == 1 && (seen > rep || rep > seen)) {
+                s1 = if held == 1 && (rep > 1 || 1 > rep) { 2 } else if rep == 1 && (held > 1 || 1 > held) && s1 == 0 { 1 } else { s1 };
+                o1 = if held == 1 && (rep > 1 || 1 > rep) && k1 == 3 { 1 } else if held == 1 && (rep > 1 || 1 > rep) { 2 } else { o1 };
+                by1 = if held == 1 && (rep > 1 || 1 > rep) { k1 } else { by1 };
+                s2 = if held == 2 && (rep > 2 || 2 > rep) { 2 } else if rep == 2 && (held > 2 || 2 > held) && s2 == 0 { 1 } else { s2 };
+                o2 = if held == 2 && (rep > 2 || 2 > rep) && k2 == 3 { 1 } else if held == 2 && (rep > 2 || 2 > rep) { 2 } else { o2 };
+                by2 = if held == 2 && (rep > 2 || 2 > rep) { k2 } else { by2 };
+                held = if rep == 1 && (held > 1 || 1 > held) && s1 == 0 { 1 } else if rep == 2 && (held > 2 || 2 > held) && s2 == 0 { 2 } else if (held == 1 && (rep > 1 || 1 > rep)) || (held == 2 && (rep > 2 || 2 > rep)) { 0 } else { held };
+                seen = rep;
+                saw1 = if rep == 1 { 1 } else { saw1 };
+                saw2 = if rep == 2 { 1 } else { saw2 };
+            }
+            action TurnEnd when (turn == 1 && (tui1 > 1 || 1 > tui1) && (tui2 > 1 || 1 > tui2) && rep == 0) {
+                turn = 2;
+                seen = 0;
+                s1 = if s1 == 1 { 2 } else { s1 };
+                o1 = if s1 == 1 && held == 1 && k1 == 3 { 1 } else if s1 == 1 && held == 1 { 2 } else if s1 == 1 { 3 } else { o1 };
+                by1 = if s1 == 1 && held == 1 { k1 } else { by1 };
+                s2 = if s2 == 1 { 2 } else { s2 };
+                o2 = if s2 == 1 && held == 2 && k2 == 3 { 1 } else if s2 == 1 && held == 2 { 2 } else if s2 == 1 { 3 } else { o2 };
+                by2 = if s2 == 1 && held == 2 { k2 } else { by2 };
+                held = 0;
+            }
+            action Gone when (turn == 1) {
+                turn = 3;
+                s1 = if s1 == 1 { 2 } else { s1 };
+                o1 = if s1 == 1 { 3 } else { o1 };
+                s2 = if s2 == 1 { 2 } else { s2 };
+                o2 = if s2 == 1 { 3 } else { o2 };
+                held = 0;
+            }
+            action Stall when (stall == 0) {
+                stall = 1;
+            }
+            action StallEnd when (stall == 1) {
+                stall = 2;
+            }
+
+            action PreActCloses when (Buggy == 1 && 2 > pre && held > 0) {
+                pre = pre + 1;
+                s1 = if held == 1 { 2 } else { s1 };
+                o1 = if held == 1 { 1 } else { o1 };
+                by1 = if held == 1 { 2 } else { by1 };
+                s2 = if held == 2 { 2 } else { s2 };
+                o2 = if held == 2 { 1 } else { o2 };
+                by2 = if held == 2 { 2 } else { by2 };
+                held = 0;
+            }
+            action SweepWordsOnly when (Buggy == 2 && turn == 1 && (seen > rep || rep > seen) && held > 0 && rep > 0) {
+                seen = rep;
+                saw1 = if rep == 1 { 1 } else { saw1 };
+                saw2 = if rep == 2 { 1 } else { saw2 };
+            }
+            action StallShared when (Buggy == 3 && stall == 0) {
+                stall = 1;
+                held = 0;
+            }
+            action SweepPersonAsCtl when (Buggy == 4 && turn == 1 && (seen > rep || rep > seen)) {
+                s1 = if held == 1 && (rep > 1 || 1 > rep) { 2 } else if rep == 1 && (held > 1 || 1 > held) && s1 == 0 { 1 } else { s1 };
+                o1 = if held == 1 && (rep > 1 || 1 > rep) && k1 == 3 { 1 } else if held == 1 && (rep > 1 || 1 > rep) { 2 } else { o1 };
+                by1 = if held == 1 && (rep > 1 || 1 > rep) && k1 == 1 { 2 } else if held == 1 && (rep > 1 || 1 > rep) { k1 } else { by1 };
+                s2 = if held == 2 && (rep > 2 || 2 > rep) { 2 } else if rep == 2 && (held > 2 || 2 > held) && s2 == 0 { 1 } else { s2 };
+                o2 = if held == 2 && (rep > 2 || 2 > rep) && k2 == 3 { 1 } else if held == 2 && (rep > 2 || 2 > rep) { 2 } else { o2 };
+                by2 = if held == 2 && (rep > 2 || 2 > rep) && k2 == 1 { 2 } else if held == 2 && (rep > 2 || 2 > rep) { k2 } else { by2 };
+                held = if rep == 1 && (held > 1 || 1 > held) && s1 == 0 { 1 } else if rep == 2 && (held > 2 || 2 > held) && s2 == 0 { 2 } else if (held == 1 && (rep > 1 || 1 > rep)) || (held == 2 && (rep > 2 || 2 > rep)) { 0 } else { held };
+                seen = rep;
+                saw1 = if rep == 1 { 1 } else { saw1 };
+                saw2 = if rep == 2 { 1 } else { saw2 };
+            }
+
+            invariant ApprovedOnlyByProvenApprove: ((o1 > 1 || 1 > o1) || (k1 == 3 && by1 == 3)) && ((o2 > 1 || 1 > o2) || (k2 == 3 && by2 == 3));
+            invariant NoPersonAsCtl: ((by1 > 2 || 2 > by1) || k1 == 2) && ((by2 > 2 || 2 > by2) || k2 == 2);
+            invariant OneStepPerBegan: (saw1 == 0 || s1 > 0) && (saw2 == 0 || s2 > 0);
+            invariant NoOrphan: (turn == 1 || ((s1 > 1 || 1 > s1) && (s2 > 1 || 1 > s2))) && (((o1 > 3 || 3 > o1) && (o2 > 3 || 3 > o2)) || turn == 3);
+            bound StateBounded: tui1 <= 2 && tui2 <= 2 && gap <= 1 && rep <= 2 && seen <= 2 && saw1 <= 1 && saw2 <= 1 && held <= 2 && s1 <= 2 && s2 <= 2 && o1 <= 3 && o2 <= 3 && by1 <= 3 && by2 <= 3 && k1 <= 3 && k2 <= 3 && pre <= 2 && turn > 0 && turn <= 3 && stall <= 2;
+        }
+    }
+}
+
 /// SESSION LOG MAIL LINK (design §2.6): the heuristic mail → turn link `aterm_slog::Fold::apply` makes as a session's mail and turns arrive and time passes (`aterm_slog::mail_link_of`, `fold_mail.rs`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]

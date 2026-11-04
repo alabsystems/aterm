@@ -907,3 +907,162 @@ fn native_exec_proposal_uses_fresh_shared_account_reads_and_typed_dispatch() {
     assert_eq!(selected.argv, ["exec", "--json", "original\ninput"]);
     assert_eq!(world.load(Cli::Codex).rotations, [NOW]);
 }
+
+/// A provider's read with `session` and `week` percent spent.
+fn usage_at(account: &str, session: u64, week: u64) -> IdentifiedUsage {
+    IdentifiedUsage {
+        identity: Identity::from_native(account, "user"),
+        usage: crate::harness::codex_app_login::usage_from_backend(
+            &aterm_json::json!({
+                "plan_type": "pro",
+                "rate_limit": {
+                    "allowed": week < 100,
+                    "primary_window": {"used_percent": session, "limit_window_seconds": 18000,
+                        "reset_at": NOW + 3600},
+                    "secondary_window": {"used_percent": week,
+                        "limit_window_seconds": 604800, "reset_at": NOW + 86_400}
+                }
+            }),
+            NOW,
+        )
+        .expect("real provider percentages"),
+    }
+}
+
+/// A FRESH READ THAT FINDS A ROW LOW SELECTS NOTHING, AND THE READ IS ON RECORD: a writer would
+/// refuse that row, and the report judges it by what was just read. CONTROL: with room it moves.
+#[test]
+fn a_fresh_read_that_finds_a_row_low_selects_nothing_and_stays_on_record() {
+    let source = Identity::from_native("source", "user");
+    let (world, mut reader) = fixture("quota-fresh-low");
+    let work = world.work_dir(Cli::Codex).join("auth.json");
+    native_auth(&work, "target");
+    reader.answers.insert(work, usage_at("target", 95, 0));
+    let proposal = codex_rotation::prepare(
+        &world.seat(),
+        &weekly_session(&world),
+        &source,
+        &reader,
+        Duration::from_secs(60),
+    )
+    .unwrap();
+    assert!(proposal.is_none(), "{proposal:?}");
+    let state = world.load(Cli::Codex);
+    assert_eq!(
+        state.accounts["work"]
+            .sample
+            .as_ref()
+            .and_then(|s| s.session_pct),
+        Some(95),
+        "the read is on record"
+    );
+}
+
+/// A WALL BESIDE A READ AT THAT LIMIT ENDS AT THE READ'S RESET, AND A LATER WALL BESIDE A READ SHORT
+/// OF IT KEEPS THAT RESET, through the writer a session's plan and a handoff's prepare both reach. A
+/// read short of a limit says nothing of when that limit's wall ends: the planning model's case 9.
+#[test]
+fn a_wall_takes_the_reset_of_a_read_at_that_limit() {
+    let walls_after = |reads: &[(Sample, &str)]| {
+        let world = World::new("wall-reset");
+        world.two(Cli::Codex);
+        world.on_main(Cli::Codex, &[]);
+        let exe = crate::harness::codex_alab::lay_package(&world.root.join("store/tried"), true);
+        for (sample, window) in reads {
+            let mut session = session(Cli::Codex, Supervisor::Aterm, Mode::Early, &exe);
+            session.sample = Some(sample.clone());
+            session.point = Point::Wall {
+                window: (*window).into(),
+                at: Some(NOW),
+            };
+            let _ = session_plan(&world.seat(), &session, |_| {});
+        }
+        let state = world.load(Cli::Codex);
+        let window = reads.last().expect("a read").1;
+        state.accounts["main"].walls[window].until
+    };
+    let at_limit = Sample {
+        week_pct: Some(100),
+        week_reset: Some(NOW + 86_400),
+        at: NOW,
+        ..Sample::default()
+    };
+    let short = Sample {
+        session_pct: Some(95),
+        session_reset: Some(NOW + 3600),
+        at: NOW,
+        ..Sample::default()
+    };
+    assert_eq!(
+        walls_after(&[(at_limit.clone(), "seven_day")]),
+        Some(NOW + 86_400)
+    );
+    assert_eq!(walls_after(&[(short.clone(), "five_hour")]), None);
+    assert_eq!(
+        walls_after(&[(at_limit, "seven_day"), (short, "seven_day")]),
+        Some(NOW + 86_400)
+    );
+}
+
+/// A HANDOFF'S PREPARE, AFTER THE READ A LAUNCH MADE, KEEPS THE WEEKLY RESET THAT READ NAMED.
+#[test]
+fn a_prepare_keeps_the_reset_a_launch_read_named() {
+    let source = Identity::from_native("source", "user");
+    let (world, reader) = fixture("prepare-keeps-reset");
+    let main = world.seat().store(Cli::Codex);
+    main.transact(NOW, &mut None, |state| {
+        let read = Sample {
+            week_pct: Some(100),
+            week_reset: Some(NOW + 86_400),
+            at: NOW,
+            ..Sample::default()
+        };
+        Ok(accounts::note_sample(state, "main", read, NOW))
+    })
+    .unwrap();
+    codex_rotation::prepare(
+        &world.seat(),
+        &weekly_session(&world),
+        &source,
+        &reader,
+        Duration::from_secs(60),
+    )
+    .unwrap()
+    .expect("a proposal");
+    let state = world.load(Cli::Codex);
+    let until = state.accounts["main"]
+        .sample
+        .as_ref()
+        .and_then(|s| s.week_reset);
+    assert_eq!(until, Some(NOW + 86_400));
+}
+
+/// A LOGIN NO ROW HANDS OFF IS A REFUSAL THAT STANDS, HOWEVER OFTEN IT IS ASKED; a spent budget or
+/// a lock is one to ask about again.
+#[test]
+fn a_session_no_row_hands_off_stands_and_a_busy_one_is_asked_again() {
+    use codex_rotation::{NoHandoff, prepare_refusal_stands};
+    for why in ["source-unbound", "source-missing", "source-unmanaged"] {
+        assert_eq!(prepare_refusal_stands(why), Some(NoHandoff::NoRowOfThePool));
+    }
+    assert_eq!(
+        prepare_refusal_stands("not-weekly-exhausted"),
+        Some(NoHandoff::LimitNotReached)
+    );
+    assert_eq!(prepare_refusal_stands("roster-busy"), None);
+}
+
+/// A RECORD THE DEADLINE DOES NOT HANG ON FITS IN WHAT IS LEFT OF IT: a spent deadline waits for no
+/// pause, and a wide one takes the whole ladder.
+#[test]
+fn a_fresh_read_waits_no_longer_for_its_record_than_the_deadline_leaves() {
+    assert!(super::super::ladder_within(Duration::ZERO).is_empty());
+    let some = Duration::from_millis(100);
+    let within = super::super::ladder_within(some);
+    assert!(!within.is_empty());
+    assert!(within.iter().sum::<Duration>() <= some);
+    assert_eq!(
+        super::super::ladder_within(Duration::from_secs(3600)),
+        accounts::LOCK_LADDER
+    );
+}

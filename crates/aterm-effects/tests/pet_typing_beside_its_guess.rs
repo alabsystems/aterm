@@ -12,7 +12,7 @@ use aterm_effects::companion::{CompanionOwner, GlowOwnership, PetFacts};
 use aterm_effects::cursor_glow::GlowStyle;
 use aterm_effects::host::{FrameGeom, HostFrameInput, TerminalFacts};
 use aterm_effects::kitty_pet::{PetAction, PetFrame, PetInputKind};
-use aterm_effects::pet_world::{PetPane, PetRect, PetReserve, PetWorldFacts};
+use aterm_effects::pet_world::{PetFill, PetPane, PetRect, PetReserve, PetWorldFacts};
 use aterm_effects::word_decorations::{DecoConfig, WordDecorations};
 use aterm_lexicon::Lexicon;
 
@@ -198,7 +198,10 @@ struct Host {
     /// letter.
     guesses: Vec<(u16, u16, u64)>,
     shots: Vec<Shot>,
-    input: Option<(u64, RenderInput)>,
+    /// The redraw's scratch, as the shipped host keeps it (`app_render`'s `input_scratch`): a
+    /// damage-consuming refill every present, so a present over the same cells keeps the pet's
+    /// reading of them ([`PetFill`]) and the word rescan's ([`WordDecorations::needs_rescan`]).
+    input: RenderInput,
     /// The chrome the last present painted, the glass it blanked, and the content sequence of
     /// the frame it painted over, for [`Knobs::chrome_lag`].
     painted: (Vec<PetRect>, Vec<PetRect>, Option<u64>),
@@ -228,7 +231,7 @@ impl Host {
             hold: FrameHold::default(),
             guesses: Vec::new(),
             shots: Vec::new(),
-            input: None,
+            input: RenderInput::default(),
             painted: (Vec::new(), Vec::new(), None),
             schedule: knobs.present_seed,
         }
@@ -323,14 +326,14 @@ impl Host {
         if self.hold.withholds(&self.term, self.now) {
             return;
         }
-        let mutations = self.term.screen_mutations();
-        if self.input.as_ref().is_none_or(|(at, _)| *at != mutations) {
-            let fresh = self
-                .term
-                .cell_frame(usize::from(self.rows), usize::from(self.cols));
-            self.input = Some((mutations, fresh));
-        }
-        let (_, input) = self.input.as_ref().expect("snapshot taken above");
+        let prior = self.input.extract_gen;
+        let refill = self.term.cell_frame_damage_scoped_into(
+            &mut self.input,
+            usize::from(self.rows),
+            usize::from(self.cols),
+        );
+        let fill = PetFill::after_refill(prior, refill);
+        let input = &self.input;
         let world = PetWorldFacts::read(&self.term, 7);
         let now = self.ms();
         self.guesses
@@ -416,7 +419,7 @@ impl Host {
             },
         };
         self.owner
-            .observe_console_reserved(input, &world, PetPane::full(input), reserve);
+            .observe_console_filled(input, fill, &world, PetPane::full(input), reserve);
         let facts = TerminalFacts::read(&self.term, 7, false);
         let host = HostFrameInput::new(
             self.now,
@@ -441,16 +444,18 @@ impl Host {
             &mut self.decos,
         );
         let frame = self.owner.tick(tick).pet;
-        self.decos.rescan_from_cells(
-            &input.cells,
-            &input.line_sizes,
-            usize::from(self.rows),
-            usize::from(self.cols),
-            &self.lexicon,
-            &self.cfg,
-            input.content_seq,
-            self.now,
-        );
+        if self.decos.needs_rescan(input.content_seq) {
+            self.decos.rescan_from_cells(
+                &input.cells,
+                &input.line_sizes,
+                usize::from(self.rows),
+                usize::from(self.cols),
+                &self.lexicon,
+                &self.cfg,
+                input.content_seq,
+                self.now,
+            );
+        }
         let caret = self.term.cursor();
         let letters_over = (frame.row.round() as usize)
             .checked_sub(1)
@@ -2243,6 +2248,10 @@ fn the_composers_rule_carries_the_cat_it_grows_under() {
     }
 }
 
+/// Where [`the_sessions_first_trip_is_its_only_one`] stops each replay (ms): past the 10 s it
+/// judges by more than a bound's longest shape ([`WRAP_BOUND_MS_MAX`]).
+const FIRST_TRIP_CUT_MS: u64 = 13_000;
+
 /// THE SESSION'S FIRST TRIP IS ITS ONLY ONE. A cat asleep at the top-left wakes
 /// as Claude Code's first screens lay out the session and its first turn pushes
 /// the composer down the screen. It goes once, and that trip ends where it then
@@ -2258,6 +2267,10 @@ fn the_composers_rule_carries_the_cat_it_grows_under() {
 /// Judged on the first 10 s at 120 and 60 Hz, with the echo from as recorded to
 /// 300 ms late, plain and with the harness: one flight at most, landing where the
 /// cat is at 3 s; plain, on the caret's row; with the harness, by the composer.
+/// Each replay stops at [`FIRST_TRIP_CUT_MS`]: a present reads only the events before
+/// it ([`Host::replay_until`]), so what it judges is what the whole replay draws, and
+/// a flight still in the air at the cut fails the test rather than falling out of
+/// [`flights_of`]. Nothing later in the take is judged here.
 ///
 /// NEGATIVE CONTROL (as run before the fix, a seat kept anywhere in reach): with
 /// the harness and the echo 10 ms late or more the cat rested at row 3.85 under
@@ -2291,20 +2304,41 @@ fn the_sessions_first_trip_is_its_only_one() {
         }
     }
     let seen = crate::common::par_map(&runs, |(label, knobs)| {
-        let h = Host::replay(&TAKES[0], *knobs);
+        let h = Host::replay_until(
+            &TAKES[0],
+            *knobs,
+            recording(TAKES[0].src, 1_000_000),
+            Some(FIRST_TRIP_CUT_MS),
+        );
         let flights: Vec<_> = flights_of(&h.shots)
             .into_iter()
             .filter(|(at, ..)| *at < 10_000)
             .map(|(at, from, landed, to)| (at, from, (landed.col.round(), landed.row), to))
             .collect();
+        let left = h
+            .shots
+            .windows(2)
+            .filter(|w| {
+                w[1].ms < 10_000
+                    && w[1].frame.action == PetAction::Leap
+                    && w[0].frame.action != PetAction::Leap
+            })
+            .count();
+        let last = h.shots.last().map_or(0, |s| s.ms);
         let at3 = h
             .shots
             .iter()
             .find(|s| s.ms >= 3_000 + knobs.echo_ms)
             .map(|s| (s.frame.col, s.frame.row, s.caret));
-        (label.clone(), knobs.brand, flights, at3)
+        (label.clone(), knobs.brand, flights, left, last, at3)
     });
-    for (label, harness, flights, at3) in seen {
+    for (label, harness, flights, left, last, at3) in seen {
+        assert!(
+            last >= 10_000 && left == flights.len(),
+            "{label}: the replay cut at {FIRST_TRIP_CUT_MS} ms presented to {last} ms, and of the \
+             {left} flights that left in the first 10 s {} came down by then",
+            flights.len()
+        );
         assert!(
             flights.len() <= 1,
             "{label}: the session's first trips (ms, caret, landing at (col, row), caret): \
@@ -3193,14 +3227,31 @@ const WRAP_BOUND_MS_MAX: u64 = 850;
 /// shape, at 120 and 60 Hz, the echo as recorded and 150 ms late, plain, with the chips, with
 /// the harness, and with the harness's chrome a present late. So does the long insert's wrap at
 /// 26.9 s, where the word the wrap broke comes down with the caret a present or more after the
-/// caret went to the line's start (8 cells on), each take also under a window's present timing
-/// (a present a vsync, two or three after the one before, late by up to 3 ms, 3 schedules).
+/// caret went to the line's start (8 cells on). Both also hold under a window's present timing
+/// (a present a vsync, two or three after the one before, late by up to 3 ms): the long insert
+/// on schedule 3 at each rate and echo, the generating take on schedule 3 at 60 Hz with the
+/// echo as recorded, and on schedules 1 and 2 at 60 Hz with the echo 150 ms late.
+///
+/// Why these schedules. A schedule moves which present shows the wrap and how many presents the
+/// flight spans, so it spreads a wrap's leave and its time aloft around the on-time cell's. Of
+/// the 128 cells with schedules 0 to 3 on both takes everywhere, the latest leave (149 ms) is
+/// the generating take's schedule 1 kept here, the longest flight (598 ms) its schedule 3 kept
+/// here, and a gather drawn out until any of the 128 leaves late first shows on its schedule 2
+/// kept here; the long insert's schedule 3 shows the word's step before the cat springs at all
+/// four rates and echoes. So a change that stretches the leave or the flight, or that reads the
+/// word's step as the wrap's end and takes the brisk shape from the wrap's mark alone, still
+/// fails. Not implied: a defect only on the generating take and only on a schedule and pair of
+/// rate and echo not run here would pass. Each cell holds its wraps and a bound for each, and a
+/// schedule that stopped moving a present (a replica of the on-time cell) fails too.
 ///
 /// NEGATIVE CONTROL (as run on main before the fix): every wrap's bound 1.06 to 1.17 s in the
 /// air, paced as a quiet crossing (0.74 of the pane a second); with the harness the cat, sat at
 /// the margin, perked first and left 424 ms after the wrap. With the word's step read as a jump
-/// that ended the wrap, the long insert's cat at the far margin crossed 101 cells in 0.96 s at
-/// 60 Hz whenever a present showed the step before the cat sprang.
+/// that ended the wrap and only a bound the wrap still marks brisk, the long insert's cat at the
+/// far margin crossed 101 cells in 0.96 s at 60 Hz whenever a present showed the step before the
+/// cat sprang (the step's reading alone no longer fails: every quiet bound is brisk now). With
+/// `CROUCH_DUR` at 0.16 s (0.15 s passes), the generating take's bound on schedule 2 at 60 Hz,
+/// the echo 150 ms late, left 205 ms after the wrap at 30.9 s.
 #[test]
 fn the_writings_wrap_is_a_brisk_bound() {
     let hosts = [
@@ -3221,24 +3272,52 @@ fn the_writings_wrap_is_a_brisk_bound() {
             ..Knobs::SHIPPED
         },
     ];
-    // `(take, the wraps it holds)`: the generating take, and the long insert.
+    // `(take, the wraps it holds, the host)`: the generating take, and the long insert.
     let mut runs: Vec<(usize, usize, Knobs)> = Vec::new();
-    for (take, wraps) in [(0usize, 3usize), (3, 1)] {
-        for host in hosts {
-            for (frame_ms, echo_ms) in [(8u64, 0u64), (16, 0), (8, 150), (16, 150)] {
-                for present_seed in 0..=3u64 {
-                    runs.push((
-                        take,
-                        wraps,
-                        Knobs {
-                            frame_ms,
-                            echo_ms,
-                            present_seed,
-                            ..host
-                        },
-                    ));
-                }
+    for host in hosts {
+        for (frame_ms, echo_ms) in [(8u64, 0u64), (16, 0), (8, 150), (16, 150)] {
+            runs.push((
+                0,
+                3,
+                Knobs {
+                    frame_ms,
+                    echo_ms,
+                    ..host
+                },
+            ));
+            for present_seed in [0u64, 3] {
+                runs.push((
+                    3,
+                    1,
+                    Knobs {
+                        frame_ms,
+                        echo_ms,
+                        present_seed,
+                        ..host
+                    },
+                ));
             }
+        }
+        runs.push((
+            0,
+            3,
+            Knobs {
+                frame_ms: 16,
+                present_seed: 3,
+                ..host
+            },
+        ));
+        for present_seed in [1u64, 2] {
+            runs.push((
+                0,
+                3,
+                Knobs {
+                    frame_ms: 16,
+                    echo_ms: 150,
+                    present_seed,
+                    ..host
+                },
+            ));
         }
     }
     let seen = crate::common::par_map(&runs, |&(take, wraps_held, knobs)| {
@@ -3283,6 +3362,23 @@ fn the_writings_wrap_is_a_brisk_bound() {
             crossings,
         )
     });
+    // A run on a schedule moved its presents: its wraps do not all fall as the on-time run's do.
+    let crossings_of = |take: usize, knobs: Knobs| {
+        let run = runs.iter().position(|&(t, _, k)| t == take && k == knobs);
+        &seen[run.expect("a run of the matrix")]
+    };
+    for &(take, _, knobs) in runs.iter().filter(|(_, _, k)| k.present_seed != 0) {
+        let (label, _, crossings) = crossings_of(take, knobs);
+        let on_time = Knobs {
+            present_seed: 0,
+            ..knobs
+        };
+        assert_ne!(
+            crossings,
+            &crossings_of(take, on_time).2,
+            "{label}: its schedule moved no present its wraps read"
+        );
+    }
     for (label, wraps_held, crossings) in seen {
         assert!(
             crossings.len() >= wraps_held,

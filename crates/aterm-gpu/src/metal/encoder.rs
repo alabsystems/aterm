@@ -867,6 +867,12 @@ pub(crate) struct Submitted {
 }
 
 impl Submitted {
+    /// How long the GPU ran this command buffer, `GPUEndTime - GPUStartTime` (zero until it ran).
+    pub(crate) fn gpu_span(&self) -> aterm_time::Duration {
+        let (start, end) = super::ffi::gpu_times(self.cb.id());
+        aterm_time::Duration::from_secs_f64((end - start).max(0.0))
+    }
+
     /// Block until terminal, classify, feed the latch once, return the outcome (same contract as [`super::swapchain::PresentTicket::wait_outcome`]).
     pub(crate) fn wait_outcome(&self) -> loss::CbOutcome {
         if let Some(done) = self.settled.get() {

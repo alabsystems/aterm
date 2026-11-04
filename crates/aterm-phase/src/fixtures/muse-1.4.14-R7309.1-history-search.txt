@@ -1,0 +1,24 @@
+# muse 1.4.14-R7309.1 · MEASURED 2026-11-04, `aterm ctl text` of a private headless aterm (144x50, aterm 0.153.0) running the real Muse Code, launched by path with a scratch `HOME`, a fake `META_API_KEY` and `--base-url http://127.0.0.1:<port>` (a local stub of Meta's model API, crates/aterm-lab) · Muse Code's prompt-history search (ctrl+r) open at a turn end, query readme, its match in the composer row · cursor=21,37
+
+  Muse Code 1.4.14
+
+❯ please read the readme
+
+◆ Hi! I am the local lab stub, not a model. (reply 1)
+
+❯ SCENE-C please look
+
+◆ Used tool operation — unavailable
+└ unknown tool `Read`. Session tool ids: muse.add_memory, muse.bash, muse.bash_input, muse.create_goal, muse.cron_create, muse.cron_delete, muse
+.cron_list, muse.edit_file, muse.edit_memory, muse.get_goal, muse.list_peer_sessions, muse.monitor, muse.read_file, muse.read_memory, muse.read_
+skill, muse.report_progress, muse.request_user_input, muse.search, muse.send_session_message, muse.snooze_reminder, muse.subagent_cancel, muse.s
+ubagent_read_result, muse.subagent_send_message, muse.subagent_spawn, muse.subagent_status, muse.subagent_wait, muse.update_goal, muse.web_fetch
+, muse.web_search, muse.work_list, muse.work_status, muse.work_stop, muse.workflow, muse.write_file, muse.write_todos
+
+◆ Implemented the parser module and its unit tests in this turn.
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ please read the readme
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  [everywhere] search prompts: readme
+  lab-stub · high · /private/tmp/at.lab0/proj · Auto-review

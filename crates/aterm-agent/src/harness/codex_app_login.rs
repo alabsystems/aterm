@@ -268,6 +268,9 @@ pub fn auth_path_in_home(home: &Path) -> PathBuf {
     }
 }
 
+/// The lock [`AuthLock::open`] makes beside [`AUTH_FILE`], and leaves there.
+pub const AUTH_LOCK_FILE: &str = "auth.json.lock";
+
 /// `auth_file`'s lock file: its name with [`LOCK_SUFFIX`] after it, in the same directory.
 #[must_use]
 pub fn lock_path(auth_file: &Path) -> PathBuf {
@@ -294,9 +297,12 @@ fn read_auth_file_bounded_with(
     // The shared opener rejects final links/reparse points using the opened handle,
     // including a name replaced after its preliminary check. It fails closed on
     // unsupported platforms and never creates or modifies the credential file.
-    let (file, _) = open(&path).ok()?;
+    let (file, meta) = open(&path).ok()?;
     let limit = AUTH_FILE_MAX as u64;
-    let mut bytes = Vec::new();
+    if meta.len() > limit {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0).saturating_add(1));
     file.take(limit.saturating_add(1))
         .read_to_end(&mut bytes)
         .ok()?;
@@ -809,8 +815,15 @@ impl RefreshJournal {
                 return Err(invalid());
             }
         }
-        let mut bytes = Vec::new();
         let limit = AUTH_FILE_MAX as u64;
+        if metadata.len() > limit {
+            return Err(invalid());
+        }
+        let mut bytes = Vec::with_capacity(
+            usize::try_from(metadata.len())
+                .unwrap_or(0)
+                .saturating_add(1),
+        );
         file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
         if bytes.len() as u64 > limit {
             return Err(invalid());
@@ -3143,7 +3156,7 @@ pub fn login_with(
             cancelled.store(true, Ordering::SeqCst);
             let _ = server_thread.join();
             return Drove {
-                outcome: Outcome::Unverified(why),
+                outcome: Outcome::PageNotOpened(why),
                 host,
             };
         }

@@ -149,8 +149,7 @@ aterm-log = { workspace = true }
 # flag a cooperative program crossed — so a replay feeds them back through the
 # same crate's `ReplaySeam`, and nothing re-spells the record kinds. From
 # `vendor/astream` (a git submodule pinned to one commit, as aterm-link's
-# broker), zero dependencies of its own; the framing, the codec and the
-# recovery are aterm's (the crate says recording never needs the wire frame).
+# broker), zero dependencies of its own; the codec is aterm's.
 astream-effects = { path = "../../vendor/astream/crates/astream-effects" }
 # THE BOOT a count of the machine's sleep is on (`supervise::fx`'s `os_asleep`,
 # `policy::sleeps::Boot`): `boot_session`, the kernel's boot id as 16 bytes,
@@ -169,11 +168,17 @@ astream-effects = { path = "../../vendor/astream/crates/astream-effects" }
 # (its directory flush's classification, `dir_flush_unavailable`), and
 # aterm-link on Unix; on Windows no `unsafe` of it is compiled.
 astream-sys = { path = "../../vendor/astream/crates/astream-sys" }
-# A tape's frames: LZ4 blocks for a frame that compression shrinks by an eighth
-# or more, and each frame's xxh64. Both first-party and dependency-free, and
-# neither a new edge in the shipped graph: aterm-scrollback's warm tier links
-# aterm-lz4, atpkg links aterm-zstd.
+# A tape's frames are astream step records (`astream_wire::steps`, claim
+# `wire.steps.torn-vs-fault`): each a CRC-32 frame whose step is its place, read
+# back with astream's torn-or-fault scan. Dependency-free, and no new edge in the
+# shipped graph: agh's write journal and aterm-codec already link it.
+astream-wire = { path = "../../vendor/astream/crates/astream-wire" }
+# A tape frame's payload: an LZ4 block for a frame that compression shrinks by an
+# eighth or more. First-party and dependency-free, and no new edge in the shipped
+# graph: aterm-scrollback's warm tier links it.
 aterm-lz4 = { workspace = true }
+# xxh64: the tape's delta keys, its ids and digest seed, and a worker's digest
+# (`policy::git_config`). First-party and dependency-free; atpkg links it.
 aterm-zstd = { workspace = true }
 # The disk reclaim (`harness::disk::target`) reaches every profile, lock and
 # cache of a build directory through directory handles it opened without

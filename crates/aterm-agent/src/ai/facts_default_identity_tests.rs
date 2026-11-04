@@ -233,18 +233,25 @@ fn default_only_wall_facts_keep_identity_refusal_ahead_of_reset_recovery() {
                     &roster,
                     picked,
                     &pool.b.home,
+                    program,
+                    None,
                 )
-                .map_err(|why| why.to_string())
             },
         )
-        .unwrap_err();
+        .unwrap_err()
+        .to_string();
         assert_eq!(calls.get(), 1);
         let row = crate::ai::state::assess(&facts, true, DoctorPool::NOW);
         if email == "other@example.com" {
-            let identity =
-                accounts_pool::check_default_login_identity(Cli::Codex, &roster, &pool.b.home)
-                    .unwrap_err()
-                    .to_string();
+            let identity = accounts_pool::check_default_login_identity(
+                Cli::Codex,
+                &roster,
+                &pool.b.home,
+                program,
+                None,
+            )
+            .unwrap_err()
+            .to_string();
             assert_eq!(observed, identity);
             assert_eq!(view.launch_refused.as_deref(), Some(identity.as_str()));
             assert!(
@@ -289,4 +296,63 @@ fn non_file_codex_facts_do_not_judge_a_contradictory_stale_auth_file() {
         assert_eq!(view.launch_refused, None);
         assert_eq!(std::fs::read(path).unwrap(), stale);
     }
+}
+
+/// A POOL WHOSE LAUNCH IS REFUSED FOR WHAT ITS DEFAULT LOGIN NAMES COUNTS IN `health:`, by the CLI's
+/// name, and asks a person for the sign-in that ends it. CONTROL: the login its row names is OK.
+#[test]
+fn a_launch_refused_for_a_moved_default_counts_in_health() {
+    let pool = DoctorPool::new(true, Some(Mode::Early));
+    pool.main_alone(Some("main@example.com"));
+    pool.state(|state| state.active = Some("main".into()));
+    let path = pool.b.home.join(".codex/auth.json");
+    std::fs::write(&path, auth(Some("main@example.com"))).unwrap();
+    let health_of = || {
+        let row = crate::ai::state::assess(&pool.facts(), true, DoctorPool::NOW);
+        crate::ai::state::health(&[row])
+    };
+    let control = health_of();
+    assert!(!control.warning.contains(&"codex"), "CONTROL: {control:?}");
+    std::fs::write(&path, auth(Some("other@example.com"))).unwrap();
+    let health = health_of();
+    assert_eq!(health.word, "WARN", "{health:?}");
+    assert_eq!(health.warning, ["codex"], "{health:?}");
+    assert_eq!(health.mends.len(), 1, "{health:?}");
+}
+
+/// A SYNC ASKS NO PERSON FOR ANYTHING: where a sync moves the row off a moved default login, the
+/// doctor's row is a note that names no person and mends nothing, and aterm's upkeep runs that sync.
+/// CONTROL: where no row holds that account, a person's sign-in ends it, and the row asks for it.
+#[test]
+fn a_moved_default_a_sync_ends_asks_no_person() {
+    use crate::ai::state::{Actor, Mark, assess};
+    let pool = DoctorPool::new(true, Some(Mode::Early));
+    let default_login = pool.b.home.join(".codex/auth.json");
+    std::fs::write(&default_login, auth(Some("other@example.com"))).unwrap();
+    pool.main_alone(Some("main@example.com"));
+    pool.state(|state| {
+        state.active = Some("main".into());
+        state.pinned = true;
+    });
+    let control = assess(&pool.facts(), true, DoctorPool::NOW);
+    assert_eq!(control.mark, Mark::Warn, "CONTROL: {control:?}");
+    assert_eq!(control.actor, Some(Actor::Person), "CONTROL: {control:?}");
+    assert!(control.mend.is_some(), "CONTROL: {control:?}");
+
+    let work = pool.b.home.join(".aterm/logins/codex/work");
+    std::fs::write(work.join("auth.json"), auth(Some("other@example.com"))).unwrap();
+    std::fs::write(
+        &pool.roster,
+        format!(
+            "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\nemail = \"main@example.com\"\n\n\
+             [[account]]\nlabel = \"work\"\nclass = \"dedicated\"\nemail = \"other@example.com\"\n\
+             dir = \"{}\"\n",
+            work.display()
+        ),
+    )
+    .unwrap();
+    let row = assess(&pool.facts(), true, DoctorPool::NOW);
+    assert_eq!(row.mend, None, "{row:?}");
+    assert_ne!(row.actor, Some(Actor::Person), "{row:?}");
+    assert!(row.mark < Mark::Warn, "{row:?}");
 }

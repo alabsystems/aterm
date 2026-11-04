@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Observations of the existing account decision, never another decision maker.
+//! Observations of account decisions and independent work, without starting recovery.
 
 use super::*;
 use aterm_agent::harness::account_progress::{
@@ -11,6 +11,21 @@ use aterm_agent::harness::account_progress::{
 #[cfg(test)]
 #[path = "progress/tests.rs"]
 pub(super) mod lifecycle_tests;
+
+#[cfg(test)]
+#[path = "progress/activity_tests.rs"]
+mod activity_tests;
+
+#[cfg(test)]
+#[path = "progress/retired_activity_tests.rs"]
+pub(super) mod retired_activity_tests;
+
+#[cfg(test)]
+#[path = "progress/expired_activity_tests.rs"]
+pub(super) mod expired_activity_tests;
+
+#[path = "progress/activity.rs"]
+pub(super) mod activity;
 
 fn observe_lock<T>(value: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>, ()> {
     match value.try_lock() {
@@ -47,6 +62,50 @@ pub(super) struct BoundProgress {
     /// The exact gate recheck, independent of displayed wall time. Normal decisions have none.
     pub(super) execution_until: Option<Instant>,
     pub(super) value: AccountProgress,
+}
+
+/// Metadata captured by the supervisor for observing work before any account decision.
+/// This carries no inventory judgment, selected account, or permission to recover.
+#[derive(Clone)]
+pub(super) struct AccountActivityContext {
+    snapshot: Snapshot,
+    generation: Arc<Mutex<()>>,
+    born: u64,
+    state: PathBuf,
+    labels: BTreeSet<String>,
+    rows: Arc<[accounts::Row]>,
+    policy: Arc<()>,
+}
+
+impl AccountActivityContext {
+    fn current(&self, kept: &Kept) -> bool {
+        progress_context_current(&self.snapshot, &self.generation, kept)
+    }
+
+    fn matches(
+        &self,
+        kept: &Kept,
+        pid: i32,
+        born: Option<u64>,
+        conversation: Option<&str>,
+    ) -> bool {
+        self.current(kept)
+            && same_progress_process(
+                self.snapshot.pid,
+                Some(self.born),
+                self.snapshot.session.as_deref(),
+                pid,
+                born,
+                conversation,
+            )
+    }
+}
+
+fn progress_context_current(snapshot: &Snapshot, generation: &Arc<Mutex<()>>, kept: &Kept) -> bool {
+    Arc::ptr_eq(generation, &kept.account.landing)
+        && kept.snapshot.as_ref().is_some_and(|current| {
+            account_process_matches(current, snapshot) && current.session == snapshot.session
+        })
 }
 
 #[derive(Default)]
@@ -199,10 +258,7 @@ impl BoundProgress {
     }
 
     fn current(&self, kept: &Kept) -> bool {
-        Arc::ptr_eq(&self.generation, &kept.account.landing)
-            && kept.snapshot.as_ref().is_some_and(|s| {
-                account_process_matches(s, &self.snapshot) && s.session == self.snapshot.session
-            })
+        progress_context_current(&self.snapshot, &self.generation, kept)
     }
 
     fn matches(
@@ -544,11 +600,13 @@ impl WorkerIdle {
         let me = who.me(&roster);
         bound.value.account = me.label().map(str::to_owned);
         let store = accounts::Store::at(&seat.state).bounded_by(seat.ladder);
-        let (Ok((state, None)), Ok((logins, None))) =
-            (store.load(seat.now), store.load_logins(seat.now))
-        else {
-            return unconfirmed(bound, "Account records could not be read consistently");
+        let records = match store.read_account_records(seat.roster.as_deref(), seat.now) {
+            Ok(records) if records.roster == roster && records.notes.is_empty() => records,
+            Ok(_) | Err(_) => {
+                return unconfirmed(bound, "Account records could not be read consistently");
+            }
         };
+        let (raw_roster, state, logins) = (records.raw_roster, records.state, records.logins);
         let (point, mut identities) = match judged {
             Some(judged)
                 if judged.roster == roster && judged.identities.seat.context().matches(&seat) =>
@@ -568,6 +626,7 @@ impl WorkerIdle {
         enrich_inventory_with_identity(
             &mut bound.value,
             &roster,
+            &raw_roster,
             &state,
             &logins,
             &accounts::enrolled(&roster),
@@ -681,6 +740,30 @@ impl HostHandle {
             project = "harness_host::tests::account_advice::execution_transition"
         )
     )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "AccountExecutionVisibility",
+            action = "RetainNormal",
+            reason = "The native fixture selects an existing normal decision; its publication is modeled by AccountProgressPolicy"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "AccountExecutionVisibility",
+            action = "RetireNormal",
+            reason = "The native fixture supplies an Off or retired policy input; policy transitions are modeled by AccountProgressPolicy"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "AccountExecutionVisibility",
+            action = "ReplaceActivityRows",
+            reason = "The native fixture supplies admitted Store publication and refreshed metadata; admission is modeled by AccountRenewalGeneration"
+        )
+    )]
     pub(super) fn account_progress_read_with_activity(
         &self,
         sid: &str,
@@ -717,30 +800,82 @@ impl HostHandle {
             .progress
             .as_ref()
             .filter(|bound| bound.matches(&kept, pid, started, conversation));
-        let Some(bound) = execution.or(normal) else {
+        let decision = execution.or(normal);
+        let independent = kept
+            .account
+            .activity_context
+            .as_ref()
+            .filter(|context| context.matches(&kept, pid, started, conversation));
+        if decision.is_none() && independent.is_none() {
             return Ok(Self::unobserved_progress(off, policy_revision));
-        };
-        let policy_retired = !bound.policy_is(&kept.account.progress_policy);
+        }
+        let policy_retired = decision.map_or_else(
+            || {
+                independent.is_some_and(|context| {
+                    !Arc::ptr_eq(&context.policy, &kept.account.progress_policy)
+                })
+            },
+            |bound| !bound.policy_is(&kept.account.progress_policy),
+        );
         let execution_active = execution.is_some();
-        let execution_until = execution.and_then(|bound| bound.execution_until);
-        let mut value = bound.value.clone();
+        let execution_until = execution
+            .and_then(|bound| bound.execution_until)
+            .filter(|until| mono < *until);
+        let mut value =
+            decision.map_or_else(|| AccountProgress::unknown(0), |bound| bound.value.clone());
         value.forecasts_paused = off || policy_retired;
-        // Prefer the gate's own roster; use a current decision only if that gate read failed.
-        let activity_context = if bound.born.is_some() && bound.state.is_none() {
-            normal
-                .filter(|normal| normal.state.is_some())
-                .unwrap_or(bound)
+        // Current decisions and live gates keep their captured metadata. Retired
+        // observations may expose independent work without renewing a judgment.
+        let fallback = decision.and_then(|bound| {
+            if bound.born.is_some() && bound.state.is_none() {
+                normal
+                    .filter(|normal| normal.state.is_some())
+                    .or(Some(bound))
+            } else {
+                Some(bound)
+            }
+        });
+        let fallback = fallback.filter(|bound| bound.state.is_some());
+        let retired_activity = independent.filter(|context| {
+            let retired_normal = normal.is_some() && !execution_active && (off || policy_retired);
+            let changed_expired_execution = execution_active
+                && execution_until.is_none()
+                && fallback.is_some_and(|bound| {
+                    bound.state.as_ref() != Some(&context.state)
+                        || bound.rows.as_ref() != context.rows.as_ref()
+                });
+            (retired_normal || changed_expired_execution)
+                && Arc::ptr_eq(&context.policy, &kept.account.progress_policy)
+        });
+        let activity_context = retired_activity.or(independent.filter(|_| fallback.is_none()));
+        let (state, labels, rows) = if let Some(context) = activity_context {
+            (
+                Some(context.state.clone()),
+                context.labels.clone(),
+                Arc::clone(&context.rows),
+            )
+        } else if let Some(bound) = fallback {
+            (
+                bound.state.clone(),
+                bound.labels.clone(),
+                Arc::clone(&bound.rows),
+            )
         } else {
-            bound
+            (None, BTreeSet::new(), Arc::from([]))
         };
-        let state = activity_context.state.clone();
-        let labels = activity_context.labels.clone();
-        let rows = Arc::clone(&activity_context.rows);
         let mut current_work = false;
-        if bound.born.is_some() {
-            if let Some(flying) = kept.account.flying.as_ref().filter(|flying| {
-                flying.pid == bound.snapshot.pid && flying.start == bound.snapshot.start
-            }) {
+        let work_snapshot = independent.map(|context| &context.snapshot).or_else(|| {
+            decision
+                .filter(|bound| bound.born.is_some())
+                .map(|bound| &bound.snapshot)
+        });
+        if let Some(snapshot) = work_snapshot {
+            if let Some(flying) = kept
+                .account
+                .flying
+                .as_ref()
+                .filter(|flying| flying.pid == snapshot.pid && flying.start == snapshot.start)
+            {
                 current_work = true;
                 if flying.rejected.is_some() {
                     value.phase = ProgressPhase::Waiting;
@@ -754,29 +889,34 @@ impl HostHandle {
                     };
                 }
             } else if let Some(moved) = kept.account.moved.as_ref().filter(|moved| {
-                account_process_matches(&moved.process, &bound.snapshot) && !moved.answered
+                account_process_matches(&moved.process, snapshot) && !moved.answered
             }) {
                 current_work = true;
                 value.phase = ProgressPhase::Verifying {
                     to: moved.to.clone(),
                 };
-            } else if kept.account.probing.as_ref().is_some_and(|probe| {
-                probe.pid == bound.snapshot.pid && probe.start == bound.snapshot.start
-            }) {
+            } else if kept
+                .account
+                .probing
+                .as_ref()
+                .is_some_and(|probe| probe.pid == snapshot.pid && probe.start == snapshot.start)
+            {
                 current_work = true;
                 value.phase = ProgressPhase::Probing;
             } else if let Some(held) = kept
                 .account
                 .held
-                .filter(|why| *why != "off" && !execution_active)
+                .filter(|why| *why != "off" && !execution_active && decision.is_some())
             {
                 value.phase = ProgressPhase::Waiting;
                 value.details.insert(0, reason(held));
             }
         }
+        let context_only = decision.is_none();
+        let active_only = context_only || retired_activity.is_some();
         drop(kept);
         // Currentness is monotonic; the wall clock is only for displayed timestamps and activity.
-        let mut execution_until = execution_until.filter(|until| mono < *until);
+        let mut execution_until = execution_until;
         if execution_active && execution_until.is_none() {
             let phase = value.phase.clone();
             expire_execution(&mut value);
@@ -793,13 +933,28 @@ impl HostHandle {
             let gate_deadline = execution_until.is_some().then_some(value.next_at);
             let activity = activity(&accounts::Store::at(&state), accounts::Cli::Claude, now);
             match activity {
-                Some(activity) => apply_login_activity(&mut value, &labels, &rows, activity, now),
+                Some(mut activity) => {
+                    if active_only {
+                        // An observation context is not a decision or a retry forecast.
+                        // It can expose actual work alongside a retired judgment or before one.
+                        activity.retain(|entry| entry.active);
+                        for entry in &mut activity {
+                            entry.next_at = None;
+                            entry.diagnostic = None;
+                        }
+                    }
+                    apply_login_activity(&mut value, &labels, &rows, activity, now);
+                }
                 None if execution_active => activity_contended = true,
                 None => return Err(()),
             }
             if let Some(deadline) = gate_deadline {
                 value.next_at = deadline;
             }
+        }
+        if context_only && !current_work && !matches!(value.phase, ProgressPhase::SigningIn { .. })
+        {
+            return Ok(Self::unobserved_progress(off, policy_revision));
         }
         if self.shared.switches.accounts() == accounts::Mode::Off && execution_active {
             value
@@ -810,6 +965,7 @@ impl HostHandle {
                 value.phase,
                 ProgressPhase::Switching { .. }
                     | ProgressPhase::Verifying { .. }
+                    | ProgressPhase::Probing
                     | ProgressPhase::SigningIn { .. }
             )
         {

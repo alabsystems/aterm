@@ -1374,7 +1374,7 @@ mod hid_idle {
                 ) != 0;
             CFRelease(value);
             #[allow(clippy::cast_precision_loss)]
-            ok.then(|| idle_ns as f64 / 1e9)
+            ok.then_some(idle_ns as f64 / 1e9)
         }
     }
 }

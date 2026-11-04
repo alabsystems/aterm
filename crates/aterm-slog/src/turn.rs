@@ -19,6 +19,51 @@ pub const STEP_ACT_MS: u64 = 500;
 /// How soon after an input's admission, with no approval or question step open then, the first such step must open for the input to bind it.
 pub const STEP_INPUT_LEAD_MS: u64 = 500;
 
+/// A box a program claims on OSC 7501: `blocked:permission` or `blocked:question`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ClaimedBox {
+    /// `blocked:permission`: an approval box.
+    Approval,
+    /// `blocked:question`: a question the program put to the person.
+    Question,
+}
+
+impl ClaimedBox {
+    /// Its step: an approval is `box=other`, since 7501 names no tool.
+    #[must_use]
+    pub const fn step(self) -> ScreenStep {
+        match self {
+            ClaimedBox::Approval => ScreenStep::Approval(BoxWord::OTHER),
+            ClaimedBox::Question => ScreenStep::Question,
+        }
+    }
+
+    /// Its carry word (`claim_what=`).
+    const fn word(self) -> &'static str {
+        match self {
+            ClaimedBox::Approval => "approval",
+            ClaimedBox::Question => "question",
+        }
+    }
+}
+
+/// What a written program mark claims of the program's box.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClaimedReport {
+    /// The box the report shows (`None`: none, whatever else it says).
+    pub boxed: Option<ClaimedBox>,
+    /// The engine's sequence where the report began: the box's identity.
+    pub began: u64,
+}
+
+/// What the tracker holds of its claimed box, for the conformance projection.
+#[cfg(any(test, debug_assertions))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClaimView {
+    /// The claim step held: (step, kind, began, under_turn); a carried one's began is `None`.
+    pub held: Option<(Node, ClaimedBox, Option<u64>, bool)>,
+}
+
 /// What an input says it means for the step it dismisses (`act=`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ActWord {
@@ -342,6 +387,16 @@ struct Held {
     opened: Option<Stamp>,
 }
 
+/// The program's claimed box step ([`TurnTracker::claim_box`]): a decision step in a slot of its
+/// own, beside the screen's step, its box, and the `began` of the report that showed it (`None`:
+/// carried across an update, so the next report of its kind adopts it).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ClaimHeld {
+    held: Held,
+    boxed: ClaimedBox,
+    began: Option<u64>,
+}
+
 /// Whether an input binds to the screen's step `what`: a decision step
 /// ([`crate::log::is_decision_step`]), the rule a node-less act and the harness's escalation
 /// read too.
@@ -410,6 +465,8 @@ pub struct TrackerView {
     pub turn: Option<Node>,
     /// The screen step held open, its kind and whether it hangs from the turn (or from the run).
     pub step: Option<(Node, ScreenStep, bool)>,
+    /// The claimed box's step held open beside it ([`TurnTracker::claim_box`]).
+    pub claim: Option<Node>,
     /// The current word.
     pub word: Verdict,
     /// The armed settle and how long it has held at the asked time.
@@ -696,6 +753,9 @@ pub struct TurnTracker {
     proof_unique: bool,
     turn: Option<Node>,
     step: Option<Held>,
+    /// The program's claimed box step, in a slot apart from [`Self::step`], so a screen stall or
+    /// wall and a claimed box stand together ([`Self::claim_box`]).
+    claim: Option<ClaimHeld>,
     word: Verdict,
     settle: Option<Settle>,
     interrupted: Interruption,
@@ -765,6 +825,7 @@ impl TurnTracker {
             proof_unique: true,
             turn: None,
             step: None,
+            claim: None,
             word: Verdict::Unknown,
             settle: None,
             interrupted: Interruption::None,
@@ -828,6 +889,10 @@ impl TurnTracker {
                 self.close_turn(log, TurnOut::Gone, Conf::Strong, None, false, at);
                 if self.step.is_some() {
                     self.close_step(log, StepOut::Gone, at);
+                }
+                // A claimed box under the run: one under the turn closed with it.
+                if self.claim.is_some() {
+                    self.close_claim(log, true, at);
                 }
                 return self.wake_at();
             }
@@ -1227,6 +1292,110 @@ impl TurnTracker {
         self.tx.stopped = true;
     }
 
+    /// THE PROGRAM'S OWN CLAIM OF ITS BOX (a written program mark's words, for a run whose screen
+    /// opens no turn: a codex-alab's): `report` showing a box (`blocked:permission` or
+    /// `blocked:question`) opens one decision step, `open p<n> approval box=other` or `open p<n>
+    /// question`, at `src=engine conf=claim`, under the open turn, else under the run, in a slot
+    /// apart from the screen's step. One step per box: the report's `began` is its identity, so a
+    /// report of the same kind and began adopts the standing step (a carried one, whose began is
+    /// unknown, adopts the next report of its kind), and any other report (another began or kind,
+    /// no box, `state=none`) is its leave: the step closes there, attributed as a screen step is
+    /// (the input bound to it within [`STEP_ACT_MS`], else `out=passed` with no `by=`), at
+    /// `src=engine conf=claim`. Its turn's close is its leave too, written first at the turn's
+    /// time (`out=gone` when the turn closed gone). Nothing opens while the screen opens the run's
+    /// turns ([`Self::ensure_turn`] closes a standing one). It arms no wake.
+    pub fn claim_box(&mut self, log: &mut Log, report: ClaimedReport, at: Stamp) -> Option<u64> {
+        self.resync(log);
+        if !log.is_open(self.run) {
+            return self.wake_at();
+        }
+        self.settle_if_due(log, at);
+        if self.screen_turns {
+            return self.wake_at();
+        }
+        if let Some(c) = self.claim.as_mut() {
+            if report.boxed == Some(c.boxed) && c.began.is_none_or(|b| b == report.began) {
+                c.began = Some(report.began);
+                return self.wake_at();
+            }
+            self.close_claim(log, false, at);
+        }
+        if let Some(boxed) = report.boxed {
+            let what = boxed.step();
+            let mut f = Fields::new();
+            if let ScreenStep::Approval(b) = what {
+                let _ = f.set(Key::Box, Val::Word(b.word()));
+            }
+            let under_turn = self.turn.is_some();
+            let parent = self.turn.unwrap_or(self.run);
+            let at = no_earlier(at, log.open_entry(parent).map_or(0, |e| e.t));
+            let open = Open::new(what.kind(), Src::Engine, Conf::Claim)
+                .under(parent)
+                .fields(f);
+            if let Ok(node) = log.open(open, at) {
+                self.claim = Some(ClaimHeld {
+                    held: Held {
+                        node,
+                        what,
+                        under_turn,
+                        detail: None,
+                        opened: Some(at),
+                    },
+                    boxed,
+                    began: Some(report.began),
+                });
+                self.opened_decision(node, at);
+            }
+        }
+        self.wake_at()
+    }
+
+    /// The claimed box's leave at `at`: its close, attributed as a screen step's
+    /// ([`Self::attribution_of`]), or `out=gone` when the program or its turn went, at
+    /// `src=engine conf=claim`; then the slot is forgotten.
+    fn close_claim(&mut self, log: &mut Log, gone: bool, at: Stamp) {
+        if let Some(c) = self.claim.as_ref()
+            && log.is_open(c.held.node)
+        {
+            let (by, out, orphan) = if gone {
+                (Actor::Nobody, StepOut::Gone, None)
+            } else {
+                self.attribution_of(&c.held, at)
+            };
+            let f = orphan
+                .and_then(|a| Fields::new().word(Key::Act, a.word()).ok())
+                .unwrap_or_default();
+            let at = no_earlier(at, log.open_entry(c.held.node).map_or(0, |e| e.t));
+            let _ = log.close(
+                c.held.node,
+                Close::new(Out::Step(out), Src::Engine, Conf::Claim)
+                    .by(by)
+                    .fields(f),
+                at,
+            );
+        }
+        self.forget_claim();
+    }
+
+    /// The claimed box's step, while one stands ([`Self::claim_box`]).
+    #[must_use]
+    pub fn claim_node(&self) -> Option<Node> {
+        self.claim.as_ref().map(|c| c.held.node)
+    }
+
+    /// What the tracker holds of its claimed box, for a conformance projection
+    /// (`ClaimedBoxSteps`).
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn claim_view(&self) -> ClaimView {
+        ClaimView {
+            held: self
+                .claim
+                .as_ref()
+                .map(|c| (c.held.node, c.boxed, c.began, c.held.under_turn)),
+        }
+    }
+
     /// The screen reported the turn interrupted (`aterm_phase::turn::interrupted`): its idle close is `out=interrupted`, and an approval step the next published verdict closes was declined (Claude Code's `⎿  Interrupted · What should Claude do instead?` under the call its box asked about: the person's Esc, or the box's own "No"), unless an act bound to it said otherwise.
     pub const fn note_interrupted(&mut self) {
         if self.turn.is_some() {
@@ -1277,7 +1446,7 @@ impl TurnTracker {
     pub fn admit(&self, at: Stamp) -> Admission {
         Admission {
             run: self.run,
-            step: self.step.as_ref().filter(|h| binds(h.what)).map(|h| h.node),
+            step: self.decision().map(|h| h.node),
             at,
             opens: self.opens,
             closes: self.closes,
@@ -1298,7 +1467,7 @@ impl TurnTracker {
             return Binding::Unbound;
         }
         if let Some(node) = adm.step {
-            if self.step.as_ref().is_some_and(|h| h.node == node) {
+            if self.decision().is_some_and(|h| h.node == node) {
                 self.bind_input(node, by, act, at);
                 return Binding::Step(node);
             }
@@ -1319,8 +1488,8 @@ impl TurnTracker {
                 });
                 Binding::Lead
             }
-            Some(1) => match self.step.as_ref() {
-                Some(h) if binds(h.what) && h.opened.is_some_and(|o| within_lead(adm.at, o)) => {
+            Some(1) => match self.decision() {
+                Some(h) if h.opened.is_some_and(|o| within_lead(adm.at, o)) => {
                     let node = h.node;
                     self.bind_input(node, by, act, at);
                     Binding::Step(node)
@@ -1334,8 +1503,8 @@ impl TurnTracker {
     /// A PERSON's input at `at` (delivery).
     pub fn person(&mut self, log: &Log, at: Stamp) -> Binding {
         self.resync(log);
-        match self.step.as_ref() {
-            Some(h) if binds(h.what) => {
+        match self.decision() {
+            Some(h) => {
                 let node = h.node;
                 self.bind_input(node, Actor::Human, None, at);
                 Binding::Step(node)
@@ -1373,6 +1542,7 @@ impl TurnTracker {
         TrackerView {
             turn: self.turn,
             step: self.step.as_ref().map(|h| (h.node, h.what, h.under_turn)),
+            claim: self.claim_node(),
             word: self.word,
             settle: self.settle.map(|s| (s.cause, s.held(now_mono))),
             last_close: self.last_close,
@@ -1470,6 +1640,14 @@ impl TurnTracker {
             }
         }
         self.tx.carry_into(&mut s);
+        if let Some(c) = &self.claim {
+            s.push_str(&format!(
+                " claim={} claim_under={} claim_what={}",
+                c.held.node,
+                u8::from(c.held.under_turn),
+                c.boxed.word()
+            ));
+        }
         s
     }
 
@@ -1539,6 +1717,33 @@ impl TurnTracker {
                     under_turn,
                     detail,
                     opened: None,
+                })
+            }
+        };
+        let claim = match get("claim") {
+            None => None,
+            Some(n) => {
+                let node = Node::parse(n).filter(|n| n.lvl == crate::vocab::Lvl::Step)?;
+                let boxed = match get("claim_what")? {
+                    "approval" => ClaimedBox::Approval,
+                    "question" => ClaimedBox::Question,
+                    _ => return None,
+                };
+                let under_turn = match get("claim_under")? {
+                    "0" => false,
+                    "1" => true,
+                    _ => return None,
+                };
+                Some(ClaimHeld {
+                    held: Held {
+                        node,
+                        what: boxed.step(),
+                        under_turn,
+                        detail: None,
+                        opened: None,
+                    },
+                    boxed,
+                    began: None,
                 })
             }
         };
@@ -1621,6 +1826,7 @@ impl TurnTracker {
             proof_unique,
             turn,
             step,
+            claim,
             word,
             settle,
             interrupted,
@@ -1680,6 +1886,34 @@ impl TurnTracker {
         }
         if self.step.as_ref().is_some_and(|s| !log.is_open(s.node)) {
             self.forget_step();
+        }
+        if self
+            .claim
+            .as_ref()
+            .is_some_and(|c| !log.is_open(c.held.node))
+        {
+            self.forget_claim();
+        }
+    }
+
+    /// The decision step inputs bind to: the claimed box, else the screen's approval or question.
+    /// The two never stand together: a claim opens only while the screen opens no turns, and a
+    /// screen approval or question opens only after [`Self::ensure_turn`], which marks the run's
+    /// turns the screen's and closes a standing claim first (the screen's step may then hang
+    /// from the claim's turn).
+    fn decision(&self) -> Option<&Held> {
+        self.claim
+            .as_ref()
+            .map(|c| &c.held)
+            .or_else(|| self.step.as_ref().filter(|h| binds(h.what)))
+    }
+
+    /// The claimed box forgotten: [`Self::forget_step`]'s bookkeeping for a decision step.
+    fn forget_claim(&mut self) {
+        if self.claim.take().is_some() {
+            self.closes += 1;
+            self.bound = None;
+            self.lead = None;
         }
     }
 
@@ -1760,6 +1994,10 @@ impl TurnTracker {
     }
 
     fn ensure_turn(&mut self, log: &mut Log, conf: Conf, at: Stamp) {
+        // The screen owns the steps where it opens turns: a claimed box leaves now.
+        if self.claim.is_some() {
+            self.close_claim(log, false, at);
+        }
         self.screen_turns = true;
         self.ensure_turn_as(log, Src::Screen, conf, at);
     }
@@ -1896,19 +2134,22 @@ impl TurnTracker {
                 opened: Some(at),
             });
             if binds(what) {
-                // An accepted input waiting on the lead binds the first
-                // approval or question step to open within it, with none
-                // closing between (T1).
-                if let Some(l) = self.lead.take()
-                    && l.opens == self.opens
-                    && l.closes == self.closes
-                    && within_lead(l.admitted, at)
-                {
-                    self.bind_input(node, l.by, l.act, l.accepted);
-                }
-                self.opens += 1;
+                self.opened_decision(node, at);
             }
         }
+    }
+
+    /// A decision step `node` opened at `at`: an accepted input waiting on the lead binds the
+    /// first approval or question step to open within it, with none closing between (T1).
+    fn opened_decision(&mut self, node: Node, at: Stamp) {
+        if let Some(l) = self.lead.take()
+            && l.opens == self.opens
+            && l.closes == self.closes
+            && within_lead(l.admitted, at)
+        {
+            self.bind_input(node, l.by, l.act, l.accepted);
+        }
+        self.opens += 1;
     }
 
     fn close_step(&mut self, log: &mut Log, out: StepOut, at: Stamp) {
@@ -1984,6 +2225,10 @@ impl TurnTracker {
         self.claim_interval = None;
         self.claim_end = None;
         self.interrupt_fresh = false;
+        // The turn's close is the leave of the box standing in it, written first at its `at`.
+        if self.claim.as_ref().is_some_and(|c| c.held.under_turn) {
+            self.close_claim(log, out == TurnOut::Gone, at);
+        }
         if self.step.as_ref().is_some_and(|h| h.under_turn) {
             self.forget_step();
         }
@@ -2110,6 +2355,14 @@ pub enum TxEvent<'a> {
         /// The vendor turn's id.
         vref: ShortId,
     },
+    /// The vendor turn `vref` was begun by the agent's own harness, as its row says (gap 25:
+    /// codex's `task_started` `turn_attribution.turn_trigger` = `alab_autopilot`). The host's act
+    /// mark that typed it reaches the turn on its own amend, once the host pairs one
+    /// ([`TurnTracker::harness_cause`]).
+    HarnessTurn {
+        /// The vendor turn's id (its prompt's).
+        vref: ShortId,
+    },
     /// `[Request interrupted by user…`.
     Interrupt,
     /// A `tool_use` part of an assistant row.
@@ -2203,6 +2456,9 @@ pub struct TxView {
     pub unsaid: bool,
     /// The running vendor turn's prompt time (wall ms; 0 when not known, a carry from before it was carried).
     pub prompt_ms: u64,
+    /// The wall time of the newest row it applied (0 before one, and after a carry): a source's
+    /// rows are written and read in time order, so every row older than it was read.
+    pub read_ms: u64,
 }
 
 /// The running vendor turn.
@@ -2430,6 +2686,7 @@ impl TurnTracker {
             dropped: self.tx.dropped,
             unsaid: self.tx.unsaid,
             prompt_ms: self.tx.cur.map_or(0, |v| v.at_ms),
+            read_ms: self.tx.read_ms,
         }
     }
 
@@ -2509,6 +2766,7 @@ impl TurnTracker {
                 self.tx_prompt(log, vref, state, conf, row, now);
                 self.vendor_observation(log, vref, "working", None, conf, row);
             }
+            TxEvent::HarnessTurn { vref } => self.tx_harness(log, vref, state, conf, row),
             TxEvent::Interrupt => {
                 self.tx_interrupt_claimed(log, state, row, pos);
                 if let Some(v) = self.tx.cur.filter(|v| v.end_ms.is_none()) {
@@ -2670,6 +2928,79 @@ impl TurnTracker {
         let _ = f.set(Key::Vref, Val::Id(vref));
         let amend = Amend::new(Kind::Turn, Src::Transcript, conf, f).by(Actor::Vendor);
         let _ = log.amend(node, amend, at);
+    }
+
+    /// A HARNESS TURN (gap 25): read at `state=on` only, on the turn the prompt `vref` mapped,
+    /// once, and only where the open names nobody, since an observed input stands:
+    /// `amend t<n> turn turn_by=harness by=vendor src=transcript conf=exact`. The open's `by=` is
+    /// never rewritten: `turn_by` is the role the vendor's row names, on its own key, never an
+    /// actor. The act that typed the turn comes on its own amend ([`Self::harness_cause`]).
+    fn tx_harness(&self, log: &mut Log, vref: ShortId, state: TxState, conf: Conf, row: Stamp) {
+        if state != TxState::On {
+            return;
+        }
+        let Some(VTurn {
+            node: Some(node),
+            vref: mapped,
+            ..
+        }) = self.tx.cur
+        else {
+            return;
+        };
+        if mapped != vref {
+            return;
+        }
+        let Some(open) = log.window().find(|r| r.node == node && r.op == Op::Open) else {
+            return;
+        };
+        if open.by != Actor::Nobody {
+            return;
+        }
+        let said = log
+            .window()
+            .any(|r| r.node == node && r.op == Op::Amend && r.f.get(Key::TurnBy).is_some());
+        if said {
+            return;
+        }
+        let Ok(f) = Fields::new().word(Key::TurnBy, "harness") else {
+            return;
+        };
+        let amend = Amend::new(Kind::Turn, Src::Transcript, conf, f).by(Actor::Vendor);
+        let _ = log.amend(node, amend, row);
+    }
+
+    /// A HARNESS TURN'S CAUSE (gap 25): the act mark `seq` the host paired with the harness turn
+    /// `turn` once its read settled the pair (aterm-gui's `session_log_transcript::harness_causes`),
+    /// on its own amend, apart from the `turn_by` amend the turn's row wrote:
+    /// `amend t<n> turn cause=<seq> cause_k=rec by=vendor src=transcript conf=<its turn_by
+    /// amend's>`. Written once, while this run is open, and only on a turn of this run that is
+    /// amended `turn_by=harness` and whose records name no cause yet; whether it wrote.
+    pub fn harness_cause(&self, log: &mut Log, turn: Node, seq: u64, at: Stamp) -> bool {
+        if !log.is_open(self.run) {
+            return false;
+        }
+        let mut ours = false;
+        let mut conf = None;
+        for r in log.window().filter(|r| r.node == turn && r.k == Kind::Turn) {
+            match r.op {
+                Op::Open => ours = r.par == Some(self.run),
+                Op::Amend if conf.is_none() && r.f.get(Key::TurnBy).is_some() => {
+                    conf = Some(r.conf);
+                }
+                _ => {}
+            }
+            if matches!(r.op, Op::Open | Op::Amend) && r.f.get(Key::Cause).is_some() {
+                return false;
+            }
+        }
+        let (true, Some(conf)) = (ours, conf) else {
+            return false;
+        };
+        let Ok(f) = Fields::new().cause(&seq.to_string()) else {
+            return false;
+        };
+        let amend = Amend::new(Kind::Turn, Src::Transcript, conf, f).by(Actor::Vendor);
+        log.amend(turn, amend, at).is_ok()
     }
 
     fn conflicting_vref(log: &Log, node: Node, vref: ShortId) -> bool {

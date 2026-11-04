@@ -270,36 +270,28 @@ fn a_face_suits_a_style_by_the_weight_it_draws_there() {
 }
 
 /// A private font directory holding `files`, removed when dropped.
-struct FontDir(std::path::PathBuf);
+struct FontDir {
+    path: std::path::PathBuf,
+    _dir: aterm_tempfile::TempDir,
+}
 
 impl FontDir {
     fn new(tag: &str, files: &[(&str, &[u8])]) -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-named-instance-{tag}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_scratch_dir(&format!("named-instance-{tag}"));
+        let path = dir.path().to_path_buf();
         for (name, bytes) in files {
-            std::fs::write(dir.join(name), bytes).unwrap();
+            std::fs::write(path.join(name), bytes).unwrap();
         }
-        Self(dir)
+        Self { path, _dir: dir }
     }
 
     fn files(&self) -> Vec<std::path::PathBuf> {
-        let mut files: Vec<_> = std::fs::read_dir(&self.0)
+        let mut files: Vec<_> = std::fs::read_dir(&self.path)
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .collect();
         files.sort();
         files
-    }
-}
-
-impl Drop for FontDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -312,7 +304,7 @@ fn offered_draws(dir: &FontDir, slot: usize, names: &[String]) -> Vec<(String, V
         names.iter().map(|name| (name.clone(), target)).collect();
     let batch = font_catalog::resolve_and_admit_in_dirs(
         &requests,
-        std::slice::from_ref(&dir.0),
+        std::slice::from_ref(&dir.path),
         font_catalog::Limits::default(),
     );
     let host = Renderer::from_bytes(CASCADIA_VARIABLE, 24.0, Theme::default()).unwrap();

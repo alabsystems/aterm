@@ -543,7 +543,7 @@ fn home_as(our_uid: u32, home: &Path) -> RunAs {
     if our_uid != 0 {
         return RunAs::Me;
     }
-    if let Some((uid, _)) = acaffiene_account(our_uid, home) {
+    if let Some((uid, _)) = acaffeine_account(our_uid, home) {
         return RunAs::Account(uid);
     }
     if aterm_uds::account::home_of(0).is_some_and(|own| same_file(&own, home)) {
@@ -705,11 +705,11 @@ fn two_accounts() -> std::io::Error {
 /// `path` opened with `opts` when it is a regular file and, under root, one owned by the account
 /// owning the way to it (root when none does): a link or a swapped folder then never makes
 /// root's read hang on a pipe or its write land in another owner's file.
-fn open_checked(
+fn open_checked_with_meta(
     path: &Path,
     opts: &mut std::fs::OpenOptions,
     root: bool,
-) -> std::io::Result<std::fs::File> {
+) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
     use std::os::unix::fs::OpenOptionsExt as _;
     let file = opts
         .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
@@ -730,7 +730,15 @@ fn open_checked(
             "not a regular file of the account it is for",
         ));
     }
-    Ok(file)
+    Ok((file, opened))
+}
+
+fn open_checked(
+    path: &Path,
+    opts: &mut std::fs::OpenOptions,
+    root: bool,
+) -> std::io::Result<std::fs::File> {
+    open_checked_with_meta(path, opts, root).map(|(file, _)| file)
 }
 
 /// `path`'s text, from a regular file only: a pipe behind a link is refused, not waited on.
@@ -739,10 +747,15 @@ fn open_checked(
 fn read_checked(path: &Path) -> std::io::Result<String> {
     use std::io::Read as _;
     const CAP: usize = 1024 * 1024;
-    let mut buf = Vec::new();
-    open_checked(path, std::fs::OpenOptions::new().read(true), false)?
-        .take(CAP as u64 + 1)
-        .read_to_end(&mut buf)?;
+    let (file, meta) = open_checked_with_meta(path, std::fs::OpenOptions::new().read(true), false)?;
+    if meta.len() > CAP as u64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "file exceeds read cap",
+        ));
+    }
+    let mut buf = Vec::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
+    file.take(CAP as u64 + 1).read_to_end(&mut buf)?;
     if buf.len() > CAP {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -894,41 +907,41 @@ fn uninstall_bundle(p: &Places) -> Option<PathBuf> {
         })
 }
 
-const CAFFEINE_CODE: &str = "acaffiene-code.noindex";
+const CAFFEINE_CODE: &str = "acaffeine-code.noindex";
 
-/// aCaffiene's files under the support folder.
+/// aCaffeine's files under the support folder.
 const CAFFEINE_FILES: [&str; 6] = [
     CAFFEINE_CODE,
-    "acaffiene",
-    "acaffiene.state",
-    "acaffiene.lock",
-    "acaffiene.bridge",
-    "acaffiene.trouble",
+    "acaffeine",
+    "acaffeine.state",
+    "acaffeine.lock",
+    "acaffeine.bridge",
+    "acaffeine.trouble",
 ];
 
 const SWEPT_DECLINE_TAG: &str = "# Recorded by aterm pkg self-uninstall for an aterm it kept.";
 
-const CAFFEINE_LABEL_PREFIX: &str = "com.aterm.aterm.acaffiene";
+const CAFFEINE_LABEL_PREFIX: &str = "com.aterm.aterm.acaffeine";
 
-fn sweep_acaffiene(s: &mut Sweep<'_>, p: &Places, app_dirs: &[PathBuf]) -> Vec<PathBuf> {
-    let kept = sweep_acaffiene_with(
+fn sweep_acaffeine(s: &mut Sweep<'_>, p: &Places, app_dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let kept = sweep_acaffeine_with(
         s,
         p,
         app_dirs,
         aterm_uds::peer::our_uid(),
-        || acaffiene_account(aterm_uds::peer::our_uid(), &p.home),
+        || acaffeine_account(aterm_uds::peer::our_uid(), &p.home),
         run_quietly,
     );
     sweep_old_caffeine(
         s,
         p,
-        acaffiene_account(aterm_uds::peer::our_uid(), &p.home),
+        acaffeine_account(aterm_uds::peer::our_uid(), &p.home),
         make_as_account,
     );
     kept
 }
 
-/// The copies of aterm under aCaffiene's name before 0.145.0, `aterm caffeine`.
+/// The copies of aterm under aCaffeine's name before 0.145.0, `aterm caffeine`.
 const OLD_CAFFEINE_CODE: &str = "caffeine-code.noindex";
 
 /// What the mug left in the support folder under its old name, besides its lock.
@@ -939,20 +952,20 @@ const OLD_CAFFEINE_FILES: [&str; 4] = [
     "caffeine.bridge",
 ];
 
-/// The old mug's lock, which stays as aCaffiene's does: an old build's mug may still take it.
+/// The old mug's lock, which stays as aCaffeine's does: an old build's mug may still take it.
 const OLD_CAFFEINE_LOCK: &str = "caffeine.lock";
 
 /// The old installed app's login job label; a dev build's adds `.dev.` and 8 lowercase hex
-/// digits (`aterm_acaffiene::legacy::is_label`).
+/// digits (`aterm_acaffeine::legacy::is_label`).
 const OLD_CAFFEINE_LABEL: &str = "com.aterm.aterm.caffeine";
 
 fn old_caffeine_label(label: &str) -> bool {
     label_of(label, OLD_CAFFEINE_LABEL)
 }
 
-/// Whether `label` is one an aCaffiene build makes (`aterm_acaffiene::launchd::is_label`): the
+/// Whether `label` is one an aCaffeine build makes (`aterm_acaffeine::launchd::is_label`): the
 /// installed app's, or a dev build's under the same grammar as [`OLD_CAFFEINE_LABEL`]'s.
-fn acaffiene_label(label: &str) -> bool {
+fn acaffeine_label(label: &str) -> bool {
     label_of(label, CAFFEINE_LABEL_PREFIX)
 }
 
@@ -975,7 +988,7 @@ fn label_of(label: &str, installed: &str) -> bool {
 /// its mug, if one runs, keeps its lock until it is quit from its menu or the login ends, so its
 /// files are left for the person to remove). Its login plists in `~/Library/LaunchAgents` go:
 /// each runs `<aterm> caffeine serve`, and one whose aterm is gone fails at every login. Its
-/// files go while its idle lock is held, as aCaffiene's do, and the lock stays. A sweep that
+/// files go while its idle lock is held, as aCaffeine's do, and the lock stays. A sweep that
 /// leaves an aterm outside its scope leaves them all for it.
 fn sweep_old_caffeine(
     s: &mut Sweep<'_>,
@@ -1036,20 +1049,20 @@ fn sweep_old_caffeine(
             }
             for path in files {
                 if path == support.join(OLD_CAFFEINE_CODE) {
-                    sweep_acaffiene_code(s, &path, std::time::SystemTime::now());
+                    sweep_acaffeine_code(s, &path, std::time::SystemTime::now());
                 } else {
                     s.rm_shared(&path, "old Caffeine file");
                 }
             }
             return;
         }
-        let Some(_hold) = acaffiene_cleanup_hold(&lock, account, make) else {
+        let Some(_hold) = acaffeine_cleanup_hold(&lock, account, make) else {
             s.skip(&lock.display().to_string(), &old_lock_kept(&support, "are"));
             return;
         };
         for path in listed() {
             if path == support.join(OLD_CAFFEINE_CODE) {
-                sweep_acaffiene_code(s, &path, std::time::SystemTime::now());
+                sweep_acaffeine_code(s, &path, std::time::SystemTime::now());
             } else {
                 s.rm_shared(&path, "old Caffeine file");
             }
@@ -1077,7 +1090,7 @@ fn old_lock_kept(support: &Path, are: &str) -> String {
     )
 }
 
-/// Whether a real run's [`acaffiene_cleanup_hold`] could take the lock at `lock`, which is there,
+/// Whether a real run's [`acaffeine_cleanup_hold`] could take the lock at `lock`, which is there,
 /// for `account`: a regular file of the account's with one name, which no mug holds. A dry run's
 /// probe: it opens the file without making it, writes nothing and lets go at once.
 fn cleanup_lock_free(lock: &Path, account: Option<(u32, u32)>) -> bool {
@@ -1097,7 +1110,7 @@ fn cleanup_lock_free(lock: &Path, account: Option<(u32, u32)>) -> bool {
 }
 
 /// A dry run's word for the lock rendezvous at `lock` that a real run's
-/// [`acaffiene_cleanup_hold`] would make, `what`'s: made, as the account's under root, and left,
+/// [`acaffeine_cleanup_hold`] would make, `what`'s: made, as the account's under root, and left,
 /// counted kept; or, where that hold makes none (root for no account), a skip saying the files
 /// would be kept, and `false`.
 fn would_make_lock(
@@ -1121,7 +1134,7 @@ fn would_make_lock(
     true
 }
 
-fn sweep_acaffiene_with(
+fn sweep_acaffeine_with(
     s: &mut Sweep<'_>,
     p: &Places,
     app_dirs: &[PathBuf],
@@ -1150,11 +1163,11 @@ fn sweep_acaffiene_with(
         return Vec::new();
     }
     let account = account();
-    let own_quit: &[&str] = &["acaffiene", "quit", "own"];
+    let own_quit: &[&str] = &["acaffeine", "quit", "own"];
     let steps: &[&[&str]] = if s.outsider.is_some() {
-        &[&["acaffiene", "startup", "off"], own_quit]
+        &[&["acaffeine", "startup", "off"], own_quit]
     } else {
-        &[&["acaffiene", "startup", "off"], &["acaffiene", "quit"]]
+        &[&["acaffeine", "startup", "off"], &["acaffeine", "quit"]]
     };
     let mut helpers: Vec<(PathBuf, PathBuf)> = app_dirs
         .iter()
@@ -1182,7 +1195,7 @@ fn sweep_acaffiene_with(
             return true;
         }
         s.skip(
-            &helper_line(aterm, &["help", "acaffiene"], account),
+            &helper_line(aterm, &["help", "acaffeine"], account),
             &format!("{NOT_AS_ROOT}; {} is kept for it", app.display()),
         );
         failed.push(app.clone());
@@ -1196,7 +1209,7 @@ fn sweep_acaffiene_with(
         if rc != 0 {
             for (app, aterm) in std::mem::take(&mut helpers) {
                 s.skip(
-                    &helper_line(&aterm, &["help", "acaffiene"], account),
+                    &helper_line(&aterm, &["help", "acaffeine"], account),
                     &format!(
                         "sudo could not run it as uid {uid} (exit {rc}); {} is kept for it",
                         app.display()
@@ -1212,18 +1225,18 @@ fn sweep_acaffiene_with(
         if s.dry {
             s.say(&format!(
                 "would ask {}, then if supported:",
-                helper_line(&aterm, &["help", "acaffiene"], account)
+                helper_line(&aterm, &["help", "acaffeine"], account)
             ));
             for args in steps {
                 s.say(&format!("would run {}", helper_line(&aterm, args, account)));
             }
             continue;
         }
-        let rc = run_helper(&aterm, &["help", "acaffiene"], account, &mut run);
+        let rc = run_helper(&aterm, &["help", "acaffeine"], account, &mut run);
         if rc != 0 {
             if account.is_some() {
                 s.skip(
-                    &helper_line(&aterm, &["help", "acaffiene"], account),
+                    &helper_line(&aterm, &["help", "acaffeine"], account),
                     &format!(
                         "could not confirm the helper ran as its account (exit {rc}); {} is kept for it",
                         app.display()
@@ -1259,7 +1272,7 @@ fn sweep_acaffiene_with(
     }
     if s.outsider.is_some() {
         for path in files {
-            s.rm_shared(&path, "aCaffiene file");
+            s.rm_shared(&path, "aCaffeine file");
         }
         return failed;
     }
@@ -1267,7 +1280,7 @@ fn sweep_acaffiene_with(
     if files.is_empty() {
         return failed;
     }
-    let lock = support.join("acaffiene.lock");
+    let lock = support.join("acaffeine.lock");
     let lone_lock = (our_uid != 0 || account.is_some())
         && !login_plist
         && files.iter().all(|path| *path == lock);
@@ -1277,51 +1290,51 @@ fn sweep_acaffiene_with(
         s.skip(
             &support.display().to_string(),
             if s.dry {
-                "aCaffiene stop would not be confirmed; its files would be kept"
+                "aCaffeine stop would not be confirmed; its files would be kept"
             } else {
-                "aCaffiene stop was not confirmed; its files are kept"
+                "aCaffeine stop was not confirmed; its files are kept"
             },
         );
         return failed;
     }
     if s.dry {
         s.say(if asked {
-            "aCaffiene file removal requires a helper above that stops aCaffiene and an acquired \
+            "aCaffeine file removal requires a helper above that stops aCaffeine and an acquired \
              idle lock; the lock itself stays"
         } else {
-            "aCaffiene file removal requires an acquired idle lock; the lock itself stays"
+            "aCaffeine file removal requires an acquired idle lock; the lock itself stays"
         });
         if files.contains(&lock) {
             // A helper's quit would end the mug that holds it; with none, a held lock stays held.
             if !asked && !cleanup_lock_free(&lock, account) {
                 s.skip(
                     &lock.display().to_string(),
-                    "aCaffiene lock is busy or could not be acquired; its files would be kept",
+                    "aCaffeine lock is busy or could not be acquired; its files would be kept",
                 );
                 return failed;
             }
-        } else if !would_make_lock(s, &lock, account, "aCaffiene") {
+        } else if !would_make_lock(s, &lock, account, "aCaffeine") {
             return failed;
         }
         for path in files {
             if path == lock {
                 s.say(&format!(
-                    "would leave aCaffiene lock rendezvous: {}",
+                    "would leave aCaffeine lock rendezvous: {}",
                     path.display()
                 ));
                 s.kept += 1;
             } else if path == support.join(CAFFEINE_CODE) {
-                sweep_acaffiene_code(s, &path, std::time::SystemTime::now());
+                sweep_acaffeine_code(s, &path, std::time::SystemTime::now());
             } else {
-                s.rm_shared(&path, "aCaffiene file");
+                s.rm_shared(&path, "aCaffeine file");
             }
         }
         return failed;
     }
-    let Some(_hold) = acaffiene_cleanup_hold(&lock, account, make_as_account) else {
+    let Some(_hold) = acaffeine_cleanup_hold(&lock, account, make_as_account) else {
         s.skip(
             &lock.display().to_string(),
-            "aCaffiene lock is busy or could not be acquired; its files are kept",
+            "aCaffeine lock is busy or could not be acquired; its files are kept",
         );
         return failed;
     };
@@ -1329,37 +1342,37 @@ fn sweep_acaffiene_with(
     for path in files {
         if path == lock {
             s.say(&format!(
-                "left aCaffiene lock rendezvous: {}",
+                "left aCaffeine lock rendezvous: {}",
                 path.display()
             ));
             s.kept += 1;
         } else if path == support.join(CAFFEINE_CODE) {
-            sweep_acaffiene_code(s, &path, std::time::SystemTime::now());
+            sweep_acaffeine_code(s, &path, std::time::SystemTime::now());
         } else {
-            s.rm_shared(&path, "aCaffiene file");
+            s.rm_shared(&path, "aCaffeine file");
         }
     }
     failed
 }
 
 /// The files in `support` whose temporaries a window's launch sweeps
-/// (`aterm_acaffiene::state::sweep_temps`): aCaffiene's mode and its update bridge's pid file,
+/// (`aterm_acaffeine::state::sweep_temps`): aCaffeine's mode and its update bridge's pid file,
 /// under its name and the old one, and its trouble record, each with what a temporary of it is.
 const WRITTEN_THROUGH_TEMPS: [(&str, &str); 5] = [
-    ("acaffiene.state", "aCaffiene save cut short"),
-    ("acaffiene.bridge", "aCaffiene save cut short"),
-    ("acaffiene.trouble", "aCaffiene save cut short"),
+    ("acaffeine.state", "aCaffeine save cut short"),
+    ("acaffeine.bridge", "aCaffeine save cut short"),
+    ("acaffeine.trouble", "aCaffeine save cut short"),
     ("caffeine.state", "old Caffeine save cut short"),
     ("caffeine.bridge", "old Caffeine save cut short"),
 ];
 
 /// The temporaries that no write will rename
 /// ([`aterm_uds::atomic_file::abandoned_temps_beside`]) of [`WRITTEN_THROUGH_TEMPS`] in
-/// `support`, and of the login items in `agents` named for a label [`acaffiene_label`] or
+/// `support`, and of the login items in `agents` named for a label [`acaffeine_label`] or
 /// [`old_caffeine_label`] takes ([`aterm_uds::atomic_file::temp_target`]), each with what it is:
 /// an ordinary window's launch removes them too, but an uninstall may come first. Their writers
 /// are gone, so no mug's stop or lock is needed for them; the session plists' folders go whole
-/// with aCaffiene's other files. A `support` that is no folder holds none, and one that cannot
+/// with aCaffeine's other files. A `support` that is no folder holds none, and one that cannot
 /// be listed is one skip, after which none of them is removed. `agents` is read as the rest of
 /// the uninstall reads it ([`sorted_entries`]): one that is no folder, or that cannot be listed
 /// (a person may lock it against login items), holds none.
@@ -1377,7 +1390,7 @@ fn cut_short_saves(
                 Err(e) => {
                     s.skip(
                         &support.display().to_string(),
-                        &format!("its aCaffiene saves cut short could not be listed: {e}"),
+                        &format!("its aCaffeine saves cut short could not be listed: {e}"),
                     );
                     return Vec::new();
                 }
@@ -1400,7 +1413,7 @@ fn login_items_cut_short(
             continue;
         };
         let what = match plist.strip_suffix(".plist") {
-            Some(label) if acaffiene_label(label) => "aCaffiene login item cut short",
+            Some(label) if acaffeine_label(label) => "aCaffeine login item cut short",
             Some(label) if old_caffeine_label(label) => "old Caffeine login item cut short",
             _ => continue,
         };
@@ -1414,28 +1427,28 @@ fn login_items_cut_short(
     found
 }
 
-fn sweep_acaffiene_code(s: &mut Sweep<'_>, code: &Path, now: std::time::SystemTime) {
-    sweep_acaffiene_code_with(
+fn sweep_acaffeine_code(s: &mut Sweep<'_>, code: &Path, now: std::time::SystemTime) {
+    sweep_acaffeine_code_with(
         s,
         code,
         now,
         &|path| std::fs::symlink_metadata(path),
-        &acaffiene_code_entries,
+        &acaffeine_code_entries,
     );
 }
 
 #[derive(Default)]
-struct ACaffieneCodePlan {
+struct ACaffeineCodePlan {
     remove: Vec<(PathBuf, &'static str)>,
     keep: Vec<(PathBuf, Duration)>,
 }
 
-fn acaffiene_code_plan_with(
+fn acaffeine_code_plan_with(
     code: &Path,
     now: std::time::SystemTime,
     metadata: &impl Fn(&Path) -> std::io::Result<std::fs::Metadata>,
     entries: &impl Fn(&Path) -> std::io::Result<Vec<PathBuf>>,
-) -> std::io::Result<ACaffieneCodePlan> {
+) -> std::io::Result<ACaffeineCodePlan> {
     let at = |path: &Path, error: std::io::Error| {
         std::io::Error::new(error.kind(), format!("{}: {error}", path.display()))
     };
@@ -1447,12 +1460,12 @@ fn acaffiene_code_plan_with(
         }
     };
     let list = |path: &Path| entries(path).map_err(|error| at(path, error));
-    let mut plan = ACaffieneCodePlan::default();
+    let mut plan = ACaffeineCodePlan::default();
     let Some(root) = inspect(code)? else {
         return Ok(plan);
     };
     if !root.is_dir() {
-        plan.remove.push((code.to_path_buf(), "aCaffiene file"));
+        plan.remove.push((code.to_path_buf(), "aCaffeine file"));
         return Ok(plan);
     }
     let partial = |path: &Path| path.extension().is_some_and(|e| e == "partial");
@@ -1461,7 +1474,7 @@ fn acaffiene_code_plan_with(
             continue;
         };
         if !meta.is_dir() || partial(&label) {
-            plan.remove.push((label, "aCaffiene file"));
+            plan.remove.push((label, "aCaffeine file"));
             continue;
         }
         let mut copies = Vec::new();
@@ -1476,11 +1489,11 @@ fn acaffiene_code_plan_with(
             if let Some(left) = left {
                 kept.push((copy, left));
             } else {
-                copies.push((copy, "aCaffiene copy"));
+                copies.push((copy, "aCaffeine copy"));
             }
         }
         if kept.is_empty() {
-            plan.remove.push((label, "aCaffiene file"));
+            plan.remove.push((label, "aCaffeine file"));
         } else {
             plan.remove.extend(copies);
             plan.keep.extend(kept);
@@ -1488,16 +1501,16 @@ fn acaffiene_code_plan_with(
     }
     if plan.keep.is_empty() {
         plan.remove.clear();
-        plan.remove.push((code.to_path_buf(), "aCaffiene file"));
+        plan.remove.push((code.to_path_buf(), "aCaffeine file"));
     }
     Ok(plan)
 }
 
-fn acaffiene_code_entries(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
-    collect_acaffiene_code_entries(std::fs::read_dir(dir)?.map(|entry| entry.map(|e| e.path())))
+fn acaffeine_code_entries(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    collect_acaffeine_code_entries(std::fs::read_dir(dir)?.map(|entry| entry.map(|e| e.path())))
 }
 
-fn collect_acaffiene_code_entries(
+fn collect_acaffeine_code_entries(
     entries: impl IntoIterator<Item = std::io::Result<PathBuf>>,
 ) -> std::io::Result<Vec<PathBuf>> {
     let mut paths = entries.into_iter().collect::<std::io::Result<Vec<_>>>()?;
@@ -1508,19 +1521,19 @@ fn collect_acaffiene_code_entries(
     Ok(paths)
 }
 
-fn sweep_acaffiene_code_with(
+fn sweep_acaffeine_code_with(
     s: &mut Sweep<'_>,
     code: &Path,
     now: std::time::SystemTime,
     metadata: &impl Fn(&Path) -> std::io::Result<std::fs::Metadata>,
     entries: &impl Fn(&Path) -> std::io::Result<Vec<PathBuf>>,
 ) {
-    let plan = match acaffiene_code_plan_with(code, now, metadata, entries) {
+    let plan = match acaffeine_code_plan_with(code, now, metadata, entries) {
         Ok(plan) => plan,
         Err(error) => {
             s.skip(
                 &code.display().to_string(),
-                &format!("cannot inspect every aCaffiene copy; all kept: {error}"),
+                &format!("cannot inspect every aCaffeine copy; all kept: {error}"),
             );
             return;
         }
@@ -1536,7 +1549,7 @@ fn sweep_acaffiene_code_with(
         s.skip(
             &path.display().to_string(),
             &format!(
-                "no aCaffiene mug said it ran from this copy, so macOS may still be assessing \
+                "no aCaffeine mug said it ran from this copy, so macOS may still be assessing \
                  its first exec, and removing it now can crash syspolicyd; remove it by hand \
                  once the Mac has been awake {} more minute(s)",
                 left.as_secs().div_ceil(60).max(1)
@@ -1545,7 +1558,7 @@ fn sweep_acaffiene_code_with(
     }
 }
 
-fn acaffiene_cleanup_hold(
+fn acaffeine_cleanup_hold(
     path: &Path,
     account: Option<(u32, u32)>,
     make: fn(&Path, u32) -> bool,
@@ -1581,7 +1594,7 @@ fn acaffiene_cleanup_hold(
     Some(held)
 }
 
-fn acaffiene_account(our_uid: u32, home: &Path) -> Option<(u32, u32)> {
+fn acaffeine_account(our_uid: u32, home: &Path) -> Option<(u32, u32)> {
     if our_uid != 0 {
         return None;
     }
@@ -1591,7 +1604,7 @@ fn acaffiene_account(our_uid: u32, home: &Path) -> Option<(u32, u32)> {
 }
 
 fn home_is_the_accounts(our_uid: u32, home: &Path) -> bool {
-    acaffiene_account(our_uid, home).is_some()
+    acaffeine_account(our_uid, home).is_some()
         || aterm_uds::account::home_of(our_uid).is_some_and(|acct| same_file(&acct, home))
 }
 
@@ -1667,18 +1680,18 @@ pub fn self_uninstall(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> bool {
-    self_uninstall_with_acaffiene(p, man_src, dry, out, err, sweep_acaffiene, CHILD_HANG)
+    self_uninstall_with_acaffeine(p, man_src, dry, out, err, sweep_acaffeine, CHILD_HANG)
 }
 
-/// [`self_uninstall`] with its aCaffiene sweep, and `hang`, how long a bundle's program is given
+/// [`self_uninstall`] with its aCaffeine sweep, and `hang`, how long a bundle's program is given
 /// to answer before its bundle is kept.
-fn self_uninstall_with_acaffiene(
+fn self_uninstall_with_acaffeine(
     p: &Places,
     man_src: Option<&Path>,
     dry: bool,
     out: &mut dyn Write,
     err: &mut dyn Write,
-    mut acaffiene: impl FnMut(&mut Sweep<'_>, &Places, &[PathBuf]) -> Vec<PathBuf>,
+    mut acaffeine: impl FnMut(&mut Sweep<'_>, &Places, &[PathBuf]) -> Vec<PathBuf>,
     hang: Duration,
 ) -> bool {
     let outsider = p.install_dir.as_ref().and_then(|_| scope_outsider(p));
@@ -1841,7 +1854,7 @@ fn self_uninstall_with_acaffiene(
         (None, _) => {}
     }
 
-    let acaffiene_kept = acaffiene(&mut s, p, &app_dirs);
+    let acaffeine_kept = acaffeine(&mut s, p, &app_dirs);
 
     for dir in &app_dirs {
         for name in ["aterm.app", "aterm.app.rollback"] {
@@ -1855,10 +1868,10 @@ fn self_uninstall_with_acaffiene(
                     "kept: its atpkg is what removes the ALab toolchain store, and that removal \
                      did not finish (above)",
                 );
-            } else if acaffiene_kept.contains(&app) {
+            } else if acaffeine_kept.contains(&app) {
                 s.skip(
                     &app.display().to_string(),
-                    "kept: its `aterm acaffiene` is what stops the aCaffiene mug, and that did \
+                    "kept: its `aterm acaffeine` is what stops the aCaffeine mug, and that did \
                      not finish (above)",
                 );
             } else if bundle_is_ours(&app) {
@@ -1934,7 +1947,7 @@ fn self_uninstall_with_acaffiene(
         }
     }
 
-    sweep_store(&mut s, p, &acaffiene_kept);
+    sweep_store(&mut s, p, &acaffeine_kept);
 
     for section in 1..=9 {
         let dir = p.man_root.join(format!("man{section}"));
@@ -2119,7 +2132,7 @@ fn store_left(p: &Places) -> Option<StoreLeft> {
     }
 }
 
-fn sweep_store(s: &mut Sweep<'_>, p: &Places, acaffiene_kept: &[PathBuf]) {
+fn sweep_store(s: &mut Sweep<'_>, p: &Places, acaffeine_kept: &[PathBuf]) {
     let store = &p.store_dir;
     match store_left(p) {
         None => {}
@@ -2143,7 +2156,7 @@ fn sweep_store(s: &mut Sweep<'_>, p: &Places, acaffiene_kept: &[PathBuf]) {
     let aterm = store.join("aterm");
     let run_as = runs_as(aterm_uds::peer::our_uid(), &p.home, &aterm);
     let unasked = match run_as {
-        _ if !is_executable_file(&aterm) || acaffiene_kept.contains(&aterm) => None,
+        _ if !is_executable_file(&aterm) || acaffeine_kept.contains(&aterm) => None,
         RunAs::Nobody => Some(NOT_AS_ROOT.to_string()),
         RunAs::Account(uid) => {
             sudo_refuses(uid).map(|rc| format!("sudo could not run it as uid {uid} (exit {rc})"))
@@ -2159,7 +2172,7 @@ fn sweep_store(s: &mut Sweep<'_>, p: &Places, acaffiene_kept: &[PathBuf]) {
     }
     let (kept, rest): (Vec<PathBuf>, Vec<PathBuf>) = sorted_entries(store)
         .into_iter()
-        .partition(|entry| acaffiene_kept.contains(entry));
+        .partition(|entry| acaffeine_kept.contains(entry));
     let (own, foreign): (Vec<PathBuf>, Vec<PathBuf>) = rest
         .into_iter()
         .partition(|entry| store_entry_is_ours(entry, run_as));
@@ -2171,7 +2184,7 @@ fn sweep_store(s: &mut Sweep<'_>, p: &Places, acaffiene_kept: &[PathBuf]) {
     for entry in &kept {
         s.skip(
             &entry.display().to_string(),
-            "kept: its `aterm acaffiene` is what stops the aCaffiene mug, and that did not \
+            "kept: its `aterm acaffeine` is what stops the aCaffeine mug, and that did not \
              finish (above)",
         );
     }

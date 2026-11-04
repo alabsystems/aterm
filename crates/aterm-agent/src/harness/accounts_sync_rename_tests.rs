@@ -408,7 +408,7 @@ fn a_legacy_row_without_login_identity_preserves_retained_state_on_assignment() 
         bed.store
             .transact_logins(NOW, &mut None, |state, logins| {
                 *state = accounts::State::default();
-                *logins = accounts::Logins::default();
+                logins.labels.clear();
                 Ok(Vec::new())
             })
             .unwrap();
@@ -518,7 +518,7 @@ fn default_account_rename_refuses_every_retained_destination_before_publication(
                 .transact_logins(NOW, &mut None, |state, logins| {
                     if source_empty {
                         *state = accounts::State::default();
-                        *logins = accounts::Logins::default();
+                        logins.labels.clear();
                     }
                     seed_reference(state, logins, "m1-2", kind);
                     Ok(Vec::new())

@@ -98,6 +98,102 @@ fn provider_identity_and_http_acceptance_cannot_be_replaced_by_file_presence() {
 }
 
 #[test]
+fn canonical_failures_distinguish_outage_from_token_rejection_and_proved_identity_mismatch() {
+    enum Expected {
+        Unavailable,
+        TokenRejected,
+        IdentityMismatch,
+    }
+    let dir = home();
+    let before = std::fs::read(dir.path().join(GLOBAL_FILE)).unwrap();
+    for (status, reply, expected) in [
+        (401, b"not-json".as_slice(), Expected::TokenRejected),
+        (403, b"<html>security gateway</html>", Expected::Unavailable),
+        (400, b"{}", Expected::Unavailable),
+        (404, b"{}", Expected::Unavailable),
+        (408, b"{}", Expected::Unavailable),
+        (429, b"{}", Expected::Unavailable),
+        (503, b"{}", Expected::Unavailable),
+        (302, b"{}", Expected::Unavailable),
+        (200, b"not-json", Expected::Unavailable),
+        (200, b"null", Expected::Unavailable),
+        (
+            200,
+            br#"{"email":"kimi-fixture@example.test"}"#,
+            Expected::Unavailable,
+        ),
+        (
+            200,
+            br#"{"email":"other@example.test"}"#,
+            Expected::Unavailable,
+        ),
+        (
+            200,
+            br#"{"email":"malformed","user_id":"full-id"}"#,
+            Expected::Unavailable,
+        ),
+        (
+            200,
+            br#"{"email":"kimi-fixture@example.test","user_id":""}"#,
+            Expected::Unavailable,
+        ),
+        (
+            200,
+            br#"{"email":"other@example.test","user_id":"full-id"}"#,
+            Expected::IdentityMismatch,
+        ),
+    ] {
+        let error = verify_with(dir.path(), Region::Global, EMAIL, 1000, |_, _| {
+            Ok((status, reply.to_vec()))
+        })
+        .err()
+        .expect("response must not produce a login proof");
+        match expected {
+            Expected::Unavailable => {
+                assert!(matches!(error, NativeError::Temporary), "{error:?}");
+                assert!(matches!(
+                    observation_error(error),
+                    ObservationError::Unavailable(_)
+                ));
+            }
+            Expected::TokenRejected => assert!(matches!(error, NativeError::Rejected)),
+            Expected::IdentityMismatch => assert!(matches!(error, NativeError::Refused(_))),
+        }
+        assert_eq!(std::fs::read(dir.path().join(GLOBAL_FILE)).unwrap(), before);
+    }
+    assert!(matches!(
+        verify_with(dir.path(), Region::Global, EMAIL, 1000, |_, _| Err(
+            "transport unavailable".into()
+        )),
+        Err(NativeError::Temporary)
+    ));
+}
+
+#[test]
+fn canonical_read_racing_native_replacement_is_unavailable_not_new_authentication() {
+    for status in [200, 401] {
+        for file in [GLOBAL_FILE, "config.toml"] {
+            let dir = home();
+            let error = verify_with(dir.path(), Region::Global, EMAIL, 1000, |_, _| {
+                std::fs::write(dir.path().join(file), "newer-writer").unwrap();
+                Ok((status, body()))
+            })
+            .err()
+            .unwrap();
+            assert!(matches!(error, NativeError::Temporary));
+            assert!(matches!(
+                observation_error(error),
+                ObservationError::Unavailable(_)
+            ));
+            assert_eq!(
+                std::fs::read(dir.path().join(file)).unwrap(),
+                b"newer-writer"
+            );
+        }
+    }
+}
+
+#[test]
 fn replaced_config_credential_link_and_empty_configs_fail_closed() {
     let dir = home();
     let config = std::fs::read(dir.path().join("config.toml")).expect("original config");
@@ -226,6 +322,7 @@ fn identity_outage_does_not_request_another_native_authentication() {
     ));
     for error in [
         NativeError::Expired,
+        NativeError::RefreshRejected,
         NativeError::Rejected,
         NativeError::Refused("provider refusal".into()),
         NativeError::Local("unsafe credential".into()),

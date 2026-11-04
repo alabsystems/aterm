@@ -819,8 +819,8 @@ fn an_empty_composer_is_blank_or_a_placeholder_and_nothing_else() {
         "typed: the cursor moved"
     );
     assert!(
-        composer_is_empty(&suggestion, None, true),
-        "no cursor: the dim cell decides"
+        !composer_is_empty(&suggestion, None, true),
+        "no cursor on the rows read: says neither, to the loop too"
     );
     assert!(
         !composer_is_empty(&suggestion, None, false),
@@ -831,8 +831,8 @@ fn an_empty_composer_is_blank_or_a_placeholder_and_nothing_else() {
         "displaced: the cursor one row below the composer"
     );
     assert!(
-        composer_is_empty(&suggestion, Some((0, 2)), true),
-        "displaced the other way"
+        !composer_is_empty(&suggestion, Some((0, 2)), true),
+        "above the composer: says neither, to the loop too"
     );
     assert!(
         !composer_is_empty(&suggestion, Some((2, 2)), false),
@@ -840,11 +840,16 @@ fn an_empty_composer_is_blank_or_a_placeholder_and_nothing_else() {
     );
     assert_eq!(composer_dim_row(&suggestion, Some((1, 2))), Some(1));
     assert_eq!(composer_dim_row(&suggestion, Some((2, 2))), Some(1));
-    assert_eq!(composer_dim_row(&suggestion, None), Some(1));
+    assert_eq!(composer_dim_row(&suggestion, None), None);
     assert_eq!(
         composer_dim_row(&suggestion, Some((1, 17))),
         None,
         "inside the text: nothing to ask"
+    );
+    assert_eq!(
+        composer_dim_row(&suggestion, Some((0, 2))),
+        None,
+        "off home: nothing to ask"
     );
     assert_eq!(
         composer_dim_row(&blank, Some((1, 2))),
@@ -1151,6 +1156,20 @@ fn the_quiet_tell_names_both_builds_and_its_verb_only_where_offered() {
         own_draft(&format!("❯ {fact}")),
         "a tell left in the composer is the harness's"
     );
+}
+
+/// A WHOLE HEAD IS ATERM'S WORDS, whitespace aside and past a caret, as a tab narrow enough to wrap
+/// inside it draws them; a part of one is no more than a person's few glyphs.
+/// NEGATIVE CONTROL: `own_words` comparing the raw text, and the wrapped head and the caret's fail.
+#[test]
+fn own_words_reads_a_whole_head_wrapped_or_past_its_caret() {
+    for head in [ANNOUNCE_HEAD, RELEASE_HEAD, TELL_HEAD] {
+        assert!(own_words(&format!("{head}more")), "{head}");
+        let (first, rest) = head.split_at(9);
+        assert!(own_words(&format!("{first}\n{rest}more")), "{head} wrapped");
+        assert!(own_words(&format!("❯ {head}more")), "{head} past its caret");
+        assert!(!own_words(first), "{first}: a part of it");
+    }
 }
 
 #[test]

@@ -11,8 +11,8 @@ use aterm_json::Value;
 use aterm_uds::spawnfd::{Stdio, command};
 
 use super::{
-    Group, Halt, Ledger, Scratch, arena_dir, await_socket, build_aterm, ctl_out, macos_version,
-    preflight, private, without_aterm_env,
+    Group, Halt, Ledger, Scratch, arena_dir, await_socket, build_aterm, ctl_out, in_scratch_world,
+    macos_version, preflight, private,
 };
 use crate::perf::trend::utc_date;
 use crate::perf::{LaneRun, arena::Args};
@@ -117,8 +117,14 @@ fn await_rendered(
     }
 }
 
-const CONFIG: &str = "scrollback_lines = 200000\nrestore_session = false\nbell_sound = false\n\n\
-                      [update]\nenabled = false\n[packages]\nenabled = false\n";
+/// The scroll window's `aterm.toml`: a deep scrollback, no persisted window,
+/// the audible bell off, and the scratch world's lanes off
+/// ([`super::scratch_config`]).
+fn config() -> String {
+    super::scratch_config(
+        "scrollback_lines = 200000\nrestore_session = false\nbell_sound = false\n",
+    )
+}
 
 /// The `scroll` lane.
 pub(crate) fn run(args: &Args) -> LaneRun {
@@ -142,13 +148,13 @@ fn run_inner(args: &Args) -> Result<String, Halt> {
         std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
         private(d)?;
     }
-    std::fs::write(config.join("aterm/aterm.toml"), CONFIG)
+    std::fs::write(config.join("aterm/aterm.toml"), self::config())
         .map_err(|e| format!("could not write the config: {e}"))?;
     let sock = sockets.sock("scroll.sock")?;
     let log = std::fs::File::create(root.join("gui.log")).map_err(|e| format!("log: {e}"))?;
     let log_err = log.try_clone().map_err(|e| format!("log: {e}"))?;
     let mut cmd = command(&aterm.bin);
-    without_aterm_env(&mut cmd)
+    in_scratch_world(&mut cmd, &home)?
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", &config)
         .env("XDG_RUNTIME_DIR", &runtime)
@@ -251,7 +257,7 @@ mod tests {
 
     #[test]
     fn the_scroll_window_starts_with_the_audible_bell_off() {
-        let doc = aterm_toml::from_str::<aterm_toml::Value>(CONFIG).expect("one document");
+        let doc = aterm_toml::from_str::<aterm_toml::Value>(&config()).expect("one document");
         assert_eq!(
             doc.get("bell_sound").and_then(aterm_toml::Value::as_bool),
             Some(false)
@@ -262,10 +268,8 @@ mod tests {
             Some(200_000)
         );
         assert_eq!(
-            doc.get("update")
-                .and_then(|t| t.get("enabled"))
-                .and_then(aterm_toml::Value::as_bool),
-            Some(false)
+            crate::smoke_stages::tests::lanes_left_on(&doc),
+            Vec::<String>::new()
         );
     }
 

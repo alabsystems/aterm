@@ -5304,11 +5304,12 @@ fn scan_maildir_once_by(
     candidates.sort_by_key(|a| std::cmp::Reverse(a.0));
     for (mtime, len, path) in candidates {
         auth_budget_ready(deadline)?;
-        let mut raw = String::new();
-        let Ok((file, _)) = super::disk::versions::open_regular_file(&path) else {
+        let Ok((file, meta)) = super::disk::versions::open_regular_file(&path) else {
             tried.insert((path.clone(), len, mtime));
             continue;
         };
+        let cap = usize::try_from(meta.len().min(EMAIL_FILE_MAX).saturating_add(1)).unwrap_or(0);
+        let mut raw = String::with_capacity(cap);
         if file.take(EMAIL_FILE_MAX).read_to_string(&mut raw).is_err() {
             tried.insert((path.clone(), len, mtime));
             continue;
@@ -9599,7 +9600,7 @@ impl VendorApprover {
             label_key,
             sign_in_once: cli
                 .renews_headlessly()
-                .then(|| format!("aterm harness accounts browser {label} --cli {}", cli.id())),
+                .then(|| super::accounts_step::Step::Browser(cli, label.to_owned()).to_string()),
             mailbox,
             mailbox_source,
             mailbox_unready,

@@ -37,7 +37,7 @@ astream-wire	-	24	3.0	1.8	=	2026-09-29: m101 (24 GiB), its real ceiling
 astream-wire	-	36	4.5	1.6	=	2026-10-20
 astream-wire	-	128	16.0	1.6	=	2026-10-18
 aterm-a11y	-	48	6.0	3.1	=	2026-10-17
-aterm-acaffiene	-	48	6.0	0.8	=	2026-10-20
+aterm-acaffeine	-	48	6.0	0.8	=	2026-10-20
 aterm-agent	-	128	16.0	11.2	=	2026-10-20
 aterm-alloc	16.0	128	16.0	0.3	=	2026-10-27
 aterm-bench	-	-	-	-	-	-

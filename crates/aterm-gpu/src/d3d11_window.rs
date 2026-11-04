@@ -34,7 +34,43 @@ const FRAME_LATENCY: u32 = 1;
 
 /// How long the acquire waits on the chain's waitable before the frame draws
 /// and presents without it (wgpu-dx12's `acquire_texture` timeout).
-const ACQUIRE_TIMEOUT_MS: u32 = 1000;
+pub(super) const ACQUIRE_TIMEOUT_MS: u32 = 1000;
+
+#[cfg(test)]
+thread_local! {
+    /// A test thread's own acquire wait in place of [`ACQUIRE_TIMEOUT_MS`] (None: the product's).
+    static TEST_ACQUIRE_WAIT_MS: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// The acquire's wait on the chain's waitable: [`ACQUIRE_TIMEOUT_MS`], or the one an
+/// [`AcquireWait`] holds on this thread.
+fn acquire_timeout_ms() -> u32 {
+    #[cfg(test)]
+    if let Some(ms) = TEST_ACQUIRE_WAIT_MS.get() {
+        return ms;
+    }
+    ACQUIRE_TIMEOUT_MS
+}
+
+/// While held, every acquire on this thread waits `ms` on the chain's waitable: a test whose
+/// frames must come back waits the one-minute hang detector for each, not the product's second.
+/// Its drop, a panic's unwind included, puts back the wait it replaced.
+#[cfg(test)]
+pub(super) struct AcquireWait(Option<u32>);
+
+#[cfg(test)]
+impl AcquireWait {
+    pub(super) fn set(ms: u32) -> Self {
+        Self(TEST_ACQUIRE_WAIT_MS.replace(Some(ms)))
+    }
+}
+
+#[cfg(test)]
+impl Drop for AcquireWait {
+    fn drop(&mut self) {
+        TEST_ACQUIRE_WAIT_MS.set(self.0);
+    }
+}
 
 /// One window's D3D11 swap chain and the window it is made on, kept alive as
 /// long as the chain.
@@ -343,7 +379,7 @@ impl GpuRenderer {
             d3d11_arm::d3d11_arm_note(&format!("armed present: the resize failed ({e})"));
             return Err(SurfacePresentFailure::Validation);
         }
-        if !win.measure_surface_acquire(|| chain.wait_for_frame(ACQUIRE_TIMEOUT_MS)) {
+        if !win.measure_surface_acquire(|| chain.wait_for_frame(acquire_timeout_ms())) {
             // wgpu-dx12's acquire: the frame draws and presents, and that
             // present's retirement gives the waitable a frame back.
             dw.timed_out_waits += 1;

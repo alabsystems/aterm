@@ -361,25 +361,40 @@ fn members_here() -> usize {
     };
     let own = member::read_node_id(&state).ok().flatten();
     let book = member::read_peers(&state).unwrap_or_default();
-    let copies = book
-        .iter()
-        .find(|peer| peer.via == member::Via::Issuer)
-        .and_then(|issuer| issuer.node.as_deref())
-        .map(|issuer| member::read_issuer_book(&state, issuer))
-        .unwrap_or_default();
-    let others = book
-        .iter()
-        .chain(&copies)
-        .filter(|peer| peer.node.is_none() || peer.node != own)
-        .map(member::answer_key)
-        .collect::<std::collections::BTreeSet<_>>()
-        .len();
+    let others = others_in_book(own.as_deref(), &book, |issuer| {
+        member::read_issuer_book(&state, issuer)
+    });
     let record = aterm_netplace::record::read(&aterm_netplace::record::dir(&state));
     herd_given(
         others,
         record.as_ref().map(|written| &written.record),
         aterm_netplace::unix_ms_now(),
     )
+}
+
+/// The other members [`members_here`] counts for the Mac whose node is `own` and whose fleet book
+/// is `book`: the book's peers and `copies_of(issuer)`, its copy of its issuer's book (read only
+/// where the book names an issuer with a node), each once by its
+/// [`aterm_net::fleet_member::answer_key`], `own` aside.
+#[cfg(unix)]
+fn others_in_book(
+    own: Option<&str>,
+    book: &[aterm_net::fleet_member::Peer],
+    copies_of: impl FnOnce(&str) -> Vec<aterm_net::fleet_member::Peer>,
+) -> usize {
+    use aterm_net::fleet_member as member;
+    let copies = book
+        .iter()
+        .find(|peer| peer.via == member::Via::Issuer)
+        .and_then(|issuer| issuer.node.as_deref())
+        .map(copies_of)
+        .unwrap_or_default();
+    book.iter()
+        .chain(&copies)
+        .filter(|peer| peer.node.is_none() || peer.node.as_deref() != own)
+        .map(member::answer_key)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
 }
 
 /// None off Unix, which keeps no fleet book, and in a test build, whose signals name their own
@@ -499,11 +514,20 @@ pub(crate) fn hear_alab_tcp(own: &[&str]) {
     hear_alab_tcp_on(process(), own);
 }
 
+/// Whether this process starts its `_alab._tcp` browse at all, `set` saying which environment
+/// variables are set: never in a scratch world ([`aterm_types::world::MARKER`], read as a plain
+/// variable so a release build honours it too) or under `CI`, as the Commons runtime and the
+/// converge runner's window lane ([`crate::converge_lane::runs`]).
+#[cfg(any(test, target_os = "macos"))]
+pub(crate) fn browse_runs(set: &dyn Fn(&str) -> bool) -> bool {
+    !set(aterm_types::world::MARKER) && !set("CI")
+}
+
 /// [`hear_alab_tcp`], telling `moved` (the process's signal, which [`start_sources`] is starting
 /// before [`process`] holds it) of each move.
 fn hear_alab_tcp_on(moved: &Arc<Moved>, own: &[&str]) {
     #[cfg(all(not(test), target_os = "macos"))]
-    if std::env::var_os("ATERM_STATE_HOME").is_none() && std::env::var_os("CI").is_none() {
+    if browse_runs(&crate::converge_lane::env_set) {
         let watch = ALAB_TCP.get_or_init(|| {
             let bell = Arc::new(aterm_secrets::wake::Bell::new());
             let watch = Arc::new(aterm_secrets::discover::Watch::idle_for(
@@ -967,6 +991,59 @@ pub(crate) mod tests {
     /// One minute: a wait for something that must happen.
     pub(crate) const HANG: Duration = Duration::from_secs(60);
 
+    /// verify measure, its GUI smoke and the perf arena start aterm in a scratch world
+    /// ([`aterm_types::world`]), often a release build that reads no development seam. Its
+    /// marker and its lanes-off tables turn off, by the product's own gates, every launch lane
+    /// that can reach the local network (macOS keys that consent to the account and the app,
+    /// so a world's use of it puts the Local Network prompt on the person's desk) or the login's
+    /// launchd domain: this process's `_alab._tcp` browse, the converge runner's window lane, the
+    /// browse's own `[swarm]` switch, fleet reads, System State's Local Network step and the
+    /// keeper job, besides the update and package lanes. Each gate is first shown open without
+    /// the world, so none passes by being shut anyway.
+    /// NEGATIVE CONTROL: a lanes-off text without its `[swarm]` table leaves the browse's switch,
+    /// fleet reads and the Local Network step on.
+    #[test]
+    fn a_scratch_world_starts_no_lane_that_reaches_the_local_network() {
+        let none = |_: &str| false;
+        let world = |name: &str| name == aterm_types::world::MARKER;
+        assert!(browse_runs(&none), "the browse runs outside a world");
+        assert!(!browse_runs(&world), "the world's marker skips the browse");
+        assert_eq!(crate::converge_lane::runs(false, false, &none), cfg!(unix));
+        assert!(
+            !crate::converge_lane::runs(false, false, &world),
+            "the world's marker skips the converge runner's window lane"
+        );
+
+        let open = crate::app_config::Config::parse("").expect("an empty config");
+        assert!(open.swarm_enabled() && open.fleet_watch_enabled());
+        assert_eq!(open.local_network_step_off(), None);
+        assert_eq!(open.keeper_setting(), None);
+        assert!(crate::app_config::update_checks_automatic(&open));
+        assert!(open.packages_enabled());
+        let empty = aterm_toml::from_str::<aterm_toml::Value>("").expect("an empty document");
+        assert_eq!(aterm_secrets::swarm::enabled_in_value(&empty), Ok(true));
+        let off = aterm_types::world::LANES_OFF;
+        let config = crate::app_config::Config::parse(off).expect("the lanes-off tables parse");
+        assert!(!config.swarm_enabled(), "swarm participation off: {off}");
+        assert!(!config.fleet_watch_enabled(), "no fleet reads: {off}");
+        assert!(
+            config.local_network_step_off().is_some(),
+            "no Local Network step: {off}"
+        );
+        assert_eq!(config.keeper_setting(), Some(false), "no keeper job: {off}");
+        assert!(
+            !crate::app_config::update_checks_automatic(&config),
+            "{off}"
+        );
+        assert!(!config.packages_enabled(), "{off}");
+        let doc = aterm_toml::from_str::<aterm_toml::Value>(off).expect("one document");
+        assert_eq!(
+            aterm_secrets::swarm::enabled_in_value(&doc),
+            Ok(false),
+            "the browse's own switch reads the swarm off: {off}"
+        );
+    }
+
     /// The `_alab._tcp` browse is a Local Network use, so it starts only once this process may
     /// use the LAN: while System State's Local Network step is still to come it waits, woken by
     /// a move (the step's question) or its timer, and reads again; once the step asked, or where
@@ -1208,6 +1285,57 @@ pub(crate) mod tests {
         let mut waiting = spread.watch_at_once();
         spread.tell_at(Woke::Beacon, Instant::now() + secs(3600));
         assert_eq!(waiting.wait(HANG), Woke::Beacon, "at once, waiting");
+    }
+
+    /// THE OTHERS A MEMBER'S BOOK COUNTS: its book's peers and its copy of its issuer's book,
+    /// read only for the `Issuer` entry's node, each member once and this Mac's own node aside; a
+    /// peer a person named counts by its place (host and port); an empty book counts none.
+    /// NEGATIVE CONTROL: reading the copy for another entry with a node (the first one, or a
+    /// `Joined` one) fails "the copy of the issuer's book", and keying a named peer by its host
+    /// alone fails "each place once".
+    #[cfg(unix)]
+    #[test]
+    fn a_member_counts_its_issuer_and_the_issuers_book_once_each_but_never_itself() {
+        use aterm_net::fleet_member::{Peer, Via};
+        let peer = |node: Option<&str>, host: &str, via: Via| Peer {
+            node: node.map(Into::into),
+            key: None,
+            key_from: None,
+            host: host.into(),
+            addr: None,
+            port: 7100,
+            version: None,
+            seen_ms: None,
+            via,
+            fleet: None,
+            signed: None,
+        };
+        let book = [
+            peer(Some("j"), "j.local", Via::Joined),
+            peer(Some("i"), "i.local", Via::Issuer),
+        ];
+        let copies = |issuer: &str| {
+            assert_eq!(issuer, "i", "the copy of the issuer's book");
+            ["x", "y", "x", "m", "j"]
+                .map(|node| peer(Some(node), node, Via::IssuerBook))
+                .to_vec()
+        };
+        assert_eq!(others_in_book(Some("m"), &book, copies), 4, "j, i, x and y");
+        let named = [
+            peer(None, "h", Via::Manual),
+            peer(None, "g", Via::Manual),
+            Peer {
+                port: 7200,
+                ..peer(None, "h", Via::Manual)
+            },
+            peer(None, "h", Via::Manual),
+        ];
+        assert_eq!(
+            others_in_book(None, &named, |_| panic!("no issuer")),
+            3,
+            "each place once: h:7100, g:7100 and h:7200"
+        );
+        assert_eq!(others_in_book(Some("m"), &[], |_| panic!("no book")), 0);
     }
 
     /// A RETURN FROM AWAY WAITS NO HERD, A REBOOT KEEPS IT (docs/DESIGN-network-place-2026-11-01.md,

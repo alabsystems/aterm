@@ -332,7 +332,6 @@ mod tests {
     #[cfg(target_vendor = "apple")]
     #[test]
     fn a_test_job_is_submitted_and_removed_without_a_trace() {
-        use std::os::unix::fs::DirBuilderExt as _;
         struct Guard(String);
         impl Drop for Guard {
             fn drop(&mut self) {
@@ -342,13 +341,8 @@ mod tests {
         let label = format!("{TEST_LABEL_PREFIX}.{}.jobtest", std::process::id());
         assert_ne!(label, INSTALLED_LABEL);
         assert_eq!(state(&label).expect("launchctl"), JobState::Absent);
-        let dir = std::env::temp_dir().join(format!("akj-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&dir)
-            .expect("dir");
-        let log = log_path(&dir.join("k.sock"));
+        let scratch = crate::test_scratch_dir("job");
+        let log = log_path(&scratch.path().join("k.sock"));
         let guard = Guard(label.clone());
         submit(
             &label,
@@ -394,6 +388,5 @@ mod tests {
             );
             std::thread::yield_now();
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

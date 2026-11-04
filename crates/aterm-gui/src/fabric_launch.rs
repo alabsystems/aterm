@@ -106,6 +106,14 @@ pub(crate) struct SupervisorStatus {
     pub(crate) configured: Option<Vec<String>>,
 }
 
+impl SupervisorStatus {
+    /// Whether the supervisor names a command: armed (an `aterm fabric on`'s attach) or
+    /// configured (`[fabric] command`), either without the other.
+    pub(crate) const fn names_a_command(&self) -> bool {
+        self.armed.is_some() || self.configured.is_some()
+    }
+}
+
 /// A snapshot of the [`Supervisor`] record.
 pub(crate) fn status() -> SupervisorStatus {
     let g = supervisor();
@@ -1307,6 +1315,21 @@ mod tests {
                 "a retired supervisor went on launching"
             );
         });
+    }
+
+    /// The Overview reads the fabric where the supervisor names a command either way: armed
+    /// alone (a bridge `aterm fabric on` attached) or configured alone (a `[fabric] command`
+    /// whose preflight failed), as well as both; with neither it names none.
+    #[test]
+    fn an_armed_or_a_configured_command_alone_names_the_bridge() {
+        let status = |armed: bool, configured: bool| SupervisorStatus {
+            armed: armed.then(|| vec!["bridge".to_owned()]),
+            configured: configured.then(|| vec!["bridge".to_owned()]),
+        };
+        assert!(!status(false, false).names_a_command());
+        assert!(status(true, false).names_a_command(), "attached at runtime");
+        assert!(status(false, true).names_a_command(), "configured, unarmed");
+        assert!(status(true, true).names_a_command());
     }
 
     #[test]

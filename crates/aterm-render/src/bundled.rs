@@ -843,22 +843,17 @@ mod tests {
         let path = module
             .split_once("::")
             .map_or_else(|| test.to_owned(), |(_, inner)| format!("{inner}::{test}"));
-        let home = std::env::temp_dir().join(format!(
-            "aterm-render-font-home-{}-{test}",
-            std::process::id()
-        ));
-        std::fs::create_dir(&home).expect("a fresh empty HOME for the child");
+        let home = crate::test_scratch_dir(&format!("font-home-{test}"));
         let out = aterm_uds::spawnfd::command(
             std::env::current_exe().expect("the test binary's own path"),
         )
         .args(["--exact", "--nocapture", "--test-threads=1", &path])
         .env(PRIVATE_FONT_HOME, "1")
-        .env("HOME", &home)
+        .env("HOME", home.path())
         .env_remove("XDG_DATA_HOME")
         .env_remove("XDG_DATA_DIRS")
         .output()
         .expect("re-running this test binary on one test");
-        let _ = std::fs::remove_dir_all(&home);
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
         if out.status.success() {

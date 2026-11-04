@@ -56,7 +56,7 @@ pub struct WindowSeen {
     /// The workspace's sub-account key where the window is a workspace's.
     pub sub: Option<String>,
     pub figure: Option<Figure>,
-    /// When the newest reading was made, by which Mac, from which source.
+    /// Original time, Mac and source of the quota reading retained with this window.
     pub read: Option<(i64, Mac, String)>,
     /// A wall standing at the read, until when.
     pub wall_until: Option<Option<i64>>,
@@ -158,23 +158,46 @@ pub(crate) fn with_seen<T>(seen: Seen, f: impl FnOnce() -> T) -> T {
 /// `seconds` as a short age: `40 s`, `12 min`, `3 h`, `2 d`.
 #[must_use]
 pub fn age(seconds: i64) -> String {
-    let s = seconds.max(0);
-    match s {
-        0..60 => format!("{s} s"),
-        60..3_600 => format!("{} min", s / 60),
-        3_600..172_800 => format!("{} h", s / 3_600),
-        _ => format!("{} d", s / 86_400),
+    duration_words(u64::try_from(seconds).unwrap_or_default())
+}
+
+fn duration_words(seconds: u64) -> String {
+    match seconds {
+        0..60 => format!("{seconds} s"),
+        60..3_600 => format!("{} min", seconds / 60),
+        3_600..172_800 => format!("{} h", seconds / 3_600),
+        _ => format!("{} d", seconds / 86_400),
     }
 }
 
 /// "m17, about 3 h ago (its clock)", or "… ahead (its clock)" for a time past `now`.
 #[must_use]
 pub fn when(by: &str, t: i64, now: i64) -> String {
+    let age = duration_words(now.abs_diff(t));
     if t > now {
-        format!("{by}, {} ahead (its clock)", age(t - now))
+        format!("{by}, {age} ahead (its clock)")
     } else {
-        format!("{by}, about {} ago (its clock)", age(now - t))
+        format!("{by}, about {age} ago (its clock)")
     }
+}
+
+/// The retained quota reading's original Mac, source and source-clock age or lead.
+#[must_use]
+pub fn read_words(t: i64, by: &str, source: &str, now: i64) -> String {
+    format!("read on {} ({source})", when(by, t, now))
+}
+
+/// Each Mac's retained sign-in word, with its age or clock lead at the projection time.
+/// These records do not establish a current provider login.
+#[must_use]
+pub fn signed_in_words(records: &[SignedIn], now: i64) -> Option<String> {
+    (!records.is_empty()).then(|| {
+        records
+            .iter()
+            .map(|record| when(&format!("{} ({})", record.on, record.state), record.t, now))
+            .collect::<Vec<_>>()
+            .join("; ")
+    })
 }
 
 fn percent(pct_x10: u16) -> String {
@@ -185,8 +208,8 @@ fn percent(pct_x10: u16) -> String {
     }
 }
 
-/// One window as a line: "5h 42% used, resets 2026-11-03T19:30:00Z, read 20 min ago on m3
-/// (statusline)"; "7d reset 2026-11-02T00:00:00Z, not read since"; "7d at its limit until …".
+/// One window as a line: its figure, reset, reading provenance and standing wall. A reading
+/// whose source clock is ahead says so; an unread reset is never shown as zero usage.
 #[must_use]
 pub fn window_line(w: &WindowSeen, now: i64) -> String {
     let w = w.as_of(now);
@@ -211,7 +234,7 @@ pub fn window_line(w: &WindowSeen, now: i64) -> String {
         None => {}
     }
     if let Some((t, by, src)) = &w.read {
-        out.push_str(&format!(", read {} ago on {by} ({src})", age(now - *t)));
+        out.push_str(&format!(", {}", read_words(*t, by, src, now)));
     }
     if let Some(until) = w.wall_until {
         match until {
@@ -225,40 +248,26 @@ pub fn window_line(w: &WindowSeen, now: i64) -> String {
     out
 }
 
-/// What the journal says of `account` as lines, for a report: last used by, signed in on, and
-/// each window. Empty where it says nothing.
+/// What the journal says of `account` as lines, for a report: last used by, sign-in records,
+/// and each window. Empty where it says nothing.
 #[must_use]
 pub fn lines(account: &AccountSeen, now: i64) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(last) = &account.last_use {
         out.push(format!("last used by {}", when(&last.by, last.t, now)));
     }
-    if !account.signed_in.is_empty() {
-        let on: Vec<String> = account
-            .signed_in
-            .iter()
-            .map(|s| format!("{} ({})", s.on, s.state))
-            .collect();
-        out.push(format!("signed in on {}", on.join(", ")));
+    if let Some(records) = signed_in_words(&account.signed_in, now) {
+        out.push(format!("sign-in records: {records}"));
     }
     out.extend(account.windows.iter().map(|w| window_line(w, now)));
     out
 }
 
-/// The account key of `label`'s row: the key its state learned ([`super::accounts::Account::pk`]),
-/// else the lab's account the row is ([`super::alab_roster::Lab::account_of`]).
+/// The current row's canonical claims key. Historical label state and registry alias matches
+/// do not establish which account the row names now.
 #[must_use]
-pub fn row_key(
-    cli: super::accounts::Cli,
-    row: &super::accounts::Row,
-    state: &super::accounts::State,
-    lab: Option<&super::alab_roster::Lab>,
-) -> Option<String> {
-    state
-        .accounts
-        .get(&row.label)
-        .and_then(|account| account.pk.clone())
-        .or_else(|| Some(lab?.account_of(cli, row)?.pk.clone()))
+pub fn row_key(cli: super::accounts::Cli, row: &super::accounts::Row) -> Option<String> {
+    super::journal::account_key(cli, row).map(|key| key.as_str().to_owned())
 }
 
 /// One roster row the journal says something of: its label, its account key, and what it says.
@@ -269,15 +278,13 @@ pub type Reported = (String, String, AccountSeen);
 pub fn rows(
     cli: super::accounts::Cli,
     roster: &super::accounts::Roster,
-    state: &super::accounts::State,
-    lab: Option<&super::alab_roster::Lab>,
     seen: &Seen,
 ) -> Vec<Reported> {
     roster
         .rows
         .iter()
         .filter_map(|row| {
-            let pk = row_key(cli, row, state, lab)?;
+            let pk = row_key(cli, row)?;
             let found = seen.accounts.get(&pk)?;
             Some((row.label.clone(), pk, found.clone()))
         })
@@ -285,7 +292,7 @@ pub fn rows(
 }
 
 /// The report's `journal` section: per row label, its account key, last use, sign-ins and
-/// windows, each time with its age at `now`.
+/// windows, each time with its signed age at `now`, or null if that age cannot fit in an i64.
 #[must_use]
 pub fn rows_json(rows: &[Reported], now: i64) -> aterm_json::Value {
     use aterm_json::{Map, Value, json};
@@ -317,7 +324,7 @@ pub fn rows_json(rows: &[Reported], now: i64) -> aterm_json::Value {
                     "used_pct_x10": pct,
                     "reset": reset,
                     "read": w.read.as_ref().map(|(t, by, src)| json!({
-                        "t": t, "age_s": now - t, "by": by, "src": src,
+                        "t": t, "age_s": now.checked_sub(*t), "by": by, "src": src,
                     })),
                     "wall_until": w.wall_until.map(|u| json!(u)),
                     "line": window_line(&w, now),
@@ -329,7 +336,7 @@ pub fn rows_json(rows: &[Reported], now: i64) -> aterm_json::Value {
             json!({
                 "ac": pk,
                 "last_use": seen.last_use.as_ref().map(|l| json!({
-                    "by": l.by, "t": l.t, "age_s": now - l.t, "clock": "its",
+                    "by": l.by, "t": l.t, "age_s": now.checked_sub(l.t), "clock": "its",
                 })),
                 "signed_in": seen.signed_in.iter().map(|s| json!({
                     "on": s.on, "state": s.state, "t": s.t,
@@ -368,21 +375,20 @@ pub fn resolve(
     cli: super::accounts::Cli,
     name: &str,
     roster: &super::accounts::Roster,
-    state: &super::accounts::State,
     lab: Option<&super::alab_roster::Lab>,
 ) -> Option<Asked> {
     if name.contains('@') {
         return None;
     }
-    if let Some(row) = roster.rows.iter().find(|row| row.label == name) {
+    let explicit = name.starts_with("ac-") && super::journal::Key::new(name).is_some();
+    if !explicit && let Some(row) = roster.rows.iter().find(|row| row.label == name) {
         return Some(Asked {
             label: Some(row.label.clone()),
-            pk: row_key(cli, row, state, lab),
+            pk: row_key(cli, row),
         });
     }
-    // A row whose state no longer holds it keeps its key in the forgotten observations, so a
-    // removed row's label still finds its history.
-    let pk = if name.starts_with("ac-") {
+    // Explicit account keys retain their history independently of current roster labels.
+    let pk = if explicit {
         Some(name.to_owned())
     } else {
         lab.and_then(|lab| {
@@ -394,7 +400,7 @@ pub fn resolve(
     let label = roster
         .rows
         .iter()
-        .find(|row| row_key(cli, row, state, lab).as_deref() == Some(pk.as_str()))
+        .find(|row| row_key(cli, row).as_deref() == Some(pk.as_str()))
         .map(|row| row.label.clone());
     Some(Asked {
         label,
@@ -506,24 +512,39 @@ mod tests {
         }
     }
 
-    /// A report says who last used the account, by its clock, where it is signed in, and each
-    /// window with its age, Mac and source; a reset nobody read since is never shown as 0.
+    /// A report says who last used the account, by its clock, the retained sign-in records, and
+    /// each window with its age, Mac and source; a reset nobody read since is never shown as 0.
     /// NEGATIVE CONTROL: with `window_line` printing a `ResetUnread` figure as `0% used`, the
     /// 7d line reads `7d 0% used…`: `left: "7d 0% used, at its limit"`.
     #[test]
     fn a_report_names_the_mac_the_age_and_never_a_guessed_zero() {
-        let lines = lines(&seen_account(), 1_000);
+        let held = seen_account();
+        let original = held.clone();
+        let lines = super::lines(&held, 1_000);
         assert_eq!(lines[0], "last used by m17, about 3 h ago (its clock)");
-        assert_eq!(lines[1], "signed in on m3 (in), m17 (out)");
+        for part in [
+            "m3 (in), about 1 min ago (its clock)",
+            "m17 (out), about 3 min ago (its clock)",
+        ] {
+            assert!(lines[1].contains(part), "{}", lines[1]);
+        }
         assert_eq!(
             lines[2],
-            "5h 42.5% used, reset unknown, read 20 min ago on m3 (statusline)"
+            "5h 42.5% used, reset unknown, read on m3, about 20 min ago (its clock) (statusline)"
         );
         assert_eq!(
             lines[3],
             "7d reset at 1970-01-01T00:00:00Z, not read since, at its limit"
         );
         assert!(lines.iter().all(|l| !l.contains('@')));
+        let later = super::lines(&held, 1_000 + 3 * 86_400);
+        assert!(later[1].contains("m3 (in), about 3 d ago (its clock)"));
+        assert!(later[1].contains("m17 (out), about 3 d ago (its clock)"));
+        let ahead = super::lines(&held, 700);
+        assert!(ahead[1].contains("m3 (in), 3 min ahead (its clock)"));
+        assert!(ahead[1].contains("m17 (out), 1 min ahead (its clock)"));
+        assert_eq!(held, original);
+        assert_eq!(signed_in_words(&[], 1_000), None);
     }
 
     /// A cached reading crossing its known reset is unknown in both report forms, while the
@@ -590,6 +611,107 @@ mod tests {
         assert_eq!(rows, original);
     }
 
+    #[test]
+    fn quota_read_provenance_tracks_the_source_clock_without_changing_the_window() {
+        let reading = 1_120;
+        let held = vec![(
+            "one".into(),
+            "ac-0123456789abcdef".into(),
+            AccountSeen {
+                last_use: Some(LastUse {
+                    by: "m3".into(),
+                    t: reading,
+                }),
+                windows: vec![WindowSeen {
+                    window: "5h".into(),
+                    sub: None,
+                    figure: Some(Figure::Used {
+                        pct_x10: 420,
+                        reset: Some(1_300),
+                    }),
+                    read: Some((reading, "m3".into(), "statusline".into())),
+                    wall_until: Some(Some(1_300)),
+                }],
+                ..Default::default()
+            },
+        )];
+        let original = held.clone();
+        for (now, words) in [
+            (1_000, "2 min ahead"),
+            (reading, "0 s ago"),
+            (1_240, "2 min ago"),
+            (1_300, "3 min ago"),
+        ] {
+            let json = rows_json(&held, now);
+            let shown = &json["one"]["windows"][0];
+            let line = shown["line"].as_str().unwrap();
+            for part in [words, "m3", "its clock", "statusline"] {
+                assert!(line.contains(part), "{line}");
+            }
+            assert_eq!(shown["read"]["t"].as_i64(), Some(reading));
+            assert_eq!(shown["read"]["age_s"].as_i64(), Some(now - reading));
+            assert_eq!(
+                json["one"]["last_use"]["age_s"].as_i64(),
+                Some(now - reading)
+            );
+            if now < 1_300 {
+                assert_eq!(shown["state"].as_str(), Some("current"));
+                assert_eq!(shown["used_pct_x10"].as_u64(), Some(420));
+                assert_eq!(shown["wall_until"].as_i64(), Some(1_300));
+            } else {
+                assert_eq!(shown["state"].as_str(), Some("reset-unread"));
+                assert!(shown["used_pct_x10"].is_null());
+                assert!(shown["wall_until"].is_null());
+            }
+            assert!(rows_text(&held, now).contains(line));
+        }
+        let mut no_read = held[0].2.windows[0].clone();
+        no_read.read = None;
+        assert!(!window_line(&no_read, 1_000).contains("read on"));
+        assert_eq!(held, original);
+    }
+
+    #[test]
+    fn relative_provenance_keeps_raw_times_when_the_signed_age_cannot_fit() {
+        for (now, t, direction) in [(i64::MIN, i64::MAX, "ahead"), (i64::MAX, i64::MIN, "ago")] {
+            let window = WindowSeen {
+                window: "5h".into(),
+                sub: None,
+                figure: Some(Figure::Used {
+                    pct_x10: 420,
+                    reset: None,
+                }),
+                read: Some((t, "m3".into(), "statusline".into())),
+                wall_until: None,
+            };
+            let shown = rows_json(
+                &[(
+                    "one".into(),
+                    "ac-0123456789abcdef".into(),
+                    AccountSeen {
+                        last_use: Some(LastUse { by: "m3".into(), t }),
+                        windows: vec![window.clone()],
+                        ..Default::default()
+                    },
+                )],
+                now,
+            );
+            let read = &shown["one"]["windows"][0]["read"];
+            assert_eq!(read["t"].as_i64(), Some(t));
+            assert!(read["age_s"].is_null());
+            assert_eq!(shown["one"]["last_use"]["t"].as_i64(), Some(t));
+            assert!(shown["one"]["last_use"]["age_s"].is_null());
+            let line = window_line(&window, now);
+            assert!(line.contains(direction), "{line}");
+            assert!(line.contains(&format!("{} d", u64::MAX / 86_400)), "{line}");
+            assert_eq!(
+                shown["one"]["windows"][0]["used_pct_x10"].as_u64(),
+                Some(420)
+            );
+            assert_eq!(window.read.as_ref().unwrap().0, t);
+        }
+    }
+
     fn roster(label: &str, email: &str) -> super::super::accounts::Roster {
         super::super::accounts::Roster {
             rows: vec![super::super::accounts::Row {
@@ -598,6 +720,212 @@ mod tests {
                 ..Default::default()
             }],
         }
+    }
+
+    #[test]
+    fn readonly_journal_attribution_follows_an_externally_replaced_identity() {
+        use super::super::accounts::{self, Cli, Store};
+        const ANN: &str = "ac-0123456789abcdef";
+        const BOB: &str = "ac-fedcba9876543210";
+        let keyer = |_: &str, email: &str| match email {
+            "ann@example.test" => Some(ANN.to_owned()),
+            "bob@example.test" => Some(BOB.to_owned()),
+            _ => None,
+        };
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let home = scratch.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let store =
+            Store::at_for(&scratch.path().join("harness"), Cli::Claude, &home).bounded_by(&[]);
+        let path = scratch.path().join("accounts.toml");
+        let old = roster("work", "ann@example.test");
+        std::fs::write(
+            &path,
+            accounts::append_rows_for(Cli::Claude, "", &old.rows).unwrap(),
+        )
+        .unwrap();
+        store
+            .transact(1_000, &mut None, |state| {
+                state.accounts.entry("work".into()).or_default();
+                super::super::journal::learn_with(Cli::Claude, &old, state, &keyer);
+                Ok(Vec::new())
+            })
+            .unwrap();
+        let replacement = roster("work", "bob@example.test");
+        std::fs::write(
+            &path,
+            accounts::append_rows_for(Cli::Claude, "", &replacement.rows).unwrap(),
+        )
+        .unwrap();
+        let images = || {
+            [
+                path.clone(),
+                store.state_file(),
+                store.logins_file(),
+                store.ledger_path(),
+                store.wake_path(),
+                store.state_witness_file(),
+                store.logins_witness_file(),
+            ]
+            .map(|path| std::fs::read(path).ok())
+        };
+        let before = images();
+        let records = store.read_account_records(Some(&path), 1_000).unwrap();
+        assert_eq!(records.state.accounts["work"].pk.as_deref(), Some(ANN));
+        assert_eq!(
+            records
+                .roster
+                .row("work")
+                .unwrap()
+                .expected_identity_email(),
+            Some("bob@example.test")
+        );
+        assert_eq!(images(), before, "the read must not rekey persisted state");
+        let ann = seen_account();
+        let mut bob = ann.clone();
+        bob.last_use.as_mut().unwrap().by = "m22".into();
+        bob.windows[0].figure = Some(Figure::Used {
+            pct_x10: 950,
+            reset: Some(2_000),
+        });
+        let seen = Seen {
+            accounts: [(ANN.into(), ann), (BOB.into(), bob.clone())].into(),
+            at: 1_000,
+        };
+        let reported =
+            super::super::journal::with_keyer(keyer, || rows(Cli::Claude, &records.roster, &seen));
+        assert_eq!(reported.len(), 1);
+        assert_eq!(
+            reported[0].1, BOB,
+            "a reused label is not current identity evidence"
+        );
+        assert_eq!(reported[0].2, bob);
+        let json = rows_json(&reported, 1_000);
+        assert_eq!(
+            json["work"]["windows"][0]["used_pct_x10"].as_u64(),
+            Some(950)
+        );
+        assert_eq!(json["work"]["last_use"]["by"].as_str(), Some("m22"));
+        let old_history = super::super::journal::with_keyer(keyer, || {
+            resolve(Cli::Claude, ANN, &records.roster, None).unwrap()
+        });
+        assert_eq!(old_history.pk.as_deref(), Some(ANN));
+        assert_eq!(
+            old_history.label, None,
+            "the replaced row no longer names Ann"
+        );
+        assert_eq!(images(), before);
+    }
+
+    #[test]
+    fn explicit_history_keys_survive_a_colliding_replacement_label() {
+        use super::super::{
+            accounts::{Cli, Event, Kind},
+            journal,
+        };
+        const ANN: &str = "ac-0123456789abcdef";
+        const BOB: &str = "ac-fedcba9876543210";
+        let mut current = roster(ANN, "bob@example.test");
+        current.rows.push(super::super::accounts::Row {
+            label: "sa-0123456789abcdef".into(),
+            email: Some("bob@example.test".into()),
+            ..Default::default()
+        });
+        journal::with_keyer(
+            |realm, email| {
+                (realm == "claude" && email == "bob@example.test").then(|| BOB.to_owned())
+            },
+            || {
+                let old = resolve(Cli::Claude, ANN, &current, None).unwrap();
+                assert_eq!(
+                    old,
+                    Asked {
+                        label: None,
+                        pk: Some(ANN.into())
+                    }
+                );
+                let replacement = resolve(Cli::Claude, BOB, &current, None).unwrap();
+                assert_eq!(replacement.label.as_deref(), Some(ANN));
+                assert_eq!(replacement.pk.as_deref(), Some(BOB));
+                let sub_like_label =
+                    resolve(Cli::Claude, "sa-0123456789abcdef", &current, None).unwrap();
+                assert_eq!(sub_like_label.pk.as_deref(), Some(BOB));
+                let mut old_event = Event::new(10, Kind::Auth, "before");
+                old_event.pk = Some(ANN.into());
+                let mut new_event = Event::new(20, Kind::Auth, ANN);
+                new_event.pk = Some(BOB.into());
+                let lines = history(
+                    &old,
+                    &[old_event, new_event, Event::new(30, Kind::Rotate, ANN)],
+                    None,
+                );
+                assert_eq!(
+                    lines.len(),
+                    1,
+                    "old key must not borrow the replacement label's events"
+                );
+                assert!(lines[0].contains(" here auth before"));
+            },
+        );
+    }
+
+    #[test]
+    fn unresolved_current_identity_keeps_local_history_without_borrowing_lab_aliases() {
+        use super::super::{
+            accounts::{Cli, Event, Kind},
+            alab_roster::{Lab, LabAccount},
+            journal,
+        };
+        const ANN: &str = "ac-0123456789abcdef";
+        let mut current = roster("work", "ann@example.test");
+        current.rows[0].identity_email = Some("bob@example.test".into());
+        let lab = Lab {
+            accounts: vec![LabAccount {
+                pk: ANN.into(),
+                cli: Cli::Claude,
+                vendor: Default::default(),
+                label: "ann".into(),
+                legacy_label: Some("before".into()),
+                email: "ann@example.test".into(),
+                identity: None,
+                browser: None,
+                joinable: true,
+                preferred: Vec::new(),
+            }],
+            ..Lab::default()
+        };
+        let seen = Seen {
+            accounts: [(ANN.into(), seen_account())].into(),
+            at: 1_000,
+        };
+        journal::with_keyer(
+            |_, _| None,
+            || {
+                let asked = resolve(Cli::Claude, "work", &current, Some(&lab)).unwrap();
+                assert_eq!(
+                    asked,
+                    Asked {
+                        label: Some("work".into()),
+                        pk: None
+                    }
+                );
+                assert!(rows(Cli::Claude, &current, &seen).is_empty());
+                assert_eq!(
+                    history(&asked, &[Event::new(10, Kind::Auth, "work")], None).len(),
+                    1
+                );
+                for name in [ANN, "ann", "before"] {
+                    let old = resolve(Cli::Claude, name, &current, Some(&lab)).unwrap();
+                    assert_eq!(
+                        old,
+                        Asked {
+                            label: None,
+                            pk: Some(ANN.into())
+                        }
+                    );
+                }
+            },
+        );
     }
 
     /// A forgotten row's observations stay under its account key (through `state.json`), and the
@@ -733,30 +1061,24 @@ mod tests {
     /// account under its old label is missed: `left: 2 right: 3`.
     #[test]
     fn history_merges_this_macs_ledger_and_the_journal_by_account_key() {
-        use super::super::accounts::{self, Event, Kind, State};
+        use super::super::accounts::{self, Event, Kind};
         const KEY: &str = "ac-0123456789abcdef";
-        let mut state = State::default();
-        state.accounts.insert(
-            "now".into(),
-            accounts::Account {
-                pk: Some(KEY.into()),
-                ..Default::default()
+        let roster = roster("now", "ann@example.test");
+        let (asked, by_key) = super::super::journal::with_keyer(
+            |realm, email| {
+                (realm == "claude" && email == "ann@example.test").then(|| KEY.to_owned())
+            },
+            || {
+                assert!(
+                    resolve(accounts::Cli::Claude, "ann@example.test", &roster, None).is_none()
+                );
+                (
+                    resolve(accounts::Cli::Claude, "now", &roster, None).unwrap(),
+                    resolve(accounts::Cli::Claude, KEY, &roster, None).unwrap(),
+                )
             },
         );
-        let roster = roster("now", "ann@example.test");
-        assert!(
-            resolve(
-                accounts::Cli::Claude,
-                "ann@example.test",
-                &roster,
-                &state,
-                None
-            )
-            .is_none()
-        );
-        let asked = resolve(accounts::Cli::Claude, "now", &roster, &state, None).unwrap();
         assert_eq!(asked.pk.as_deref(), Some(KEY));
-        let by_key = resolve(accounts::Cli::Claude, KEY, &roster, &state, None).unwrap();
         assert_eq!(by_key.label.as_deref(), Some("now"));
         let mut renamed = Event::new(10, Kind::Auth, "before");
         renamed.pk = Some(KEY.into());
@@ -790,16 +1112,8 @@ mod tests {
     /// NEGATIVE CONTROL: with `rows` keeping rows the journal has no entry for, `left: 2 right: 1`.
     #[test]
     fn the_report_lists_only_rows_the_journal_knows() {
-        use super::super::accounts::{self, State};
+        use super::super::accounts;
         const KEY: &str = "ac-0123456789abcdef";
-        let mut state = State::default();
-        state.accounts.insert(
-            "one".into(),
-            accounts::Account {
-                pk: Some(KEY.into()),
-                ..Default::default()
-            },
-        );
         let mut both = roster("one", "ann@example.test");
         both.rows.push(accounts::Row {
             label: "two".into(),
@@ -807,7 +1121,12 @@ mod tests {
         });
         let mut seen = Seen::default();
         seen.accounts.insert(KEY.into(), seen_account());
-        let rows = rows(accounts::Cli::Claude, &both, &state, None, &seen);
+        let rows = super::super::journal::with_keyer(
+            |realm, email| {
+                (realm == "claude" && email == "ann@example.test").then(|| KEY.to_owned())
+            },
+            || rows(accounts::Cli::Claude, &both, &seen),
+        );
         assert_eq!(rows.len(), 1);
         let json = rows_json(&rows, 1_000);
         assert_eq!(json["one"]["ac"].as_str(), Some(KEY));

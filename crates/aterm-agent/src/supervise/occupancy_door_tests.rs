@@ -669,7 +669,11 @@ fn each_guard_in_hand_holds_the_due_line_once() {
             if !on {
                 s.draft_seen = None;
             } else if s.draft_seen.is_none() {
-                s.draft_seen = Some(("and also the docs".to_string(), s.fx.mono()));
+                s.draft_seen = Some((
+                    "and also the docs".to_string(),
+                    s.fx.mono(),
+                    turn_end_loop::DraftCell::Typed,
+                ));
             }
         }),
     ];
@@ -752,7 +756,13 @@ fn the_f1_days_fact_rows_are_bounded_however_its_guards_flap() {
                 let at = drafted.get().unwrap_or_else(|| s.fx.mono());
                 drafted.set(Some(at));
                 s.driver = seq % 2 == 0;
-                s.draft_seen = (seq % 2 == 1).then(|| ("and also the docs".to_string(), at));
+                s.draft_seen = (seq % 2 == 1).then(|| {
+                    (
+                        "and also the docs".to_string(),
+                        at,
+                        turn_end_loop::DraftCell::Typed,
+                    )
+                });
             },
         )
     };

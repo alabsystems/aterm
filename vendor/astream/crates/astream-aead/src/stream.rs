@@ -203,10 +203,8 @@ const fn has_hello_magic(hello: &[u8; HELLO_LEN]) -> bool {
         && hello[3] == HELLO_MAGIC[3]
 }
 
-const fn join_hellos(
-    hello_client: &[u8; HELLO_LEN],
-    hello_server: &[u8; HELLO_LEN],
-) -> [u8; 2 * HELLO_LEN] {
+#[inline(always)]
+const fn hello_client_q0(hello_client: &[u8; HELLO_LEN]) -> [u8; 16] {
     [
         hello_client[0],
         hello_client[1],
@@ -224,6 +222,12 @@ const fn join_hellos(
         hello_client[13],
         hello_client[14],
         hello_client[15],
+    ]
+}
+
+#[inline(always)]
+const fn hello_client_q1(hello_client: &[u8; HELLO_LEN]) -> [u8; 16] {
+    [
         hello_client[16],
         hello_client[17],
         hello_client[18],
@@ -240,10 +244,22 @@ const fn join_hellos(
         hello_client[29],
         hello_client[30],
         hello_client[31],
+    ]
+}
+
+#[inline(always)]
+const fn hello_client_tail(hello_client: &[u8; HELLO_LEN]) -> [u8; 4] {
+    [
         hello_client[32],
         hello_client[33],
         hello_client[34],
         hello_client[35],
+    ]
+}
+
+#[inline(always)]
+const fn hello_server_q0(hello_server: &[u8; HELLO_LEN]) -> [u8; 16] {
+    [
         hello_server[0],
         hello_server[1],
         hello_server[2],
@@ -260,6 +276,12 @@ const fn join_hellos(
         hello_server[13],
         hello_server[14],
         hello_server[15],
+    ]
+}
+
+#[inline(always)]
+const fn hello_server_q1(hello_server: &[u8; HELLO_LEN]) -> [u8; 16] {
+    [
         hello_server[16],
         hello_server[17],
         hello_server[18],
@@ -276,10 +298,38 @@ const fn join_hellos(
         hello_server[29],
         hello_server[30],
         hello_server[31],
+    ]
+}
+
+#[inline(always)]
+const fn hello_server_tail(hello_server: &[u8; HELLO_LEN]) -> [u8; 4] {
+    [
         hello_server[32],
         hello_server[33],
         hello_server[34],
         hello_server[35],
+    ]
+}
+
+const fn join_hellos(
+    hello_client: &[u8; HELLO_LEN],
+    hello_server: &[u8; HELLO_LEN],
+) -> [u8; 2 * HELLO_LEN] {
+    let [c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13, c14, c15] =
+        hello_client_q0(hello_client);
+    let [c16, c17, c18, c19, c20, c21, c22, c23, c24, c25, c26, c27, c28, c29, c30, c31] =
+        hello_client_q1(hello_client);
+    let [c32, c33, c34, c35] = hello_client_tail(hello_client);
+    let [s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15] =
+        hello_server_q0(hello_server);
+    let [s16, s17, s18, s19, s20, s21, s22, s23, s24, s25, s26, s27, s28, s29, s30, s31] =
+        hello_server_q1(hello_server);
+    let [s32, s33, s34, s35] = hello_server_tail(hello_server);
+    [
+        c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13, c14, c15, c16, c17, c18, c19,
+        c20, c21, c22, c23, c24, c25, c26, c27, c28, c29, c30, c31, c32, c33, c34, c35, s0, s1, s2,
+        s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15, s16, s17, s18, s19, s20, s21,
+        s22, s23, s24, s25, s26, s27, s28, s29, s30, s31, s32, s33, s34, s35,
     ]
 }
 
@@ -517,7 +567,8 @@ impl<S: Read + Write> SealedStream<S> {
     /// transport or its confirm fails to authenticate (wrong key, tampered
     /// hello); `UnexpectedEof` if the peer closed mid-handshake.
     pub fn handshake_client(inner: S, key: [u8; KEY_LEN]) -> io::Result<Self> {
-        Self::handshake(inner, key, true)
+        let op: fn(S, [u8; KEY_LEN], bool) -> io::Result<Self> = Self::handshake;
+        op(inner, key, true)
     }
 
     /// Open the server end of a sealed stream over `inner` under the pre-shared
@@ -528,7 +579,8 @@ impl<S: Read + Write> SealedStream<S> {
     /// # Errors
     /// As [`handshake_client`](Self::handshake_client).
     pub fn handshake_server(inner: S, key: [u8; KEY_LEN]) -> io::Result<Self> {
-        Self::handshake(inner, key, false)
+        let op: fn(S, [u8; KEY_LEN], bool) -> io::Result<Self> = Self::handshake;
+        op(inner, key, false)
     }
 
     fn handshake(mut inner: S, key: [u8; KEY_LEN], is_client: bool) -> io::Result<Self> {
@@ -543,7 +595,8 @@ impl<S: Read + Write> SealedStream<S> {
         inner.write_all(&mine)?;
         inner.flush()?;
         let mut theirs = [0u8; HELLO_LEN];
-        inner.read_exact(&mut theirs)?;
+        let read_exact_op: fn(&mut S, &mut [u8]) -> io::Result<()> = Read::read_exact;
+        read_exact_op(&mut inner, &mut theirs)?;
         if !has_hello_magic(&theirs) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -587,7 +640,14 @@ impl<S: Read + Write> SealedStream<S> {
             // The confirm is empty, so the one pre-authentication record read is
             // capped at exactly one empty record: an unkeyed peer cannot make us
             // allocate anything larger.
-            let got = match read_record(
+            let read_rec_op: fn(
+                &mut S,
+                &[u8; KEY_LEN],
+                &Session,
+                &mut RecvState,
+                usize,
+            ) -> io::Result<bool> = read_record;
+            let got = match read_rec_op(
                 &mut stream.inner,
                 &stream.key,
                 &stream.session,
@@ -728,11 +788,12 @@ fn write_record<S: Write>(
 /// (a timeout included) leaves `*filled` at the resumable position; an EOF
 /// before the end is truncation (`UnexpectedEof`).
 fn fill<S: Read>(inner: &mut S, buf: &mut [u8], filled: &mut usize) -> io::Result<()> {
+    let read_op: fn(&mut S, &mut [u8]) -> io::Result<usize> = Read::read;
     while let Some(rem) = buf.get_mut(*filled..) {
         if rem.is_empty() {
             break;
         }
-        match inner.read(rem) {
+        match read_op(inner, rem) {
             Ok(0) => {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -767,11 +828,13 @@ fn read_record<S: Read>(
     let Some(next_seq) = rs.seq.checked_add(1) else {
         return Err(io::Error::other("sealed stream: record sequence exhausted"));
     };
+    let fill_op: fn(&mut S, &mut [u8], &mut usize) -> io::Result<()> = fill;
     if rs.body_len == 0 {
         if rs.hdr_filled == 0 {
             // At a record boundary a clean EOF is an orderly close.
+            let read_op: fn(&mut S, &mut [u8]) -> io::Result<usize> = Read::read;
             let n = loop {
-                match inner.read(&mut rs.hdr) {
+                match read_op(inner, &mut rs.hdr) {
                     Ok(n) => break n,
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                     Err(e) => return Err(e),
@@ -782,7 +845,7 @@ fn read_record<S: Read>(
             }
             rs.hdr_filled = n;
         }
-        fill(inner, &mut rs.hdr, &mut rs.hdr_filled)?;
+        fill_op(inner, &mut rs.hdr, &mut rs.hdr_filled)?;
         let Some(n) = decode_record_len(&rs.hdr, limit) else {
             rs.poisoned = true;
             return Err(io::Error::new(
@@ -810,7 +873,7 @@ fn read_record<S: Read>(
             "sealed record buffer short",
         ));
     };
-    fill(inner, body_buf, &mut rs.body_filled)?;
+    fill_op(inner, body_buf, &mut rs.body_filled)?;
     record_aad(&mut rs.aad, &session.recv, rs.seq);
     let end = match open_in_place(key, &rs.aad, body_buf) {
         Ok(plain) => NONCE_LEN.saturating_add(plain.len()),
@@ -874,11 +937,18 @@ impl<S: Read> Read for SealedStream<S> {
                 "sealed stream: receive state mutex poisoned",
             ));
         };
+        let read_rec_op: fn(
+            &mut S,
+            &[u8; KEY_LEN],
+            &Session,
+            &mut RecvState,
+            usize,
+        ) -> io::Result<bool> = read_record;
         while rs.pos >= rs.end {
             // Drained (or nothing open yet): read and open the next record. An
             // empty record — the handshake confirm, or a peer's empty write — is
             // skipped here; `Ok(0)` is reserved for EOF at a record boundary.
-            if !read_record(
+            if !read_rec_op(
                 &mut self.inner,
                 &self.key,
                 &self.session,

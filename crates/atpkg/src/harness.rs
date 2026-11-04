@@ -40,15 +40,15 @@ pub const fn is_harness(program: &str) -> bool {
 }
 
 /// The harness a vendor program's `agents/` twin hands its session to once that harness is
-/// installed, as `(program, tool)`: the harness that serves aterm's harness contract 3 for that
-/// agent (`crates/aterm-agent/src/harness/contract.rs`, `ROSTER`;
-/// `docs/DESIGN-harness-repos-2026-10-24.md` §9 step 6). Only grok-alab today: a harness joins
-/// here in the aterm change that rosters it, never before (its claim would be refused and it
-/// would only run the vendor in its place).
+/// installed, as `(program, tool)` (`docs/DESIGN-harness-repos-2026-10-24.md` §9 step 6). A
+/// claiming harness also joins `crates/aterm-agent/src/harness/contract.rs`'s `ROSTER` in the
+/// same change. kimi-alab claims no aterm duties yet; its process handoff needs only the Kimi
+/// program mapping in `aterm-agent-names`.
 #[must_use]
 pub const fn twin_harness(vendor: &str) -> Option<(&'static str, &'static str)> {
     match vendor.as_bytes() {
         b"grok" => Some(("grok-alab", "grok-alab")),
+        b"kimi" => Some(("kimi-alab", "kimi-alab")),
         _ => None,
     }
 }
@@ -440,21 +440,23 @@ mod tests {
         const _: () = assert!(is_harness("x-alab") && !is_harness("-alab"));
     }
 
-    /// Only grok's twin hands its session to a harness, grok-alab, which is a harness program;
-    /// no other vendor's does yet, and no harness's own name does.
+    /// Grok and Kimi hand their sessions to their harnesses; no other vendor or harness name does.
     #[test]
-    fn only_grok_hands_its_session_to_grok_alab() {
-        assert_eq!(twin_harness("grok"), Some(("grok-alab", "grok-alab")));
-        assert!(is_harness("grok-alab"));
+    fn grok_and_kimi_hand_their_sessions_to_their_harnesses() {
+        for (vendor, harness) in [("grok", "grok-alab"), ("kimi", "kimi-alab")] {
+            assert_eq!(twin_harness(vendor), Some((harness, harness)));
+            assert!(is_harness(harness));
+        }
         for other in [
             "claude",
             "codex",
             "codex-old",
             "agy",
             "muse",
-            "kimi",
             "grok-alab",
+            "kimi-alab",
             "Grok",
+            "Kimi",
             "",
         ] {
             assert_eq!(twin_harness(other), None, "{other:?}");

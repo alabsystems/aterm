@@ -10,11 +10,12 @@ use aterm_spec::derive::{InvariantKind, Model};
 use aterm_spec::interp::{self, State};
 
 /// Each dial and the one law it is written to break.
-const DIALS: [(i64, &str); 4] = [
+const DIALS: [(i64, &str); 5] = [
     (1, "NothingLoggedWhileHeld"),
     (2, "OnlyEchoedKeysLogged"),
     (3, "HostedGlowMatchesItsLog"),
     (4, "AttachStartsFromRest"),
+    (5, "OnlyEchoedKeysLogged"),
 ];
 
 /// The state after firing `steps` in order from `model`'s initial state, each of which must be
@@ -86,6 +87,27 @@ fn a_held_key_is_logged_only_once_its_echo_shows() {
     let blind = interp::with_buggy(&model, 2);
     let s = walk(&blind, &["Attach", "Hold", "Release"]);
     assert!(!blind.check_invariant("OnlyEchoedKeysLogged", &s));
+}
+
+#[test]
+fn a_key_logged_at_its_press_is_one_that_carries_no_text_or_is_echoed() {
+    let model = aos_key_hold_model();
+    let s = walk(&model, &["Attach", "Key", "Key"]);
+    assert_eq!((s["att"], s["held"], s["unproven"]), (1, 0, 0));
+    let s = walk(&model, &["Attach", "Hold"]);
+    assert!(
+        !model.action_enabled("Key", &s),
+        "a key while keys wait joins them or stops the recording"
+    );
+
+    let unechoed = interp::with_buggy(&model, 5);
+    let s = walk(&unechoed, &["Attach", "Key"]);
+    assert_eq!(s["unproven"], 1, "a text key logged at its press, unechoed");
+    assert!(!unechoed.check_invariant("OnlyEchoedKeysLogged", &s));
+    assert!(
+        !unechoed.action_enabled("Key", &walk(&unechoed, &["Attach", "Hold"])),
+        "dial 5 keeps Key's guard: it breaks the claim, not the hold"
+    );
 }
 
 #[test]

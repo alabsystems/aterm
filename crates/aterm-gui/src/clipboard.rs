@@ -77,10 +77,12 @@ fn file_copy(path: &Path, text: &str) -> bool {
 
 fn file_paste(path: &Path) -> Option<String> {
     use std::io::Read as _;
-    let mut text = String::new();
-    std::fs::File::open(path)
-        .ok()?
-        .take(CLIPBOARD_FILE_CAP)
+    let (file, meta) = aterm_uds::regular_file::open(path).ok()?;
+    let cap = usize::try_from(meta.len().min(CLIPBOARD_FILE_CAP))
+        .unwrap_or(0)
+        .saturating_add(1);
+    let mut text = String::with_capacity(cap);
+    file.take(CLIPBOARD_FILE_CAP)
         .read_to_string(&mut text)
         .ok()?;
     (!text.is_empty()).then_some(text)

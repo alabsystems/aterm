@@ -17,13 +17,15 @@ enum Location {
 }
 
 impl Location {
+    /// Where `dir` is, `default` where it names none. What a failure stops is its caller's to say:
+    /// an admission has written nothing, while a sync may have published rows before it.
     fn of(dir: Option<&str>, default: Option<&Path>) -> Result<Self, String> {
         let Some(path) = dir.map(Path::new).or(default) else {
             return Ok(Self::Default);
         };
         resolve(path).map_err(|why| {
             format!(
-                "cannot establish login directory ownership for {}: {why}; nothing was written",
+                "cannot establish login directory ownership for {}: {why}",
                 path.display()
             )
         })
@@ -118,11 +120,20 @@ pub(in crate::harness) fn retained_directory_owner<'a>(
     label: &str,
     dir: &str,
 ) -> Result<Option<&'a str>, String> {
+    retained_directory_owner_at(logins, rows, label, dir, None)
+}
+
+/// Resolve default-login custody too when the native default home is known.
+pub(in crate::harness) fn retained_directory_owner_at<'a>(
+    logins: &'a Logins,
+    rows: &'a [Row],
+    label: &str,
+    dir: &str,
+    default: Option<&Path>,
+) -> Result<Option<&'a str>, String> {
     let wanted = Location::of(Some(dir), None)?;
     for row in rows.iter().filter(|row| row.label != label) {
-        if let Some(kept) = row.dir.as_deref()
-            && wanted.conflicts(&Location::of(Some(kept), None)?)
-        {
+        if wanted.conflicts(&Location::of(row.dir.as_deref(), default)?) {
             return Ok(Some(row.label.as_str()));
         }
     }
@@ -131,8 +142,8 @@ pub(in crate::harness) fn retained_directory_owner<'a>(
         .iter()
         .filter(|(owner, _)| owner.as_str() != label)
     {
-        for kept in binding.dir.iter().chain(binding.was.iter().flatten()) {
-            if wanted.conflicts(&Location::of(Some(kept), None)?) {
+        for kept in std::iter::once(&binding.dir).chain(&binding.was) {
+            if wanted.conflicts(&Location::of(kept.as_deref(), default)?) {
                 return Ok(Some(owner));
             }
         }
@@ -217,23 +228,21 @@ impl Store {
         )?;
         let (logins, _) = self.load_logins(now)?;
         let default = self.default_home();
+        let location = |dir: Option<&str>| {
+            Location::of(dir, default.as_deref())
+                .map_err(|why| format!("{why}; nothing was written"))
+        };
         let mut retained = Vec::new();
         for row in existing.rows.iter().chain(rows) {
-            retained.push((
-                row.label.as_str(),
-                Location::of(row.dir.as_deref(), default.as_deref())?,
-            ));
+            retained.push((row.label.as_str(), location(row.dir.as_deref())?));
         }
         for (owner, binding) in &logins.labels {
             for dir in std::iter::once(&binding.dir).chain(&binding.was) {
-                retained.push((
-                    owner.as_str(),
-                    Location::of(dir.as_deref(), default.as_deref())?,
-                ));
+                retained.push((owner.as_str(), location(dir.as_deref())?));
             }
         }
         for row in rows {
-            let wanted = Location::of(row.dir.as_deref(), default.as_deref())?;
+            let wanted = location(row.dir.as_deref())?;
             if let Some((owner, _)) = retained
                 .iter()
                 .find(|(owner, location)| *owner != row.label && wanted.conflicts(location))

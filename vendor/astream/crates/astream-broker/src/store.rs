@@ -142,7 +142,7 @@ contract_fn! {
     /// Verified predicate for retaining a `(producer_id, producer_seq) -> Offset`
     /// deduplication entry across a retention cut to `cut_min`: every record at or above
     /// `cut_min` stays in the kept suffix, and every record below `cut_min` was dropped.
-    #[cfg(feature = "retention")]
+    #[cfg(any(test, feature = "retention"))]
     #[must_use]
     pub(crate) const fn dedup_retains_from_cut(record_off: u64, cut_min: u64) -> bool
     clauses [ensures result == (cut_min <= record_off)]
@@ -665,7 +665,7 @@ pub type ToldPage = (Vec<Arc<BrokerRecord>>, u64, Option<crate::proto::Gap>);
 
 struct RebuiltIndices {
     records: Vec<BrokerRecord>,
-    dedup: HashMap<(u64, u64), Offset>,
+    dedup: crate::dedup::DedupIndex,
     last: BTreeMap<String, Offset>,
     subject_charges: HashMap<String, u64>,
     subjects_per_producer: HashMap<u64, usize>,
@@ -733,7 +733,9 @@ pub struct BrokerLog {
     /// `base + i` — so a consumer's offsets stay meaningful across retention.
     base: Offset,
     next: Offset,
-    dedup: HashMap<(u64, u64), Offset>,
+    /// The exactly-once ingest index: `(producer_id, producer_seq) -> Offset` for every
+    /// retained produce (`dedup.rs`).
+    dedup: crate::dedup::DedupIndex,
     /// LAST-VALUE index: subject -> the offset of that subject's most recent durable
     /// record. Ordered, so a query seeks to a filter's literal prefix in `O(log n)` and
     /// then scans forward under a bound the caller supplies, rather than walking the
@@ -947,8 +949,8 @@ pub struct BrokerLog {
     #[cfg(test)]
     pub(crate) id_at_poison: Option<Option<Vec<u8>>>,
     /// Positional cold reads (`file.read_at`) performed by [`record_arc`](Self::record_arc)
-    /// during this open, for unit tests proving cold-read bounds.
-    #[cfg(all(test, any(unix, feature = "retention")))]
+    /// during this open: what a residency budget costs its readers
+    /// ([`cold_reads`](Self::cold_reads)).
     cold_reads: std::sync::atomic::AtomicU64,
     /// The documented fault-injection seam ([`inject_faults`](Self::inject_faults)).
     faults: InjectedFaults,
@@ -3383,12 +3385,13 @@ pub struct OpenOptions {
     /// a bucket's record or byte budget is exhausted. `None` by default. Ignored by
     /// [`BrokerLog::open_opts`].
     pub rate_limit: Option<RateLimit>,
-    /// When `true` (`false` by default), latch a per-`(conn_id, producer_id)` sticky
-    /// sequence gap fence whenever a `Publish` or `ProcessAndProduce` is refused
-    /// (`DESIGN-aterm-fabric` §14 Open Question 7 & §15;
-    /// [`Broker::set_sticky_batch_refusal`](crate::Broker::set_sticky_batch_refusal)),
-    /// refusing pipelined writes past the failed sequence (`gap-fenced=<seq>: ...`) until
-    /// an idempotent retry at `<= <seq>` commits. Ignored by [`BrokerLog::open_opts`].
+    /// When `true` (`false` by default), offer every connection sticky producer gap fencing,
+    /// fixed for this broker's lifetime (`DESIGN-aterm-fabric` §14 Open Question 7 & §15):
+    /// on a connection that asks ([`Request::FenceGaps`](crate::proto::Request::FenceGaps)),
+    /// latch a per-`(conn_id, producer_id)` fence whenever a `Publish` or `ProcessAndProduce`
+    /// is refused, refusing pipelined writes past the failed sequence
+    /// (`gap-fenced=<seq>: ...`) until an idempotent retry at `<= <seq>` commits. A
+    /// connection that never asks is never fenced. Ignored by [`BrokerLog::open_opts`].
     pub sticky_batch_refusal: bool,
     /// `Some(bytes)`: keep at most about `bytes` of decoded records resident (subject and
     /// body, plus a fixed per-record charge), reading older retained records back from
@@ -4953,7 +4956,6 @@ impl BrokerLog {
             refuse_barrier: false,
             #[cfg(test)]
             id_at_poison: None,
-            #[cfg(all(test, any(unix, feature = "retention")))]
             cold_reads: std::sync::atomic::AtomicU64::new(0),
             closed: false,
             released: false,
@@ -5144,7 +5146,7 @@ impl BrokerLog {
         records: Vec<BrokerRecord>,
         record_bts: &[Option<u64>],
     ) -> RebuiltIndices {
-        let mut dedup = HashMap::new();
+        let mut dedup = crate::dedup::DedupIndex::new();
         let mut group_commits: HashMap<String, u64> = compacted.group_commits;
         let mut last: BTreeMap<String, Offset> = BTreeMap::new();
         let mut subject_charges: HashMap<String, u64> = HashMap::new();
@@ -5229,7 +5231,7 @@ impl BrokerLog {
             // last-value index. Rebuilding both here is what makes exactly-once ingest
             // AND retained state survive a restart.
             if !is_hidden_record(r) {
-                dedup.insert((r.producer_id, r.producer_seq), r.seq);
+                dedup.insert(r.producer_id, r.producer_seq, r.seq);
                 let carried_owner = pending_carried_charges.remove(&r.subject);
                 carried_last.remove(&r.subject);
                 carried_last_bt.remove(&r.subject);
@@ -5256,6 +5258,8 @@ impl BrokerLog {
                 *e = crate::proto::group_commit_monotone(*e, c.upto);
             }
         }
+        // Built whole from every retained record: give back what its growth left spare.
+        dedup.shrink_to_fit();
         RebuiltIndices {
             records,
             dedup,
@@ -6461,7 +6465,7 @@ impl BrokerLog {
                 Some(&hw) => crate::proto::will_is_fenced(hw, w.producer_seq),
                 None => false,
             };
-            if !self.dedup.contains_key(&(w.producer_id, w.producer_seq)) && !fenced {
+            if !self.dedup.contains(w.producer_id, w.producer_seq) && !fenced {
                 pending_wills = pending_wills.saturating_add(1);
             }
         }
@@ -6670,7 +6674,7 @@ impl BrokerLog {
         if is_hidden_subject(&subject) {
             return Err(reserved_err(&subject));
         }
-        if let Some(&off) = self.dedup.get(&(producer_id, producer_seq)) {
+        if let Some(off) = self.dedup.get(producer_id, producer_seq) {
             self.cover_resent(off, &subject, producer_id, None)?;
             return Ok((off, true));
         }
@@ -6690,7 +6694,7 @@ impl BrokerLog {
             ));
         }
         self.append_record(rec)?; // Strict: on disk when this returns Ok; Relaxed: page cache
-        self.dedup.insert((producer_id, producer_seq), seq);
+        self.dedup.insert(producer_id, producer_seq, seq);
         Ok((seq, false))
     }
 
@@ -6712,7 +6716,7 @@ impl BrokerLog {
         body: Vec<u8>,
     ) -> Result<(Offset, bool), CheckedPublishError> {
         self.check_poisoned()?;
-        if let Some(offset) = self.dedup.get(&(producer_id, producer_seq)).copied() {
+        if let Some(offset) = self.dedup.get(producer_id, producer_seq) {
             let record = self
                 .read_range(offset, 1)
                 .into_iter()
@@ -6800,7 +6804,7 @@ impl BrokerLog {
         if is_hidden_subject(&out_subject) {
             return Err(reserved_err(&out_subject));
         }
-        if let Some(&off) = self.dedup.get(&(producer_id, producer_seq)) {
+        if let Some(off) = self.dedup.get(producer_id, producer_seq) {
             // The commit was already applied at first append.
             self.cover_resent(off, &out_subject, producer_id, Some(&group))?;
             return Ok((off, true));
@@ -6821,7 +6825,7 @@ impl BrokerLog {
             ));
         }
         self.append_record(rec)?;
-        self.dedup.insert((producer_id, producer_seq), seq);
+        self.dedup.insert(producer_id, producer_seq, seq);
         Ok((seq, false))
     }
 
@@ -6882,7 +6886,7 @@ impl BrokerLog {
     /// to, checking both the durable dedup map and the in-flight batch. (A key is
     /// never in both: staging consults both first, and a commit clears the staged view.)
     fn staged_or_durable_dup(&self, key: (u64, u64)) -> Option<Offset> {
-        if let Some(&off) = self.dedup.get(&key) {
+        if let Some(off) = self.dedup.get(key.0, key.1) {
             Some(off)
         } else {
             self.staged_dedup.get(&key).copied()
@@ -7438,7 +7442,7 @@ impl BrokerLog {
             if is_hidden_subject(&w.subject) {
                 continue;
             }
-            if off.0 < min && !self.dedup.contains_key(&(w.producer_id, w.producer_seq)) {
+            if off.0 < min && !self.dedup.contains(w.producer_id, w.producer_seq) {
                 let fenced = match self.high_water.get(&w.producer_id) {
                     Some(&hw) => crate::proto::will_is_fenced(hw, w.producer_seq),
                     None => false,
@@ -8014,7 +8018,7 @@ impl BrokerLog {
             self.apply_retire(&rec);
             if !is_hidden_record(&rec) {
                 self.dedup
-                    .insert((rec.producer_id, rec.producer_seq), rec.seq);
+                    .insert(rec.producer_id, rec.producer_seq, rec.seq);
                 if let Some(bt) = bt_ms {
                     let slot = self.producer_last_bt.entry(rec.producer_id).or_insert(bt);
                     *slot = broker_bt_advance(*slot, bt);
@@ -9195,7 +9199,7 @@ impl BrokerLog {
 
     /// The retained record's summary at ABSOLUTE offset `off`, or `None` if it was pruned
     /// or is not committed.
-    fn summary_at(&self, off: u64) -> Option<&crate::tier::Summary> {
+    fn summary_at(&self, off: u64) -> Option<crate::tier::Summary<'_>> {
         let rel = off.checked_sub(self.base.0)?;
         let Ok(i) = usize::try_from(rel) else {
             return None;
@@ -9232,7 +9236,6 @@ impl BrokerLog {
             None => self.durable_len,
         };
         let len = usize::try_from(end.checked_sub(start)?).ok()?;
-        #[cfg(all(test, any(unix, feature = "retention")))]
         self.cold_reads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let bytes = self.file.read_at(start, len).ok()?;
@@ -9249,9 +9252,13 @@ impl BrokerLog {
         Some(Arc::new(rec))
     }
 
-    /// Positional cold reads performed since open or the last [`reset_cold_reads`](Self::reset_cold_reads).
-    #[cfg(all(test, any(unix, feature = "retention")))]
-    pub(crate) fn cold_reads(&self) -> u64 {
+    /// The records this open has read back from the file because the residency budget left
+    /// them cold ([`set_resident_budget`](Self::set_resident_budget)): one for every frame
+    /// [`record_arc`](Self::record_arc) read, whether it decoded or not, since the open (or, in
+    /// a unit test, the last `reset_cold_reads`). Every retained record resident (no budget)
+    /// keeps it at 0.
+    #[must_use]
+    pub fn cold_reads(&self) -> u64 {
         self.cold_reads.load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -9270,6 +9277,16 @@ impl BrokerLog {
     #[cfg(test)]
     pub(crate) fn hot_capacity_for_test(&self) -> usize {
         self.tier.hot_capacity()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tier_for_test(&self) -> &crate::tier::Tier {
+        &self.tier
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tier_mut_for_test(&mut self) -> &mut crate::tier::Tier {
+        &mut self.tier
     }
 
     /// Bound the decoded records this log keeps resident to about `budget` bytes of
@@ -9460,7 +9477,7 @@ impl BrokerLog {
 
     #[cfg(feature = "retention")]
     /// THE RETENTION PLANNING at `now` (ms), the cut never above `ceiling`, or at `forced`
-    /// (`retention::plan`). Stamps what the tick has not seen yet first.
+    /// (`retention::plan_over`). Stamps what the tick has not seen yet first.
     fn retention_plan(
         &mut self,
         now: u64,
@@ -9474,20 +9491,18 @@ impl BrokerLog {
                 ..crate::retention::Plan::default()
             };
         };
-        // The planner reads each retained record's summary (offset, subject, bytes), and
-        // loads a whole record only to carry it below the cut: a log with a residency
-        // budget plans without decoding its cold records.
-        let view = crate::retention::View {
+        // The planner reads each retained record's slot in the tier (offset, subject, bytes,
+        // broker time), and loads a whole record only to carry it below the cut: a log with
+        // a residency budget plans without decoding its cold records.
+        let scene = crate::retention::Scene {
             base: self.base.0,
             ceiling: ceiling.min(self.next.0),
-            records: self.tier.summaries(),
-            record_bts: self.tier.bts(),
             stamps: &self.hold.stamps,
             groups: &self.group_commits,
             held: &self.hold.entries,
             now,
         };
-        let mut plan = crate::retention::plan(rules, &view, forced);
+        let mut plan = crate::retention::plan_over(rules, &scene, &self.tier, forced);
         for (idx, at_ms, bt_ms) in std::mem::take(&mut plan.carry_unloaded) {
             let Some(rec) = self.record_arc(idx) else {
                 plan = crate::retention::Plan {
@@ -9841,12 +9856,7 @@ impl BrokerLog {
         // 5) In memory (infallible): re-base, drop the pruned records and every dedup
         //    entry whose retained offset lies below `c.min` without decoding dropped
         //    cold frames from disk, then take the carried state and the new identity.
-        self.dedup
-            .retain(|_, off| dedup_retains_from_cut(off.0, c.min));
-        if self.dedup.capacity() > 64 && self.dedup.len() <= self.dedup.capacity() / 4 {
-            self.dedup
-                .shrink_to(self.dedup.len().saturating_mul(2).max(16));
-        }
+        self.dedup.retain_from(c.min);
         let drain_len = usize::try_from(c.drop_count)
             .unwrap_or(self.tier.len())
             .min(self.tier.len());
@@ -10130,15 +10140,13 @@ impl BrokerLog {
         false
     }
 
-    /// The retained committed records' summaries in `from..to`, borrowed directly from
-    /// the tier with no allocation and no cold reads.
-    pub(crate) fn visible_summaries(&self, from: Offset, to: Offset) -> &[crate::tier::Summary] {
-        let sums = self.tier.summaries();
-        let len = sums.len();
+    /// The retained committed records' summaries in `from..to` (none when `to <= from`),
+    /// read from the tier with no allocation and no cold reads.
+    pub(crate) fn visible_summaries(&self, from: Offset, to: Offset) -> crate::tier::Summaries<'_> {
+        let len = self.tier.len();
         let lo = from.0.saturating_sub(self.base.0).min(len as u64) as usize;
         let hi = to.0.saturating_sub(self.base.0).min(len as u64) as usize;
-        let hi = hi.max(lo);
-        sums.get(lo..hi).unwrap_or(&[])
+        self.tier.summaries(lo, hi)
     }
 
     /// Records at indices `lo..hi`, stopping at the first one that cannot be read.
@@ -10831,23 +10839,32 @@ mod tests {
     }
 
     /// The directory flush goes on exactly where `astream_sys::dir_flush_unavailable` says
-    /// the entry cannot be flushed: the volume's `ENOTSUP` (Darwin's 45, which std leaves
-    /// uncategorized, so a list of kinds alone refused the log there; Linux's 95) is
-    /// tolerated, and `EIO` is returned with its errno. Either way the flush is asked of
-    /// the directory that names the path, `.` for a bare name.
+    /// the entry cannot be flushed: the volume's `ENOTSUP` (Darwin's 45, Linux's 95) and on
+    /// Apple `ENODEV` (19, what a full flush of `/dev/null` answers) are tolerated, and
+    /// `EIO` is returned with its errno. Either way the flush is asked of the directory that
+    /// names the path, `.` for a bare name. `ENODEV` keeps the errno half under test: the
+    /// Trust std reads Darwin's 45 as `Unsupported` (a stock std leaves it uncategorized),
+    /// but no std names 19 by a kind the rule reads, so a list of kinds alone refuses the
+    /// log there. CONTROL: 19's kind alone is not unavailable.
     #[test]
     #[cfg(unix)]
     fn the_directory_flush_tolerates_enotsup_and_returns_eio() {
-        let enotsup = if cfg!(target_vendor = "apple") {
-            45
+        let refused: &[i32] = if cfg!(target_vendor = "apple") {
+            let enodev = io::Error::from_raw_os_error(19);
+            assert!(
+                !astream_sys::dir_flush_unavailable(&io::Error::from(enodev.kind())),
+                "CONTROL: std names ENODEV by kind ({enodev:?}); the errno half is untested"
+            );
+            &[45, 19]
         } else {
-            95
+            &[95]
         };
         for (path, dir) in [
             (Path::new("/logs/x.log"), Path::new("/logs")),
             (Path::new("x.log"), Path::new(".")),
         ] {
-            for (errno, tolerated) in [(enotsup, true), (5, false)] {
+            let errnos = refused.iter().map(|&errno| (errno, true));
+            for (errno, tolerated) in errnos.chain([(5, false)]) {
                 let mut asked = None;
                 let flushed = sync_parent_dir_by(path, |d| {
                     asked = Some(d.to_path_buf());
@@ -13282,7 +13299,7 @@ mod model_tests {
         // The dedup map itself, not just its effect on a few probes: commit records
         // must be absent from it and every publish/rpw key present at its offset.
         assert_eq!(
-            sorted_map(&log.dedup),
+            log.dedup.entries(),
             sorted_model_map(&model.dedup),
             "{ctx}: durable dedup map"
         );

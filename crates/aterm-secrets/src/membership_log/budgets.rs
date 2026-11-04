@@ -31,7 +31,7 @@ use super::{Kind, MAX_RECORDS_STREAM};
 pub const MAX_WEIGHED_RECORDS: usize = 4096;
 /// The most keyed records (every kind [`Kind::weighed`] is not) a [`Log`](super::Log) holds.
 pub const MAX_KEYED_RECORDS: usize = 12_288;
-/// The most records a 0.146-0.151 build takes: it reads a records stream (a pull's answer, a
+/// The most records a 0.146-0.152 build takes: it reads a records stream (a pull's answer, a
 /// POST, a records file) and a Commons control inventory (`commons::journal::MAX_NODES`) of at
 /// most this many, and refuses a longer one whole.
 pub const LEGACY_RECORDS: usize = 4096;
@@ -40,14 +40,10 @@ const _: () = assert!(LEGACY_RECORDS == crate::commons::journal::MAX_NODES);
 /// The most records a [`Log`](super::Log) holds in all, which a [`Store`](super::Store) counts
 /// its waiting records in too, and the record bound of every stream it reads or writes.
 ///
-/// It is [`LEGACY_RECORDS`] while members still serve and take records from 0.146-0.151 builds:
-/// those refuse a whole stream past it, so a member's log past it would cut each of them off at
-/// once, part-way through the batch that crossed it. The held total may pass it only once a
-/// member refuses those builds before its log crosses (no stream of a crossed log reaches one)
-/// and members trade records on a wire with no inventory bound; it is never more than the two
-/// budgets together.
-pub const MAX_HELD_RECORDS: usize = LEGACY_RECORDS;
-const _: () = assert!(MAX_HELD_RECORDS <= MAX_WEIGHED_RECORDS + MAX_KEYED_RECORDS);
+/// Modern peers negotiate this capacity before exchanging crossed history. Legacy wires keep
+/// [`LEGACY_RECORDS`], and the local storage layout pins its required reader capacity before
+/// publishing larger custody. Both disjoint budgets can therefore use their full share.
+pub const MAX_HELD_RECORDS: usize = MAX_WEIGHED_RECORDS + MAX_KEYED_RECORDS;
 
 impl Kind {
     /// Whether the quorum weighing reads records of this kind, which count against the weighed
@@ -132,6 +128,27 @@ impl RecordCounts {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// MUTANT of [`counted`], on for one test thread: every record counts as weighed, as a log
+    /// that judged the keyed kinds by the weighed budget would.
+    pub(crate) static KEYED_AS_WEIGHED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// What one record of `kind` adds to a [`Log`](super::Log)'s counts, held or judged against its
+/// budgets: [`RecordCounts::of`]. Every count the log keeps, and every record it judges as it
+/// inserts or lands one, goes through it; a batch a caller counts by hand and judges against
+/// the log's counts ([`Log::passed_by`](super::Log::passed_by) for a proof's admission,
+/// [`RecordBudgets::passed_by`] for a Commons recovery) does not.
+pub(super) fn counted(kind: Kind) -> RecordCounts {
+    #[cfg(test)]
+    if KEYED_AS_WEIGHED.with(std::cell::Cell::get) {
+        return RecordCounts::of(Kind::Admit);
+    }
+    RecordCounts::of(kind)
+}
+
 /// The record budgets of one [`Log`](super::Log), which it keeps for its life (and its clones
 /// keep): the weighed and keyed budgets, disjoint by [`Kind::weighed`], and the held total.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -175,11 +192,10 @@ impl RecordBudgets {
     /// whatever loads or builds a log (a records file, a removal plan, a proof's admission). The
     /// budgets before come back when `run` returns or unwinds.
     ///
-    /// The held total may be raised past [`MAX_HELD_RECORDS`], up to the two budgets together
-    /// (where the activation slice puts it), so a test can hold a log past [`LEGACY_RECORDS`]
-    /// (`crate::crossing`). Network streams stay bounded by [`MAX_HELD_RECORDS`]. Local-file
-    /// recovery uses the receiving store's held budget, so such a log can be written and
-    /// reopened without losing its tail.
+    /// The held total stays within the two budgets together; tests can choose a limit on either
+    /// side of [`LEGACY_RECORDS`] (`crate::crossing`). Network streams stay bounded by
+    /// [`MAX_HELD_RECORDS`]. Local-file recovery uses the receiving store's held budget, so such
+    /// a log can be written and reopened without losing its tail.
     ///
     /// # Panics
     /// The weighed or keyed budget is larger than [`RecordBudgets::PRODUCTION`]'s (the weighing

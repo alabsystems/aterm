@@ -833,8 +833,8 @@ fn every_setup(label: &str) -> Vec<Setup> {
 #[test]
 fn the_setup_names_accounts_browser_only_where_it_opens_a_window() {
     let url = "https://accounts.x.ai/oauth2/device?user_code=WMRT-8KQZ";
-    let adopt = "run `aterm harness accounts adopt-default main --email <your x.ai email> --cli \
-                 grok`, ";
+    let adopt = "run `aterm harness accounts adopt-default main --email <e> --cli grok` with your \
+                 x.ai email, ";
     let window = needs_you_line(
         Some(&Setup::Adopt {
             label: "main".to_owned(),
@@ -969,7 +969,7 @@ fn the_need_leads_with_the_setup_and_fits_the_attention_cap() {
     };
     assert!(
         need_words(Some(&adopt), url, Some("WMRT-8KQZ")).ends_with(
-            "(aterm harness accounts adopt-default default-home --email <you> --cli grok)"
+            "(aterm harness accounts adopt-default default-home --email <e> --cli grok)"
         ) && needs_you_line(Some(&adopt), url, Some("WMRT-8KQZ"))
             .contains("run `aterm harness accounts adopt-default default-home --email")
     );

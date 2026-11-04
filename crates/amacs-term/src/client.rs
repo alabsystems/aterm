@@ -433,7 +433,7 @@ mod tests {
     /// byte written.
     #[test]
     fn success_writes_zero_bytes_to_the_tty() {
-        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_scratch_dir("zero-bytes");
         let first = dir.path().join("COMMIT_EDITMSG");
         let second = dir.path().join("notes.md");
         std::fs::write(&first, "x\n").expect("first file");
@@ -490,7 +490,7 @@ mod tests {
     /// an abort ends the run 1, saying nothing (the person asked for it).
     #[test]
     fn no_wait_never_waits_and_an_abort_is_exit_1() {
-        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_scratch_dir("no-wait");
         let file = dir.path().join("a.txt");
         std::fs::write(&file, "a\n").expect("file");
         let target = Target {
@@ -577,7 +577,7 @@ mod tests {
     fn realpath_and_percent_encoding_of_symlinked_and_spaced_paths() {
         use amacs::protocol::uri::{file_uri_to_path, path_to_file_uri};
 
-        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_scratch_dir("realpath-uri");
         let real_dir = dir.path().join("with space");
         std::fs::create_dir(&real_dir).expect("dir");
         let real_file = real_dir.join("COMMIT EDITMSG#1");

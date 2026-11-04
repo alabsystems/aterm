@@ -635,7 +635,7 @@ mod tests {
 
     #[test]
     fn loaded_jobs_are_selected_without_reading_unrelated_environment() {
-        assert_eq!(labels("services = {\n 7 0 systems.alab.aterm-node\n 8 0 another.job\n 9 0 systems.alab.aterm-secrets\n 0 0 systems.alab.astream-broker.n-1\n 0 0 com.aterm.aterm.acaffiene\n 0 0 systems.alab.aterm-auto-alab\n}").unwrap(), vec!["com.aterm.aterm.acaffiene", "systems.alab.astream-broker.n-1", "systems.alab.aterm-auto-alab", "systems.alab.aterm-node", "systems.alab.aterm-secrets"]);
+        assert_eq!(labels("services = {\n 7 0 systems.alab.aterm-node\n 8 0 another.job\n 9 0 systems.alab.aterm-secrets\n 0 0 systems.alab.astream-broker.n-1\n 0 0 com.aterm.aterm.acaffeine\n 0 0 systems.alab.aterm-auto-alab\n}").unwrap(), vec!["com.aterm.aterm.acaffeine", "systems.alab.astream-broker.n-1", "systems.alab.aterm-auto-alab", "systems.alab.aterm-node", "systems.alab.aterm-secrets"]);
         assert!(labels("unknown output").is_err());
         assert!(labels("services = {\n 7 0 systems.alab.aterm-node").is_err());
         assert!(labels("services = {\n unexpected\n}").is_err());

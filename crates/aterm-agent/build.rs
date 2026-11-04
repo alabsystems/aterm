@@ -9,7 +9,9 @@
 //! (`src/harness/codex_steps.rs`), the builds the `codex-alab-*` rollout reductions' own lines
 //! name (`# codex <build> · lab reduce …`). A commit of a build's reductions (`lab
 //! claude-measure`, `lab codex-measure`) measures it, and a release, built from a clean clone,
-//! lists the committed ones.
+//! lists the committed ones. And `CODEX_SHOWN` (`src/harness/codex_steps.rs`): for each of those
+//! codex-alab builds, what its reductions show (`harness::codex_shown::words`), which gates the
+//! codex fold's later reads.
 
 use std::fmt::Write as _;
 use std::io::BufRead as _;
@@ -17,6 +19,9 @@ use std::path::PathBuf;
 
 #[path = "../aterm-spec-anchor/anchor_rules.rs"]
 mod anchor_rules;
+
+#[path = "src/harness/codex_shown.rs"]
+mod codex_shown;
 
 /// The step testdata, beside the manifest.
 const STEPS: &str = "src/harness/testdata/steps";
@@ -79,14 +84,35 @@ fn main() {
     anchor_rules::emit();
     println!("cargo::rerun-if-changed={STEPS}");
     for family in &FAMILIES {
-        measured_builds(family);
+        let builds = measured_builds(family);
+        if family.program == "codex" {
+            codex_shown(&builds);
+        }
     }
+}
+
+/// Write `$OUT_DIR/codex_shown.rs`: for each codex-alab build a reduction names (`builds`, sorted),
+/// the build and what its reductions show (`codex_shown::shown_in`), as `&[("<build>",
+/// "<words>"), …]`. No upstream `codex-*` reduction is read.
+fn codex_shown(builds: &[String]) {
+    let dir =
+        PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets it")).join(STEPS);
+    let mut code = String::from("&[\n");
+    for b in builds {
+        let shown = codex_shown::shown_in(&dir, b);
+        let _ = writeln!(code, "    ({b:?}, {shown:?}),");
+    }
+    code.push_str("]\n");
+    let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("cargo sets OUT_DIR"))
+        .join("codex_shown.rs");
+    std::fs::write(&out, code).unwrap_or_else(|e| panic!("{}: {e}", out.display()));
 }
 
 /// Write `$OUT_DIR/<family.out>`: every build a reduction of `family` that measures it names in
 /// its first line, sorted, once each. A reduction that opens with no build, or none at all,
-/// fails the build: an empty list would leave every tab of that program unmeasured.
-fn measured_builds(family: &Family) {
+/// fails the build: an empty list would leave every tab of that program unmeasured. The builds
+/// written.
+fn measured_builds(family: &Family) -> Vec<String> {
     let dir =
         PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets it")).join(STEPS);
     let entries = std::fs::read_dir(&dir)
@@ -139,4 +165,5 @@ fn measured_builds(family: &Family) {
     let out =
         PathBuf::from(std::env::var_os("OUT_DIR").expect("cargo sets OUT_DIR")).join(family.out);
     std::fs::write(&out, code).unwrap_or_else(|e| panic!("{}: {e}", out.display()));
+    builds
 }

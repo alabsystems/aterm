@@ -510,6 +510,9 @@ fn born(pid: u32) -> Birth {
 
 struct Scratch {
     dir: PathBuf,
+    /// Guarded `.ubd` `.noindex` directory; dropped after `Scratch::drop` kills roles and drains
+    /// `self.dir`.
+    _scratch: aterm_tempfile::TempDir,
     /// Each started by `spawnfd`: it holds its stdio and nothing else of this
     /// process, not another test's pipe for as long as its role lives.
     kids: Vec<aterm_uds::spawnfd::Child>,
@@ -538,11 +541,21 @@ impl Drop for Scratch {
 
 impl Scratch {
     fn new(name: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("akk-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let mut end = name.len().min(12);
+        while end > 0 && !name.is_char_boundary(end) {
+            end -= 1;
+        }
+        let short = &name[..end];
+        let scratch = aterm_tempfile::Builder::new()
+            .prefix(&format!("akk-{short}-"))
+            .suffix(".noindex")
+            .tempdir_in("/tmp")
+            .expect("scratch");
+        let dir = scratch.path().to_path_buf();
         std::fs::create_dir_all(dir.join("logs")).expect("scratch");
         Scratch {
             dir,
+            _scratch: scratch,
             kids: Vec::new(),
             pids: Vec::new(),
         }

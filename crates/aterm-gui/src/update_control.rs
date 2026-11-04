@@ -405,25 +405,6 @@ mod tests {
             None,
             "a lane that will not apply by itself is held by nothing"
         );
-
-        let mut said = false;
-        assert!(
-            crate::native_update_auto_intent::restored_hold_line(11, true, &mut said).is_some(),
-            "the hold's start is said"
-        );
-        assert_eq!(
-            crate::native_update_auto_intent::restored_hold_line(11, true, &mut said),
-            None,
-            "once"
-        );
-        assert!(
-            crate::native_update_auto_intent::restored_hold_line(11, false, &mut said).is_some(),
-            "its end is said"
-        );
-        assert_eq!(
-            crate::native_update_auto_intent::restored_hold_line(11, false, &mut said),
-            None
-        );
     }
 
     fn installed_activation(build: u64) -> StagedUpdate {

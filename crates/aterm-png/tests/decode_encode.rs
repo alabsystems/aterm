@@ -3,6 +3,7 @@
 
 //! `aterm-png` decode and encode integration tests over the repository's PNG corpus.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// What one decode produced.
@@ -98,13 +99,52 @@ fn encode(color: aterm_png::ColorType, w: u32, h: u32, pixels: &[u8]) -> Vec<u8>
     out
 }
 
-fn corpus() -> Vec<PathBuf> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+fn repository_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
         .expect("crate lives two levels under the repository root")
-        .to_path_buf();
-    corpus_under(&root)
+        .to_path_buf()
+}
+
+/// What a PNG's format comes to: IHDR's bit depth, colour type, compression, filter and interlace
+/// bytes, and the kinds of chunk found by walking the chunk headers.
+fn format_class(bytes: &[u8]) -> (Vec<u8>, BTreeSet<Vec<u8>>) {
+    let mut kinds = BTreeSet::new();
+    let mut at = 8usize;
+    while let Some(head) = bytes.get(at..at.saturating_add(8)) {
+        let (len, kind) = head.split_at(4);
+        kinds.insert(kind.to_vec());
+        let len = u32::from_be_bytes(len.try_into().expect("four bytes"));
+        at = at.saturating_add(12).saturating_add(len as usize);
+    }
+    (bytes.get(24..29).unwrap_or_default().to_vec(), kinds)
+}
+
+/// The corpus the test below walks: every PNG outside `docs/measured`, and in it, where evidence
+/// screenshots keep landing, the smallest file of each [`format_class`]. A later screenshot of a
+/// new format or with a new kind of chunk joins by itself; no file is named.
+fn corpus_by_class(root: &Path) -> Vec<PathBuf> {
+    let evidence = root.join("docs").join("measured");
+    let (screenshots, mut kept): (Vec<PathBuf>, Vec<PathBuf>) = corpus_under(root)
+        .into_iter()
+        .partition(|path| path.starts_with(&evidence));
+    let mut smallest: BTreeMap<_, (usize, PathBuf)> = BTreeMap::new();
+    for path in screenshots {
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let size = bytes.len();
+        let pick = smallest
+            .entry(format_class(&bytes))
+            .or_insert_with(|| (size, path.clone()));
+        if size < pick.0 {
+            *pick = (size, path);
+        }
+    }
+    kept.extend(smallest.into_values().map(|(_, path)| path));
+    kept.sort();
+    kept
 }
 
 fn corpus_skips(root: &Path, parent: &Path, name: &str) -> bool {
@@ -138,9 +178,23 @@ fn corpus_under(root: &Path) -> Vec<PathBuf> {
     found
 }
 
+/// Every PNG of [`corpus_by_class`] decodes in all modes without a panic, and every 8-bit
+/// non-indexed one re-encodes to bytes that decode identically. A file decode refuses is skipped,
+/// as it was when this walked every screenshot, so leaving screenshots out loses no refusal this
+/// test could see: it fails on a panic, a refused re-encoding, a differing round trip, or most of
+/// the corpus not coming through.
+///
+/// Why the screenshots left out are implied: past format and chunk kinds, which each class keeps,
+/// what only they hold is scale. No threshold in the code lies between the largest raw image kept,
+/// 6.18 MB (the most pixels kept are 1.82 Mpx), and the largest screenshot left out, 25.4 MB:
+/// `WINDOW`, `PIECE`, `IDAT_CHUNK`, `COMPACT_SLACK` and `PUMP_TARGET` are all 64 KiB or less, and
+/// the byte limits (`Limits::default` and `DECODE_BYTE_LIMIT`, 64 MiB, and this test's 512 MiB) sit
+/// above both. The one stream feature they alone carry, a match at distance 32768 through the
+/// streaming reader PNG decode reads with, has its own test
+/// (`deflate::tests::roundtrips_extreme_match_geometry`).
 #[test]
 fn the_repository_corpus_decodes_and_round_trips() {
-    let files = corpus();
+    let files = corpus_by_class(&repository_root());
     let round_tripped = aterm_spec::check::each(&files, |path| {
         let Ok(bytes) = std::fs::read(path) else {
             return 0usize;
@@ -173,8 +227,9 @@ fn the_repository_corpus_decodes_and_round_trips() {
     });
     let images: usize = round_tripped.into_iter().sum();
     assert!(
-        images > 0,
-        "corpus must decode at least one 8-bit non-indexed PNG"
+        images * 2 > files.len(),
+        "most of the corpus must decode as 8-bit non-indexed PNGs: {images} of {} did",
+        files.len()
     );
 }
 

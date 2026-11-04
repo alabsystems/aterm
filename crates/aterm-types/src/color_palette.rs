@@ -135,6 +135,19 @@ impl ColorPalette {
         }
     }
 
+    /// The heap bytes this palette holds past its own size: its overrides once more than 16 spill them out of line.
+    #[inline]
+    #[must_use]
+    pub const fn heap_bytes(&self) -> usize {
+        if self.overrides.spilled() {
+            self.overrides
+                .capacity()
+                .saturating_mul(core::mem::size_of::<(u8, Rgb)>())
+        } else {
+            0
+        }
+    }
+
     /// The RGB value for an indexed color.
     #[inline]
     #[must_use]

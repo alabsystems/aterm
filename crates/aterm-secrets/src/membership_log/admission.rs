@@ -22,7 +22,7 @@ use super::{Body, Entrant, EpochAudience, Evidence, Log, MemberId, Record, Recor
 use crate::Result;
 use crate::age::Recipient;
 use aterm_digest::Sha256;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 /// Epochs of an admission, each with its audience, by audience then id.
 type AudienceEpochs = Vec<(EpochAudience, RecordId)>;
@@ -350,133 +350,38 @@ impl Log {
     }
 
     /// [`Log::left_out`] evaluated directly from the log's effective `Epoch` and `Wrap` records
-    /// without decrypting audience entries.
+    /// without decrypting audience entries: also when a newest epoch of `audience` holds no
+    /// `Wrap` to `member` although `member`'s own entry lies in its causal past, for any
+    /// audience. Taken once per log state ([`epochs`](super::epochs)).
     #[must_use]
     pub fn audience_left_out(&self, audience: &EpochAudience, member: &MemberId) -> bool {
-        let membership = self.membership();
-        let Some(seat) = membership.get(member) else {
-            return true;
-        };
-        let Some(&entry_at) = self.held.get(&seat.entry) else {
-            return true;
-        };
-        let recipient = seat.binding.recipient();
-        if self.audience_left_out_recipient(audience, &recipient) {
-            return true;
-        }
-        let effective = self.effective();
-        let mut epochs: Vec<(usize, RecordId)> = Vec::new();
-        let mut wrapped_epochs: BTreeSet<RecordId> = BTreeSet::new();
-        for (i, record) in self.order.iter().enumerate().skip(1) {
-            if !effective.counts(i) {
-                continue;
-            }
-            match record.body() {
-                Body::Epoch { audience: aud, .. } if aud == audience => {
-                    epochs.push((i, *record.id()));
-                }
-                Body::Wrap {
-                    epoch,
-                    recipient: to,
-                    ..
-                } if *to == recipient => {
-                    wrapped_epochs.insert(*epoch);
-                }
-                _ => {}
-            }
-        }
-        epochs
-            .iter()
-            .filter(|&&(a, _)| {
-                !epochs
-                    .iter()
-                    .any(|&(b, _)| a != b && effective.before(a, b))
-            })
-            .any(|&(at, ref epoch)| {
-                !wrapped_epochs.contains(epoch)
-                    && (entry_at == at || effective.before(entry_at, at))
-            })
+        let verdict = self.epochs().leaves_out_member(self, audience, member);
+        #[cfg(test)]
+        super::epochs::oracle::check("audience_left_out", verdict, || {
+            super::epochs::oracle::audience_left_out(self, audience, member)
+        });
+        verdict
     }
 
     /// Whether a causally newest [`Body::Epoch`] of `audience` in this log leaves `recipient` out
     /// on purpose: it holds no [`Body::Wrap`] to `recipient` although `recipient`'s member entry
     /// (for [`EpochAudience::Everyone`] / [`EpochAudience::Commons`]) or a prior [`Body::Wrap`] of
-    /// `audience` to `recipient` lies in its causal past.
+    /// `audience` to `recipient` lies in its causal past. Taken once per log state
+    /// ([`epochs`](super::epochs)).
     #[must_use]
     pub fn audience_left_out_recipient(
         &self,
         audience: &EpochAudience,
         recipient: &Recipient,
     ) -> bool {
-        let membership = self.membership();
-        let entry_at = membership
-            .members()
-            .values()
-            .filter(|m| m.binding.recipient() == *recipient)
-            .filter_map(|seat| {
-                let &at = self.held.get(&seat.entry)?;
-                let is_listed = matches!(
-                    self.order[at].body(),
-                    Body::Admit {
-                        evidence: super::Evidence::Listed,
-                        ..
-                    }
-                );
-                Some((at, is_listed))
-            })
-            .max_by_key(|&(at, is_listed)| (!is_listed, at));
-        let effective = self.effective();
-        let mut epochs: Vec<(usize, RecordId)> = Vec::new();
-        let mut epoch_ids: BTreeSet<RecordId> = BTreeSet::new();
-        let mut wrapped_epochs: BTreeMap<RecordId, usize> = BTreeMap::new();
-        for (i, record) in self.order.iter().enumerate().skip(1) {
-            if !effective.counts(i) {
-                continue;
-            }
-            match record.body() {
-                Body::Epoch { audience: aud, .. } if aud == audience => {
-                    epochs.push((i, *record.id()));
-                    epoch_ids.insert(*record.id());
-                }
-                Body::Wrap {
-                    epoch,
-                    recipient: to,
-                    ..
-                } if to == recipient => {
-                    wrapped_epochs.entry(*epoch).or_insert(i);
-                }
-                _ => {}
-            }
-        }
-        let is_commons_or_everyone =
-            matches!(audience, EpochAudience::Everyone | EpochAudience::Commons);
-        let prior_wrap_indices: Vec<usize> = wrapped_epochs
-            .iter()
-            .filter_map(|(ep, &w_at)| epoch_ids.contains(ep).then_some(w_at))
-            .collect();
-        epochs
-            .iter()
-            .filter(|&&(a, _)| {
-                !epochs
-                    .iter()
-                    .any(|&(b, _)| a != b && effective.before(a, b))
-            })
-            .any(|&(at, ref epoch)| {
-                if wrapped_epochs.contains_key(epoch) {
-                    return false;
-                }
-                let knew_entry = is_commons_or_everyone
-                    && entry_at.is_some_and(|(e_at, _)| e_at == at || effective.before(e_at, at));
-                let knew_wrap = prior_wrap_indices.iter().any(|&w_at| {
-                    let superseded_by_entry = is_commons_or_everyone
-                        && entry_at.is_some_and(|(e_at, is_listed)| {
-                            effective.before(at, e_at)
-                                || (!is_listed && effective.before(w_at, e_at))
-                        });
-                    !superseded_by_entry && (w_at == at || effective.before(w_at, at))
-                });
-                knew_entry || knew_wrap
-            })
+        let verdict = self
+            .epochs()
+            .leaves_out_recipient(self, audience, recipient);
+        #[cfg(test)]
+        super::epochs::oracle::check("audience_left_out_recipient", verdict, || {
+            super::epochs::oracle::audience_left_out_recipient(self, audience, recipient)
+        });
+        verdict
     }
 
     /// C11's label for a Mac asking under `requested` (`docs/DESIGN-alab-swarm-2026-10-27.md`

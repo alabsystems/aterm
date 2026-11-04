@@ -19,10 +19,7 @@ fn canonical(root: &Path) -> Validated {
 }
 
 fn scratch() -> aterm_tempfile::TempDir {
-    aterm_tempfile::Builder::new()
-        .prefix("agh-policy-")
-        .tempdir()
-        .expect("a scratch directory")
+    crate::test_fixtures::scratch_dir("policy")
 }
 
 fn present(_: &str) -> Presence {

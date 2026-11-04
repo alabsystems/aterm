@@ -243,22 +243,22 @@ impl Drop for Scratch {
 pub struct World {
     pub root: PathBuf,
     pub home: PathBuf,
+    /// The scratch world's marker value ([`aterm_types::world::state_home`]).
+    pub state: PathBuf,
     pub sock: PathBuf,
     pub log: PathBuf,
 }
 
-/// The automatic lanes off: no update check, no package loop, the machine's own preferences left alone.
-pub const CONFIG_OFF: &str = "[update]\nenabled = false\nauto_apply = false\n\
-                              [packages]\nenabled = false\n\
-                              [machine]\nuniversal_control = \"leave\"\n";
-
 impl World {
-    /// Lay out `root`: `home/` with a two-column `/bin/sh` prompt (so a typed burst never wraps on a long host name), `cfg/aterm/aterm.toml` holding the audible bell off, `config_head` then [`CONFIG_OFF`], and `run/`.
+    /// Lay out `root`: `home/` with a two-column `/bin/sh` prompt (so a typed burst never wraps on a long host name), `cfg/aterm/aterm.toml` holding the audible bell off, `config_head` then a scratch world's lanes off ([`aterm_types::world::LANES_OFF`]), and `run/`.
     /// # Errors
-    /// A file or directory could not be written.
+    /// A file or directory could not be written, or the platform keeps no state under HOME.
     pub fn prepare(root: &Path, config_head: &str) -> std::io::Result<Self> {
         use std::os::unix::fs::PermissionsExt;
         let home = root.join("home");
+        let state = aterm_types::world::state_home(&home).ok_or_else(|| {
+            std::io::Error::other("this platform keeps no aterm state under a world's HOME")
+        })?;
         for dir in [home.clone(), root.join("cfg/aterm"), root.join("run")] {
             std::fs::create_dir_all(&dir)?;
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
@@ -267,24 +267,24 @@ impl World {
         std::fs::write(home.join(".shrc"), "PS1='$ '\n")?;
         std::fs::write(
             root.join("cfg/aterm/aterm.toml"),
-            format!("bell_sound = false\n{config_head}\n{CONFIG_OFF}"),
+            format!(
+                "bell_sound = false\n{config_head}\n{}",
+                aterm_types::world::LANES_OFF
+            ),
         )?;
         Ok(Self {
             root: root.to_path_buf(),
             home,
+            state,
             sock: root.join("s.sock"),
             log: root.join("gui.log"),
         })
     }
 
-    /// The instance's whole environment: nothing inherited.
+    /// The instance's whole environment: nothing inherited, and the scratch world's marker
+    /// ([`aterm_types::world::MARKER`]), which turns off the lanes that reach the local network in
+    /// a build with development seams or without.
     fn env(&self) -> Vec<(&'static str, OsString)> {
-        // Keep the platform's usual path under this private HOME, with or without
-        // development seams. The marker also disables live fleet services here.
-        #[cfg(target_os = "macos")]
-        let state = self.home.join("Library/Application Support/aterm");
-        #[cfg(not(target_os = "macos"))]
-        let state = self.home.join(".local/state/aterm");
         let mut env = vec![
             ("HOME", self.home.clone().into_os_string()),
             ("PATH", "/usr/bin:/bin:/usr/sbin:/sbin".into()),
@@ -293,7 +293,10 @@ impl World {
             ("TERM", "xterm-256color".into()),
             ("XDG_CONFIG_HOME", self.root.join("cfg").into_os_string()),
             ("XDG_RUNTIME_DIR", self.root.join("run").into_os_string()),
-            ("ATERM_STATE_HOME", state.into_os_string()),
+            (
+                aterm_types::world::MARKER,
+                self.state.clone().into_os_string(),
+            ),
             ("HISTFILE", "/dev/null".into()),
         ];
         if let Some(v) = std::env::var_os("ATERM_TRACE_SPAWN") {
@@ -941,9 +944,51 @@ mod tests {
         assert_eq!(keys("bell_sound"), 1, "one bell key: {text}");
         assert!(text.contains(head), "the head follows: {text}");
         assert!(
-            text.ends_with(CONFIG_OFF),
+            text.ends_with(aterm_types::world::LANES_OFF),
             "the lanes-off tables close it: {text}"
         );
+    }
+
+    /// Each entry of [`aterm_types::world::LANES_OFF`] that `doc` does not hold with the same
+    /// value, as `table.key`.
+    fn lanes_left_on(doc: &aterm_toml::Value) -> Vec<String> {
+        let off = aterm_toml::from_str::<aterm_toml::Value>(aterm_types::world::LANES_OFF)
+            .expect("the lanes-off tables are one document");
+        let mut on = Vec::new();
+        for (table, keys) in off.as_table().expect("a document is a table") {
+            for (key, value) in keys.as_table().expect("each entry is a table") {
+                if doc.get(table).and_then(|held| held.get(key)) != Some(value) {
+                    on.push(format!("{table}.{key}"));
+                }
+            }
+        }
+        on
+    }
+
+    /// A measured instance of the handed bundle (`/Applications/aterm (dev).app`: a release
+    /// build, no development seams) starts, unless its world says otherwise, the lanes that act
+    /// for the login's own account: its window's `_alab._tcp` browse and converge runner, a
+    /// local-network use macOS puts its consent prompt on the desk for, and a keeper job in the
+    /// login's launchd domain. The world says otherwise in both places those lanes read: its
+    /// `aterm.toml`, read back as a document, holds every lanes-off entry after a head that opens
+    /// a table of its own, and its environment carries the scratch world's marker at the state
+    /// folder under its HOME.
+    #[test]
+    fn a_measure_world_starts_no_lane_of_the_logins_account() {
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let head = "cursor_trail_style = \"off\"\n[sparkle_words]\nenabled = false";
+        let world = World::prepare(dir.path(), head).expect("world");
+        let text =
+            std::fs::read_to_string(world.root.join("cfg/aterm/aterm.toml")).expect("written");
+        let doc = aterm_toml::from_str::<aterm_toml::Value>(&text).expect("one document");
+        assert_eq!(lanes_left_on(&doc), Vec::<String>::new(), "{text}");
+        let state = aterm_types::world::state_home(&world.home).expect("a state folder");
+        let marker = world
+            .env()
+            .into_iter()
+            .find(|(name, _)| *name == aterm_types::world::MARKER)
+            .map(|(_, value)| value);
+        assert_eq!(marker, Some(state.into_os_string()));
     }
 
     #[test]

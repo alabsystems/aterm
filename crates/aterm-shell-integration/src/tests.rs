@@ -1823,21 +1823,118 @@ fn test_powershell_osc7_path_percent_encodes_windows_paths() {
 
 #[cfg(windows)]
 #[test]
-fn test_cache_dir_windows_uses_localappdata() {
-    let dir = cache_dir();
-    let text = dir.to_string_lossy().into_owned();
-    assert!(
-        !text.starts_with("/tmp") && !text.starts_with("\\tmp"),
-        "Windows cache dir must never resolve to a drive-root /tmp; got: {text}"
+fn test_per_user_cache_dir_on_windows_is_localappdata() {
+    let expected = match windows_absolute(std::env::var_os("LOCALAPPDATA")) {
+        Some(local) => PathBuf::from(local).join("aterm").join("shell-integration"),
+        None => std::env::temp_dir().join("aterm-shell-integration"),
+    };
+    assert_eq!(
+        per_user_cache_dir(),
+        expected,
+        "a Windows host takes %LOCALAPPDATA%, else the temp dir"
     );
-    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-        assert!(
-            dir.starts_with(&local),
-            "cache dir must live under %LOCALAPPDATA%; got: {text}"
+}
+
+#[test]
+fn test_per_user_cache_dir_takes_each_platforms_sources_in_order() {
+    let env = |pairs: &'static [(&'static str, &'static str)]| {
+        move |key: &str| {
+            pairs
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| std::ffi::OsString::from(value))
+        }
+    };
+    let env_of = |name: &'static str, value: &'static str| {
+        move |key: &str| (key == name).then(|| std::ffi::OsString::from(value))
+    };
+    let temp = || PathBuf::from("/t");
+    let all: &[(&str, &str)] = &[
+        ("LOCALAPPDATA", "C:\\L"),
+        ("XDG_CACHE_HOME", "/x"),
+        ("HOME", "/h"),
+    ];
+    let tail = Path::new("aterm").join("shell-integration");
+    assert_eq!(
+        per_user_cache_dir_from(true, env(all), temp),
+        Path::new("C:\\L").join(&tail),
+        "Windows: %LOCALAPPDATA% wins over XDG_CACHE_HOME and HOME"
+    );
+    for absolute in ["\\\\srv\\L", "//srv/L", "C:/L", "\\\\?\\C:\\L"] {
+        assert_eq!(
+            per_user_cache_dir_from(true, env_of("LOCALAPPDATA", absolute), temp),
+            Path::new(absolute).join(&tail),
+            "Windows: a %LOCALAPPDATA% of {absolute:?} is absolute"
         );
-        assert!(
-            text.ends_with("shell-integration"),
-            "cache dir must end with aterm\\shell-integration; got: {text}"
+    }
+    for relative in ["local", "C:local", "/L", " ", "1:\\L", "\\\\", "\\\\\\L"] {
+        assert_eq!(
+            per_user_cache_dir_from(true, env_of("LOCALAPPDATA", relative), temp),
+            temp().join("aterm-shell-integration"),
+            "Windows: a %LOCALAPPDATA% of {relative:?} is not absolute there, so it is unset"
+        );
+    }
+    assert_eq!(
+        per_user_cache_dir_from(true, env(&[("XDG_CACHE_HOME", "/x"), ("HOME", "/h")]), temp),
+        temp().join("aterm-shell-integration"),
+        "Windows without %LOCALAPPDATA%: the temp dir, never XDG_CACHE_HOME or HOME"
+    );
+    assert_eq!(
+        per_user_cache_dir_from(false, env(all), temp),
+        Path::new("/x").join(&tail),
+        "elsewhere: XDG_CACHE_HOME first, and LOCALAPPDATA means nothing"
+    );
+    assert_eq!(
+        per_user_cache_dir_from(false, env(&[("HOME", "/h")]), temp),
+        Path::new("/h").join(".cache").join(&tail),
+        "elsewhere without XDG_CACHE_HOME: HOME's .cache"
+    );
+    assert_eq!(
+        per_user_cache_dir_from(false, env(&[]), temp),
+        temp().join("aterm-shell-integration"),
+        "elsewhere with neither: the temp dir"
+    );
+    assert_eq!(
+        per_user_cache_dir_from(true, env(&[("LOCALAPPDATA", "")]), temp),
+        temp().join("aterm-shell-integration"),
+        "Windows with a blank %LOCALAPPDATA%: the temp dir"
+    );
+    assert_eq!(
+        per_user_cache_dir_from(false, env(&[("XDG_CACHE_HOME", ""), ("HOME", "/h")]), temp),
+        Path::new("/h").join(".cache").join(&tail),
+        "a blank XDG_CACHE_HOME is unset"
+    );
+    assert_eq!(
+        per_user_cache_dir_from(false, env(&[("XDG_CACHE_HOME", "c"), ("HOME", "/h")]), temp),
+        Path::new("/h").join(".cache").join(&tail),
+        "a relative XDG_CACHE_HOME is unset"
+    );
+    assert_eq!(
+        per_user_cache_dir_from(false, env(&[("HOME", "")]), temp),
+        temp().join("aterm-shell-integration"),
+        "a blank HOME is unset"
+    );
+    assert_eq!(
+        per_user_cache_dir_from(false, env(&[("HOME", "h")]), temp),
+        temp().join("aterm-shell-integration"),
+        "a relative HOME is unset"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let bytes = b"/c\xff";
+        assert_eq!(
+            per_user_cache_dir_from(
+                false,
+                |key: &str| match key {
+                    "XDG_CACHE_HOME" => Some(std::ffi::OsString::from_vec(bytes.to_vec())),
+                    "HOME" => Some("/h".into()),
+                    _ => None,
+                },
+                temp
+            ),
+            Path::new(std::ffi::OsStr::from_bytes(bytes)).join(&tail),
+            "an absolute XDG_CACHE_HOME that is not UTF-8 is still the cache's base"
         );
     }
 }
@@ -1845,7 +1942,8 @@ fn test_cache_dir_windows_uses_localappdata() {
 #[cfg(unix)]
 #[test]
 fn test_cache_dir_is_the_per_user_cache_outside_the_containment_write_roots() {
-    let (base, tail) = match (std::env::var_os("XDG_CACHE_HOME"), std::env::var_os("HOME")) {
+    let xdg = posix_absolute(std::env::var_os("XDG_CACHE_HOME"));
+    let (base, tail) = match (xdg.clone(), posix_absolute(std::env::var_os("HOME"))) {
         (Some(cache), _) => (PathBuf::from(cache), "aterm/shell-integration"),
         (None, Some(home)) => (PathBuf::from(home), ".cache/aterm/shell-integration"),
         (None, None) => (std::env::temp_dir(), "aterm-shell-integration"),
@@ -1855,7 +1953,7 @@ fn test_cache_dir_is_the_per_user_cache_outside_the_containment_write_roots() {
         base.join(tail),
         "the per-user cache, whatever the mode"
     );
-    if std::env::var_os("XDG_CACHE_HOME").is_none() {
+    if xdg.is_none() {
         let root = aterm_uds::test_binary::scratch_root().expect("this test binary's root");
         assert_eq!(cache_dir(), root.join("cache/aterm/shell-integration"));
     }

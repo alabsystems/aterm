@@ -509,6 +509,8 @@ fn final_store_reconsiders_an_initially_known_record() {
 
 #[test]
 fn actual_sync_decodes_once_and_keeps_receive_semantics() {
+    // Every server it reads is its own on loopback, which answers.
+    let _answering = client::ServersAnswering::within(HANG);
     let (attempts, frames) = valid_work();
     unreadable_descendants(true);
     unreadable_descendants(false);

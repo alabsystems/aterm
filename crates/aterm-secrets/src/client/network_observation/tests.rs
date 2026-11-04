@@ -58,6 +58,8 @@ fn fetch_body(paths: &Paths) -> Received {
 
 #[test]
 fn actual_url_body_is_recorded_but_unchanged_poll_cache_and_raw_replay_do_not_renew_it() {
+    // Every server it reads is its own on loopback, which answers.
+    let _answering = ServersAnswering::set();
     let root = aterm_tempfile::tempdir().unwrap();
     let (paths, server, _) = fixture(root.path());
     sync_reader_until(&paths, Instant::now() + Duration::from_secs(60)).unwrap();
@@ -144,6 +146,8 @@ fn actual_url_body_is_recorded_but_unchanged_poll_cache_and_raw_replay_do_not_re
 
 #[test]
 fn actual_peer_url_body_keeps_peer_role_after_primary_missing() {
+    // Every server it reads is its own on loopback, which answers.
+    let _answering = ServersAnswering::set();
     let root = aterm_tempfile::tempdir().unwrap();
     let (paths, server, peer) = fixture(root.path());
     let mut config = configured(&paths).unwrap();
@@ -160,6 +164,49 @@ fn actual_peer_url_body_keeps_peer_role_after_primary_missing() {
         VaultNetworkSource::PeerUrl
     );
     server.stop();
+}
+
+#[test]
+fn an_exact_peer_does_not_replace_a_healthy_configured_source_receipt() {
+    for bounded in [false, true] {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let (paths, primary, _) = fixture(root.path());
+        let peer = crate::server::start(
+            std::net::TcpListener::bind("127.0.0.1:0").unwrap(),
+            &crate::server::Options {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                store: root.path().join("peer"),
+                advertise: None,
+                pins: Vec::new(),
+                hold: Duration::from_millis(20),
+                keep_awake: false,
+            },
+        )
+        .unwrap();
+        let peer_url = format!("http://{}/v1/team", peer.addr);
+        transport::publish(
+            &Source::Url(peer_url.clone()),
+            &std::fs::read(paths.cache_file()).unwrap(),
+        )
+        .unwrap();
+        if bounded {
+            super::super::bounded::sync_reader_with_candidates_until(
+                &paths,
+                Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+                &[peer_url],
+            )
+            .unwrap();
+        } else {
+            sync_with_candidates(&paths, None, &[peer_url]).unwrap();
+        }
+        assert_eq!(
+            observed(&paths).unwrap().source(),
+            VaultNetworkSource::ConfiguredUrl,
+            "bounded={bounded}: the configured URL supplied the held body"
+        );
+        peer.stop();
+        primary.stop();
+    }
 }
 
 #[test]
@@ -189,6 +236,8 @@ fn deferred_unchanged_repair_does_not_record_a_real_body() {
 
 #[test]
 fn failed_actual_body_apply_retains_old_receipt_without_projecting_it() {
+    // Every server it reads is its own on loopback, which answers.
+    let _answering = ServersAnswering::set();
     let root = aterm_tempfile::tempdir().unwrap();
     let (paths, server, _) = fixture(root.path());
     sync_reader_until(&paths, Instant::now() + Duration::from_secs(60)).unwrap();
@@ -210,19 +259,26 @@ fn failed_actual_body_apply_retains_old_receipt_without_projecting_it() {
 
 #[test]
 fn cache_substitution_clears_even_identical_previous_body_provenance() {
-    let root = aterm_tempfile::tempdir().unwrap();
-    let (paths, server, _) = fixture(root.path());
-    let Received { body, .. } = fetch_body(&paths);
-    let config = configured(&paths).unwrap();
-    let mut state = load_state(&paths).unwrap();
-    state.records_digest = Some([219; 32]);
-    save_state(&paths, &state).unwrap();
+    let _answering = ServersAnswering::set();
+    let lab = crate::client::log_entries_tests::two_macs(&[(Audience::Everyone, "shared", b"old")]);
+    let paths = &lab.m7;
+    let Received { body, .. } = fetch_body(paths);
+    let config = configured(paths).unwrap();
+    let mut state = load_state(paths).unwrap();
+    state.network_materialization = None;
+    save_state(paths, &state).unwrap();
+    let admin = admin_open(&lab.m22).unwrap();
+    let mut doc = admin.doc.clone();
+    doc.set_entry(&Audience::Everyone, "shared", b"new")
+        .unwrap();
+    admin_publish(&lab.m22, &admin, &doc).unwrap();
+    save_records(paths, &load_records(&lab.m22).unwrap().encode()).unwrap();
     assert!(
-        log_entries::current_records_digest(&paths, &config, &state) != state.records_digest,
+        log_entries::current_records_digest(paths, &config, &state) != state.records_digest,
         "CONTROL: local records need reapplication"
     );
     apply_fetched_until(
-        &paths,
+        paths,
         config,
         state,
         Received {
@@ -234,11 +290,15 @@ fn cache_substitution_clears_even_identical_previous_body_provenance() {
     )
     .unwrap();
     assert_eq!(
-        original_time(&paths),
+        original_time(paths),
         None,
         "local substitution cannot inherit even an exact-body earlier network token"
     );
-    server.stop();
+    assert_eq!(
+        std::fs::read(paths.home.join(".secrets/shared")).unwrap(),
+        b"new"
+    );
+    lab.server.stop();
 }
 
 #[test]
@@ -253,6 +313,8 @@ fn f20_log_only_update_requires_a_real_body_to_record_the_new_materialization() 
         CLOCK.load(Ordering::SeqCst)
     }
 
+    // Every server it reads is its own on loopback, which answers.
+    let _answering = ServersAnswering::set();
     let macs = two_macs_at(
         &[(Audience::Everyone, "shared", b"v1".as_slice())],
         false,

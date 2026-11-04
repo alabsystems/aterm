@@ -19,6 +19,8 @@ use crate::pyjson::J;
 
 #[path = "codex_alab_policy_model.rs"]
 pub mod policy;
+#[path = "codex_alab_terminals_model.rs"]
+pub mod terminals;
 
 /// Legacy continuation substring shared with [`CONTINUE_TEXT`].
 pub const KEEP_GOING: &str = "keep going";
@@ -383,6 +385,27 @@ fn question_call() -> J {
     )
 }
 
+/// The continue leg's continuation's call (gap 20): a command that fails and prints nothing,
+/// with no login shell (`login`, codex-alab's `ExecCommandArgs`,
+/// codex-rs/core/src/tools/handlers/unified_exec.rs). The leg's opening runs it under the jail
+/// alone (`CodexSandbox::Jail`, the `continue` row of the proof's `OPENINGS`), whether the proof
+/// or `autopilot-captures`' Cruise scene opens it, so codex's sandbox-denial check
+/// (codex-rs/sandboxing/src/denial.rs) reads no denial and asks for no escalation.
+fn failing_call() -> J {
+    call_item(
+        "exec_command",
+        &J::obj([("cmd", J::s("exit 3")), ("login", J::Bool(false))]),
+    )
+}
+
+/// How many of a request's user texts are a continuation's ([`step_of`]'s Continue words).
+fn continuations(body: &J) -> usize {
+    user_texts(body)
+        .iter()
+        .filter(|t| t.contains(CONTINUE_TEXT) || t.contains(KEEP_GOING))
+        .count()
+}
+
 /// The approval and box legs' call: an escalated `exec_command` under `on-request`.
 fn approval_call() -> J {
     call_item(
@@ -395,11 +418,92 @@ fn approval_call() -> J {
     )
 }
 
+/// How many escalated commands a `lab codex-boxes` run's model asks for, one a response.
+pub const BOXES: usize = 20;
+
+/// What a `codex-boxes` run's model says once its last command ran.
+pub const BOXES_DONE: &str = "Ran all twenty commands, one at a time.\n\nATERM-TASK-DONE";
+
+/// Each `codex-boxes` run's held responses, by leg and box: the lab sends one only once it holds
+/// the tab ([`release_box`]), so codex-alab's checks wait and the box goes to codex's TUI.
+static BOX_GATES: OnceLock<Mutex<BoxGates>> = OnceLock::new();
+
+/// Each held response's leg, its box (from 0) and its gate.
+type BoxGates = Vec<(String, usize, Arc<ResponseGate>)>;
+
+fn box_gate(leg: &str, k: usize) -> Arc<ResponseGate> {
+    let mut gates = BOX_GATES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((_, _, gate)) = gates.iter().find(|(l, n, _)| l == leg && *n == k) {
+        return Arc::clone(gate);
+    }
+    let gate = Arc::new(ResponseGate::default());
+    gates.push((leg.to_string(), k, Arc::clone(&gate)));
+    gate
+}
+
+/// Send the response that asks for `leg`'s box `k` (from 0), which the model holds until then.
+pub fn release_box(leg: &str, k: usize) {
+    box_gate(leg, k).release();
+}
+
+/// The tag of the request box `k` (from 0) answers: `box01` to `box20`.
+#[must_use]
+pub fn box_tag(k: usize) -> String {
+    format!("box{:02}", k + 1)
+}
+
+/// Box `k`'s call: an escalated `exec_command` under `on-request`, as the approval leg's.
+fn box_call(k: usize) -> J {
+    let n = k + 1;
+    call_item(
+        "exec_command",
+        &J::obj([
+            ("cmd", J::s(format!("echo box-{n} >> ran.txt; echo done"))),
+            ("sandbox_permissions", J::s("require_escalated")),
+            ("justification", J::s(format!("write box {n}'s marker"))),
+        ]),
+    )
+}
+
+/// How many tool outputs `body` carries: the boxes a `codex-boxes` run's model has had answered.
+fn tool_outputs(body: &J) -> usize {
+    body.get("input")
+        .and_then(J::as_arr)
+        .unwrap_or_default()
+        .iter()
+        .filter(|it| it.get("type").and_then(J::as_str) == Some("function_call_output"))
+        .count()
+}
+
+/// A `codex-boxes` leg's answer (`boxes<n>`): box `k` while `k` of [`BOXES`] ran, each held until
+/// the lab releases it, then [`BOXES_DONE`] to every later request.
+fn boxes_answer(body: &J, leg: &str) -> Answered {
+    let k = tool_outputs(body);
+    let (mut a, name) = if k < BOXES {
+        let mut a = Answered::items(vec![box_call(k)]);
+        a.gate = Some(box_gate(leg, k));
+        (a, box_tag(k))
+    } else {
+        (
+            Answered::items(vec![message_item(BOXES_DONE)]),
+            "done".to_string(),
+        )
+    };
+    a.tag = format!("{leg}:{name}");
+    a
+}
+
 /// Computes the fake model's [`Answered`] response for `body`.
 #[must_use]
 fn answer(body: &J, resets: &Mutex<Vec<(String, i64)>>, now: &dyn Fn() -> i64) -> Answered {
     let leg = leg_of(body).unwrap_or_else(|| "-".to_string());
     if let Some(answer) = policy::answer(body, &leg) {
+        return answer;
+    }
+    if let Some(answer) = terminals::answer(body, &leg) {
         return answer;
     }
     let say = |text: &str| Answered::items(vec![message_item(text)]);
@@ -414,6 +518,9 @@ fn answer(body: &J, resets: &Mutex<Vec<(String, i64)>>, now: &dyn Fn() -> i64) -
         let mut a = say(&crate::stub::schema_answer(schema));
         a.tag = format!("{leg}:side");
         return a;
+    }
+    if leg.starts_with("boxes") {
+        return boxes_answer(body, &leg);
     }
     let (user, tool) = request_view(body);
     let step = step_of(body);
@@ -441,6 +548,10 @@ fn answer(body: &J, resets: &Mutex<Vec<(String, i64)>>, now: &dyn Fn() -> i64) -
         }
         ("needs", Step::Continue | Step::Other) => say(NEEDS_CLEARED),
         ("continue", Step::Person) => say(STEP_ONE),
+        ("continue", Step::Continue) if tool.is_none() && continuations(body) == 1 => {
+            name = "fail".to_string();
+            Answered::items(vec![failing_call()])
+        }
         ("hold", Step::Person) => slow(STEP_ONE, HOLD_FIRST_TURN),
         ("off", Step::Person) => slow(STEP_ONE, SLOW_TURN),
         ("exchange" | "control", Step::Person) => slow(EXCHANGE_REPLY, SLOW_TURN),
@@ -667,10 +778,82 @@ mod tests {
         );
         assert!(!says_done(Some(STEP_ONE)), "the first turn ends undone");
         let after = answer(&body(&["LEG-continue Write a plan", CONTINUE_TEXT], None));
-        assert_eq!(after.tag, "continue:continue");
+        assert_eq!(after.tag, "continue:fail");
+        let ran = answer(&body(
+            &["LEG-continue Write a plan", CONTINUE_TEXT],
+            Some("Process exited with code 3"),
+        ));
+        assert_eq!(ran.tag, "continue:continue");
+        assert!(text_of(&ran).contains("All done."));
         assert!(says_done(Some(CONTINUED_DONE)));
         let plain = answer(&body(&["hello"], None));
         assert_eq!((plain.status, plain.tag.as_str()), (200, "-:other"));
+    }
+
+    /// The calls `a` answers with: each `function_call` item's name and its parsed arguments.
+    fn calls_of(a: &Answered) -> Vec<(String, J)> {
+        a.body
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter_map(|d| J::parse(d).ok())
+            .filter_map(|d| d.get("item").cloned())
+            .filter(|it| it.get("type").and_then(J::as_str) == Some("function_call"))
+            .map(|it| {
+                let name = it.get("name").and_then(J::as_str).unwrap_or("").to_string();
+                let args = it
+                    .get("arguments")
+                    .and_then(J::as_str)
+                    .and_then(|a| J::parse(a).ok())
+                    .unwrap_or(J::Null);
+                (name, args)
+            })
+            .collect()
+    }
+
+    /// GAP 20'S LAB LEG: the continue leg's continuation, the Autopilot's turn, runs one command
+    /// that exits 3, then says it continued; the person's turn, a later continuation and every
+    /// other leg's continuation run nothing.
+    #[test]
+    fn the_continue_legs_continuation_runs_one_failing_command() {
+        let p = "LEG-continue Write a plan";
+        let fail = answer(&body(&[p, CONTINUE_TEXT], None));
+        assert_eq!(fail.tag, "continue:fail");
+        let called = calls_of(&fail);
+        assert_eq!(called.len(), 1, "{}", fail.body);
+        let (name, args) = &called[0];
+        assert_eq!(name, "exec_command");
+        assert_eq!(args.get("cmd").and_then(J::as_str), Some("exit 3"));
+        assert!(
+            matches!(args.get("login"), Some(J::Bool(false))),
+            "no login shell: {}",
+            args.py()
+        );
+        assert!(args.get("sandbox_permissions").is_none(), "{}", args.py());
+        let ran = answer(&body(
+            &[p, CONTINUE_TEXT],
+            Some("Process exited with code 3"),
+        ));
+        assert_eq!(ran.tag, "continue:continue");
+        assert!(calls_of(&ran).is_empty());
+        assert!(text_of(&ran).contains("All done."));
+        let again = answer(&body(&[p, CONTINUE_TEXT, CONTINUE_TEXT], None));
+        assert_eq!(
+            again.tag, "continue:continue",
+            "only the first continuation fails"
+        );
+        assert!(calls_of(&again).is_empty());
+        let person = answer(&body(&[p], None));
+        assert_eq!(person.tag, "continue:person");
+        assert!(calls_of(&person).is_empty());
+        for leg in ["hold", "off", "control"] {
+            let a = answer(&body(
+                &[&format!("LEG-{leg} Write a plan"), CONTINUE_TEXT],
+                None,
+            ));
+            assert_eq!(a.tag, format!("{leg}:continue"));
+            assert!(calls_of(&a).is_empty(), "{leg}");
+            assert!(text_of(&a).contains("All done."), "{leg}");
+        }
     }
 
     #[test]
@@ -1036,6 +1219,44 @@ mod tests {
         );
         let a = answer(&b);
         assert_eq!((a.status, a.tag.as_str()), (200, "usage:side"));
+    }
+
+    /// A `codex-boxes` leg asks for box `k + 1` once `k` ran, each response held on a gate of its
+    /// own that a retry of it waits on too, then says it is done, held by nothing.
+    #[test]
+    fn a_boxes_leg_asks_for_its_twenty_boxes_one_held_response_each() {
+        let ran = |k: usize| {
+            let mut input = vec![user("LEG-boxes1 Run the twenty commands, one at a time.")];
+            input.extend((0..k).map(|_| {
+                J::obj([
+                    ("type", J::s("function_call_output")),
+                    ("output", J::s("done")),
+                ])
+            }));
+            answer(&J::obj([("input", J::Arr(input))]))
+        };
+        let first = ran(0);
+        assert_eq!(first.tag, "boxes1:box01");
+        let said = text_of(&first);
+        assert!(
+            said.contains("box-1 ") && said.contains("require_escalated"),
+            "{said}"
+        );
+        let gate = |a: &Answered| Arc::clone(a.gate.as_ref().expect("a held response"));
+        assert!(
+            Arc::ptr_eq(&gate(&first), &gate(&ran(0))),
+            "a retry waits on the same gate"
+        );
+        let last = ran(BOXES - 1);
+        assert_eq!(last.tag, "boxes1:box20");
+        assert!(!Arc::ptr_eq(&gate(&first), &gate(&last)), "a gate a box");
+        let done = ran(BOXES);
+        assert_eq!(done.tag, "boxes1:done");
+        assert!(done.gate.is_none() && text_of(&done).contains("Ran all twenty commands"));
+        assert_eq!(
+            answer(&body(&["LEG-box Run the build."], None)).tag,
+            "box:call"
+        );
     }
 
     /// v6 §14.5 (5a): the model reads each of Cruise's six angled done checks, bare, as typed

@@ -375,7 +375,7 @@ pub fn codex_launch_program() -> PathBuf {
 /// [`WorkerCli::unstarted`] finds it in the configured one.
 #[must_use]
 pub fn codex_launch_program_in(agents: Option<&Path>) -> PathBuf {
-    codex_launch_program_by(|word| super::upgrade_drive::twin_naming(&agents?.join(word), word))
+    codex_launch_program_by(|word| super::upgrade_drive::agent_twin_in(agents?, word))
 }
 
 /// The program a launch aterm makes of `cli`, a pooled CLI other than Claude Code and Codex
@@ -726,7 +726,7 @@ pub(crate) fn starter_of(
         }
         Launches::Alab => {
             let image = image
-                .filter(|i| i.file_name().and_then(|n| n.to_str()) == Some(cli.word))
+                .filter(|i| super::upgrade_drive::names_program(i, cli.word))
                 .filter(|i| super::codex_alab::alab_bytes(i))?;
             twin()
                 .and_then(super::self_claimed::alab_twin)

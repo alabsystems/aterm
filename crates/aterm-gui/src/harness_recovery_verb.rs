@@ -5,7 +5,7 @@
 
 use aterm_agent::harness::account_progress::{AccountProgress, ProgressPhase};
 
-pub(crate) const USAGE: &str = "ERR usage: harness policy | recovery\n";
+pub(crate) const USAGE: &str = "ERR usage: harness policy | recovery | fact for=<rule> reader=<id> kinds=<k> wall=<w> | fact told episode=<hex>\n";
 
 pub(crate) fn snapshot(
     timeline: &crate::session_timeline::SessionTimeline,

@@ -387,7 +387,13 @@ fn a_sync_that_syncs_nothing_names_the_sheets_conflicts() {
                     run_accounts_sync(&env, sheet.to_str(), None, false, &mut out, &mut err)
                 } else {
                     let source = named.then(|| sheet.to_str()).flatten();
-                    run_cli_accounts_sync(cli, &env, (source, None, false), &mut out, &mut err)
+                    run_cli_accounts_sync(
+                        cli,
+                        (&env, None),
+                        (source, None, false),
+                        &mut out,
+                        &mut err,
+                    )
                 };
                 let err = String::from_utf8(err).unwrap();
                 assert_eq!(code, ExitCode::FAILURE, "{cli:?} {named}: {err}");
@@ -443,7 +449,7 @@ fn an_accounts_sync_names_the_sheets_conflicting_rows() {
             let code = if cli == Cli::Claude {
                 run_accounts_sync(&env, sheet.to_str(), None, json, &mut out, &mut err)
             } else {
-                run_cli_accounts_sync(cli, &env, (None, None, json), &mut out, &mut err)
+                run_cli_accounts_sync(cli, (&env, None), (None, None, json), &mut out, &mut err)
             };
             let (out, err) = (
                 String::from_utf8(out).unwrap(),
@@ -2180,7 +2186,8 @@ machines = [\"m16\"]
         bed.secret(&cli_fleet_file(cli), fleet);
         let env = quiet_env(&bed.home, &bed.state, &bed.aterm_toml(), NOW);
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let code = run_cli_accounts_sync(cli, &env, (None, None, false), &mut out, &mut err);
+        let code =
+            run_cli_accounts_sync(cli, (&env, None), (None, None, false), &mut out, &mut err);
         let (out, err) = (
             String::from_utf8(out).unwrap(),
             String::from_utf8(err).unwrap(),
@@ -2366,6 +2373,8 @@ fn a_grok_rows_background_renewal_hands_off_nothing_and_a_kimi_rows_still_starts
     fake_headless_browser(&bed.home);
     let grok = Roster::parse_for(Cli::Grok, GROK_ROSTER).unwrap();
     let kimi = Roster::parse_for(Cli::Kimi, &kimi_roster).unwrap();
+    fs::write(bed.roster(Cli::Grok), GROK_ROSTER).unwrap();
+    fs::write(bed.roster(Cli::Kimi), &kimi_roster).unwrap();
     let handed = Arc::new(Mutex::new(0usize));
     let count = Arc::clone(&handed);
     let spawn = move |_work: Box<dyn FnOnce() + Send>| {
@@ -2600,7 +2609,7 @@ region = \"global\"
 
     // 1. Contended `signin.lock` returns Held without stamping `last_attempt` cooldown.
     let held_lock = store.signin_now().unwrap().expect("signin lock free");
-    let empty_logins = accounts::Logins::default();
+    let empty_logins = store.load_logins(now).unwrap().0;
     assert_eq!(
         spawn_vendor_renewal(
             Cli::Kimi,
@@ -2627,8 +2636,19 @@ region = \"global\"
     drop(held_lock);
 
     // 2. Recent `wrong_at` holds without burning cooldown until mailbox config updates.
-    let mut wrong_logins = accounts::Logins::default();
-    accounts::note_wrong_account(&mut wrong_logins, "kimi-1", now - 60);
+    store
+        .transact_pool_logins_within(
+            &[],
+            &bed.roster(Cli::Kimi),
+            now,
+            &mut None,
+            |raw, _, logins| {
+                assert_eq!(raw, &roster);
+                Ok(accounts::note_wrong_account(logins, "kimi-1", now - 60))
+            },
+        )
+        .unwrap();
+    let wrong_logins = store.load_logins(now).unwrap().0;
     assert_eq!(
         spawn_vendor_renewal(
             Cli::Kimi,
@@ -2940,6 +2960,28 @@ fn kimi_bot_check() -> super::super::login_drive::Outcome {
     )
 }
 
+/// Publish a scripted browser result with the row and workflow the window inspected.
+fn record_kimi_browser_window(bed: &Bed, label: &str, at: i64, why: &str) {
+    let store = accounts::Store::at_for(&bed.state, Cli::Kimi, &bed.home);
+    let path = bed.roster(Cli::Kimi);
+    let observed = store.read_account_records(Some(&path), at).unwrap();
+    let row = observed.raw_roster.row(label).unwrap();
+    let workflow = accounts::current_workflow(row, &observed.logins).unwrap();
+    let parent = accounts::RenewalParent::capture(&observed.logins, label);
+    store
+        .transact_pool_logins_within(&[], &path, at, &mut None, |raw, _, logins| {
+            assert_eq!(raw.row(label), Some(row));
+            parent.require_current(logins, label)?;
+            assert!(accounts::workflow_token_current(row, logins, workflow));
+            accounts::admit_workflow(logins, label)?;
+            let mut event = accounts::Event::new(at, accounts::Kind::SignIn, label).because(why);
+            event.workflow = Some(workflow);
+            assert!(accounts::workflow_event_matches(row, logins, &event));
+            Ok(vec![event])
+        })
+        .unwrap();
+}
+
 /// A POOL ROW WHOSE BACKGROUND RENEWAL MET CLOUDFLARE'S BOT CHECK IS LEFT ALONE PAST THE
 /// 15-MINUTE COOLDOWN, as one that stopped for a person, though nobody is asked (design R-13):
 /// each try starts a live sign-in at the vendor that the check ends again, so the cooldown alone
@@ -3068,12 +3110,12 @@ region = \"global\"
 
         let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
         assert!(!try_again(&bed, &guard, Renewal::BotCheck, now, 901));
-        store
-            .append(&[
-                accounts::Event::new(now + 901, accounts::Kind::SignIn, "kimi-1")
-                    .because("www.kimi.ai window done session-kept"),
-            ])
-            .unwrap();
+        record_kimi_browser_window(
+            &bed,
+            "kimi-1",
+            now + 901,
+            "www.kimi.ai window done session-kept",
+        );
         assert!(
             kimi_pool_upkeep(&bed, &guard, now + 902),
             "CONTROL: a new signed-in window lifts the hold once (bound here: {bound})"
@@ -3226,8 +3268,21 @@ region = \"global\"
         accounts::SignInAction::Browser,
         accounts::SignInAction::Login,
     ] {
-        let mut task_logins = accounts::Logins::default();
-        accounts::note_sign_in_task(&mut task_logins, "kimi-1", action, now - 300);
+        store
+            .transact_pool_logins_within(
+                &[],
+                &bed.roster(Cli::Kimi),
+                now,
+                &mut None,
+                |raw, _, logins| {
+                    assert_eq!(raw, &roster);
+                    accounts::admit_workflow(logins, "kimi-1")?;
+                    accounts::note_sign_in_task(logins, "kimi-1", action, now - 300);
+                    Ok(Vec::new())
+                },
+            )
+            .unwrap();
+        let task_logins = store.load_logins(now).unwrap().0;
         let restarted_guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
         assert_eq!(
             spawn_vendor_renewal(
@@ -3262,19 +3317,27 @@ region = \"global\"
     }
     let mut note = None;
     store
-        .transact_logins(now, &mut note, |_state, logins| {
-            accounts::note_sign_in_task(
-                logins,
-                "kimi-1",
-                accounts::SignInAction::Browser,
-                now - 120,
-            );
-            accounts::note_wrong_account(logins, "kimi-3", now - 60);
-            Ok(vec![
-                accounts::Event::new(now - 120, accounts::Kind::SignIn, "kimi-1")
-                    .because("www.kimi.ai device needs-sign-in"),
-            ])
-        })
+        .transact_pool_logins_within(
+            &[],
+            &bed.roster(Cli::Kimi),
+            now,
+            &mut note,
+            |raw, _state, logins| {
+                assert_eq!(raw, &roster);
+                accounts::admit_workflow(logins, "kimi-1")?;
+                accounts::note_sign_in_task(
+                    logins,
+                    "kimi-1",
+                    accounts::SignInAction::Browser,
+                    now - 120,
+                );
+                accounts::note_wrong_account(logins, "kimi-3", now - 60);
+                Ok(vec![
+                    accounts::Event::new(now - 120, accounts::Kind::SignIn, "kimi-1")
+                        .because("www.kimi.ai device needs-sign-in"),
+                ])
+            },
+        )
         .unwrap();
     let pool_guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
     let cooldown = Mutex::new(None);
@@ -3330,17 +3393,20 @@ region = \"global\"
         .last_attempt
         .insert("kimi:kimi-1".to_owned(), Instant::now());
     let (logins_with_task, _) = store.load_logins(now).unwrap();
+    let bound = accounts::bound(&roster, &logins_with_task);
+    live_guard.lock().unwrap().activity_owners.insert(
+        "kimi:kimi-1".into(),
+        LoginOwner::new(&store, Cli::Kimi, "kimi-1", now)
+            .observing(&logins_with_task)
+            .for_row(bound.row("kimi-1").unwrap())
+            .for_workflow(roster.row("kimi-1").unwrap(), &logins_with_task),
+    );
     for unsigned_why in [
         "www.kimi.ai window done no-session",
         "www.kimi.ai window interrupted session-unknown",
         "www.kimi.ai window done untidied",
     ] {
-        store
-            .append(&[
-                accounts::Event::new(now - 10, accounts::Kind::SignIn, "kimi-1")
-                    .because(unsigned_why),
-            ])
-            .unwrap();
+        record_kimi_browser_window(&bed, "kimi-1", now - 10, unsigned_why);
         assert_eq!(
             spawn_vendor_renewal(
                 Cli::Kimi,
@@ -3361,12 +3427,12 @@ region = \"global\"
 
     // 4. Positive: `accounts browser` recording `window done session-kept` unparks `live_guard`
     // immediately ONCE, and preserves normal 15m `last_attempt` cooldown if that attempt fails.
-    store
-        .append(&[
-            accounts::Event::new(now - 5, accounts::Kind::SignIn, "kimi-1")
-                .because("www.kimi.ai window done session-kept"),
-        ])
-        .unwrap();
+    record_kimi_browser_window(
+        &bed,
+        "kimi-1",
+        now - 5,
+        "www.kimi.ai window done session-kept",
+    );
     let before = *spawned.lock().unwrap();
     assert_eq!(
         spawn_vendor_renewal(
@@ -3404,11 +3470,30 @@ region = \"global\"
 
     // 5. Wall-clock expiry of `PERSON_BACKOFF` (`>= 6h`) unparks even if monotonic `Instant`
     // paused during sleep.
-    let mut login_task_logins = accounts::Logins::default();
-    accounts::note_sign_in_task(
-        &mut login_task_logins,
-        "kimi-1",
-        accounts::SignInAction::Login,
+    store
+        .transact_pool_logins_within(
+            &[],
+            &bed.roster(Cli::Kimi),
+            now,
+            &mut None,
+            |_, _, logins| {
+                accounts::admit_workflow(logins, "kimi-1")?;
+                accounts::note_sign_in_task(logins, "kimi-1", accounts::SignInAction::Login, now);
+                Ok(Vec::new())
+            },
+        )
+        .unwrap();
+    let login_task_records = store
+        .read_account_records(Some(&bed.roster(Cli::Kimi)), now)
+        .unwrap();
+    let login_task_logins = &login_task_records.logins;
+    assert_eq!(
+        accounts::current_sign_in_task(
+            login_task_records.raw_roster.row("kimi-1").unwrap(),
+            login_task_logins,
+        )
+        .unwrap()
+        .at,
         now,
     );
     let slept_guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
@@ -3418,6 +3503,16 @@ region = \"global\"
         super::super::cli::Renewal::NeedsPerson,
         Instant::now(),
     );
+    slept_guard.lock().unwrap().activity_owners.insert(
+        "kimi:kimi-1".into(),
+        LoginOwner::new(&store, Cli::Kimi, "kimi-1", now)
+            .observing(login_task_logins)
+            .for_row(login_task_records.roster.row("kimi-1").unwrap())
+            .for_workflow(
+                login_task_records.raw_roster.row("kimi-1").unwrap(),
+                login_task_logins,
+            ),
+    );
     assert_eq!(
         spawn_vendor_renewal(
             Cli::Kimi,
@@ -3425,8 +3520,8 @@ region = \"global\"
             &bed.state,
             &bed.roster(Cli::Kimi),
             &roster,
-            &login_task_logins,
-            roster.row("kimi-1").cloned().unwrap(),
+            login_task_logins,
+            login_task_records.roster.row("kimi-1").cloned().unwrap(),
             now + PERSON_BACKOFF_SECS,
             &slept_guard,
             &spawn,
@@ -3903,5 +3998,105 @@ fn harness_accounts_off_stops_window_upkeep_sign_ins_as_well_as_sync() {
                 "CONTROL: early dispatches due sign-in work (spawned={spawned}, upkept={upkept:?})"
             );
         }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn published_kimi_refresh_schedules_without_a_browser_and_keeps_identity_retry_holds() {
+    for case in 0..5 {
+        let bed = Bed::new("kimi-native-no-browser");
+        let cli = Cli::Kimi;
+        let store = accounts::Store::at_for(&bed.state, cli, &bed.home);
+        let path = bed.roster(cli);
+        let raw = accounts::Row {
+            label: "native".into(),
+            email: Some("owner@example.com".into()),
+            vendor: accounts::Vendor {
+                region: Some(crate::ai::connector::Region::Global),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        fs::write(&path, accounts::row_text(&raw).unwrap()).unwrap();
+        if case == 4 {
+            let home = store.default_home().unwrap();
+            drop(
+                crate::harness::cli::shared_provider::kimi_pending_proof_fixture(
+                    &home,
+                    crate::ai::connector::Region::Global,
+                    "owner@example.com",
+                    true,
+                ),
+            );
+        }
+        if matches!(case, 1..=3) {
+            let dir = store.claim_staging_dir(&raw.label).unwrap();
+            store
+                .transact_pool_logins_within(
+                    &accounts::LOCK_LADDER,
+                    &path,
+                    NOW,
+                    &mut None,
+                    |_, state, logins| {
+                        let events = accounts::note_renewed(
+                            state,
+                            logins,
+                            &raw.label,
+                            None,
+                            dir.to_str().unwrap(),
+                            None,
+                            NOW,
+                        );
+                        if case == 2 {
+                            accounts::note_sign_in_task(
+                                logins,
+                                &raw.label,
+                                accounts::SignInAction::Browser,
+                                NOW,
+                            );
+                        }
+                        if case == 3 {
+                            accounts::note_wrong_account(logins, &raw.label, NOW - 5);
+                        }
+                        Ok(events)
+                    },
+                )
+                .unwrap();
+        }
+        let records = store.read_account_records(Some(&path), NOW).unwrap();
+        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        assert!(!guard_reads(&guard).has_browser(&bed.home));
+        let handed = Arc::new(Mutex::new(0));
+        let counted = handed.clone();
+        let spawn = move |_work: Box<dyn FnOnce() + Send>| {
+            *counted.lock().unwrap() += 1;
+            Ok(())
+        };
+        let result = spawn_vendor_renewal(
+            cli,
+            &bed.home,
+            &bed.state,
+            &path,
+            &records.raw_roster,
+            &records.logins,
+            records.roster.row(&raw.label).unwrap().clone(),
+            NOW,
+            &guard,
+            &spawn,
+        );
+        assert_eq!(
+            result,
+            match case {
+                0 => RenewalDispatch::Failed,
+                3 => RenewalDispatch::Held,
+                _ => RenewalDispatch::Started,
+            },
+            "case {case}"
+        );
+        assert_eq!(
+            *handed.lock().unwrap(),
+            usize::from(matches!(case, 1 | 2 | 4))
+        );
     }
 }

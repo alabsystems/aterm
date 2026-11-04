@@ -342,10 +342,10 @@ impl Follow {
     /// The whole lines written since the last read; a file that shrank (made fresh) is read from
     /// its start again.
     fn lines(&mut self) -> Vec<String> {
-        let Ok(mut f) = std::fs::File::open(&self.path) else {
+        let Ok((mut f, meta)) = aterm_uds::regular_file::open(&self.path) else {
             return Vec::new();
         };
-        let len = f.metadata().map_or(0, |m| m.len());
+        let len = meta.len();
         if len < self.offset {
             self.offset = 0;
             self.partial.clear();
@@ -353,7 +353,8 @@ impl Follow {
         if f.seek(std::io::SeekFrom::Start(self.offset)).is_err() {
             return Vec::new();
         }
-        let mut bytes = Vec::new();
+        let rem = len.saturating_sub(self.offset).min(16 * 1024 * 1024);
+        let mut bytes = Vec::with_capacity(usize::try_from(rem).unwrap_or(0).saturating_add(1));
         if f.take(16 * 1024 * 1024).read_to_end(&mut bytes).is_err() {
             return Vec::new();
         }

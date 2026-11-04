@@ -152,7 +152,9 @@ const NONBLOCK_OPEN_FLAG: i32 = 0x0000_0800;
 const NONBLOCK_OPEN_FLAG: i32 = 0x0000_0004;
 
 /// Open `path` without blocking on FIFOs and verify the opened descriptor is a regular file.
-pub(crate) fn open_regular_nonblock(path: &Path) -> io::Result<std::fs::File> {
+pub(crate) fn open_regular_nonblock_with_meta(
+    path: &Path,
+) -> io::Result<(std::fs::File, std::fs::Metadata)> {
     #[cfg(any(
         all(
             any(target_os = "linux", target_os = "android"),
@@ -197,13 +199,14 @@ pub(crate) fn open_regular_nonblock(path: &Path) -> io::Result<std::fs::File> {
         target_os = "dragonfly",
     )))]
     let file = std::fs::File::open(path)?;
-    if !file.metadata()?.is_file() {
+    let meta = file.metadata()?;
+    if !meta.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "not a regular file",
         ));
     }
-    Ok(file)
+    Ok((file, meta))
 }
 
 #[cfg(test)]

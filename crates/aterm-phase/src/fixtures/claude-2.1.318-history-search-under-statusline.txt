@@ -1,0 +1,19 @@
+# claude-code 2.1.318 · MEASURED 2026-11-04, `aterm ctl text` of a private headless aterm (144x50, aterm 0.153.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · Claude Code's prompt-history search (ctrl+r) open at a turn end under a status line (statusLine set: the lab's `statusline on`), query look, its match SCENE-CM please look in the composer row in typed ink; the status line on the footer's first row, the search heading the mode row under it · cursor=17,22
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.lab0/proj
+
+
+❯ SCENE-CM please look
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Implemented the parser module and its unit tests in this turn.
+
+✻ Worked for 7s · done 6:17 AM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ SCENE-CM please look
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  lab status line
+  search prompts: look  ⏵⏵ auto mode on (shift+tab to cycle)

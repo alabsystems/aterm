@@ -177,8 +177,17 @@ fn exercise(cli: Cli, operation: i64, fault: i64) -> [bool; 6] {
     let mut expected_state = fixture.store.load(NOW).unwrap().0;
     let mut expected_logins = fixture.store.load_logins(NOW).unwrap().0;
     let expected_before = expected_logins.clone();
-    let expected_events = apply(operation, &mut expected_state, &mut expected_logins);
+    let raw = Roster::load_for(cli, &fixture.path).unwrap();
+    workflow_scope::begin(Some(&raw), &mut expected_logins);
+    let mut expected_events = apply(operation, &mut expected_state, &mut expected_logins);
     advance_renewal_generations(&expected_before, &mut expected_logins, &expected_events).unwrap();
+    workflow_scope::finish(
+        &expected_before,
+        Some(&raw),
+        &mut expected_logins,
+        &mut expected_events,
+    )
+    .unwrap();
     advance_sign_in_receipts(
         &expected_before,
         &mut expected_logins,

@@ -322,25 +322,19 @@ fn lay(dir: &Path) -> PathBuf {
     std::fs::canonicalize(dir).expect("canonical")
 }
 
-struct Scratch(PathBuf);
+struct Scratch(
+    PathBuf,
+    #[expect(dead_code, reason = "RAII cleanup guard")] aterm_tempfile::TempDir,
+);
 
 impl Scratch {
     fn new(name: &str) -> Self {
-        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-conformance-disk-{name}-{}-{n}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch");
-        Self(dir)
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        let dir = aterm_tempfile::Builder::new()
+            .prefix(&format!("aterm-conformance-disk-{name}-"))
+            .suffix(".noindex")
+            .tempdir()
+            .expect("scratch");
+        Self(dir.path().to_path_buf(), dir)
     }
 }
 
@@ -555,18 +549,19 @@ fn under_a_projection_each_tier_stops_where_the_fill_no_longer_crosses() {
 fn the_reserve_is_released_exactly_where_the_model_lets_it_go() {
     use aterm_agent::harness::cli::{ReserveMove, disk_reserve_look};
     let m = disk_reclaim_pass_model();
-    let tmp = std::env::temp_dir().join(format!(
-        "aterm-conformance-disk-reserve-{}",
-        std::process::id()
-    ));
-    let state = tmp.join("state");
+    let tmp = aterm_tempfile::Builder::new()
+        .prefix("aterm-conformance-disk-reserve-")
+        .suffix(".noindex")
+        .tempdir()
+        .expect("scratch");
+    let state = tmp.path().join("state");
     let t = Config::default().thresholds(None);
     for (measure, free, level) in [
         ("MeasureLow", 20 * GIB_BYTES, disk::Level::Low),
         ("MeasureShort", 6 * GIB_BYTES, disk::Level::Short),
         ("MeasureEmergency", 2 * GIB_BYTES, disk::Level::Emergency),
     ] {
-        let reserve = tmp.join(format!("{measure}/reserve"));
+        let reserve = tmp.path().join(format!("{measure}/reserve"));
         std::fs::create_dir_all(reserve.parent().expect("folder")).expect("folder");
         std::fs::write(&reserve, vec![7u8; 4096]).expect("a small reserve");
         let moved = disk_reserve_look(&state, &reserve, level, Some(free), &t, NOW);
@@ -586,7 +581,6 @@ fn the_reserve_is_released_exactly_where_the_model_lets_it_go() {
             assert!(reserve.exists());
         }
     }
-    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 #[test]

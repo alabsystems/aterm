@@ -297,7 +297,7 @@ fn stays_down(home: &Path) -> Result<bool, String> {
 pub(crate) fn owed(config_path: Option<&Path>, host: Option<&str>) -> bool {
     match (config_path, host) {
         (Some(config), Some(host)) => {
-            crate::debugger_access::host_record_lists(config, OWED_RECORD, host).unwrap_or(false)
+            crate::host_record::lists(config, OWED_RECORD, host).unwrap_or(false)
         }
         _ => false,
     }
@@ -309,14 +309,14 @@ pub(crate) fn note_owed(config_path: Option<&Path>, host: Option<&str>, still_ow
         return;
     };
     let noted = if still_owed {
-        crate::debugger_access::note_host_record(
+        crate::host_record::note(
             config,
             OWED_RECORD,
             host,
             aterm_time::unix_secs().unwrap_or(0),
         )
     } else {
-        crate::debugger_access::forget_host_record(config, OWED_RECORD, host)
+        crate::host_record::forget(config, OWED_RECORD, host)
     };
     if let Err(error) = noted {
         aterm_log::warn!("secrets vault: the owed-subscriber record was not updated: {error}");
@@ -1205,8 +1205,8 @@ mod tests {
             "unreadable: nothing owed"
         );
         assert!(
-            crate::debugger_access::read_host_record(&config, OWED_RECORD, "MAC-A"),
-            "where the declined record's reader fails toward named"
+            crate::host_record::lists(&config, OWED_RECORD, "MAC-A").is_err(),
+            "the record's reader names the failure"
         );
         note_owed(Some(&config), Some("MAC-A"), false);
         assert_eq!(

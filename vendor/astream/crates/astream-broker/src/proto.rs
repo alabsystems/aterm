@@ -305,6 +305,8 @@ const TAG_RETIRE: u8 = 0x10;
 const TAG_GAP_NOTICES: u8 = 0x11;
 const TAG_BROKER_TIMES: u8 = 0x12;
 const TAG_STATS: u8 = 0x13;
+const TAG_CLEAR_GAP_FENCES: u8 = 0x14;
+const TAG_FENCE_GAPS: u8 = 0x15;
 const TAG_ACK: u8 = 0x81;
 const TAG_DELIVERY: u8 = 0x82;
 const TAG_ERROR: u8 = 0x83;
@@ -340,6 +342,21 @@ pub const REQUEST_BROKER_TIMES: u64 = 1 << 3;
 /// Bit 4 of [`NonceExt::requests`]: the broker accepts [`Request::Stats`] (`0x13`)
 /// and answers with [`Response::Stats`] (`REQUIREMENTS` R5).
 pub const REQUEST_STATS: u64 = 1 << 4;
+
+/// Bit 5 of [`NonceExt::requests`]: the broker GAP-FENCES each producer's writes on a
+/// connection THAT ASKS ([`Request::FenceGaps`], `0x15`; the broker was opened with
+/// `OpenOptions::sticky_batch_refusal`): once one of a producer's writes sent after the ask is
+/// refused, every later one it sends on that connection above the refused sequence is refused
+/// `gap-fenced=<seq>` in send order, until a write at or under that sequence commits, the
+/// connection closes, or it asks [`Request::ClearGapFences`] (`0x14`), which this bit
+/// announces too. A producer that pipelines writes whose order must hold on the log asks
+/// before it keeps more than one in flight: unasked, a refused batch is rolled back and the
+/// next write lands, ahead of the refused one's retry (`DESIGN-aterm-fabric` §14 Q7). A
+/// connection that never asks, one of a client that predates the verb among them, is served
+/// unfenced on any broker, so a refusal it does not retry next fences nothing it sends after
+/// it. A broker opened without the option leaves the bit clear, refuses the ask, and still
+/// answers `ClearGapFences` (it clears nothing).
+pub const REQUEST_GAP_FENCES: u64 = 1 << 5;
 
 const STATS_MAX_ITEMS: usize = 65_536;
 
@@ -716,6 +733,34 @@ pub enum Request {
     /// fleet-wide read grant (`/f/<F>/>` or `/>`) on a guarded broker; never returns
     /// record bodies. Answered with [`Response::Stats`]. Announced by [`REQUEST_STATS`].
     Stats { filter: String },
+    /// LIFT THIS CONNECTION'S GAP FENCES (`OpenOptions::sticky_batch_refusal`,
+    /// [`REQUEST_GAP_FENCES`]): answered in the request loop once every write the
+    /// connection sent before it is answered, so each of those was judged under the fences
+    /// as they stood; then every fence the connection holds is dropped, as a close drops
+    /// them, and a write it sends after this one is judged afresh. A producer sends it once
+    /// it has READ the answer to every write it sent, so it knows which were refused, which
+    /// of them it will send again and in what order. Answered with a `Mark`; appends
+    /// nothing; on a guarded broker any unexpired capability permits it (it lifts only the
+    /// fences this connection's own writes set). The connection stays fenced: its next
+    /// refused write fences again. A connection that never asked [`Request::FenceGaps`],
+    /// and a broker opened without the option, hold no fence and are answered the same;
+    /// a broker that predates the verb answers `Error 5 "malformed request"` and keeps the
+    /// connection.
+    ClearGapFences,
+    /// GAP-FENCE THIS CONNECTION'S WRITES from now on (`OpenOptions::sticky_batch_refusal`,
+    /// [`REQUEST_GAP_FENCES`]): answered in the request loop once every write the connection
+    /// sent before it is answered, each of those judged unfenced; then a refused `Publish` or
+    /// `ProcessAndProduce` it sends latches a fence on its producer, and every later write of
+    /// that producer above the refused sequence is refused `gap-fenced=<seq>` until a write
+    /// at or under it commits, [`Request::ClearGapFences`] lifts it, or the connection
+    /// closes. The ask holds for the connection's life. A producer asks once, before it keeps
+    /// several writes in flight whose order must hold; a connection that never asks is never
+    /// fenced, so a client that predates the verb, and does not lift fences, is served as
+    /// before. Answered with a `Mark`; appends nothing; on a guarded broker any unexpired
+    /// capability permits it (it fences only this connection's own writes). A broker opened
+    /// without the option, and one that predates the verb, answer `Error 5` and keep the
+    /// connection, which stays unfenced.
+    FenceGaps,
 }
 
 /// Per-connection attached producer row in [`WireStats`] (`REQUIREMENTS` R5).
@@ -1258,7 +1303,7 @@ const fn take_ext_entry_header(b: &[u8]) -> Option<(u8, usize, &[u8])> {
 /// |------|------------|-------|
 /// | 0x01 | durability | `requested u8, served u8, reason u8, horizon_ms u32 LE, rules u16 LE` ([`ServedInfo`]) |
 /// | 0x02 | lineage    | `n u8`, then `n × (generation u64 LE, common u64 LE)` ([`Lineage`]) |
-/// | 0x03 | 8 bytes    | the request set a broker announces (`u64` LE bitmask; bit 0 = [`REQUEST_RETIRE`], bit 1 = [`REQUEST_GAP_NOTICES`], bit 2 = [`REQUEST_TOLD_FETCH`]) |
+/// | 0x03 | 8 bytes    | the request set a broker announces (`u64` LE bitmask; bit 0 = [`REQUEST_RETIRE`], bit 1 = [`REQUEST_GAP_NOTICES`], bit 2 = [`REQUEST_TOLD_FETCH`], bit 3 = [`REQUEST_BROKER_TIMES`], bit 4 = [`REQUEST_STATS`], bit 5 = [`REQUEST_GAP_FENCES`]) |
 /// | 0x04 | health     | `flags u8` (bit 0: poisoned), `barrier u64 LE, full u64 LE, skipped u64 LE, failed u64 LE`, `n u16 LE`, `n` bytes of the poison's reason (UTF-8); bytes after it are a later build's, skipped ([`HelloHealth`]) |
 /// | 0x05 | retention  | the rules the log is retained by, as `Retention::encode` writes them (the `retention` feature) |
 ///
@@ -1275,7 +1320,8 @@ pub struct NonceExt {
     /// Tag 0x02: where the log's generations agree.
     pub lineage: Option<Lineage>,
     /// Tag 0x03: the request-set bitmask announced by the broker (bit 0 = [`REQUEST_RETIRE`],
-    /// bit 1 = [`REQUEST_GAP_NOTICES`], bit 2 = [`REQUEST_TOLD_FETCH`]).
+    /// bit 1 = [`REQUEST_GAP_NOTICES`], bit 2 = [`REQUEST_TOLD_FETCH`], bit 3 = [`REQUEST_BROKER_TIMES`],
+    /// bit 4 = [`REQUEST_STATS`], bit 5 = [`REQUEST_GAP_FENCES`]).
     pub requests: Option<u64>,
     /// Tag 0x04: whether the log is poisoned, and the flushes it has issued.
     pub health: Option<HelloHealth>,
@@ -1436,6 +1482,18 @@ impl NonceExt {
     pub const fn supports_stats(&self) -> bool {
         match self.requests {
             Some(r) => (r & REQUEST_STATS) != 0,
+            None => false,
+        }
+    }
+
+    /// Whether this `Hello` extension block announces that the broker GAP-FENCES each
+    /// producer's writes on a connection that asks ([`Request::FenceGaps`], `0x15`) after a
+    /// refused one, and lifts a connection's fences on [`Request::ClearGapFences`] (`0x14`):
+    /// [`REQUEST_GAP_FENCES`].
+    #[must_use]
+    pub const fn supports_gap_fences(&self) -> bool {
+        match self.requests {
+            Some(r) => (r & REQUEST_GAP_FENCES) != 0,
             None => false,
         }
     }
@@ -1876,6 +1934,8 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
         Request::IdleMarks => p[1] = TAG_IDLE_MARKS,
         Request::GapNotices => p[1] = TAG_GAP_NOTICES,
         Request::BrokerTimes => p[1] = TAG_BROKER_TIMES,
+        Request::ClearGapFences => p[1] = TAG_CLEAR_GAP_FENCES,
+        Request::FenceGaps => p[1] = TAG_FENCE_GAPS,
         Request::Stats { filter } => {
             p[1] = TAG_STATS;
             put_str(&mut p, filter);
@@ -2071,6 +2131,8 @@ pub(crate) fn decode_request_with_bt(p: &[u8]) -> Option<(Request, Option<u64>)>
         TAG_IDLE_MARKS => Request::IdleMarks,
         TAG_GAP_NOTICES => Request::GapNotices,
         TAG_BROKER_TIMES => Request::BrokerTimes,
+        TAG_CLEAR_GAP_FENCES => Request::ClearGapFences,
+        TAG_FENCE_GAPS => Request::FenceGaps,
         TAG_STATS => Request::Stats {
             filter: r.string()?,
         },
@@ -2949,19 +3011,20 @@ mod tests {
     /// retained values, bounded reads, a last will, a proof-of-possession attach, an
     /// exactly-once inbox, request/reply, barriers, presence, negotiated liveness and a
     /// producer's view of its own subject budget, a conditional retire, a tail told what
-    /// retention gave up, broker-stamped wall times (`bt=`), and read-grant-gated operator
-    /// `Stats` — rides on NINETEEN request tags and EIGHT response tags. This
-    /// test is the budget: it enumerates every byte and fails if a twentieth request tag
-    /// or a ninth response tag ever decodes, and it pins each tag's NUMBER, so a
-    /// renumbering that would silently re-interpret an old client's frames breaks the
-    /// build instead. `Keepalive` at 0x0D, `IdleMarks` at 0x0E, `Budget` at 0x0F, `Retire`
-    /// at 0x10, `GapNotices` at 0x11, `BrokerTimes` at 0x12, `Stats` at 0x13, `Budget`'s
-    /// reply at 0x86, `Gap` at 0x87 and `Stats` reply at 0x88 took numbers no earlier
-    /// version decoded: an older broker refuses each request as malformed and keeps the
-    /// connection, and never sends the reply. Additions, not reinterpretations; no version
-    /// change.
+    /// retention gave up, broker-stamped wall times (`bt=`), read-grant-gated operator
+    /// `Stats`, and a gap fence a connection asks for and its producer lifts once it read
+    /// its answers — rides on TWENTY-ONE request tags and EIGHT response tags. This test is
+    /// the budget: it enumerates every byte and fails if a twenty-second request tag or a
+    /// ninth response tag ever decodes, and it pins each tag's NUMBER, so a renumbering that
+    /// would silently re-interpret an old client's frames breaks the build instead.
+    /// `Keepalive` at 0x0D, `IdleMarks` at 0x0E, `Budget` at 0x0F, `Retire` at 0x10,
+    /// `GapNotices` at 0x11, `BrokerTimes` at 0x12, `Stats` at 0x13, `ClearGapFences` at
+    /// 0x14, `FenceGaps` at 0x15, `Budget`'s reply at 0x86, `Gap` at 0x87 and `Stats` reply
+    /// at 0x88 took numbers no earlier version
+    /// decoded: an older broker refuses each request as malformed and keeps the connection,
+    /// and never sends the reply. Additions, not reinterpretations; no version change.
     #[test]
-    fn the_tag_budget_is_nineteen_requests_and_eight_responses() {
+    fn the_tag_budget_is_twenty_one_requests_and_eight_responses() {
         // Version 2: `Attach` kept its tag (0x07) and its wire SHAPE (a str then a
         // byte string) while its MEANING changed (`{grant, proof}`, answered with a
         // Mark), so under an unchanged version byte a version-1 Attach would decode
@@ -2979,7 +3042,7 @@ mod tests {
         );
 
         // Every tag's NUMBER, pinned against the variant that carries it.
-        let request_tags: [(u8, Request); 19] = [
+        let request_tags: [(u8, Request); 21] = [
             (
                 0x01,
                 Request::Publish {
@@ -3098,6 +3161,8 @@ mod tests {
                     filter: String::new(),
                 },
             ),
+            (0x14, Request::ClearGapFences),
+            (0x15, Request::FenceGaps),
         ];
         for (tag, req) in &request_tags {
             let bytes = encode_request(req);
@@ -3200,7 +3265,7 @@ mod tests {
         }
         assert_eq!(
             decodable_requests, declared_requests,
-            "exactly nineteen request tags decode, and no other byte does"
+            "exactly twenty-one request tags decode, and no other byte does"
         );
         assert_eq!(
             decodable_responses, declared_responses,

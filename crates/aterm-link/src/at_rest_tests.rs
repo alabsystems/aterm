@@ -323,6 +323,88 @@ fn a_wrong_key_refuses_and_its_remedy_is_the_keys() {
     assert_eq!(s.snapshot(), before, "and cuts nothing");
 }
 
+/// THE BUDGET'S COLD READ, SEALED (D10): a broker keeps only its residency budget of decoded
+/// records in memory, so on a sealed log aterm opens, a record that fell out of that window is
+/// read back from the file through the bound open (the broker counts it, `cold_reads`), and a
+/// reader fetching it over the socket gets the record that was published. The broker is held
+/// to a budget of 0, the newest record alone, so what it keeps never depends on
+/// [`durability::RESIDENT_BUDGET_SEAM`] (`none` would keep every record resident, a large byte
+/// count would need that many bytes published). NEGATIVE CONTROL: under another key the log
+/// refuses at the open, so no cold read is served under it.
+#[test]
+fn a_record_the_budget_left_cold_reads_back_sealed_as_published() {
+    const BODY: usize = 4096;
+    let n = 3;
+    let body = |seq: usize| -> Vec<u8> {
+        let mut b = vec![u8::try_from(seq % 251).expect("below 251"); BODY];
+        b[..SENTINEL.len()].copy_from_slice(SENTINEL);
+        b
+    };
+    let s = Scratch::new();
+    s.plant_key(&KEY);
+    let prepared = prepare(&s.log(), Backups::INERT).expect("prepared");
+    let key = prepared.key.as_ref().map(Key::bytes).expect("a key");
+    let opened = durability::open_escalating(
+        &s.log(),
+        None,
+        Durability::Ordered,
+        Some([7; 16]),
+        Vec::new(),
+        Some(key),
+    )
+    .expect("open");
+    opened.broker.set_resident_budget(0);
+    let served = opened.broker.serve(s.sock()).expect("serve");
+    let mut client = astream_broker::Client::connect(s.sock()).expect("connect");
+    for seq in 1..=n {
+        client
+            .publish(9, u64::try_from(seq).expect("small"), "/o/cold", &body(seq))
+            .expect("acked");
+    }
+    let (resident, _, retained) = opened.broker.residency();
+    assert_eq!(
+        (resident, retained),
+        (1, n),
+        "every record retained, the newest alone resident"
+    );
+    let cold_before = opened.broker.cold_reads();
+    let (rows, _) = client.fetch(0, "/o/cold", 1).expect("fetch the oldest");
+    let [(_, subject, got)] = rows.as_slice() else {
+        panic!("one record, not {}", rows.len());
+    };
+    assert_eq!(subject, "/o/cold");
+    assert!(
+        *got == body(1),
+        "the cold record reads back as it was published"
+    );
+    assert!(
+        opened.broker.cold_reads() > cold_before,
+        "the fetch read the oldest back from the file"
+    );
+    drop(client);
+    drop(served);
+    drop(opened);
+    assert!(is_sealed(&s.log()));
+    assert!(
+        !s.holds_sentinel(""),
+        "the cold record's body is in the log sealed, never in the clear"
+    );
+
+    let before = s.snapshot();
+    let refused = durability::open_escalating(
+        &s.log(),
+        None,
+        Durability::Ordered,
+        Some([7; 16]),
+        Vec::new(),
+        Some(OTHER),
+    )
+    .err()
+    .expect("another key refuses");
+    assert_eq!(refused.kind(), io::ErrorKind::InvalidData, "{refused}");
+    assert_eq!(s.snapshot(), before, "and reads nothing out");
+}
+
 /// A sealed log is never opened keyless, with its `.seal` or without it, and a keyed open of one
 /// whose `.seal` is gone refuses too: a deleted binding reads as nothing older.
 #[test]

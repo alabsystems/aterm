@@ -209,10 +209,12 @@ pub fn read_outcome(path: &Path) -> Option<Met> {
         opts.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
     }
     let file = opts.open(path).ok()?;
-    if !file.metadata().ok()?.is_file() {
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() {
         return None;
     }
-    let mut text = String::new();
+    let cap = usize::try_from(meta.len().min(256).saturating_add(1)).unwrap_or(0);
+    let mut text = String::with_capacity(cap);
     file.take(256).read_to_string(&mut text).ok()?;
     Met::parse(&text)
 }
@@ -3977,10 +3979,14 @@ pub(super) fn poll_mailbox_for_magic_link(
             candidates.sort_by_key(|a| std::cmp::Reverse(a.0));
             for (mtime, len, path) in candidates {
                 tried.insert((path.clone(), len, mtime));
-                let mut raw = String::new();
-                let Some(file) = open_regular_file(&path) else {
+                let Ok((file, _)) = aterm_uds::regular_file::open(&path) else {
                     continue;
                 };
+                let mut raw = String::with_capacity(
+                    usize::try_from(len.min(EMAIL_FILE_MAX))
+                        .unwrap_or(0)
+                        .saturating_add(1),
+                );
                 if file.take(EMAIL_FILE_MAX).read_to_string(&mut raw).is_err() {
                     continue;
                 }
@@ -4481,12 +4487,6 @@ pub fn store_dir_of(
     store_dir.is_dir().then(|| store_dir.to_path_buf())
 }
 
-fn open_regular_file(path: &Path) -> Option<std::fs::File> {
-    aterm_uds::regular_file::open(path)
-        .ok()
-        .map(|(file, _)| file)
-}
-
 fn discover_store_dir() -> Option<PathBuf> {
     let arg0 = std::env::args_os().next().map(PathBuf::from);
     store_dir_of(&|name| std::env::var_os(name), arg0.as_deref())
@@ -4624,11 +4624,13 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
     let local_state = || {
         use std::io::Read as _;
         let path = local_state_path(home.as_deref()?);
-        let mut text = String::new();
-        open_regular_file(&path)?
-            .take(LOCAL_STATE_MAX)
-            .read_to_string(&mut text)
-            .ok()?;
+        let (file, meta) = aterm_uds::regular_file::open(&path).ok()?;
+        let mut text = String::with_capacity(
+            usize::try_from(meta.len().min(LOCAL_STATE_MAX))
+                .unwrap_or(0)
+                .saturating_add(1),
+        );
+        file.take(LOCAL_STATE_MAX).read_to_string(&mut text).ok()?;
         Some(text)
     };
     let mut run = |mut cmd: aterm_uds::spawnfd::Command| cmd.status().is_ok_and(|s| s.success());

@@ -13,6 +13,7 @@ pub mod cells;
 pub mod changed;
 pub mod checks;
 pub mod cli;
+mod compiler_message;
 /// The disk a run will write, claimed before it builds (`docs/DESIGN-adaptive-build-2026-10-24.md`, DISK-ADMIT).
 #[cfg(unix)]
 pub mod disk;

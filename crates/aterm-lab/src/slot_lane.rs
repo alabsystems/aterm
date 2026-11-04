@@ -713,18 +713,26 @@ fn lane(inst: &Instance, world: &World, holder: &mut Running) -> Result<Option<V
             )
         },
     );
-    let armed_before = crate::util::scratch_text(&world.state().join("logs/aterm.log"))
-        .matches(aterm_sysprobe::slots::ARMED_LINE)
-        .count();
+    let log = world.state().join("logs/aterm.log");
+    let armed_lines = |text: &str| text.matches(aterm_sysprobe::slots::ARMED_LINE).count();
+    let mut log_cursor = crate::util::LineTailCursor::default();
+    let armed_before = armed_lines(&log_cursor.poll_scratch_text(&log).unwrap_or_default().1);
     let mut control = ctl_start(
         inst,
         world,
         &[&at, "await", "sys", "slots>=1", "timeout=60000"],
     )?;
-    let log = world.state().join("logs/aterm.log");
-    let armed_lines = |text: &str| text.matches(aterm_sysprobe::slots::ARMED_LINE).count();
+    let mut armed = armed_before;
     let deadline = Instant::now() + MUST;
-    while armed_lines(&crate::util::scratch_text(&log)) < armed_before + 1 {
+    loop {
+        let (reset, delta) = log_cursor.poll_scratch_text(&log).unwrap_or_default();
+        if reset {
+            armed = 0;
+        }
+        armed += armed_lines(&delta);
+        if armed > armed_before {
+            break;
+        }
         control.step()?;
         if control.collected() {
             return Err("the ctl client ended before the slots wait armed".into());

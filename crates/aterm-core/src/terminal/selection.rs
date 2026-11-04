@@ -332,16 +332,15 @@ impl Terminal {
                 .ok()
                 .and_then(|idx| self.grid.row_at_screen(idx))
                 .is_some_and(|r| r.is_wrapped())
-        } else if row < 0 {
-            match history_line {
-                Some(line) => line.is_wrapped(),
-                None => usize::try_from(-(i64::from(row)) - 1)
-                    .ok()
-                    .and_then(|rev_idx| self.grid.history_line_rev(rev_idx))
-                    .is_some_and(|l| l.is_wrapped()),
-            }
         } else {
-            false
+            row < 0
+                && match history_line {
+                    Some(line) => line.is_wrapped(),
+                    None => usize::try_from(-(i64::from(row)) - 1)
+                        .ok()
+                        .and_then(|rev_idx| self.grid.history_line_rev(rev_idx))
+                        .is_some_and(|l| l.is_wrapped()),
+                }
         }
     }
 

@@ -894,6 +894,24 @@ pub(crate) fn ensure_notary(may_change: bool) -> Outcome {
             next: "re-run without --check to store one".into(),
         };
     }
+    match aterm_secrets::client::Paths::live()
+        .and_then(|paths| aterm_secrets::client::release::sync_notary(&paths))
+    {
+        Ok(Some(note)) => {
+            return Outcome::Ready {
+                ids: Vec::new(),
+                note: Some(note),
+            };
+        }
+        Ok(None) => {}
+        Err(error) => {
+            return Outcome::Waiting {
+                what: format!("shared notary credential could not be materialized: {error}"),
+                next: "retry after the authenticated vault credential or notary service recovers"
+                    .into(),
+            };
+        }
+    }
     let profile = NOTARY_PROFILE;
     step(
         "notary",

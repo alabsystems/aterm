@@ -425,16 +425,17 @@ pub const LIMIT_DRAFT_OWN: NoticeText = NoticeText {
     ..LIMIT_DRAFT
 };
 
-/// [`LIMIT_DRAFT`] where the draft stands under Claude Code's open completion menu (`super::turn_end::Composer::Diverted`): Enter there runs or completes the menu's highlighted entry (`/clear` for a `/cl` left standing), not the draft (`super::turn_end::MENU_DIVERTS`).
+/// [`LIMIT_DRAFT`] where something stands over the prompt (`super::turn_end::Composer::Diverted`): Claude Code's open completion menu, whose Enter runs or completes its highlighted entry (`/clear` for a `/cl` left standing), not the draft (`super::turn_end::MENU_DIVERTS`), or its prompt-history search, whose Enter sends the old prompt it found and under which the prompt may hold nothing (`super::turn_end::SEARCH_DIVERTS`). Once it is closed the prompt is read again: a draft left there raises [`LIMIT_DRAFT`].
 pub const LIMIT_DRAFT_MENU: NoticeText = NoticeText {
     id: "limit-draft-menu",
     code: "lm",
-    happened: "Claude Code hit this account's usage limit, and the tab has a draft under an open menu.",
-    todo: "Close the menu in the tab, then send the draft.",
+    happened: "Claude Code hit this account's usage limit, and a menu or search stands over the prompt.",
+    did: "aterm does not switch the tab to {label} while its prompt is covered.",
+    todo: "Close what stands over the prompt in the tab.",
     ..LIMIT_DRAFT
 };
 
-/// The notices a draft in the prompt alone raises, whose step is the draft's going: the point each stands at is decided again the moment the prompt reads otherwise, sent or cleared.
+/// The notices a draft in the prompt, or what stands over it, alone raises, whose step is its going: the point each stands at is decided again the moment the prompt reads otherwise, sent, cleared or closed.
 pub const DRAFT_HOLDS: &[&str] = &[
     LIMIT_DRAFT.id,
     LIMIT_DRAFT_OWN.id,

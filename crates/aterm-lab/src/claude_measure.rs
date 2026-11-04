@@ -271,6 +271,7 @@ pub(crate) const CLAUDE: Family = Family {
     source: "transcript",
     read: TRANSCRIPT_KEYS,
     inert,
+    words: &[],
     holds: is_reduction,
     measures: every,
     kind: record_kind,
@@ -1095,11 +1096,13 @@ fn same_bytes(a: &Path, b: &Path) -> bool {
         }
         Some(n)
     };
-    let (Ok(mut fa), Ok(mut fb)) = (std::fs::File::open(a), std::fs::File::open(b)) else {
+    let (Ok((mut fa, ma)), Ok((mut fb, mb))) = (
+        crate::util::open_regular_file_with_meta(a),
+        crate::util::open_regular_file_with_meta(b),
+    ) else {
         return false;
     };
-    let len = |f: &std::fs::File| f.metadata().map(|m| m.len()).ok();
-    if len(&fa).is_none() || len(&fa) != len(&fb) {
+    if ma.len() != mb.len() {
         return false;
     }
     let (mut ba, mut bb) = (vec![0u8; 1 << 20], vec![0u8; 1 << 20]);

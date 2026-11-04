@@ -294,6 +294,12 @@ struct ConnState {
     /// What its tail was told of the records retention gave up below it, once it is a
     /// subscription that asked.
     told: Option<Told>,
+    /// Producer -> the lowest sequence of its refused here since its fence was last lifted
+    /// ([`State::gap_fences`]).
+    fences: BTreeMap<u64, u64>,
+    /// It asked to be gap-fenced (`Request::FenceGaps`), on a broker that offers it: only
+    /// then does a refused publish of it fence its later ones ([`ConnState::fences`]).
+    fence_asked: bool,
 }
 
 impl ConnState {
@@ -307,6 +313,8 @@ impl ConnState {
             sub: None,
             gaps: false,
             told: None,
+            fences: BTreeMap::new(),
+            fence_asked: false,
         }
     }
 }
@@ -418,6 +426,16 @@ pub(crate) struct State {
     next_conn: u64,
     /// Producer id -> principal, for the principal rule.
     principals: BTreeMap<u64, String>,
+    /// THE BROKER GAP-FENCES each producer's publishes on a connection that asks
+    /// (`FenceGaps`, [`ConnState::fence_asked`]), as `aterm link broker` opens it (astream's
+    /// `sticky_batch_refusal`; `false`: one opened by an older build): a refused publish fences
+    /// the connection's later ones by its producer above its sequence (`gap-fenced=`) until one
+    /// at or under it lands, the producer lifts them (`ClearGapFences`) or the connection closes;
+    /// its `Hello` offers it ([`ConnState::fences`]).
+    pub(crate) gap_fences: bool,
+    /// Publishes refused behind a fence, and lifts that took one down.
+    pub(crate) gap_fenced: u64,
+    pub(crate) fences_lifted: u64,
     /// Refuse the next this-many publishes by a NODE producer, and group commits.
     pub(crate) refuse_next: u32,
     /// HELD ACKS (aterm-0).
@@ -506,6 +524,12 @@ pub(crate) enum ArmMutant {
     FreshDedup,
     /// A will fires whatever its producer published since.
     NoWillFence,
+    /// A broker that says it gap-fences lets a publish land behind one of its producer's
+    /// refused on that connection.
+    NoGapFence,
+    /// A broker that gap-fences fences every connection, asked or not (astream `8a15cdb`..
+    /// `ea8bab7`): a refusal on a connection that never asked holds back what it sends after.
+    FenceUnasked,
     /// Corrupt each published payload byte.
     AlterPayload,
     /// `Budget` answers `reserved: 0`, whatever its producer's wills hold.
@@ -641,6 +665,9 @@ impl Broker {
                 conns: BTreeMap::new(),
                 next_conn: 1,
                 principals: BTreeMap::new(),
+                gap_fences: true,
+                gap_fenced: 0,
+                fences_lifted: 0,
                 refuse_next: 0,
                 holds: None,
                 held_total: 0,
@@ -849,6 +876,12 @@ impl Broker {
     pub(crate) fn commit_writes(&self) -> (u64, u64) {
         let s = lock(&self.state);
         (s.commits_corked, s.commits_alone)
+    }
+
+    /// Publishes refused behind a gap fence, and lifts that took one down ([`State::gap_fences`]).
+    pub(crate) fn fence_counts(&self) -> (u64, u64) {
+        let s = lock(&self.state);
+        (s.gap_fenced, s.fences_lifted)
     }
 
     /// THE RECORDS WHOSE ACKS THIS BROKER HOLDS for process `pid` on its open connections.
@@ -1312,8 +1345,9 @@ impl State {
 
     /// THE RETENTION at `now` (ms of the world's wall clock), the cut never above `ceiling`,
     /// or at `forced`: astream's planning (`BrokerLog::retention_plan`: the stamps first,
-    /// then `retention::plan`), then what its job's finish does ([`State::apply`]). Whether
-    /// anything landed.
+    /// then the planning over its tier's slots, `plan_over`; here `retention::plan` over a
+    /// slice of records, which wraps the same `plan_over`), then what its job's finish does
+    /// ([`State::apply`]). Whether anything landed.
     fn plan_and_apply(&mut self, now: u64, ceiling: u64, forced: Option<u64>) -> bool {
         let head = self.log.len() as u64;
         let stamps_before = self.ret.stamps.clone();
@@ -2191,7 +2225,12 @@ impl State {
                         | astream_broker::REQUEST_GAP_NOTICES
                         | astream_broker::REQUEST_TOLD_FETCH
                         | astream_broker::REQUEST_BROKER_TIMES
-                        | astream_broker::REQUEST_STATS,
+                        | astream_broker::REQUEST_STATS
+                        | if self.gap_fences {
+                            astream_broker::REQUEST_GAP_FENCES
+                        } else {
+                            0
+                        },
                 ),
                 health: None,
                 // The rules this open set, and none read back from an earlier one's.
@@ -2202,6 +2241,48 @@ impl State {
                     .filter(|_| self.ret.active && self.mutant != ArmMutant::Unretained)
                     .map(Retention::encode),
             },
+        }
+    }
+
+    /// The fence that refuses `producer`'s publish at `seq` on `conn` (astream's
+    /// `StickyFenceTable::check`), on a broker that gap-fences: the lowest sequence of its
+    /// refused there since its fence was lifted, below `seq`.
+    fn fence_of(&self, conn: u64, producer: u64, seq: u64) -> Option<u64> {
+        if !self.gap_fences || self.mutant == ArmMutant::NoGapFence {
+            return None;
+        }
+        let fence = *self.conns.get(&conn)?.fences.get(&producer)?;
+        (seq > fence).then_some(fence)
+    }
+
+    /// `producer`'s publish at `seq` on `conn` was answered: a refusal latches its fence at
+    /// the lower of `seq` and the one it holds, and one that lands at or under its fence lifts
+    /// it (astream's `record_refusal` and `record_commit`), on a broker that gap-fences, for a
+    /// connection that asked ([`ConnState::fence_asked`]).
+    fn fence_on(&mut self, conn: u64, producer: u64, seq: u64, landed: bool) {
+        if !self.gap_fences {
+            return;
+        }
+        let unasked = self.mutant == ArmMutant::FenceUnasked;
+        let Some(fences) = self
+            .conns
+            .get_mut(&conn)
+            .filter(|c| c.fence_asked || unasked)
+            .map(|c| &mut c.fences)
+        else {
+            return;
+        };
+        match (landed, fences.get(&producer).copied()) {
+            (false, Some(fence)) => {
+                fences.insert(producer, fence.min(seq));
+            }
+            (false, None) => {
+                fences.insert(producer, seq);
+            }
+            (true, Some(fence)) if seq <= fence => {
+                fences.remove(&producer);
+            }
+            (true, _) => {}
         }
     }
 
@@ -2229,16 +2310,66 @@ impl State {
                 producer_seq,
                 subject,
                 body,
-            } => match self.publish(producer_id, producer_seq, &subject, &body) {
-                Ok((offset, deduped)) => {
+            } => {
+                // A retire is no producer's write in sequence: astream neither fences nor
+                // latches one.
+                let fenced = subject != astream_broker::RETIRE_SUBJECT;
+                if let Some(fence) = self
+                    .fence_of(conn, producer_id, producer_seq)
+                    .filter(|_| fenced)
+                {
                     self.notes.push(format!(
-                        "publish c{conn} seq={producer_seq} {subject} @{offset}{}",
-                        if deduped { " dup" } else { "" }
+                        "publish c{conn} seq={producer_seq} {subject} gap-fenced={fence}"
                     ));
-                    vec![Response::PublishAck { offset, deduped }]
+                    self.gap_fenced += 1;
+                    return vec![Response::Error {
+                        code: astream_broker::proto::ERR_REFUSED,
+                        msg: astream_broker::sticky_fence::format_gap_fenced_msg(
+                            fence,
+                            producer_seq,
+                        ),
+                    }];
                 }
-                Err(e) => vec![*e],
-            },
+                let answer = self.publish(producer_id, producer_seq, &subject, &body);
+                if fenced {
+                    self.fence_on(conn, producer_id, producer_seq, answer.is_ok());
+                }
+                match answer {
+                    Ok((offset, deduped)) => {
+                        self.notes.push(format!(
+                            "publish c{conn} seq={producer_seq} {subject} @{offset}{}",
+                            if deduped { " dup" } else { "" }
+                        ));
+                        vec![Response::PublishAck { offset, deduped }]
+                    }
+                    Err(e) => vec![*e],
+                }
+            }
+            Request::FenceGaps => {
+                self.notes.push(format!("fence gaps c{conn}"));
+                if !self.gap_fences {
+                    return vec![Response::Error {
+                        code: astream_broker::proto::ERR_REFUSED,
+                        msg: "gap fences not kept: the broker was opened without \
+                              sticky_batch_refusal"
+                            .to_string(),
+                    }];
+                }
+                if let Some(c) = self.conns.get_mut(&conn) {
+                    c.fence_asked = true;
+                }
+                vec![self.mark(head, String::new())]
+            }
+            Request::ClearGapFences => {
+                if let Some(c) = self.conns.get_mut(&conn).filter(|_| self.gap_fences) {
+                    if !c.fences.is_empty() {
+                        c.fences.clear();
+                        self.fences_lifted += 1;
+                    }
+                }
+                self.notes.push(format!("clear gap fences c{conn}"));
+                vec![self.mark(head, String::new())]
+            }
             Request::Retire {
                 producer_id,
                 subject,

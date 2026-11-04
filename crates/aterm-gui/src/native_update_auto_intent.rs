@@ -736,4 +736,47 @@ mod tests {
             AttemptDisposition::ManualOnly
         );
     }
+
+    /// `restored_hold_line` announces the start and end edges of the restored-agents hold once
+    /// each, and `NEGATIVE CONTROL:` repeats at an unchanged edge return `None` with `said`
+    /// preserved.
+    #[test]
+    fn restored_hold_line_announces_each_edge_once() {
+        let mut said = false;
+        assert_eq!(
+            restored_hold_line(11, false, &mut said),
+            None,
+            "negative control: idle before any hold announces nothing"
+        );
+        assert!(!said);
+
+        let start = restored_hold_line(11, true, &mut said).expect("hold start announced");
+        assert!(said);
+        assert!(start.contains("build 11"), "{start:?}");
+        assert!(start.contains("held while"), "{start:?}");
+        assert!(
+            start.contains(&format!(
+                "{} s",
+                crate::harness_host::RESTORED_HOLD.as_secs()
+            )),
+            "{start:?}"
+        );
+        assert_eq!(
+            restored_hold_line(11, true, &mut said),
+            None,
+            "negative control: standing hold is not repeated"
+        );
+        assert!(said);
+
+        let end = restored_hold_line(11, false, &mut said).expect("hold end announced");
+        assert!(!said);
+        assert!(end.contains("build 11"), "{end:?}");
+        assert!(end.contains("hold is over"), "{end:?}");
+        assert_eq!(
+            restored_hold_line(11, false, &mut said),
+            None,
+            "negative control: cleared hold is not repeated"
+        );
+        assert!(!said);
+    }
 }

@@ -79,7 +79,14 @@ pub(crate) fn launch_transition(
         }
         Err(why) => {
             if case == 6 {
-                assert!(why.contains("holds its own"), "{why}");
+                // Kimi's own `mcp.json` is drift where aterm links an overlay home; elsewhere the
+                // home is refused before any entry is looked at.
+                let refusal = if cfg!(unix) {
+                    "holds its own"
+                } else {
+                    crate::harness::accounts_overlay::NO_LINKS
+                };
+                assert!(why.contains(refusal), "{why}");
             }
             if case == 10 {
                 assert!(why.contains(accounts::LOCK_HELD), "{why}");

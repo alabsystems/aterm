@@ -144,6 +144,16 @@ impl D3dDevice {
     pub(crate) fn pipeline(&self, spec: &PipelineSpec) -> Result<D3dPipeline, String> {
         let vs_code = shaders::bytecode(spec.library, spec.vs, Stage::Vertex)?;
         let ps_code = shaders::bytecode(spec.library, spec.fs, Stage::Pixel)?;
+        self.pipeline_from(spec, &vs_code, &ps_code)
+    }
+
+    /// [`Self::pipeline`] from bytecode compiled for `spec`'s two entry points.
+    fn pipeline_from(
+        &self,
+        spec: &PipelineSpec,
+        vs_code: &[u8],
+        ps_code: &[u8],
+    ) -> Result<D3dPipeline, String> {
         let shared = &self.0;
         let vt = shared.device_vt();
         let dev = shared.device_raw();
@@ -268,6 +278,39 @@ mod tests {
         assert_eq!(built.len(), crate::pipeline_table::PIPELINE_COUNT);
     }
 
+    /// Every row's two entry points also compile with the flags a shipped build passes (FXC's
+    /// optimizer on, which this build's own compiles skip), and the row's pipeline builds from
+    /// that bytecode.
+    /// NEGATIVE CONTROL: some row's release bytecode differs from the same compile with the
+    /// optimizer skipped, asserted below, so the release flags run the optimizer in every build
+    /// (`RELEASE_FLAGS` gaining `SKIP_OPTIMIZATION` fails it).
+    #[test]
+    fn every_table_row_compiles_and_builds_with_the_release_flags() {
+        let dev = super::super::test_device();
+        let unoptimized = shaders::RELEASE_FLAGS | d3d::D3DCOMPILE_SKIP_OPTIMIZATION;
+        let mut optimized = false;
+        for p in ALL_PIPELINES {
+            let spec = p.spec();
+            let compile = |entry, stage, flags| {
+                shaders::compile_source(
+                    shaders::source(spec.library),
+                    shaders::file_name(spec.library),
+                    entry,
+                    stage,
+                    flags,
+                )
+                .unwrap_or_else(|e| panic!("row {}: {e}", p.name()))
+            };
+            let vs = compile(spec.vs, Stage::Vertex, shaders::RELEASE_FLAGS);
+            let ps = compile(spec.fs, Stage::Pixel, shaders::RELEASE_FLAGS);
+            optimized |= vs != compile(spec.vs, Stage::Vertex, unoptimized)
+                || ps != compile(spec.fs, Stage::Pixel, unoptimized);
+            dev.pipeline_from(spec, &vs, &ps)
+                .unwrap_or_else(|e| panic!("row {} from release bytecode: {e}", p.name()));
+        }
+        assert!(optimized, "the release flags changed no row's bytecode");
+    }
+
     /// A broken twin is refused with the compiler's log, not drawn blank: the
     /// negative control for the compile check above.
     #[test]
@@ -277,14 +320,15 @@ mod tests {
         let good = "return float4(s2l(i.color.xyz), i.color.w);";
         assert!(src.contains(good), "the control edits a line the twin has");
         let broken = src.replace(good, "return undeclared;");
-        let err = shaders::compile_source(&broken, "cell.hlsl", "fs_bg", Stage::Pixel)
-            .expect_err("must not compile");
+        let err =
+            shaders::compile_source(&broken, "cell.hlsl", "fs_bg", Stage::Pixel, shaders::FLAGS)
+                .expect_err("must not compile");
         assert!(err.contains("does not compile"), "{err}");
         assert!(
             err.contains("undeclared"),
             "the compiler's log is carried: {err}"
         );
-        shaders::compile_source(src, "cell.hlsl", "fs_bg", Stage::Pixel)
+        shaders::compile_source(src, "cell.hlsl", "fs_bg", Stage::Pixel, shaders::FLAGS)
             .expect("the unedited twin compiles");
     }
 

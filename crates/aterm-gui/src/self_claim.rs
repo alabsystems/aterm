@@ -188,7 +188,8 @@ pub(crate) fn typed(sid: &str, resume: &self_claimed::Resume) {
         .insert(sid.to_string(), resume.clone());
 }
 
-fn typed_for(sid: &str) -> Option<self_claimed::Resume> {
+/// The line the crash rule last typed in tab `sid` ([`typed`]).
+pub(crate) fn typed_for(sid: &str) -> Option<self_claimed::Resume> {
     TYPED
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -711,6 +712,50 @@ pub(crate) fn book_act(sid: &str, holder: &str, act: &str) -> bool {
     written
 }
 
+/// BOOK A FACT A PROVEN SELF-CLAIM'S ACT CARRIED IN ITS SESSION'S LEDGER (`harness fact told`,
+/// gap 23): `fact`, told by `holder`'s act on session `sid`'s proven claim at `t_ms`, as one
+/// [`aterm_agent::supervise::approvals::SelfClaimFactRow`] in the ledger under `state` (the
+/// state directory; `None` where there is none), through the ledger's one append under the lock
+/// its cut holds ([`aterm_agent::supervise::approvals::book_self_claim_fact`]): aterm's own
+/// `fact-<kind>@v1` `typed` row with the claim's holder, which a successor seeds told and Settings
+/// ▸ Harness counts as the holder's. Blocking file I/O on the control lane that took the ack,
+/// with no session lock held; whether the row was written (a failure is logged, and the told
+/// mark stands in memory).
+pub(crate) fn book_fact(
+    state: Option<&std::path::Path>,
+    sid: &str,
+    holder: &str,
+    fact: &aterm_agent::supervise::Fact,
+    t_ms: i64,
+) -> bool {
+    use aterm_agent::supervise::approvals;
+    let kind = fact.key.kind.word();
+    let Some(path) = state.and_then(|root| approvals::path_under(root, Some(sid))) else {
+        aterm_log::info!(
+            "self-claim @{sid}: fact {kind} {:016x}: no state directory to book it in",
+            fact.key.id
+        );
+        return false;
+    };
+    let mut refused = Vec::new();
+    let written = approvals::book_self_claim_fact(
+        &path,
+        Some(sid),
+        t_ms,
+        &approvals::SelfClaimFactRow { holder, fact },
+        &mut refused,
+    )
+    .is_some();
+    if !written {
+        aterm_log::info!(
+            "self-claim @{sid}: fact {kind} {:016x}: not booked: {}",
+            fact.key.id,
+            String::from_utf8_lossy(&refused).trim()
+        );
+    }
+    written
+}
+
 /// Refresh the record copy when a proven claim is released on `ctx`, keep it for the exit or read
 /// only ([`keep_to_read`]), and notify the host.
 pub(crate) fn released(ctx: &crate::SessionCtx, proven: &Proven, revision: u64) {
@@ -1019,6 +1064,7 @@ mod tests {
             draft_empty: None,
             frame: None,
             goal: None,
+            background_terminals: None,
             initializing: false,
         })
     }
@@ -1169,6 +1215,7 @@ mod tests {
                     &mut asked,
                     7594,
                     tap_target_by(ctx, 4242, alive_as_proven),
+                    None,
                     (at, None)
                 ),
                 Ask::Read(watched.clone()),
@@ -1195,6 +1242,7 @@ mod tests {
                 &mut asked,
                 7594,
                 tap_target(ctx, 4242),
+                None,
                 (t0 + RECHECK * 2, None)
             ),
             Ask::Stop
@@ -1392,6 +1440,7 @@ mod tests {
                 draft_empty: None,
                 frame: None,
                 goal: None,
+                background_terminals: None,
                 initializing: false,
             }))
         };

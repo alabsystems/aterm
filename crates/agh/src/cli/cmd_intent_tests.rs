@@ -21,10 +21,7 @@ use crate::write::WriteOp;
 
 /// A scratch root.
 fn scratch() -> aterm_tempfile::TempDir {
-    aterm_tempfile::Builder::new()
-        .prefix("agh-intents-")
-        .tempdir()
-        .expect("a scratch directory")
+    crate::test_fixtures::scratch_dir("intents")
 }
 
 /// A test context under `root` whose transport answers nothing, with no token anywhere.

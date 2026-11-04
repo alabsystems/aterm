@@ -878,14 +878,15 @@ fn read_tape_bytes(path: &std::path::Path, limit: u64) -> std::io::Result<Vec<u8
 fn read_regular_bytes(path: &std::path::Path, limit: u64, kind: &str) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
 
-    let file = crate::harness::footer::open_regular(path)
+    let (file, meta) = crate::harness::footer::open_regular_with_meta(path)
         .ok_or_else(|| std::io::Error::other("not a readable regular file"))?;
     let overflow = || std::io::Error::other(format!("{kind} input exceeds {limit} bytes"));
-    if file.metadata()?.len() > limit {
+    if meta.len() > limit {
         return Err(overflow());
     }
     let lookahead = limit.checked_add(1).ok_or_else(overflow)?;
-    let mut bytes = Vec::new();
+    let cap = usize::try_from(meta.len().min(limit).saturating_add(1)).unwrap_or(0);
+    let mut bytes = Vec::with_capacity(cap);
     file.take(lookahead).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > limit {
         return Err(overflow());
@@ -1032,8 +1033,9 @@ mod tests {
         }
     }
 
-    /// `classify` resolves the secret list's home roots under the `HOME` it runs with, and holds a
-    /// line to the proof gaps the advisory word holds it to, so the two agree on every line.
+    /// `classify` resolves the secret list's home roots under the home the advisory word reads
+    /// (`approval::advisory_home`: `HOME`, else Windows' `USERPROFILE`), and holds a line to the
+    /// proof gaps the advisory word holds it to, so the two agree on every line.
     #[test]
     fn classify_reads_the_shell_home_and_the_proof_gaps() {
         let home =
@@ -1356,8 +1358,7 @@ mod tests {
 
     #[test]
     fn the_ledger_takes_its_worker_from_the_journal_when_none_is_named() {
-        let dir = std::env::temp_dir().join(format!("aterm-drive-ledger-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let dir = crate::supervise::ScratchDir::new("drive-ledger", "journal");
         let path = dir.join("journal.jsonl");
         let line = |sid: &str| {
             crate::supervise::journal::JournalRecord::of_line(1, Some(sid), "TIMEOUT", None)
@@ -1378,8 +1379,6 @@ mod tests {
         )
         .expect_err("no worker");
         assert!(err.starts_with("ledger needs the worker:"), "{err}");
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir(dir);
     }
 
     /// `tape ls` lists the hosted store newest first, a session's alone with

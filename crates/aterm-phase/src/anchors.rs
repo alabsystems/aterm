@@ -446,6 +446,10 @@ pub const ANCHORS: &[Anchor] = &[
     composed("title.rest", "✳", "2.1.304"),
     lit("footer.shortcuts", "? for shortcuts", "2.1.283"),
     hint("footer.clear", "esc to clear", "2.1.283"),
+    // The prompt-history search's label (Ctrl-R) on a footer row, its query after it; in a narrow
+    // window wrapped in its own column beside the query (`crate::phase::history_search`).
+    lit("history.search", "search prompts:", "2.1.318"),
+    lit("history.no_match", "no matching prompt:", "2.1.318"),
     composed("mode.bypass", "bypass permissions on", "2.1.283"),
     composed("mode.auto", "auto mode on", "2.1.283"),
     composed("mode.accept_edits", "accept edits on", "2.1.283"),
@@ -1520,6 +1524,14 @@ pub const MUSE_ANCHORS: &[Anchor] = &[
     ),
     lit("muse.composer.offline", "Voice offline", "1.4.10-R6427.1"),
     lit("muse.composer.error", "Voice error", "1.4.10-R6427.1"),
+    // What follows the scope on the prompt-history search's row (Ctrl-R), its query after it
+    // (`crate::muse::history_search`).
+    lit("muse.history.search", "search prompts:", "1.4.14-R7309.1"),
+    lit(
+        "muse.history.no_match",
+        "no matching prompt:",
+        "1.4.14-R7309.1",
+    ),
     lit("muse.sidechat.label", "Side Chat", "1.4.10-R6427.1"),
     lit("muse.sidechat.footer", "Side chat mode", "1.4.10-R6427.1"),
     lit("muse.box.always_prefix", "Always allow ", "1.4.10-R6427.1"),
@@ -1950,6 +1962,9 @@ pub const TRANSCRIPT_KEYS: &[Anchor] = &[
 
 /// The keys and closed words of Codex's rollout rows the session log's Codex step fold reads:
 /// `lab codex-measure` refuses GONE when a build drops one the previous measured build showed.
+/// The closed word a gated read reads (`codex_steps::GATED_WORDS`: `alab_autopilot`) is not
+/// here: a build that drops it reads it off through its own reductions (`CODEX_SHOWN`), and the
+/// measurement notes it.
 pub const ROLLOUT_KEYS: &[Anchor] = &[
     lit("rollout.timestamp", "timestamp", "0.163.0"),
     lit("rollout.type", "type", "0.163.0"),
@@ -2010,6 +2025,12 @@ pub const ROLLOUT_KEYS: &[Anchor] = &[
         "usage_limit_exceeded",
         "0.163.0",
     ),
+    lit("rollout.item_completed", "item_completed", "0.163.0"),
+    lit("rollout.item", "item", "0.163.0"),
+    lit("rollout.exit_code", "exit_code", "0.163.0"),
+    lit("rollout.task_started", "task_started", "0.163.0"),
+    lit("rollout.turn_attribution", "turn_attribution", "0.163.0"),
+    lit("rollout.turn_trigger", "turn_trigger", "0.163.0"),
 ];
 
 /// Whether version `a` is newer than `b`, numerically part by part.
@@ -2510,6 +2531,12 @@ mod tests {
                 "rollout.codex_error_info",
                 "rollout.usage_limit_exceeded",
                 "rollout.exec_command",
+                "rollout.item_completed",
+                "rollout.item",
+                "rollout.exit_code",
+                "rollout.task_started",
+                "rollout.turn_attribution",
+                "rollout.turn_trigger",
             ] {
                 let a = ROLLOUT_KEYS.iter().find(|a| a.id == key).expect("a key");
                 assert!(contains_bytes(&alab, &quoted(a)), "{key} on {build}");

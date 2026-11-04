@@ -72,15 +72,22 @@ pub(crate) fn open_nonblock(path: &Path) -> io::Result<std::fs::File> {
     }
 }
 
-pub(crate) fn open_regular_nonblock(path: &Path) -> io::Result<std::fs::File> {
+pub(crate) fn open_regular_nonblock_with_meta(
+    path: &Path,
+) -> io::Result<(std::fs::File, std::fs::Metadata)> {
     let f = open_nonblock(path)?;
-    if !f.metadata()?.is_file() {
+    let meta = f.metadata()?;
+    if !meta.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "not a regular file",
         ));
     }
-    Ok(f)
+    Ok((f, meta))
+}
+
+pub(crate) fn open_regular_nonblock(path: &Path) -> io::Result<std::fs::File> {
+    open_regular_nonblock_with_meta(path).map(|(f, _)| f)
 }
 
 pub(crate) fn read_bounded_regular(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
@@ -97,11 +104,10 @@ pub(crate) fn read_bounded_regular(path: &Path, max_bytes: usize) -> io::Result<
             "not a regular file",
         ));
     }
-    let f = open_regular_nonblock(path)?;
+    let (f, opened) = open_regular_nonblock_with_meta(path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
-        let opened = f.metadata()?;
         if opened.dev() != meta.dev() || opened.ino() != meta.ino() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -109,10 +115,19 @@ pub(crate) fn read_bounded_regular(path: &Path, max_bytes: usize) -> io::Result<
             ));
         }
     }
-    let cap = u64::try_from(max_bytes)
-        .unwrap_or(u64::MAX)
+    let max_u64 = u64::try_from(max_bytes).unwrap_or(u64::MAX);
+    if opened.len() > max_u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("file exceeds {max_bytes}-byte limit"),
+        ));
+    }
+    let cap = max_u64.saturating_add(1);
+    let init = usize::try_from(opened.len())
+        .unwrap_or(0)
+        .min(max_bytes)
         .saturating_add(1);
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(init);
     let read = f.take(cap).read_to_end(&mut bytes)?;
     if read > max_bytes {
         return Err(io::Error::new(

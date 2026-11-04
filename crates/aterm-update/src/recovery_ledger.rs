@@ -688,7 +688,14 @@ fn read_opened_text(mut file: std::fs::File) -> std::io::Result<String> {
     if skip > 0 {
         file.seek(SeekFrom::Start(skip))?;
     }
-    let mut bytes = Vec::new();
+    let cap = usize::try_from(
+        meta.len()
+            .saturating_sub(skip)
+            .min(MAX_READ_BYTES)
+            .saturating_add(1),
+    )
+    .unwrap_or(0);
+    let mut bytes = Vec::with_capacity(cap);
     file.take(MAX_READ_BYTES).read_to_end(&mut bytes)?;
     let text = String::from_utf8_lossy(&bytes);
     let text = if skip > 0 {

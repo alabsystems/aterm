@@ -77,10 +77,14 @@ pub(crate) fn read_bounded(path: &Path) -> Result<Vec<u8>> {
         .read(true)
         .custom_flags(O_NONBLOCK)
         .open(path)?;
-    if !file.metadata()?.is_file() {
+    let meta = file.metadata()?;
+    if !meta.is_file() {
         return Err(Error::new("CSV path is not a regular file"));
     }
-    let mut bytes = Vec::new();
+    if meta.len() > MAX_CSV as u64 {
+        return Err(Error::new("CSV exceeds import capacity"));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
     file.take((MAX_CSV + 1) as u64).read_to_end(&mut bytes)?;
     if bytes.len() > MAX_CSV {
         return Err(Error::new("CSV exceeds import capacity"));

@@ -9,31 +9,29 @@ use crate::harness::host_path::abs;
 const NOW: i64 = 1_789_603_200;
 
 /// A fresh directory under the system temp dir, removed on drop.
-pub(crate) struct Tmp(PathBuf);
+pub(crate) struct Tmp(Option<aterm_tempfile::TempDir>);
 
 impl Tmp {
     pub(crate) fn new(tag: &str) -> Tmp {
-        let mut dir = std::env::temp_dir();
-        dir.push(format!(
-            "aterm-harness-disk-{tag}-{}-{:?}",
-            std::process::id(),
-            aterm_time::since_epoch().map_or(0, |d| d.as_nanos())
-        ));
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        Tmp(dir)
+        let dir = aterm_tempfile::Builder::new()
+            .prefix(&format!("aterm-harness-disk-{tag}-"))
+            .suffix(".noindex")
+            .tempdir()
+            .expect("temp dir");
+        Tmp(Some(dir))
     }
 
     pub(crate) fn path(&self) -> &Path {
-        &self.0
+        self.0.as_ref().expect("live temp dir").path()
     }
 }
 
 impl Drop for Tmp {
     fn drop(&mut self) {
         #[cfg(unix)]
-        {
+        if let Some(dir) = &self.0 {
             use std::os::unix::fs::PermissionsExt as _;
-            let mut stack = vec![self.0.clone()];
+            let mut stack = vec![dir.path().to_path_buf()];
             while let Some(d) = stack.pop() {
                 let _ = std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755));
                 if let Ok(rd) = std::fs::read_dir(&d) {
@@ -45,7 +43,7 @@ impl Drop for Tmp {
                 }
             }
         }
-        let _ = std::fs::remove_dir_all(&self.0);
+        drop(self.0.take());
     }
 }
 

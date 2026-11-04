@@ -1915,6 +1915,7 @@ fn a_composer_the_read_cannot_judge_holds_the_line() {
     for (tag, words, cell) in cells {
         let tag = format!("write-unjudged-{tag}");
         let set = |m: &mut Mock| {
+            m.cursor_on_caret = true;
             m.cursor_col = Some(2);
             cell(m);
         };
@@ -4136,6 +4137,63 @@ fn no_fact_is_offered_where_the_agent_waits_on_its_own_workflows() {
         ran.calls
     );
     assert!(host.fact.lock().expect("fact").is_some(), "still owed");
+}
+
+/// A monitor the turn left running under a workflow's progress row its workflow outlived
+/// (2.1.304 leaves the row drawn at its full bar,
+/// `claude-2.1.304-agents-panel-workflow-done-3m20s-120col.txt`) is a break of the agent's own
+/// background work like any other, and the host's fact owed there is offered at it. Before, the
+/// break was read by the reader's one rule, the progress row's `a workflow running`, read ahead
+/// of the monitor's, and the fact stayed unoffered for as long as the row stood. The row alone
+/// names nothing the turn left, and nothing is offered at it.
+#[test]
+fn a_fact_owed_at_a_monitor_under_an_outlived_progress_row_is_offered_there() {
+    fn outlived() -> Vec<String> {
+        aterm_phase::prompt::fixtures::screen(include_str!(
+            "../../../aterm-phase/src/fixtures/claude-2.1.304-agents-panel-workflow-done-3m20s-120col.txt"
+        ))
+    }
+    fn monitored() -> Vec<String> {
+        let mut r = outlived();
+        let done = r
+            .iter_mut()
+            .find(|r| r.starts_with("✻ Brewed for 3m 20s"))
+            .expect("the done row");
+        done.push_str(" · 1 monitor still running");
+        r
+    }
+    assert_eq!(
+        aterm_phase::phase::background_wait(&monitored()),
+        Some("a workflow running"),
+        "the reader's one rule"
+    );
+    let offered = |tag: &str, drawn: &dyn Fn(usize) -> Vec<String>| {
+        let host = Arc::new(DoorHost::default());
+        host.wants.store(true, Ordering::SeqCst);
+        *host.fact.lock().expect("fact") = Some(disk_free_typed());
+        let ran = Script {
+            host: Arc::clone(&host),
+            drawn,
+            ..Script::new(tag, Occupancy::Off, &[0, 60])
+        }
+        .run(&mut nothing);
+        let offered = ran
+            .calls
+            .iter()
+            .filter(|c| *c == "at_background_fact")
+            .count();
+        (offered, host.fact.lock().expect("fact").is_some())
+    };
+    assert_eq!(
+        offered("background-fact-outlived-monitor", &|_| monitored()),
+        (1, false),
+        "offered and typed"
+    );
+    assert_eq!(
+        offered("background-fact-outlived-alone", &|_| outlived()),
+        (0, true),
+        "CONTROL: the row alone, still owed"
+    );
 }
 
 /// The credits hold at a background break is a lasting withhold of the loop's: it is told to the

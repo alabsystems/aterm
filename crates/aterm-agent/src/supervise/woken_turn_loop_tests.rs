@@ -193,6 +193,7 @@ fn woken_run(tag: &str, case: Case) -> Woke {
         m.sleeps_at.insert(slept_at, case.slept_s);
     }
     m.human_seq = case.human_seq;
+    m.cursor_on_caret = true;
     m.cell_attrs = case.cell_attrs;
     m.autopilot = case.autopilot;
     m.vanish_after = Some(u32::try_from(2 * case.max_s).unwrap_or(u32::MAX));
@@ -782,6 +783,7 @@ fn the_vendors_continuation_the_harnesss_esc_stopped_gets_the_limits_resume() {
 fn only_claude_codes_retry_row_is_pressed() {
     let press = |reader: &'static dyn ScreenReader| {
         let mut m = Mock::new(vec![queued()]);
+        m.cursor_on_caret = true;
         m.human_seq = Some(0);
         let clock = virtual_clock();
         clock.set_full_wake(Some(true));
@@ -842,6 +844,7 @@ fn only_claude_codes_retry_row_is_pressed() {
 #[test]
 fn the_harnesss_mark_lasts_only_until_claude_code_could_take_the_key() {
     let mut m = Mock::new(vec![queued()]);
+    m.cursor_on_caret = true;
     m.human_seq = Some(0);
     let clock = virtual_clock();
     clock.set_full_wake(Some(true));

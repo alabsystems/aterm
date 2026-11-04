@@ -124,9 +124,12 @@ pub fn system_awake_since() -> u64 {
     }
     #[cfg(target_os = "linux")]
     {
-        std::fs::read_to_string("/proc/stat")
+        use std::io::Read as _;
+        std::fs::File::open("/proc/stat")
             .ok()
-            .and_then(|stat| {
+            .and_then(|f| {
+                let mut stat = String::with_capacity(4096);
+                f.take(256 * 1024).read_to_string(&mut stat).ok()?;
                 stat.lines()
                     .find_map(|l| l.strip_prefix("btime "))
                     .and_then(|s| crate::parse_uint::<u64>(s.trim()))
@@ -4464,12 +4467,13 @@ fn read_back(opts: &Opts) -> BTreeMap<String, u64> {
         .flatten()
         .filter(|text| u64::try_from(text.len()).is_ok_and(|len| len <= BACK_MAX))
         .or_else(|| {
-            std::fs::symlink_metadata(&path)
+            aterm_uds::regular_file::open(&path)
                 .ok()
-                .filter(|m| m.is_file())
-                .and_then(|_| std::fs::File::open(&path).ok())
-                .and_then(|f| {
-                    let mut text = String::new();
+                .and_then(|(f, m)| {
+                    let cap = usize::try_from(m.len().min(BACK_MAX))
+                        .unwrap_or(0)
+                        .saturating_add(1);
+                    let mut text = String::with_capacity(cap);
                     std::io::Read::read_to_string(&mut std::io::Read::take(f, BACK_MAX), &mut text)
                         .ok()
                         .map(|_| text)

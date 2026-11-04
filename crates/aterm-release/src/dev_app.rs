@@ -25,8 +25,8 @@ pub const DEV_APP_NAME: &str = "aterm (dev).app";
 pub const DEV_MARK_KEY: &str = "ATermDevBuild";
 
 /// The SHA-256 of the `aterm` executable a dev bundle was assembled from. Two builds of one
-/// dirty tree share their version, build and commit, and a running aCaffiene mug tells that its
-/// bundle was replaced by the `Info.plist` alone (`aterm_acaffiene::code::code_fingerprint`), so
+/// dirty tree share their version, build and commit, and a running aCaffeine mug tells that its
+/// bundle was replaced by the `Info.plist` alone (`aterm_acaffeine::code::code_fingerprint`), so
 /// this key is what changes when only the code did.
 pub const DEV_BINARY_KEY: &str = "ATermDevBinarySHA256";
 
@@ -288,6 +288,10 @@ fn identity_keychain(keychain: Option<&Path>, home: &Path, cwd: &Path) -> (PathB
     }
 }
 
+/// The paths a build stamp is of, as `crates/aterm/build.rs` asks git of them.
+#[path = "../../aterm/stamp_paths.rs"]
+mod stamp_paths;
+
 /// The build facts, read from the checkout once, as `crates/aterm/build.rs` would read them: the
 /// plist is stamped with them and the build is pinned to them ([`Stamp::pins`]), so plist and
 /// binary agree even when HEAD moves mid-build.
@@ -296,7 +300,8 @@ struct Stamp {
     version: String,
     /// HEAD's committer epoch.
     build: u64,
-    /// HEAD's 12-digit id, `-dirty` when the tree has changes.
+    /// HEAD's 12-digit id, `-dirty` when the tree has changes outside the measured ledger
+    /// ([`stamp_paths::PATHSPEC`]).
     commit: String,
     commit_full: String,
     /// Commits since the newest `v*.*.0` tag; `0` without one.
@@ -331,7 +336,8 @@ impl Stamp {
             .and_then(|s| s.parse().ok())
             .ok_or_else(|| format!("HEAD's committer epoch {epoch:?} is not a number"))?;
         let mut commit = git(root, &["rev-parse", "--short=12", "HEAD"])?;
-        if !git(root, &["status", "--porcelain"])?.is_empty() {
+        let status = [&["status", "--porcelain"][..], &stamp_paths::PATHSPEC].concat();
+        if !git(root, &status)?.is_empty() {
             commit.push_str("-dirty");
         }
         let commit_full = git(root, &["rev-parse", "HEAD"])?;
@@ -1229,6 +1235,19 @@ mod tests {
                 commit_full: full.clone(),
                 dev_commits: 2,
             }
+        );
+        // The build script's rule: the measured ledger's entries, which a perf set writes
+        // between its runs, leave the stamp clean; a changed source file below marks it dirty.
+        std::fs::create_dir_all(root.join("docs/measured/fabric")).unwrap();
+        std::fs::write(
+            root.join("docs/measured/fabric/2026-11-04-fabric-1001.json"),
+            "{}",
+        )
+        .unwrap();
+        assert_eq!(
+            Stamp::of(&root).expect("stamp").commit,
+            full[..12],
+            "a ledger entry dirtied the stamp"
         );
         std::fs::write(root.join("Cargo.toml"), "edited").unwrap();
         assert!(Stamp::of(&root).is_err(), "no workspace version");

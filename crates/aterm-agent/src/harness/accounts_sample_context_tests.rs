@@ -194,20 +194,42 @@ pub(crate) fn context_transition(
             let work = world.two(Cli::Codex);
             let case = state["case"];
             if case == 9 {
+                let path = world.cfg.join(Cli::Codex.accounts().roster_file);
                 world
                     .seat()
                     .store(Cli::Codex)
-                    .transact_logins(NOW - MIN, &mut None, |state, logins| {
-                        Ok(accounts::note_renewed(
-                            state,
-                            logins,
-                            "work",
-                            work.to_str(),
-                            work.to_str().unwrap(),
-                            None,
-                            NOW - MIN,
-                        ))
-                    })
+                    .transact_pool_logins_within(
+                        &[],
+                        &path,
+                        NOW - MIN,
+                        &mut None,
+                        |_, state, logins| {
+                            let events = accounts::note_renewed(
+                                state,
+                                logins,
+                                "work",
+                                work.to_str(),
+                                work.to_str().unwrap(),
+                                None,
+                                NOW - MIN,
+                            );
+                            Ok(events)
+                        },
+                    )
+                    .unwrap();
+                world
+                    .seat()
+                    .store(Cli::Codex)
+                    .transact_pool_logins_within(
+                        &[],
+                        &path,
+                        NOW - MIN,
+                        &mut None,
+                        |_, _, logins| {
+                            accounts::admit_workflow(logins, "work")?;
+                            Ok(Vec::new())
+                        },
+                    )
                     .unwrap();
             }
             seed(&world, NOW - if case == 6 { USAGE_FRESH_S } else { MIN });
@@ -271,21 +293,70 @@ pub(crate) fn context_transition(
                 }
                 9 => {
                     let (mut before, _) = store.load_logins(NOW).unwrap();
+                    let path = world.cfg.join(Cli::Codex.accounts().roster_file);
                     store
-                        .transact_logins(NOW - MIN, &mut None, |state, logins| {
-                            Ok(accounts::note_renewed(
-                                state,
-                                logins,
-                                "work",
-                                work.to_str(),
-                                work.to_str().unwrap(),
-                                None,
-                                NOW - MIN,
-                            ))
-                        })
+                        .transact_pool_logins_within(
+                            &[],
+                            &path,
+                            NOW - MIN,
+                            &mut None,
+                            |_, state, logins| {
+                                let events = accounts::note_renewed(
+                                    state,
+                                    logins,
+                                    "work",
+                                    work.to_str(),
+                                    work.to_str().unwrap(),
+                                    None,
+                                    NOW - MIN,
+                                );
+                                Ok(events)
+                            },
+                        )
+                        .unwrap();
+                    store
+                        .transact_pool_logins_within(
+                            &[],
+                            &path,
+                            NOW - MIN,
+                            &mut None,
+                            |_, _, logins| {
+                                accounts::admit_workflow(logins, "work")?;
+                                Ok(Vec::new())
+                            },
+                        )
                         .unwrap();
                     let (mut after, _) = store.load_logins(NOW).unwrap();
                     assert_ne!(before, after);
+                    let seat = world.seat();
+                    let raw = seat.roster(Cli::Codex).unwrap();
+                    let row = raw.row("work").unwrap();
+                    assert!(accounts::current_workflow(row, &before).is_some());
+                    assert!(accounts::current_workflow(row, &after).is_some());
+                    assert!(after.workflow_clock > before.workflow_clock);
+                    assert_ne!(
+                        accounts::current_workflow(row, &before),
+                        accounts::current_workflow(row, &after),
+                        "the verified replacement has its own workflow"
+                    );
+                    let effective = accounts::bound(&raw, &before);
+                    let row = effective.row("work").unwrap();
+                    let old_context = super::super::sample_context(&seat, Cli::Codex, row, &before);
+                    let mut workflow_only = before.clone();
+                    workflow_only.workflow_clock = after.workflow_clock;
+                    workflow_only.workflows.clone_from(&after.workflows);
+                    assert_eq!(
+                        super::super::sample_context(&seat, Cli::Codex, row, &workflow_only),
+                        old_context,
+                        "workflow custody alone does not invalidate a credential sample"
+                    );
+                    assert_ne!(
+                        super::super::sample_context(&seat, Cli::Codex, row, &after),
+                        old_context,
+                        "the credential publication generation invalidates the sample"
+                    );
+                    before.workflow_clock = after.workflow_clock;
+                    before.workflows.clone_from(&after.workflows);
                     before.labels.get_mut("work").unwrap().renewal_generation = 0;
                     after.labels.get_mut("work").unwrap().renewal_generation = 0;
                     before
@@ -302,7 +373,7 @@ pub(crate) fn context_transition(
                     after.generation_clock = 0;
                     assert_eq!(
                         before, after,
-                        "only publication generation metadata changed"
+                        "only publication generations and independent workflow custody changed"
                     );
                 }
                 _ => {}

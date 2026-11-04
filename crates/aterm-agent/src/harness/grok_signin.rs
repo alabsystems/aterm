@@ -81,6 +81,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use super::accounts_step::Step;
 use super::login_drive::{self, Approval, Approver, Drove, Handoff, Outcome};
 use crate::ai::connector::{Cli, Drive, Flow, GROK_SIGNIN};
 
@@ -283,10 +284,10 @@ pub fn target(
 ) -> Result<PathBuf, String> {
     if let Some(file) = set(var, LOGIN_FILE_ENV) {
         return Err(format!(
-            "{LOGIN_FILE_ENV} names {}, a pooled login, which `aterm harness accounts {} <label> \
-             --cli grok` signs in; this gate signs in only Grok Build's own home",
+            "{LOGIN_FILE_ENV} names {}, a pooled login, which `{}` signs in; this gate signs in \
+             only Grok Build's own home",
             PathBuf::from(file).display(),
-            Cli::Grok.sign_in_verb(true)
+            Step::sign_in(Cli::Grok, Step::CHOSEN_LABEL, true)
         ));
     }
     if set(var, HOME_ENV).is_some_and(|d| !Path::new(&d).is_absolute()) {
@@ -431,12 +432,10 @@ impl Setup {
     /// The command or file the short words name, after the page in the attention entry.
     fn exact(&self) -> String {
         match self {
-            Setup::Window(label) => format!("aterm harness accounts browser {label} --cli grok"),
+            Setup::Window(label) => Step::Browser(Cli::Grok, label.clone()).to_string(),
             Setup::Mailbox(_) | Setup::MailboxPassword { .. } => "ai-mailbox.toml".to_owned(),
             Setup::Email { .. } => "email = \"…\" in Grok Build's roster".to_owned(),
-            Setup::Adopt { label, .. } => {
-                format!("aterm harness accounts adopt-default {label} --email <you> --cli grok")
-            }
+            Setup::Adopt { label, .. } => Step::AdoptDefault(Cli::Grok, label.clone()).to_string(),
         }
     }
 
@@ -447,42 +446,44 @@ impl Setup {
         fn then(label: &str, window: bool) -> String {
             if window {
                 format!(
-                    "then run `aterm harness accounts browser {label} --cli grok` at this \
-                     machine's desk and sign in there, or put that email's mailbox in the vault \
-                     (ai-mailbox.toml)"
+                    "then run `{}` at this machine's desk and sign in there, or put that email's \
+                     mailbox in the vault (ai-mailbox.toml)",
+                    Step::Browser(Cli::Grok, label.to_owned())
                 )
             } else {
                 format!(
                     "then put that email's mailbox in the vault (ai-mailbox.toml), or install a \
                      Chromium that opens a window (Google Chrome for Testing or Chromium) and \
-                     run `aterm harness accounts browser {label} --cli grok` at this machine's \
-                     desk"
+                     run `{}` at this machine's desk",
+                    Step::Browser(Cli::Grok, label.to_owned())
                 )
             }
         }
         match self {
             Setup::Window(label) => format!(
-                "run `aterm harness accounts browser {label} --cli grok` at this machine's desk \
-                 and sign in there, or put {label}'s mailbox in the vault (ai-mailbox.toml)"
+                "run `{}` at this machine's desk and sign in there, or put {label}'s mailbox in \
+                 the vault (ai-mailbox.toml)",
+                Step::Browser(Cli::Grok, label.clone())
             ),
             Setup::Mailbox(label) => format!(
                 "put {label}'s mailbox in the vault (ai-mailbox.toml), or install a Chromium that \
-                 opens a window (Google Chrome for Testing or Chromium) and run `aterm harness \
-                 accounts browser {label} --cli grok` at this machine's desk"
+                 opens a window (Google Chrome for Testing or Chromium) and run `{}` at this \
+                 machine's desk",
+                Step::Browser(Cli::Grok, label.clone())
             ),
             Setup::MailboxPassword { label, login } => format!(
                 "fill in the password of mailbox {login} (its [[mailboxes]] entry in the vault's \
                  ai-mailbox.toml), or install a Chromium that opens a window (Google Chrome for \
-                 Testing or Chromium) and run `aterm harness accounts browser {label} --cli \
-                 grok` at this machine's desk"
+                 Testing or Chromium) and run `{}` at this machine's desk",
+                Step::Browser(Cli::Grok, label.clone())
             ),
             Setup::Email { label, window } => format!(
                 "add `email = \"…\"` to {label}'s row in Grok Build's roster, {}",
                 then(label, *window)
             ),
             Setup::Adopt { label, window } => format!(
-                "run `aterm harness accounts adopt-default {label} --email <your x.ai email> \
-                 --cli grok`, {}",
+                "run `{}` with your x.ai email, {}",
+                Step::AdoptDefault(Cli::Grok, label.clone()),
                 then(label, *window)
             ),
         }
@@ -1385,7 +1386,9 @@ fn unsigned_why(outcome: &Outcome) -> String {
         }
         Outcome::Exited(None) => "grok was ended by a signal".to_owned(),
         Outcome::SignedIn { .. } => "grok said it signed in but left no login file".to_owned(),
-        Outcome::NotRun(why) | Outcome::Unverified(why) => why.clone(),
+        Outcome::NotRun(why) | Outcome::PageNotOpened(why) | Outcome::Unverified(why) => {
+            why.clone()
+        }
         Outcome::Refused(why)
         | Outcome::NeedsYou(why)
         | Outcome::NeedsSignIn(why)
@@ -1495,8 +1498,8 @@ struct Led {
 pub fn refused_way_out(label: &str, window: bool) -> String {
     let again = if window {
         format!(
-            "or sign {label}'s browser profile in again as its account: `aterm harness accounts \
-             browser {label} --cli grok`"
+            "or sign {label}'s browser profile in again as its account: `{}`",
+            Step::Browser(Cli::Grok, label.to_owned())
         )
     } else {
         format!(
@@ -1715,8 +1718,9 @@ fn preflight(gate: &Gate<'_>) -> Result<Prepared, String> {
     .map_err(|e| format!("no private PATH could be made: {e}"))?;
     if !program.is_file() {
         return Err(format!(
-            "`{}` is not installed here (`aterm pkg install grok` installs it)",
-            program.display()
+            "`{}` is not installed here (`{}` installs it)",
+            program.display(),
+            Step::install(Cli::Grok)
         ));
     }
     let staging = aterm_tempfile::Builder::new()
@@ -1931,7 +1935,7 @@ fn place(staged: &Path, target: &Path) -> Result<(), String> {
     if !meta.is_file() || meta.len() == 0 || meta.len() > LOGIN_MAX {
         return Err("grok's login file is empty, too large or not a file".to_owned());
     }
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0).saturating_add(1));
     file.take(LOGIN_MAX.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(|e| format!("grok's login file cannot be read: {e}"))?;

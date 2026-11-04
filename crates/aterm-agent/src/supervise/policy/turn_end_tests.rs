@@ -112,7 +112,6 @@ fn idle(said: &str, worked: Option<Duration>) -> TurnEndReading {
         login_back: false,
         auto_continue: None,
         since_limit: None,
-        background: false,
         served_in_transcript: false,
         chosen_in_transcript: None,
         conversation: Conversation::Hostless,
@@ -4641,6 +4640,83 @@ fn a_loop_that_follows_holds_an_esc_from_the_point_its_record_marks() {
     }
 }
 
+/// THE ACTS OF A LIMIT'S PLACE ARE ONE LIST (gap 23): for every rule this policy names,
+/// [`limits_place_rule`] (what `harness fact` judges `why=limit` by for a proven self-claim's
+/// act) is [`TurnEndState::in_limits_place`]'s rule half, read with a usage window's track that
+/// this loop met; with no track no act is in a limit's place. The list itself is pinned: the done
+/// check, the go-ahead, the three answers and Land's four acts. Kills M32 (two rule lists).
+#[test]
+fn limits_place_rule_is_in_limits_place() {
+    use super::super::approval::{RULE_PROSE_LONG_TERM, RULE_PROSE_SHORT_TERM};
+    let now = t0();
+    let mut st = TurnEndState::default();
+    st.observe(
+        &walled(WallKind::UsageSession, "Usage limit reached", None),
+        now,
+    );
+    let rules = [
+        RULE_CONTINUE,
+        RULE_DONE_CHECK,
+        RULE_OPEN_ITEMS,
+        RULE_UNCOMMITTED,
+        RULE_LEFT,
+        RULE_GO_AHEAD,
+        RULE_GO_AHEAD_HOUR,
+        RULE_LAND,
+        RULE_LAND_NUDGE,
+        RULE_LAND_ANSWER,
+        RULE_LAND_CHECK,
+        RULE_SUGGESTION,
+        RULE_API_RETRY,
+        RULE_API_BACK,
+        RULE_API_CUTOFF,
+        RULE_OUTAGE_RESUME,
+        RULE_LOGIN_BACK,
+        RULE_LIMIT_RESUME,
+        RULE_MODEL_FALLBACK,
+        RULE_MODEL_RESTORE,
+        RULE_ACCOUNT,
+        RULE_USAGE_PROBE,
+        RULE_COMPACT,
+        RULE_LOGIN,
+        RULE_ANSWER,
+        RULE_PROSE_LONG_TERM,
+        RULE_PROSE_SHORT_TERM,
+        RULE_CONSENT,
+        RULE_CREDITS_HOLD,
+        RULE_MEMORY_RESTART,
+        RULE_INPUT_LOST,
+        RULE_HOST_TURN,
+        "policy-continue@v1",
+    ];
+    assert!(
+        st.in_limits_place(RULE_DONE_CHECK),
+        "CONTROL: the usage window's track stands"
+    );
+    for rule in rules {
+        assert_eq!(st.in_limits_place(rule), limits_place_rule(rule), "{rule}");
+        assert!(!TurnEndState::default().in_limits_place(rule), "{rule}");
+    }
+    let placed: Vec<&str> = rules
+        .into_iter()
+        .filter(|rule| limits_place_rule(rule))
+        .collect();
+    assert_eq!(
+        placed,
+        [
+            RULE_DONE_CHECK,
+            RULE_GO_AHEAD,
+            RULE_LAND,
+            RULE_LAND_NUDGE,
+            RULE_LAND_ANSWER,
+            RULE_LAND_CHECK,
+            RULE_ANSWER,
+            RULE_PROSE_LONG_TERM,
+            RULE_PROSE_SHORT_TERM,
+        ]
+    );
+}
+
 /// A no-progress fact a reading may carry ([`crate::supervise::facts`]).
 fn hung_fact() -> crate::supervise::facts::Fact {
     crate::supervise::facts::Fact {
@@ -5210,13 +5286,16 @@ fn a_draft_over_an_open_menu_is_not_submitted() {
     };
     let clear = menu("/clear");
     let clear: Vec<&str> = clear.iter().map(String::as_str).collect();
-    assert_eq!(composer_of(&over("/cl", &clear)), Composer::Diverted);
+    assert_eq!(
+        composer_of(&over("/cl", &clear)),
+        Composer::Diverted(Diversion::Menu)
+    );
     assert_eq!(
         composer_of(&screen(SLASH_MENU_POINTER_DOWN_MEASURED)),
-        Composer::Diverted
+        Composer::Diverted(Diversion::Menu)
     );
     let standing = TurnEndReading {
-        composer: Composer::Diverted,
+        composer: Composer::Diverted(Diversion::Menu),
         person: Some(grace),
         key: Some(grace),
         ..idle("Fixed the parser.", Some(JOB))
@@ -5228,7 +5307,7 @@ fn a_draft_over_an_open_menu_is_not_submitted() {
             reason: MENU_DIVERTS.to_string()
         }
     );
-    assert!(Composer::Diverted.drafted());
+    assert!(Composer::Diverted(Diversion::Menu).drafted());
     assert_eq!(
         composer_of(&screen(CONTEXT_WALL_COMPACT_MENU_MEASURED)),
         Composer::Typed
@@ -5281,9 +5360,13 @@ fn a_draft_over_a_menu_is_what_enter_did_with_it_measured() {
         (
             "2.1.302 pointed",
             AT_MENU_POINTED_2_1_302,
-            Composer::Diverted,
+            Composer::Diverted(Diversion::Menu),
         ),
-        ("2.1.268 `/cl`", SLASH_MENU_2_1_268, Composer::Diverted),
+        (
+            "2.1.268 `/cl`",
+            SLASH_MENU_2_1_268,
+            Composer::Diverted(Diversion::Menu),
+        ),
         (
             "2.1.268 `and @RE`",
             AT_MENU_PARTIAL_2_1_268,
@@ -5341,13 +5424,13 @@ fn a_draft_over_an_at_menus_selection_drawn_in_colour_only_is_what_enter_does_me
             "`and @RE`, the file selected",
             &re,
             AT_MENU_DOWN_CELLS_2_1_268,
-            Composer::Diverted,
+            Composer::Diverted(Diversion::Menu),
         ),
         (
             "`and @RE`, the agent selected",
             &re,
             AT_MENU_DOWN2_CELLS_2_1_268,
-            Composer::Diverted,
+            Composer::Diverted(Diversion::Menu),
         ),
         (
             "`read @no`, none selected",
@@ -5359,7 +5442,7 @@ fn a_draft_over_an_at_menus_selection_drawn_in_colour_only_is_what_enter_does_me
             "`read @no`, `novel.txt` selected",
             &no,
             AT_MENU_NO_DOWN_CELLS_2_1_268,
-            Composer::Diverted,
+            Composer::Diverted(Diversion::Menu),
         ),
     ] {
         let fg = fg_of(rows, measured);
@@ -5371,7 +5454,11 @@ fn a_draft_over_an_at_menus_selection_drawn_in_colour_only_is_what_enter_does_me
         Some(vec![Some("999999".to_string())]),
         Some(vec![Some("b1b9f9".to_string())]),
     ] {
-        assert_eq!(composer_of(&one, fg.clone()), Composer::Diverted, "{fg:?}");
+        assert_eq!(
+            composer_of(&one, fg.clone()),
+            Composer::Diverted(Diversion::Menu),
+            "{fg:?}"
+        );
     }
     assert_eq!(
         composer_of(&screen(AT_MENU_PARTIAL_2_1_302), None),
@@ -5426,19 +5513,19 @@ fn a_draft_over_a_selection_drawn_in_colour_only_is_what_enter_runs_measured() {
             "`/update-config` selected",
             &config,
             SLASH_MENU_CONFIG_DOWN_CELLS_2_1_268,
-            Composer::Diverted,
+            Composer::Diverted(Diversion::Menu),
         ),
         (
             "`/copy` of two",
             &copy,
             SLASH_MENU_COPY_CELLS_2_1_268,
-            Composer::Diverted,
+            Composer::Diverted(Diversion::Menu),
         ),
         (
             "`/fork` of two",
             &copy,
             SLASH_MENU_COPY_DOWN_CELLS_2_1_268,
-            Composer::Diverted,
+            Composer::Diverted(Diversion::Menu),
         ),
     ] {
         let fg = fg_of(rows, measured);
@@ -5448,7 +5535,7 @@ fn a_draft_over_a_selection_drawn_in_colour_only_is_what_enter_runs_measured() {
     let grace = Duration::from_secs(u64::from(cfg().human_grace_s));
     for (composer, act) in [
         (
-            Composer::Diverted,
+            Composer::Diverted(Diversion::Menu),
             TurnEndAction::Escalate {
                 reason: MENU_DIVERTS.to_string(),
             },
@@ -5465,7 +5552,7 @@ fn a_draft_over_a_selection_drawn_in_colour_only_is_what_enter_runs_measured() {
     }
     assert_eq!(composer_of(&config, None), Composer::Unknown);
     let cl = screen(SLASH_MENU_2_1_268);
-    assert_eq!(composer_of(&cl, None), Composer::Diverted);
+    assert_eq!(composer_of(&cl, None), Composer::Diverted(Diversion::Menu));
     let usage = screen(SLASH_MENU_USAGE_MEASURED);
     let entries = aterm_phase::phase::completion_menu(&usage)
         .expect("the pointed menu")
@@ -6019,6 +6106,7 @@ fn closing(said: &str, prompt: &str, done: Option<Duration>) -> TurnEndReading {
         answered: Some(ScreenAnswer {
             prompt: crate::supervise::approvals::words_hash(prompt),
             work: done,
+            harness: false,
         }),
         ..idle(said, None)
     }
@@ -6046,6 +6134,7 @@ fn an_act_answered_before_any_read_saw_it_run_is_taken_by_its_row_or_its_record(
             answered: over.map(|o| ScreenAnswer {
                 prompt: crate::supervise::approvals::words_hash(o),
                 work: Some(secs(6)),
+                harness: false,
             }),
             ..idle(IDLE, None)
         };
@@ -9628,7 +9717,11 @@ fn a_turn_served_since_a_moved_login_owes_its_resume_no_more() {
 #[test]
 fn a_prompt_answered_since_a_moved_login_owes_its_resume_no_more() {
     let answered = |prompt: u64, r: &TurnEndReading| TurnEndReading {
-        answered: Some(ScreenAnswer { prompt, work: None }),
+        answered: Some(ScreenAnswer {
+            prompt,
+            work: None,
+            harness: false,
+        }),
         ..r.clone()
     };
     let (mut st, r, now) = held_limit();
@@ -12461,6 +12554,7 @@ fn a_moved_to_login_that_answers_before_any_read_sees_it_run_has_served() {
         answered: Some(ScreenAnswer {
             prompt: crate::supervise::approvals::words_hash(ASKED),
             work: None,
+            harness: false,
         }),
         conversation: ours(),
         ..session_wall(t)
@@ -12628,6 +12722,7 @@ fn a_prompt_answered_at_once_under_a_move_ahead_answers_the_move() {
         answered: Some(ScreenAnswer {
             prompt: crate::supervise::approvals::words_hash(NEXT),
             work: None,
+            harness: false,
         }),
         worked: None,
         ..session_wall(t)
@@ -15589,6 +15684,7 @@ fn the_standing_needs_clear_on_nothing_someone_elses_turn_or_off() {
     let answered = |prompt: u64| ScreenAnswer {
         prompt,
         work: Some(5 * MIN),
+        harness: false,
     };
     let mut st = standing(now);
     at(
@@ -17431,7 +17527,7 @@ fn a_renewed_login_is_followed_and_a_renewable_one_signed_in() {
         ..gone.clone()
     };
     let diverted = TurnEndReading {
-        composer: Composer::Diverted,
+        composer: Composer::Diverted(Diversion::Menu),
         ..gone.clone()
     };
     let [relaunch_off, resume_off, cannot_restart, not_made] = MOVE_HELD_WHYS;
@@ -17507,7 +17603,7 @@ fn a_renewed_login_is_followed_and_a_renewable_one_signed_in() {
         );
         let reason = match shown.composer {
             Composer::Own => "clear them, and the tab moves",
-            Composer::Diverted => "close the menu",
+            Composer::Diverted(Diversion::Menu) => "close the menu",
             _ => "send or clear it",
         };
         assert!(is_escalate(&a, reason), "{:?}: {a:?}", shown.composer);
@@ -17519,7 +17615,7 @@ fn a_renewed_login_is_followed_and_a_renewable_one_signed_in() {
         );
         assert_eq!(
             e.action.contains("menu"),
-            shown.composer == Composer::Diverted,
+            shown.composer == Composer::Diverted(Diversion::Menu),
             "{:?}: {e:?}",
             shown.composer
         );
@@ -18904,7 +19000,11 @@ fn a_lost_login_over_a_done_task_is_signed_in() {
     st.observe(&before, t - MIN);
     assert!(st.seed_task_done());
     let asked = |prompt: u64| TurnEndReading {
-        answered: Some(ScreenAnswer { prompt, work: None }),
+        answered: Some(ScreenAnswer {
+            prompt,
+            work: None,
+            harness: false,
+        }),
         ..wall.clone()
     };
     st.observe(&asked(1), t);

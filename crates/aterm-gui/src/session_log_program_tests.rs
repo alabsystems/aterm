@@ -1292,3 +1292,398 @@ fn edges_move_no_turn_but_a_codex_runs() {
         );
     }
 }
+
+const BLOCKED: &[u8] = b"\x1b]7501;state=blocked:app=codex:kind=permission\x1b\\";
+
+/// A record line of the host tier without its sequence, its wall clock read as ms past `base`
+/// into the test (`t=+<ms>`).
+fn timed(line: &str, base: u64) -> String {
+    let (head, t) = line
+        .rsplit_once(" t=")
+        .expect("a record line ends with its t=");
+    let ms = t.parse::<u64>().expect("a wall clock") - super::super::tests::WALL0 - base;
+    let rest = head.split_once(' ').map_or(head, |(_, r)| r);
+    format!("{rest} t=+{ms}")
+}
+
+/// The live turn and box step opens and closes, oldest first ([`timed`]).
+fn box_lines(tl: &std::sync::Mutex<SessionTimeline>, base: u64) -> Vec<String> {
+    lines_of(tl)
+        .into_iter()
+        .filter(|l| {
+            [" turn ", " approval ", " question "]
+                .iter()
+                .any(|k| l.contains(k))
+                && (l.contains(" open ") || l.contains(" close "))
+        })
+        .map(|l| timed(&l, base))
+        .collect()
+}
+
+/// The node of the run whose `open` names `agent`.
+fn run_named(tl: &std::sync::Mutex<SessionTimeline>, agent: &str) -> String {
+    let lines = lines_of(tl);
+    let open = lines
+        .iter()
+        .find(|l| l.contains(" open ") && l.contains(agent))
+        .unwrap_or_else(|| panic!("no {agent} run: {lines:#?}"));
+    node_of(open).to_string()
+}
+
+/// G1, A CODEX BOX IS A CLAIMED APPROVAL STEP (GAP 26): a codex-alab's `working`, `blocked` on a
+/// permission, `working` and `idle`, each written as its program mark, are one claimed turn whose
+/// one box is an approval step `box=other src=engine conf=claim`, opened at the box's mark and
+/// closed `out=passed` (no input dismissed it) at the mark that stopped showing it, and the
+/// turn's close counts it (`appr=1`, no `qs=`). A host that writes no step (SessionLog::claim_box
+/// a no-op, or write_program never calling it) fails it.
+#[test]
+fn a_codex_box_opens_a_claimed_approval_step_and_the_turn_counts_it() {
+    let (tl, hand) = opened();
+    with_agent(&tl, "codex");
+    let run = codex_run(&tl);
+    let moves = [
+        (W::Working, None),
+        (W::Blocked, Some(ProgramBlockedKind::Permission)),
+        (W::Working, None),
+        (W::Idle, None),
+    ];
+    for (i, (state, kind)) in (0_u64..).zip(moves) {
+        hand.set(5_000 + 1_000 * i);
+        tl.lock()
+            .unwrap()
+            .note_program_state(report(state, kind), 10 + i);
+    }
+    assert_eq!(
+        box_lines(&tl, 0),
+        [
+            format!("open t1 turn par={run} src=engine conf=claim t=+5000"),
+            "open p1 approval par=t1 box=other src=engine conf=claim t=+6000".to_string(),
+            "close p1 approval out=passed dur_ms=1000 src=engine conf=claim t=+7000".to_string(),
+            "close t1 turn out=done dur_ms=3000 steps=1 appr=1 src=engine conf=claim t=+8000"
+                .to_string(),
+        ]
+    );
+}
+
+/// G2, A CODEX-ALAB ACT NEVER LANDS ON ITS CLAIMED BOX, AND CLAUDE'S BYTES ARE UNCHANGED (GAP 26
+/// D4, R12): while a codex box's claimed step stands, codex-alab's `approve-all@v1` is marked
+/// where it lands with no such step (the turn) and closes nothing; the step then closes at its
+/// leave `out=passed`, an act being no input. A Claude Code tab given the same reports and act
+/// writes no step and no claimed turn: its records are the ones the host wrote before GAP 26.
+#[test]
+fn codex_acts_never_land_on_a_claim_step_and_claude_is_unchanged() {
+    let flow = |agent: &str| {
+        let (tl, hand) = opened();
+        with_agent(&tl, agent);
+        let run = run_named(&tl, agent);
+        let seq0 = tl.lock().unwrap().slog().log().last_seq();
+        let moves = [
+            (W::Working, None),
+            (W::Blocked, Some(ProgramBlockedKind::Permission)),
+        ];
+        for (i, (state, kind)) in (0_u64..).zip(moves) {
+            hand.set(5_000 + 1_000 * i);
+            tl.lock()
+                .unwrap()
+                .note_program_state(report(state, kind), 10 + i);
+        }
+        hand.set(6_500);
+        let acted = tl.lock().unwrap().note_harness_act(
+            "approve-all@v1",
+            "codex-alab@1",
+            aterm_slog::Actor::Ctl,
+        );
+        assert!(acted.is_some(), "{agent}: the act is kept");
+        hand.set(7_000);
+        tl.lock()
+            .unwrap()
+            .note_program_state(report(W::Working, None), 12);
+        let lines: Vec<String> = lines_of(&tl)
+            .into_iter()
+            .filter(|l| {
+                l.split(' ')
+                    .next()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .is_some_and(|s| s > seq0)
+            })
+            .map(|l| timed(&l, 0))
+            .collect();
+        (run, lines)
+    };
+    let act = "act word=approve rule=approve-all.v1 holder=codex-alab@1 \
+               harness_act=approve-all@v1 by=ctl src=mark conf=claim t=+6500";
+    let (run, claude) = flow("claude");
+    assert_eq!(
+        claude,
+        [
+            format!("mark {run} program state=working src=engine conf=claim t=+5000"),
+            format!(
+                "mark {run} program state=blocked ask=permission src=engine conf=claim t=+6000"
+            ),
+            format!("mark {run} {act}"),
+            format!("mark {run} program state=working src=engine conf=claim t=+7000"),
+        ],
+        "Claude Code's records, as the host before GAP 26 wrote them"
+    );
+    let (run, codex) = flow("codex");
+    assert_eq!(
+        codex,
+        [
+            format!("mark {run} program state=working src=engine conf=claim t=+5000"),
+            format!("open t1 turn par={run} src=engine conf=claim t=+5000"),
+            format!(
+                "mark {run} program state=blocked ask=permission src=engine conf=claim t=+6000"
+            ),
+            "open p1 approval par=t1 box=other src=engine conf=claim t=+6000".to_string(),
+            format!("mark t1 {act}"),
+            format!("mark {run} program state=working src=engine conf=claim t=+7000"),
+            "close p1 approval out=passed dur_ms=1000 src=engine conf=claim t=+7000".to_string(),
+        ],
+        "codex-alab's act is marked off its claimed box and closes nothing"
+    );
+}
+
+/// G3, A COALESCED BOX OPENS NO STEP (R4): past the run's burst a `blocked` and the `working`
+/// after it inside one refill are one pending move, written as `working coalesced=1` once a token
+/// frees, and no step opens: the box steps follow the written marks, which the bucket bounds. A
+/// host that moves the box at the observation, before the bucket, opens one.
+#[test]
+fn a_coalesced_box_opens_no_step() {
+    let (tl, hand) = opened();
+    with_agent(&tl, "codex");
+    hand.set(5_000);
+    burst(&tl, PROGRAM_BURST as usize, W::Working);
+    assert_eq!(
+        program_lines(&tl).len(),
+        PROGRAM_BURST as usize,
+        "PRECONDITION: the bucket is empty"
+    );
+    {
+        let mut g = tl.lock().unwrap();
+        g.note_program_state(report(W::Blocked, Some(ProgramBlockedKind::Permission)), 2);
+        g.note_program_state(report(W::Working, None), 3);
+    }
+    hand.set(6_000);
+    tick(&tl);
+    let programs = program_lines(&tl);
+    assert!(
+        programs.len() == PROGRAM_BURST as usize + 1
+            && programs[PROGRAM_BURST as usize]
+                .contains(" program state=working coalesced=1 src=engine conf=claim "),
+        "the box coalesced into the working after it: {programs:#?}"
+    );
+    let steps: Vec<String> = box_lines(&tl, 0)
+        .into_iter()
+        .filter(|l| !l.contains(" turn "))
+        .collect();
+    assert_eq!(
+        steps,
+        Vec::<String>::new(),
+        "no step for a box no mark wrote"
+    );
+}
+
+/// G4, THE SUPERVISOR'S ASK LANDS ON THE STANDING BOX AND IS NOT CARRIED (R17): an attention ask
+/// while a codex box's claimed step stands is that step's escalation (`mark p1 need`), which its
+/// close ends. The next box's step gets none carried, even through the agent-word move's carry
+/// ([`SessionLog::carry_escalation`]): its close `out=passed` with no `by=` is codex-alab
+/// answering inside the program, never a box left unanswered.
+#[test]
+fn the_escalation_lands_on_the_standing_box_and_is_not_carried() {
+    let h = crate::session_store::test_handle(61);
+    let hand = super::super::tests::hand_clock(&h.ctx.timeline);
+    let store = crate::session_store::new_store();
+    store.write().unwrap().register(h.clone());
+    with_agent(&h.ctx.timeline, "codex");
+    let note = |ms: u64, state: W, kind: Option<ProgramBlockedKind>, began: u64| {
+        hand.set(ms);
+        h.ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .note_program_state(report(state, kind), began);
+    };
+    let escalated = || {
+        h.ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .slog()
+            .log()
+            .state()
+            .needs
+            .iter()
+            .flatten()
+            .filter(|n| n.word == "escalated")
+            .map(|n| n.node.to_string())
+            .collect::<Vec<_>>()
+    };
+    note(5_000, W::Working, None, 10);
+    note(6_000, W::Blocked, Some(ProgramBlockedKind::Permission), 11);
+    super::tests::supervisor_asks(
+        &h.ctx,
+        Some("codex approval echo"),
+        Some(aterm_types::needs::AttentionKind::Ask),
+    );
+    assert_eq!(super::tests::escalation_marks(&h.ctx), ["mark p1 need"]);
+    assert_eq!(escalated(), ["p1"]);
+    note(7_000, W::Working, None, 12);
+    assert_eq!(
+        escalated(),
+        Vec::<String>::new(),
+        "the box's close ended it"
+    );
+    note(8_000, W::Blocked, Some(ProgramBlockedKind::Permission), 13);
+    {
+        let mut g = h.ctx.timeline.lock().unwrap();
+        let now = g.slog().now();
+        g.slog_mut().carry_escalation(now);
+    }
+    assert_eq!(
+        super::tests::escalation_marks(&h.ctx),
+        ["mark p1 need"],
+        "nothing carried to the next box"
+    );
+    assert_eq!(escalated(), Vec::<String>::new());
+}
+
+/// G5, THE SWEEP MOVES THE BOXES THROUGH note_program_state (the production wiring): a codex in
+/// front reports a box, then a `working` and a second box between two sweeps, then `working`:
+/// the sweep's program-state hold opens the first box's step, the second sweep's new box (the
+/// same words, a new `began`) ends it and opens the second's, and the last ends that one, with
+/// no wake noted for any of them. A sweep that loses the report's `began` keeps one step for
+/// both boxes.
+#[test]
+fn the_sweep_opens_and_closes_through_note_program_state() {
+    let mut tab = CodexTab::new();
+    let base = tab.base;
+    tab.says_at(WORKING, 900);
+    tab.sweep_at(1_000);
+    let wake = |tab: &CodexTab| tab.app.session_status.slog_wakes.next();
+    let wake0 = wake(&tab);
+    tab.says_at(BLOCKED, 1_100);
+    tab.sweep_at(1_200);
+    assert_eq!(wake(&tab), wake0, "the box arms no wake");
+    tab.says_at(WORKING, 1_210);
+    tab.says_at(BLOCKED, 1_220);
+    tab.sweep_at(1_400);
+    assert_eq!(wake(&tab), wake0, "the second box arms no wake");
+    tab.says_at(WORKING, 1_500);
+    tab.sweep_at(1_600);
+    assert_eq!(wake(&tab), wake0, "the leave arms no wake");
+    let steps: Vec<String> = box_lines(&tab.ctx.timeline, base)
+        .into_iter()
+        .filter(|l| !l.contains(" turn "))
+        .collect();
+    assert_eq!(
+        steps,
+        [
+            "open p1 approval par=t1 box=other src=engine conf=claim t=+1200",
+            "close p1 approval out=passed dur_ms=200 src=engine conf=claim t=+1400",
+            "open p2 approval par=t1 box=other src=engine conf=claim t=+1400",
+            "close p2 approval out=passed dur_ms=200 src=engine conf=claim t=+1600",
+        ]
+    );
+}
+
+/// G6, A HELD BOX THE TICK WRITES KEEPS ITS OBSERVATION TIME (GAP 26): the run's program bucket is
+/// empty (a burst), so the sweep that shows a codex's `blocked` on a permission holds its mark;
+/// its `done` comes before a token frees, and the next sweep's tick writes the held `blocked` a
+/// second later. Its box's step opens at the sweep that observed it, as its claimed turn does,
+/// so the `done` edge closes the turn at its own time, the box first. A box claimed on the
+/// flush clock opens after that edge and drags the turn's close to the flush.
+#[test]
+fn a_held_box_the_tick_writes_keeps_its_observation_time() {
+    let mut tab = CodexTab::new();
+    let base = tab.base;
+    tab.says_at(DONE, 900);
+    tab.sweep_at(1_000);
+    burst(&tab.ctx.timeline, PROGRAM_BURST as usize - 1, W::Done);
+    assert_eq!(
+        program_lines(&tab.ctx.timeline).len(),
+        PROGRAM_BURST as usize,
+        "PRECONDITION: the bucket is empty"
+    );
+    let before = box_lines(&tab.ctx.timeline, base).len();
+    tab.says_at(BLOCKED, 1_010);
+    tab.sweep_at(1_015);
+    assert_eq!(
+        box_lines(&tab.ctx.timeline, base).len(),
+        before,
+        "PRECONDITION: the held blocked opened nothing"
+    );
+    tab.says_at(DONE, 1_027);
+    tab.sweep_at(2_015);
+    let programs = program_lines(&tab.ctx.timeline);
+    assert!(
+        programs.len() == PROGRAM_BURST as usize + 1
+            && programs[PROGRAM_BURST as usize].contains(" program state=blocked ask=permission "),
+        "PRECONDITION: the tick wrote the held blocked: {programs:#?}"
+    );
+    let got = box_lines(&tab.ctx.timeline, base).split_off(before);
+    let node = |i: usize| {
+        got.get(i)
+            .and_then(|l| l.split(' ').nth(1))
+            .unwrap_or("-")
+            .to_string()
+    };
+    let (t, p) = (node(0), node(1));
+    assert!(
+        got.len() == 4
+            && got[0].starts_with(&format!("open {t} turn "))
+            && got[0].ends_with(" src=engine conf=claim t=+1015"),
+        "the claimed turn at the sweep that saw it: {got:#?}"
+    );
+    assert_eq!(
+        got[1..],
+        [
+            format!("open {p} approval par={t} box=other src=engine conf=claim t=+1015"),
+            format!("close {p} approval out=passed dur_ms=12 src=engine conf=claim t=+1027"),
+            format!(
+                "close {t} turn out=done dur_ms=12 steps=1 appr=1 src=engine conf=claim t=+1027"
+            ),
+        ],
+        "the box at its observation, the turn closed at its edge: {got:#?}"
+    );
+}
+
+/// G7, A STANDING CODEX BOX MOVES `status` (GAP 26): while a codex box's claimed step stands,
+/// `status`'s `step=` names it and `need=`/`need_since_ms=` its claim need, as a Claude Code
+/// box's step and need do; its leave puts both back to `-`.
+#[test]
+fn a_standing_codex_box_is_the_status_step_and_need() {
+    let (tl, hand) = opened();
+    with_agent(&tl, "codex");
+    let fields = |tl: &std::sync::Mutex<SessionTimeline>| {
+        let g = tl.lock().unwrap();
+        g.slog().status_fields(g.slog().now().wall_ms)
+    };
+    let moves = [
+        (W::Working, None),
+        (W::Blocked, Some(ProgramBlockedKind::Permission)),
+    ];
+    for (i, (state, kind)) in (0_u64..).zip(moves) {
+        hand.set(5_000 + 1_000 * i);
+        tl.lock()
+            .unwrap()
+            .note_program_state(report(state, kind), 10 + i);
+    }
+    hand.set(6_400);
+    let p = tl
+        .lock()
+        .unwrap()
+        .slog()
+        .codex_claim_step()
+        .expect("PRECONDITION: the box's step stands");
+    let standing = fields(&tl);
+    assert!(
+        standing.contains(&format!(" step={p} need=approval:other need_since_ms=400")),
+        "{standing}"
+    );
+    hand.set(7_000);
+    tl.lock()
+        .unwrap()
+        .note_program_state(report(W::Working, None), 12);
+    let left = fields(&tl);
+    assert!(left.contains(" step=- need=- need_since_ms=-"), "{left}");
+}

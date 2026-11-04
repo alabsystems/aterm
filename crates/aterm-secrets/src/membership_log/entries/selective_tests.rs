@@ -134,7 +134,7 @@ fn named_selection_keeps_reader_unavailability_distinct_from_absence() {
 }
 
 #[test]
-fn audience_selection_keeps_the_full_reader_without_current_keys() {
+fn exact_audience_reads_remain_available_without_current_keys() {
     let mut fixture = Fixture::new();
     assert_eq!(fixture.in_audience(&Audience::Everyone), Some(Vec::new()));
     assert!(fixture.named().is_none());
@@ -148,7 +148,7 @@ fn audience_selection_keeps_the_full_reader_without_current_keys() {
 }
 
 #[test]
-fn audience_selection_does_not_replace_everyone_with_the_host_winner() {
+fn exact_audience_reads_keep_everyone_separate_from_the_host_winner() {
     let mut fixture = Fixture::new();
     let (epoch, key) = fixture.epoch(EpochAudience::Everyone);
     let everyone = entry(TARGET, b"everyone", Audience::Everyone);
@@ -166,7 +166,7 @@ fn audience_selection_does_not_replace_everyone_with_the_host_winner() {
 }
 
 #[test]
-fn audience_selection_still_resolves_anchors_in_other_audiences() {
+fn exact_audience_reads_resolve_anchors_in_other_audiences() {
     let mut fixture = Fixture::new();
     let (epoch, key) = fixture.epoch(EpochAudience::Everyone);
     let mut root = entry("root", b"base", Audience::Everyone);

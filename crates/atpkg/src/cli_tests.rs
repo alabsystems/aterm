@@ -713,10 +713,150 @@ fn the_lease_verb_runs_nothing_on_a_missing_build_and_holds_nothing_outside_the_
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
+#[test]
+fn the_lease_verb_runs_nothing_when_a_managed_lease_cannot_be_taken() {
+    let layout = temp_layout("lease-verb-refuse-unheld");
+    let bin = layout.build_dir("trust", 9193).join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    // An existing non-directory prevents lease registration on every host, without
+    // relying on the current user's permission checks or a racing reclaimer.
+    std::fs::write(crate::lease::dir(&layout.prefix), b"not a directory").unwrap();
+    let ran = layout.prefix.join("ran");
+    let args = LeaseArgs {
+        dir: bin,
+        who: None,
+        command: vec!["/usr/bin/touch".into(), ran.display().to_string()],
+    };
+    let mut said = Vec::new();
+    let run = lease_and_run(
+        Some(&layout.prefix),
+        &args,
+        "must hold",
+        crate::lease::DEFAULT_WAIT,
+        &mut |line| said.push(line.to_string()),
+    );
+    assert!(!ran.exists(), "the unprotected command ran: {run:?}");
+    assert!(
+        matches!(run, LeaseRun::NotHeld(_, crate::lease::LeaseError::Io(_))),
+        "{run:?}"
+    );
+    assert!(
+        said.is_empty(),
+        "no successful hold was announced: {said:?}"
+    );
+}
+
+#[test]
+fn the_lease_verb_runs_nothing_without_a_package_prefix() {
+    let layout = temp_layout("lease-verb-refuse-no-prefix");
+    let bin = layout.build_dir("trust", 9194).join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let ran = layout.prefix.join("ran");
+    let args = LeaseArgs {
+        dir: bin,
+        who: None,
+        command: vec!["/usr/bin/touch".into(), ran.display().to_string()],
+    };
+    let mut said = Vec::new();
+    let run = lease_and_run(
+        None,
+        &args,
+        "must hold",
+        crate::lease::DEFAULT_WAIT,
+        &mut |line| said.push(line.to_string()),
+    );
+    assert!(!ran.exists(), "the unresolved command ran: {run:?}");
+    assert!(matches!(run, LeaseRun::NoPrefix), "{run:?}");
+    assert!(
+        said.is_empty(),
+        "no successful hold was announced: {said:?}"
+    );
+}
+
+#[test]
+fn the_lease_verb_requires_a_directory_and_follows_directory_symlinks() {
+    let layout = temp_layout("lease-verb-directory");
+    let managed = layout.build_dir("trust", 9196).join("bin");
+    let unmanaged = layout.prefix.join("outside");
+    std::fs::create_dir_all(managed.parent().unwrap()).unwrap();
+    std::fs::write(&managed, b"not a directory").unwrap();
+    std::fs::write(&unmanaged, b"not a directory").unwrap();
+    let ran = layout.prefix.join("ran");
+    let args = |dir: &std::path::Path| LeaseArgs {
+        dir: dir.to_path_buf(),
+        who: None,
+        command: vec!["/usr/bin/touch".into(), ran.display().to_string()],
+    };
+    let mut failures = Vec::new();
+    for dir in [&managed, &unmanaged] {
+        for target in ["file", "file-link", "dangling-link"] {
+            if target != "file" {
+                std::fs::remove_file(dir).unwrap();
+                let to = if target == "file-link" {
+                    let file = layout.prefix.join("target-file");
+                    std::fs::write(&file, b"not a directory").unwrap();
+                    file
+                } else {
+                    layout.prefix.join("missing-target")
+                };
+                std::os::unix::fs::symlink(to, dir).unwrap();
+            }
+            let mut said = Vec::new();
+            let run = lease_and_run(
+                Some(&layout.prefix),
+                &args(dir),
+                "directory check",
+                crate::lease::DEFAULT_WAIT,
+                &mut |line| said.push(line.to_string()),
+            );
+            let expected_managed = dir == &managed;
+            if !matches!(&run, LeaseRun::Missing(m) if m.dir == *dir && m.managed == expected_managed)
+                || ran.exists()
+                || !said.is_empty()
+            {
+                failures.push(format!(
+                    "{dir:?} ({target}): {run:?}, ran={}, said={said:?}",
+                    ran.exists()
+                ));
+            }
+            if ran.exists() {
+                std::fs::remove_file(&ran).unwrap();
+            }
+            assert_eq!(
+                crate::lease::holders(
+                    &layout.prefix,
+                    &crate::lease::Subject::build("trust", 9196).unwrap(),
+                ),
+                crate::lease::Holders::Free,
+                "invalid paths must not retain a lease",
+            );
+        }
+        std::fs::remove_file(dir).unwrap();
+        let real = dir.with_extension("real");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(real, dir).unwrap();
+        let run = lease_and_run(
+            Some(&layout.prefix),
+            &args(dir),
+            "directory link",
+            crate::lease::DEFAULT_WAIT,
+            &mut |_| {},
+        );
+        assert!(matches!(run, LeaseRun::Ran(s) if s.success()), "{run:?}");
+        assert!(ran.exists(), "valid directory symlinks remain usable");
+        std::fs::remove_file(&ran).unwrap();
+    }
+    let _ = std::fs::remove_dir_all(&layout.prefix);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 #[cfg(unix)]
 #[test]
 fn the_lease_verb_hands_its_command_every_descriptor_its_caller_gave_it() {
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    let layout = temp_layout("lease-verb-fds");
+    let bin = layout.build_dir("trust", 9195).join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
     let null = std::fs::File::open("/dev/null").unwrap();
     // SAFETY: `F_DUPFD` duplicates a test-owned descriptor onto an unused fd >= 100.
     let fd = unsafe { libc::fcntl(null.as_raw_fd(), libc::F_DUPFD, 100) };
@@ -724,7 +864,7 @@ fn the_lease_verb_hands_its_command_every_descriptor_its_caller_gave_it() {
     // SAFETY: `fd` was just opened here and nothing else owns it.
     let held = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
     let args = LeaseArgs {
-        dir: std::path::PathBuf::from("/nonexistent/toolchain/bin"),
+        dir: bin,
         who: None,
         command: vec![
             "/bin/sh".into(),
@@ -732,7 +872,13 @@ fn the_lease_verb_hands_its_command_every_descriptor_its_caller_gave_it() {
             aterm_spec::host::held_probe(fd),
         ],
     };
-    let run = lease_and_run(None, &args, "w", crate::lease::DEFAULT_WAIT, &mut |_| {});
+    let run = lease_and_run(
+        Some(&layout.prefix),
+        &args,
+        "w",
+        crate::lease::DEFAULT_WAIT,
+        &mut |_| {},
+    );
     let LeaseRun::Ran(status) = run else {
         panic!("the command ran: {run:?}");
     };

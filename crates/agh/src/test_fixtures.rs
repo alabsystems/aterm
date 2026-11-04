@@ -39,6 +39,17 @@ pub(crate) fn setup_file(path: &Path, bytes: &[u8]) {
         .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
 }
 
+/// Creates a `.noindex` scratch directory for tests with a short UTF-8-safe prefix.
+pub(crate) fn scratch_dir(tag: &str) -> aterm_tempfile::TempDir {
+    let end = tag.floor_char_boundary(24);
+    let prefix = format!("agh-{}-", &tag[..end]);
+    aterm_tempfile::Builder::new()
+        .prefix(&prefix)
+        .suffix(".noindex")
+        .tempdir()
+        .expect("a scratch directory")
+}
+
 /// Write `text` as `dirs`' agh.toml (`Dirs::config_file`), making the config directory
 /// private and its parent first.
 #[cfg(unix)]
@@ -47,4 +58,21 @@ pub(crate) fn write_config(dirs: &Dirs, text: &str) {
     std::fs::create_dir_all(parent).expect("the config's parent");
     aterm_uds::private_file::create_private_dir(&dirs.config).expect("the config directory");
     setup_file(&dirs.config_file(), text.as_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    /// NEGATIVE CONTROL: multi-byte UTF-8 tags straddling byte 24 must truncate at a valid char
+    /// boundary without panicking and preserve the `.noindex` Spotlight-exclusion suffix.
+    #[test]
+    fn scratch_dir_truncates_utf8_tags_and_preserves_noindex_suffix() {
+        let dir = super::scratch_dir("aaaaaaaaaaaaaaaaaaaaaaaé-extra-tail");
+        let name = dir
+            .path()
+            .file_name()
+            .and_then(|os| os.to_str())
+            .expect("scratch dir name is UTF-8");
+        assert!(name.starts_with("agh-aaaaaaaaaaaaaaaaaaaaaaa-"));
+        assert!(name.ends_with(".noindex"));
+    }
 }

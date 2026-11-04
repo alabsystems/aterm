@@ -763,3 +763,61 @@ fn the_build_and_test_output_are_read_as_cargo_and_libtest_write_them() {
         ["anchors::tests::a"]
     );
 }
+
+/// A GATED WORD A BUILD DROPS IS NOTED (gaps 20, 25), as the build's: a gated read is per build
+/// (`CODEX_SHOWN` is what all of a build's reductions show), so where the previous build's
+/// continue and usage legs showed `turn_trigger=alab_autopilot` and none of this build's legs
+/// does, the note says its harness read is off on this build, and nothing refuses, since a read
+/// that is off says nothing false. NEGATIVE CONTROL: where the usage leg still shows the word,
+/// the build's read stays on, so the continue leg's loss alone notes no such line.
+#[test]
+fn a_gated_word_a_build_drops_is_noted() {
+    let leg = |name: &str| {
+        std::fs::read_to_string(format!(
+            "{COMMITTED}/codex-alab-0.166.0-dev.13766-{name}.jsonl"
+        ))
+        .expect("a 13766 leg")
+    };
+    let plant = |text: &str| {
+        text.replacen(
+            r#""turn_trigger":"""#,
+            r#""turn_trigger":"alab_autopilot""#,
+            1,
+        )
+    };
+    let (cont, usage) = (leg("continue"), leg("usage"));
+    assert!(
+        plant(&cont) != cont && plant(&usage) != usage,
+        "blanked triggers to plant"
+    );
+    let prev = "0.166.0-dev.13765+gabc";
+    let build = "0.166.0-dev.13766+gcd79a420c";
+    let committed = [
+        reduction(
+            "codex-alab-0.166.0-dev.13765-continue.jsonl",
+            Some(prev),
+            &plant(&cont),
+        ),
+        reduction(
+            "codex-alab-0.166.0-dev.13765-usage.jsonl",
+            Some(prev),
+            &plant(&usage),
+        ),
+    ];
+    let line = format!(
+        "turn_trigger=alab_autopilot gone since {prev}: its gated read is off on this build"
+    );
+    let dropped = vec![("continue", cont.clone()), ("usage", usage.clone())];
+    let j = judge(&CODEX, build, &dropped, &committed).expect("a gated word gone refuses nothing");
+    assert_eq!(j.prev.as_deref(), Some(prev));
+    assert!(j.noted.contains(&line), "{:?}", j.noted);
+    let kept = vec![("continue", cont), ("usage", plant(&usage))];
+    let j = judge(&CODEX, build, &kept, &committed).expect("nothing refuses");
+    assert!(
+        j.noted
+            .iter()
+            .all(|n| !n.contains("turn_trigger=alab_autopilot")),
+        "the usage leg still shows it, so the build's read is on: {:?}",
+        j.noted
+    );
+}

@@ -1682,23 +1682,35 @@ pub(super) fn store_version(program: &Path) -> Option<String> {
     super::upgrade_muse_live::build_version(&version, Some(dir)).map(|_| version)
 }
 
-/// `twin` when it is a managed twin that execs `program`'s own build ([`catalog::twin_binary`]).
-/// It reads unix twins only (a `#!/bin/sh` body): the `.cmd` twin atpkg lays on Windows is never
-/// parsed here, so a Windows landing is not read, though the wake polls that twin there
-/// (`upgrade_wake::twin_under`).
+/// Whether `exe` is `program`'s executable by its file name, as atpkg names one in a build's
+/// `bin/` (`atpkg::store::ToolName::exe_file`: `codex`, `codex.exe` on Windows).
+pub(super) fn names_program(exe: &Path, program: &str) -> bool {
+    atpkg::store::ToolName::new(program)
+        .is_some_and(|tool| exe.file_name() == Some(std::ffi::OsStr::new(&tool.exe_file())))
+}
+
+/// `twin` when it is a managed twin that execs `program`'s own build ([`catalog::twin_binary`]:
+/// a `sh` twin's body, or on Windows a `.cmd` twin's) by its executable's name
+/// ([`names_program`]), and that executable is a file.
 pub(super) fn twin_naming(twin: &Path, program: &str) -> Option<PathBuf> {
     let text = crate::harness::accounts::read_bounded(twin, 64 * 1024)
         .ok()
         .flatten()?;
     let exe = catalog::twin_binary(&text)?;
-    (exe.file_name().and_then(|n| n.to_str()) == Some(program) && exe.is_file())
-        .then(|| twin.to_path_buf())
+    (names_program(&exe, program) && exe.is_file()).then(|| twin.to_path_buf())
 }
 
-/// `program`'s managed twin ([`twin_naming`]) at `agents/<program>`, the unix spelling: on
-/// Windows atpkg lays `agents\<program>.cmd`, which is not looked for.
+/// `program`'s managed twin ([`twin_naming`]) in the `agents/` directory `agents`, where atpkg
+/// lays it (`atpkg::store::Layout::agent_shim`: `agents/<program>`, `agents\<program>.cmd` on
+/// Windows).
+pub(super) fn agent_twin_in(agents: &Path, program: &str) -> Option<PathBuf> {
+    let tool = atpkg::store::ToolName::new(program)?;
+    twin_naming(&agents.join(tool.shim_file()), program)
+}
+
+/// `program`'s managed twin ([`agent_twin_in`]) in the configured atpkg layout's `agents/`.
 pub(super) fn managed_agent_twin(program: &str) -> Option<PathBuf> {
-    twin_naming(&agents_dir()?.join(program), program)
+    agent_twin_in(&agents_dir()?, program)
 }
 
 #[cfg(not(test))]
@@ -1862,12 +1874,13 @@ pub(super) fn native_root(home: &Path) -> PathBuf {
     home.join(".local/share/claude/versions")
 }
 
-/// `program`'s managed twin under `layout` at `agents/<program>`, the unix spelling. On Windows
-/// atpkg lays `agents\<program>.cmd` and [`catalog::twin_binary`] reads no `.cmd` body, as
-/// [`Targets::read_with`] reads the native `~/.local/bin/claude` link and not `claude.exe`: a
-/// Windows landing is not read.
+/// `program`'s managed twin under `layout`, where atpkg lays it
+/// (`atpkg::store::Layout::agent_shim`: `agents/<program>`, `agents\<program>.cmd` on Windows):
+/// the twin itself where `program` is not dev-linked, else only while the build it execs
+/// ([`catalog::twin_binary`]) is in the store. The native half ([`Targets::read_with`]) reads the
+/// `~/.local/bin/claude` link alone, not Windows' `claude.exe`.
 fn managed_twin(layout: &atpkg::store::Layout, program: &str) -> Option<PathBuf> {
-    let twin = layout.agents_dir().join(program);
+    let twin = layout.agent_shim(&atpkg::store::ToolName::new(program)?);
     if !atpkg::linkmode::is_linked(layout, program) {
         return Some(twin);
     }
@@ -3308,11 +3321,15 @@ pub(super) fn tap_profile_store(opts: &Opts) -> bool {
 /// `XDG_CONFIG_HOME`) holds a config, which keeps the tap off ([`super::tap::GateFacts::profile_store`]).
 #[must_use]
 pub fn tap_profile_store_at(home: &Path) -> bool {
+    tap_profile_store_in(home, host_xdg_config_home().as_deref())
+}
+
+/// [`tap_profile_store_at`] with the host's `XDG_CONFIG_HOME` passed in.
+fn tap_profile_store_in(home: &Path, host_xdg: Option<&str>) -> bool {
     use super::accounts::{profile_configs_dir, profile_configured};
     let home = home.display().to_string();
     let by_home = profile_configs_dir([("HOME", home.as_str())]);
-    let by_xdg = host_xdg_config_home()
-        .and_then(|xdg| profile_configs_dir([("XDG_CONFIG_HOME", xdg.as_str())]));
+    let by_xdg = host_xdg.and_then(|xdg| profile_configs_dir([("XDG_CONFIG_HOME", xdg)]));
     by_home
         .into_iter()
         .chain(by_xdg)
@@ -7429,15 +7446,16 @@ impl Tasked {
             return transcript_exists_in(claude_dir, session)
                 .and_then(|any| (!any).then_some(false));
         };
-        let mut f = std::fs::File::open(path).ok()?;
-        let len = f.metadata().ok()?.len();
+        let (mut f, meta) = aterm_uds::regular_file::open(path).ok()?;
+        let len = meta.len();
         if len < self.read_to {
             self.read_to = 0;
             self.scan = upgrade::TaskScan::default();
             self.scan.supervisor_typed(ours);
         }
         f.seek(SeekFrom::Start(self.read_to)).ok()?;
-        let mut buf = Vec::new();
+        let rem = len.saturating_sub(self.read_to).min(TASK_READ_BYTES);
+        let mut buf = Vec::with_capacity(usize::try_from(rem).unwrap_or(0).saturating_add(1));
         f.take(TASK_READ_BYTES).read_to_end(&mut buf).ok()?;
         let at_end = self.read_to.saturating_add(buf.len() as u64) >= len;
         let whole = buf.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
@@ -7544,8 +7562,8 @@ impl Finished {
         }
         self.at_end = false;
         let path = self.path.as_ref()?;
-        let mut f = std::fs::File::open(path).ok()?;
-        let len = f.metadata().ok()?.len();
+        let (mut f, meta) = aterm_uds::regular_file::open(path).ok()?;
+        let len = meta.len();
         if self.begun && len >= self.read_to {
             let at_end = self.fold_on(&mut f, len, false)?;
             self.at_end = at_end;
@@ -7579,7 +7597,8 @@ impl Finished {
 
     fn fold_on(&mut self, f: &mut std::fs::File, len: u64, skip_cut: bool) -> Option<bool> {
         f.seek(SeekFrom::Start(self.read_to)).ok()?;
-        let mut buf = Vec::new();
+        let rem = len.saturating_sub(self.read_to).min(TASK_READ_BYTES);
+        let mut buf = Vec::with_capacity(usize::try_from(rem).unwrap_or(0).saturating_add(1));
         Read::take(&mut *f, TASK_READ_BYTES)
             .read_to_end(&mut buf)
             .ok()?;
@@ -8258,11 +8277,10 @@ pub fn conversation_under(home: &Path, session: &str) -> bool {
 }
 
 pub(super) fn tail_to_end(path: &Path, bytes: u64) -> (String, u64) {
-    let Ok(mut f) = std::fs::File::open(path) else {
+    let Ok((mut f, meta)) = aterm_uds::regular_file::open(path) else {
         return (String::new(), 0);
     };
-    let len = f.metadata().map_or(0, |m| m.len());
-    tail_window(&mut f, len, bytes)
+    tail_window(&mut f, meta.len(), bytes)
 }
 
 fn tail_window(f: &mut (impl Read + Seek), len: u64, bytes: u64) -> (String, u64) {
@@ -8270,20 +8288,23 @@ fn tail_window(f: &mut (impl Read + Seek), len: u64, bytes: u64) -> (String, u64
     if f.seek(SeekFrom::Start(start)).is_err() {
         return (String::new(), 0);
     }
-    let mut buf = Vec::new();
+    let rem = len.saturating_sub(start).min(bytes);
+    let mut buf = Vec::with_capacity(usize::try_from(rem).unwrap_or(0).saturating_add(1));
     let _ = f.take(bytes).read_to_end(&mut buf);
     let end = start.saturating_add(buf.len() as u64);
     (lossy(buf), end)
 }
 
 pub(super) fn since(path: &Path, from: u64, cap: u64) -> String {
-    let Ok(mut f) = std::fs::File::open(path) else {
+    let Ok((mut f, meta)) = aterm_uds::regular_file::open(path) else {
         return String::new();
     };
-    if f.metadata().map_or(0, |m| m.len()) < from || f.seek(SeekFrom::Start(from)).is_err() {
+    let len = meta.len();
+    if len < from || f.seek(SeekFrom::Start(from)).is_err() {
         return String::new();
-    }
-    let mut buf = Vec::new();
+    };
+    let rem = len.saturating_sub(from).min(cap);
+    let mut buf = Vec::with_capacity(usize::try_from(rem).unwrap_or(0).saturating_add(1));
     let _ = f.take(cap).read_to_end(&mut buf);
     lossy(buf)
 }

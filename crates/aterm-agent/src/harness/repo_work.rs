@@ -1555,7 +1555,7 @@ fn submodule_records(
     )
 }
 
-fn open_git_file(path: &Path) -> Option<std::fs::File> {
+fn open_git_file(path: &Path) -> Option<(std::fs::File, std::fs::Metadata)> {
     #[cfg(unix)]
     let file = {
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -1572,7 +1572,8 @@ fn open_git_file(path: &Path) -> Option<std::fs::File> {
         }
         std::fs::File::open(path).ok()?
     };
-    file.metadata().ok()?.is_file().then_some(file)
+    let meta = file.metadata().ok()?;
+    meta.is_file().then_some((file, meta))
 }
 
 /// The boundary commits of the shallow clone at `dir` (its `shallow` file, the first
@@ -1582,7 +1583,12 @@ fn open_git_file(path: &Path) -> Option<std::fs::File> {
 fn shallow_roots(dir: &Path, reads: &Reads<'_>) -> Option<std::collections::HashSet<String>> {
     let at = git_offline(dir, &["rev-parse", "--git-path", "shallow"], reads, None)?;
     let mut text = String::new();
-    if let Some(file) = open_git_file(&dir.join(at.trim_end_matches(['\n', '\r']))) {
+    if let Some((file, meta)) = open_git_file(&dir.join(at.trim_end_matches(['\n', '\r']))) {
+        text.reserve(
+            usize::try_from(meta.len().min(SHALLOW_BYTES))
+                .unwrap_or(0)
+                .saturating_add(1),
+        );
         let _ =
             std::io::Read::read_to_string(&mut std::io::Read::take(file, SHALLOW_BYTES), &mut text);
     }
@@ -1603,10 +1609,14 @@ fn shallow_roots(dir: &Path, reads: &Reads<'_>) -> Option<std::collections::Hash
 /// cut.
 fn remote_fetch_heads(dir: &Path, reads: &Reads<'_>) -> Option<Vec<String>> {
     let at = git_offline(dir, &["rev-parse", "--git-path", "FETCH_HEAD"], reads, None)?;
-    let Some(file) = open_git_file(&dir.join(at.trim_end_matches(['\n', '\r']))) else {
+    let Some((file, meta)) = open_git_file(&dir.join(at.trim_end_matches(['\n', '\r']))) else {
         return Some(Vec::new());
     };
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(meta.len().min(FETCH_HEAD_BYTES))
+            .unwrap_or(0)
+            .saturating_add(1),
+    );
     let _ =
         std::io::Read::read_to_end(&mut std::io::Read::take(file, FETCH_HEAD_BYTES), &mut bytes);
     let text = String::from_utf8_lossy(&bytes);
@@ -2278,12 +2288,8 @@ fn without_lagging_submodules(
 /// bytes; `None` where it is no file or cannot be read.
 fn reflog_tail(path: &Path) -> Option<std::fs::File> {
     use std::io::{Read as _, Seek as _, SeekFrom};
-    let mut file = std::fs::File::open(path).ok()?;
-    let len = file
-        .metadata()
-        .ok()
-        .filter(std::fs::Metadata::is_file)?
-        .len();
+    let (mut file, meta) = open_git_file(path)?;
+    let len = meta.len();
     let from = len.saturating_sub(LAG_REFLOG);
     if from > 0 {
         // From the byte before `from`: a line that starts at `from` is whole.

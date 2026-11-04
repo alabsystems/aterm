@@ -273,7 +273,8 @@ fn read_drift_file(path: &str, max_bytes: u64) -> io::Result<String> {
         )));
     }
     let cap = usize::try_from(max_bytes).unwrap_or(usize::MAX);
-    let mut text = String::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
+    let mut text =
+        String::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
     file.take(max_bytes.saturating_add(1))
         .read_to_string(&mut text)
         .map_err(map_err)?;
@@ -780,10 +781,8 @@ mod tests {
         use std::io::BufRead as _;
         use std::os::unix::net::UnixListener;
         const CAST: &str = "{\"version\": 2, \"width\": 20, \"height\": 8}\n[0.1, \"o\", \"hi\"]\n";
-        let dir = std::env::temp_dir().join(format!("aterm-ctl-drift-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let sock = dir.join("old.sock");
-        let _ = std::fs::remove_file(&sock);
+        let scratch = crate::test_scratch_dir("drift");
+        let sock = scratch.path().join("old.sock");
         let listener = UnixListener::bind(&sock).expect("bind");
         let server = std::thread::spawn(move || {
             let mut seen = Vec::new();
@@ -850,8 +849,6 @@ mod tests {
                 "@s-x cast drift",
             ]
         );
-        let _ = std::fs::remove_file(&sock);
-        let _ = std::fs::remove_dir(&dir);
     }
 
     /// The offline form with no analyzer refuses by name, and with a selector is
@@ -874,9 +871,8 @@ mod tests {
             missing.to_string().contains("/nonexistent.cast"),
             "{missing}"
         );
-        let dir = std::env::temp_dir().join(format!("aterm-ctl-offline-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let file = dir.join("saved.cast");
+        let scratch = crate::test_scratch_dir("offline");
+        let file = scratch.path().join("saved.cast");
         std::fs::write(&file, "{\"version\": 2, \"width\": 20, \"height\": 8}\n").expect("write");
         let saved = strings(&["cast", "drift", "--file", file.to_str().expect("utf8")]);
         let unknown = LocalVerbs {
@@ -897,7 +893,5 @@ mod tests {
             offline_entry(&saved, &pre_undo).expect("refused by the analyzer"),
             Some(ExitCode::FAILURE)
         );
-        let _ = std::fs::remove_file(&file);
-        let _ = std::fs::remove_dir(&dir);
     }
 }

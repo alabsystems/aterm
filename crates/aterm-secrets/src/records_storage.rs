@@ -22,6 +22,13 @@ const MAGIC: &str = "aterm-records-layout/1";
 const PIN_MAGIC: &str = "aterm-records-pin/1";
 const META_LIMIT: usize = 1024;
 
+/// No data or transition witness exists at this logical entry.
+pub(crate) fn absent(entry: &Path) -> Result<bool> {
+    Ok(fsx::kind(entry)? == fsx::Kind::Missing
+        && fsx::kind(&pin_path(entry)?)? == fsx::Kind::Missing
+        && fsx::kind(&intent_path(entry)?)? == fsx::Kind::Missing)
+}
+
 fn refused(why: &str) -> Error {
     Error::new(format!("membership records storage: {why}"))
 }
@@ -89,6 +96,27 @@ fn recover_locked(entry: &Path) -> Result<()> {
 /// its records writer lock throughout selection and publication.
 pub(crate) fn write_path(entry: &Path, fence: bool) -> Result<WriteTarget> {
     let guard = writer_lock(entry)?;
+    select_write_path(entry, fence, guard)
+}
+
+/// Accept a snapshot only while its file is unchanged, before preparing any layout or
+/// raising its capacity. The returned target keeps that comparison and the write atomic
+/// with respect to other writers using the records lock.
+pub(crate) fn write_path_if_unchanged(
+    entry: &Path,
+    fence: bool,
+    expected: Option<fsx::FileStamp>,
+) -> Result<WriteTarget> {
+    let guard = writer_lock(entry)?;
+    if fsx::stamp_if_present(&data_path(entry)?)? != expected {
+        return Err(refused(
+            "the records changed since this writer read them; retry after reading",
+        ));
+    }
+    select_write_path(entry, fence, guard)
+}
+
+fn select_write_path(entry: &Path, fence: bool, guard: WriterLock) -> Result<WriteTarget> {
     recover_locked(entry)?;
     if fence && fsx::kind(entry)? != fsx::Kind::Dir {
         Context::new(entry)?.prepare(|_| Ok(()))?;
@@ -106,7 +134,16 @@ pub(crate) fn write_path(entry: &Path, fence: bool) -> Result<WriteTarget> {
 /// lock, including when separate servers share a store directory.
 pub(crate) struct WriteTarget {
     path: PathBuf,
-    _guard: File,
+    _guard: WriterLock,
+}
+
+/// Release the logical writer even while a forked child retains its file description.
+struct WriterLock(File);
+
+impl Drop for WriterLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
 }
 
 impl std::ops::Deref for WriteTarget {
@@ -123,7 +160,7 @@ impl AsRef<Path> for WriteTarget {
     }
 }
 
-fn writer_lock(entry: &Path) -> Result<File> {
+fn writer_lock(entry: &Path) -> Result<WriterLock> {
     let context = Context::new(entry)?;
     let file = File::from(syscall(fd::openat(
         &context.parent,
@@ -134,10 +171,10 @@ fn writer_lock(entry: &Path) -> Result<File> {
     private_file(&file, 0)?;
     #[expect(
         clippy::disallowed_methods,
-        reason = "exclusive records writer lock; the unshared CLOEXEC descriptor releases it on drop"
+        reason = "exclusive records writer lock; WriterLock releases it by LOCK_UN before close"
     )]
     file.lock()?;
-    Ok(file)
+    Ok(WriterLock(file))
 }
 
 fn check_capacity(required: usize) -> Result<()> {
@@ -749,6 +786,40 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_snapshot_never_prepares_or_raises_the_layout() {
+        for fenced in [false, true] {
+            let (_root, entry) = fixture();
+            let path = if fenced {
+                budget(32).within(|| prepare_path(&entry))
+            } else {
+                entry.clone()
+            };
+            let expected = fsx::stamp(&path);
+            fsx::write_atomic(&path, b"another writer's newer history", 0o600).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            budget(64).within(|| {
+                assert!(write_path_if_unchanged(&entry, true, expected).is_err());
+            });
+            budget(32).within(|| {
+                assert_eq!(data_path(&entry).unwrap(), path);
+                assert_eq!(std::fs::read(&path).unwrap(), before);
+            });
+            assert_eq!(pin_path(&entry).unwrap().exists(), fenced);
+        }
+    }
+
+    #[test]
+    fn an_absent_snapshot_refuses_a_new_file_before_preparing_a_layout() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let entry = root.path().join("records");
+        fsx::write_atomic(&entry, b"new history", 0o600).unwrap();
+        assert!(write_path_if_unchanged(&entry, true, None).is_err());
+        assert_eq!(std::fs::read(&entry).unwrap(), b"new history");
+        assert!(!pin_path(&entry).unwrap().exists());
+        assert!(!intent_path(&entry).unwrap().exists());
+    }
+
+    #[test]
     fn a_larger_writer_fences_format_aware_smaller_readers_before_changing_data() {
         let (_root, entry) = fixture();
         let data = budget(32).within(|| prepare_path(&entry));
@@ -793,6 +864,9 @@ mod tests {
     fn the_write_target_keeps_a_process_shared_lock_until_the_write_finishes() {
         let (_root, entry) = fixture();
         let target = write_path(&entry, true).unwrap();
+        // A sibling fork retains this open file description until it execs. Keep a copy
+        // here so releasing the logical writer cannot depend on that scheduling window.
+        let inherited = target._guard.0.try_clone().unwrap();
         let other = fsx::open_lock(&entry.with_file_name("records.writing")).unwrap();
         #[expect(
             clippy::disallowed_methods,
@@ -808,6 +882,8 @@ mod tests {
         )]
         let after = other.try_lock();
         after.unwrap();
+        other.unlock().unwrap();
+        drop(inherited);
     }
 
     #[test]

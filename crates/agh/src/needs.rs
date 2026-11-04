@@ -288,10 +288,7 @@ mod tests {
 
     /// A scratch root.
     fn scratch() -> aterm_tempfile::TempDir {
-        aterm_tempfile::Builder::new()
-            .prefix("agh-needs-")
-            .tempdir()
-            .expect("a scratch directory")
+        crate::test_fixtures::scratch_dir("needs")
     }
 
     /// The mode bits of `path`.

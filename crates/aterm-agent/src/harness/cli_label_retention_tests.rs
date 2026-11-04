@@ -244,7 +244,8 @@ fn creation_case(case: i64, cli: Cli) -> (i64, i64, i64) {
             }
             result.is_ok()
         } else {
-            run_accounts_adopt(cli, &env, &host, &row, &mut out, &mut err) == ExitCode::SUCCESS
+            run_accounts_adopt(cli, &env, &host, &row, None, &mut out, &mut err)
+                == ExitCode::SUCCESS
         }
     });
     let after = data_files(tmp.path());

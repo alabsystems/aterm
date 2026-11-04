@@ -11,12 +11,13 @@
 //! sample its caller read and, for Codex, OpenAI's `/wham/usage` endpoint for the row launched.
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::accounts::{
     self, Advice, Cli, Mode, Point, Roster, Row, Sample, StayWhy, Store, Supervisor,
 };
+use super::accounts_step::Step;
 pub use super::codex_app_login::Reading;
 use super::codex_app_login::Usage;
 use super::provider_read;
@@ -171,7 +172,37 @@ pub struct Seat<'a> {
     pub now: i64,
 }
 
+/// A [`Seat`]'s store and roster path, held for a [`SyncHere`].
+#[derive(Debug)]
+pub struct SeatSync {
+    store: Store,
+    roster: PathBuf,
+    now: i64,
+}
+
+impl SeatSync {
+    /// The [`SyncHere`] these name.
+    #[must_use]
+    pub fn here(&self) -> SyncHere<'_> {
+        SyncHere {
+            store: &self.store,
+            roster: &self.roster,
+            now: self.now,
+        }
+    }
+}
+
 impl Seat<'_> {
+    /// What a sync of `cli` with no source named reads on this seat ([`SyncHere`]).
+    #[must_use]
+    pub fn sync_here(&self, cli: Cli) -> SeatSync {
+        SeatSync {
+            store: self.store(cli),
+            roster: self.config_dir.join(cli.accounts().roster_file),
+            now: self.now,
+        }
+    }
+
     /// `cli`'s roster: an empty one where it has no file.
     ///
     /// # Errors
@@ -261,7 +292,7 @@ pub const NO_WORKER: &str = "; no worker was started";
 /// under rotation off no row.
 #[must_use]
 pub fn unpin_line(cli: Cli) -> String {
-    format!("aterm harness accounts use --auto --cli {}", cli.id())
+    super::accounts_step::Step::Auto(cli).to_string()
 }
 
 /// What a launch of a pooled CLI under one row sets in the program's environment.
@@ -403,8 +434,7 @@ pub fn prepare_google_worker(
                 program,
                 seat.state,
                 &row.label,
-                row.email
-                    .as_deref()
+                row.expected_identity_email()
                     .ok_or("Native Google row has no expected email")?,
                 profile,
                 std::time::Instant::now() + Duration::from_secs(30),
@@ -668,22 +698,180 @@ pub fn check_launch_login_identity(
     roster: &Roster,
     picked: Option<&Row>,
     home: &Path,
-) -> io::Result<()> {
+    program: Option<&Path>,
+    sync: Option<SyncHere<'_>>,
+) -> Result<(), IdentityRefusal> {
     if cli == Cli::Codex
         && !keyring_held_in(cli, home)
         && let Some(row) = picked.or_else(|| roster.row_for_login(None))
     {
-        check_login_identity(cli, row, home)?;
+        check_login_identity(cli, row, home).map_err(|why| {
+            let moved = row
+                .dir
+                .is_none()
+                .then(|| accounts::default_login_address(cli, home))
+                .flatten()
+                .filter(|address| {
+                    row.expected_identity_email()
+                        .is_some_and(|expected| !accounts::email_matches(expected, address))
+                });
+            match moved {
+                Some(address) => {
+                    let end = default_moved_end(cli, row, program, sync);
+                    IdentityRefusal::DefaultMoved {
+                        words: default_moved_words(&address, &end),
+                        row: row.label.clone(),
+                        step: end.step,
+                    }
+                }
+                None => IdentityRefusal::Login(format!(
+                    "{why}: `{}`",
+                    row_sign_in_step(cli, row, program)
+                )),
+            }
+        })?;
     }
     Ok(())
+}
+
+/// Why a launch's login is refused ([`check_launch_login_identity`]), which is what says whether a
+/// row on a moved default login is why a launch does not run, rather than a pin or a wall beside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdentityRefusal {
+    /// `row`, the row on the default login, whose login names another account: `step` ends it.
+    DefaultMoved {
+        /// The row.
+        row: String,
+        /// The step that ends it ([`DefaultMovedEnd`]).
+        step: Step,
+        /// A surface's words ([`default_moved_words`]).
+        words: String,
+    },
+    /// Any other identity the login does not hold: the words, with the row's sign-in.
+    Login(String),
+}
+
+impl std::fmt::Display for IdentityRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DefaultMoved { words, .. } => f.write_str(words),
+            Self::Login(words) => f.write_str(words),
+        }
+    }
+}
+
+/// Where a sync with no source named would read for this pool, so a surface can ask what that sync
+/// does ([`super::accounts_sync::default_move_verdict`]) before naming it.
+#[derive(Debug, Clone, Copy)]
+pub struct SyncHere<'a> {
+    /// The pool's store.
+    pub store: &'a Store,
+    /// The roster it keeps, beside `aterm.toml`.
+    pub roster: &'a Path,
+    /// Now, unix seconds.
+    pub now: i64,
+}
+
+/// The sign-in that makes `row`'s login its own: its own sign-in, or where `program` keeps no row's
+/// login its own ([`super::codex_alab::auth_path_unread`]) and the row is on the default login, the
+/// vendor's in that home, since `accounts login` refuses it there
+/// ([`super::codex_alab::default_row_staging`]).
+#[must_use]
+pub fn row_sign_in_step(cli: Cli, row: &Row, program: Option<&Path>) -> Step {
+    if row.dir.is_none() {
+        default_row_sign_in_step(cli, &row.label, program)
+    } else {
+        Step::Login(cli, row.label.clone())
+    }
+}
+
+/// [`row_sign_in_step`] of `label`, the row on the default login.
+#[must_use]
+pub fn default_row_sign_in_step(cli: Cli, label: &str, program: Option<&Path>) -> Step {
+    if program.is_some_and(|program| super::codex_alab::auth_path_unread(program).is_some()) {
+        Step::VendorLogin(cli)
+    } else {
+        Step::Login(cli, label.to_owned())
+    }
+}
+
+/// What ends a row on the default login's being refused while that login names another account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefaultMovedEnd {
+    /// The one step that ends it: the sync where that sync moves the row, else the row's sign-in
+    /// ([`row_sign_in_step`]), and for a row another Mac keeps, which signs it in, the report.
+    pub step: Step,
+    /// Why a sync moves nothing here, where a row names that account and the sync refuses the move.
+    pub sync_refused: Option<String>,
+}
+
+/// [`DefaultMovedEnd`] of `row` on the verdict of the sync itself
+/// ([`super::accounts_sync::default_move_verdict`]). With no `sync` to ask, the row's sign-in, which
+/// is the step that holds whatever that sync would do.
+#[must_use]
+pub fn default_moved_end(
+    cli: Cli,
+    row: &Row,
+    program: Option<&Path>,
+    sync: Option<SyncHere<'_>>,
+) -> DefaultMovedEnd {
+    use super::accounts_sync::DefaultMove;
+    if row.held_by.is_some() {
+        return DefaultMovedEnd {
+            step: Step::Report(cli),
+            sync_refused: None,
+        };
+    }
+    let verdict = sync.map_or(DefaultMove::Stays, |sync| {
+        super::accounts_sync::default_move_verdict(sync)
+    });
+    match verdict {
+        DefaultMove::Moves => DefaultMovedEnd {
+            step: Step::Sync(cli),
+            sync_refused: None,
+        },
+        DefaultMove::Stays => DefaultMovedEnd {
+            step: row_sign_in_step(cli, row, program),
+            sync_refused: None,
+        },
+        DefaultMove::Refused(why) => DefaultMovedEnd {
+            step: row_sign_in_step(cli, row, program),
+            sync_refused: Some(why),
+        },
+    }
+}
+
+/// What a surface says of a row on the default login that names `address`, another account, and of
+/// the step that ends it: what that sync would say where it refuses.
+#[must_use]
+pub fn default_moved_words(address: &str, end: &DefaultMovedEnd) -> String {
+    let step = &end.step;
+    let what = match step {
+        Step::Sync(_) => "moves this row off it",
+        Step::Report(_) => "says which Mac keeps this row",
+        Step::VendorLogin(_) => "signs that login in as this row",
+        _ => "signs this row in again",
+    };
+    match &end.sync_refused {
+        Some(why) => format!(
+            "the default login names {address}: `{step}` {what}; a sync moves no row here: {why}"
+        ),
+        None => format!("the default login names {address}: `{step}` {what}"),
+    }
 }
 
 /// Check a known Codex default row before a launch passes its login through unchanged.
 ///
 /// # Errors
 /// As [`check_launch_login_identity`] for the default row.
-pub fn check_default_login_identity(cli: Cli, roster: &Roster, home: &Path) -> io::Result<()> {
-    check_launch_login_identity(cli, roster, None, home)
+pub fn check_default_login_identity(
+    cli: Cli,
+    roster: &Roster,
+    home: &Path,
+    program: Option<&Path>,
+    sync: Option<SyncHere<'_>>,
+) -> Result<(), IdentityRefusal> {
+    check_launch_login_identity(cli, roster, None, home, program, sync)
 }
 
 /// [`accounts::login_env_for`] for `row`, once `cli`'s overlay home for it links the shared
@@ -959,13 +1147,14 @@ fn usage_due(seat: &Seat<'_>, cli: Cli, before: &PoolSnapshot, row: &Row) -> boo
     })
 }
 
-/// The most rows one launch reads ([`read_launch_rows`]). A pool whose picks keep turning out
-/// spent starts on what it knows after this many, so a launch never becomes a sweep of the pool.
+/// The most rows one launch reads ([`read_launch_rows`]), a cold relaunch's read of the row it ran
+/// on included ([`cold_launch_env`]). A pool whose picks keep turning out spent starts on what it
+/// knows after this many, so a launch never becomes a sweep of the pool.
 pub const LAUNCH_READS: usize = 3;
 
 /// The owner's no-polling rule at a launch: only the row the launch is about to start on is read.
 /// The row is picked from what is on record; a read that shows it cannot serve (a wall, a sign-out)
-/// makes the next pick the row being launched, up to [`LAUNCH_READS`]. Where nothing on record
+/// makes the next pick the row being launched, up to `reads` rows. Where nothing on record
 /// serves, a row known signed out is the one left to try, so a login signed in again by hand comes
 /// back. Every other row's figures stay as they were read, with their age.
 ///
@@ -979,10 +1168,11 @@ fn read_launch_rows(
     enrolled: &std::collections::BTreeSet<String>,
     unread: Option<&super::codex_alab::AuthPathUnread>,
     read: ReadUsage<'_>,
+    reads: usize,
 ) -> Result<(), String> {
     let roster = snapshot.roster.clone();
     let mut asked = std::collections::BTreeSet::new();
-    while asked.len() < LAUNCH_READS {
+    while asked.len() < reads {
         let picked = pick_row(cli, &roster, &snapshot.state, enrolled, unread, seat.now);
         let next = picked.ok().or_else(|| {
             roster.rows.iter().find(|row| {
@@ -1159,6 +1349,95 @@ fn poll_usage(
     Ok((snapshot_held(seat, cli, &store, &held)?.state, true))
 }
 
+/// What a handoff read of one row it might move a session to, and the credential it read under.
+#[derive(Debug)]
+pub(super) struct FreshRead {
+    /// The row.
+    pub label: String,
+    /// The login's context as it stood before the read; `None` where it could not be captured.
+    pub context: Option<accounts::AuthContext>,
+    /// What it read.
+    pub usage: super::codex_app_login::Usage,
+}
+
+/// Records what a handoff read of `reads`' rows, as [`poll_usage`] records a launch's read, so a
+/// report and a later writer judge each row by it: a row whose credential changed during its read
+/// or that is gone keeps what it had.
+///
+/// # Errors
+/// The records could not be locked or written.
+/// The steps of [`accounts::LOCK_LADDER`] that fit in `wait`: a record that a caller's deadline
+/// does not hang on gives way to that deadline.
+pub(super) fn ladder_within(wait: std::time::Duration) -> Vec<std::time::Duration> {
+    let mut left = wait;
+    accounts::LOCK_LADDER
+        .iter()
+        .copied()
+        .take_while(|pause| {
+            let fits = *pause <= left;
+            left = left.saturating_sub(*pause);
+            fits
+        })
+        .collect()
+}
+
+pub(super) fn note_fresh_reads(
+    seat: &Seat<'_>,
+    cli: Cli,
+    reads: &[FreshRead],
+    wait: std::time::Duration,
+) -> Result<(), String> {
+    if reads.is_empty() {
+        return Ok(());
+    }
+    let store = seat.store(cli);
+    let path = seat.config_dir.join(cli.accounts().roster_file);
+    store
+        .transact_pool_logins_within(
+            &ladder_within(wait),
+            &path,
+            seat.now,
+            &mut None,
+            |raw, state, logins| {
+                let current = accounts::bound(raw, logins);
+                let mut events = Vec::new();
+                for read in reads {
+                    let Some(row) = current.row(&read.label) else {
+                        continue;
+                    };
+                    if read.context.is_none() || store.capture_auth_context(row) != read.context {
+                        continue;
+                    }
+                    let renewed = logins.get(&read.label).and_then(|b| b.renewed_at);
+                    let sample = &read.usage.sample;
+                    if sample.at > seat.now || renewed.is_some_and(|at| sample.at < at) {
+                        continue;
+                    }
+                    let noted = accounts::note_sample(state, &read.label, sample.clone(), seat.now);
+                    if !noted.is_empty()
+                        && let Some(account) = state.accounts.get_mut(&read.label)
+                    {
+                        account.sample_context = Some(sample_context(seat, cli, row, logins));
+                    }
+                    events.extend(noted);
+                    for &(window, until) in &read.usage.walls {
+                        events.extend(accounts::note_wall(
+                            state,
+                            &read.label,
+                            window,
+                            until,
+                            seat.now,
+                            seat.now,
+                        ));
+                    }
+                }
+                Ok(events)
+            },
+        )
+        .map(|_| ())
+        .map_err(|why| why.to_string())
+}
+
 /// Test seam: a row at a time, as many launches would, each of `roster`'s rows of `cli` whose login
 /// is here and whose sample is due, through [`poll_usage`]; the labels read. The mechanics of one
 /// read are tested through this; nothing in the product reads more than the launching row.
@@ -1248,7 +1527,18 @@ pub fn launch_env_for(
     read: ReadUsage<'_>,
     program: Option<&Path>,
 ) -> Result<Option<LoginEnv>, String> {
+    let sync = seat.sync_here(cli);
     launch_env_using(seat, cli, read, program, |row| {
+        // A refusal of the login a row names says what ends it, as every other surface does.
+        check_launch_login_identity(
+            cli,
+            &Roster::default(),
+            Some(row),
+            seat.home,
+            program,
+            Some(sync.here()),
+        )
+        .map_err(|why| io::Error::other(why.to_string()))?;
         login_env(cli, row, seat.home)
     })
 }
@@ -1352,7 +1642,14 @@ pub fn default_serving<'a>(
 /// contradicts its row's expected identity.
 pub fn default_row_now(seat: &Seat<'_>, cli: Cli) -> Result<super::codex_alab::DefaultRow, String> {
     let roster = seat.bound_roster(cli)?;
-    check_default_login_identity(cli, &roster, seat.home).map_err(|why| why.to_string())?;
+    check_default_login_identity(
+        cli,
+        &roster,
+        seat.home,
+        None,
+        Some(seat.sync_here(cli).here()),
+    )
+    .map_err(|why| why.to_string())?;
     let (state, _) = seat
         .store(cli)
         .load(seat.now)
@@ -1471,8 +1768,9 @@ pub fn off_launch<'a>(
 /// roster, or its row is not signed in here; on a Codex program that keeps no row's login its
 /// own ([`super::codex_alab::auth_path_unread`]), the pin is on a row of its own, or the row on
 /// this machine's own login cannot serve; under rotation off, the recorded claims keep the pin's
-/// row from this Mac ([`off_launch`]); a preparation-only hold stands on the default row; or no
-/// row is usable.
+/// row from this Mac ([`off_launch`]); a preparation-only hold stands on the default row; the
+/// login home of the row it would take, the owner's pin's or every usable one's, is made nowhere
+/// here ([`super::accounts_overlay::unmade_here`]); or no row is usable.
 pub fn launch_now<'a>(
     (cli, keyring, mode): (Cli, bool, Mode),
     roster: &'a Roster,
@@ -1487,7 +1785,13 @@ pub fn launch_now<'a>(
     let unread = default_only(cli, roster, program);
     let unread = unread.as_ref();
     if mode == Mode::Off {
-        return off_pick(cli, roster, state, enrolled, unread, now);
+        let pinned = off_pick(cli, roster, state, enrolled, unread, now)?;
+        // The launch prepares the pin's login after its claim verdict: a home made nowhere here
+        // refuses it ([`super::accounts_overlay::unmade_here`]).
+        if let Some(why) = pinned.and_then(|row| super::accounts_overlay::unmade_here(cli, row)) {
+            return Err(why.to_string());
+        }
+        return Ok(pinned);
     }
     if let Some(why) = unread
         && let Some(pinned) = pinned_own(roster, state)
@@ -1499,7 +1803,24 @@ pub fn launch_now<'a>(
         default_execution(cli, roster, state)?;
         return Ok(None);
     }
-    pick_row(cli, roster, state, enrolled, unread, now).map(Some)
+    // As the launch sets aside a row whose login cannot be prepared and picks again, refusing in
+    // that preparation's words when the owner's pin is on it or no row is left. The records are
+    // copied only once a pick is set aside.
+    let mut row = pick_row(cli, roster, state, enrolled, unread, now)?;
+    let mut excluded = std::collections::BTreeSet::new();
+    loop {
+        let Some(why) = super::accounts_overlay::unmade_here(cli, row) else {
+            return Ok(Some(row));
+        };
+        if (state.pinned && state.active.as_deref() == Some(row.label.as_str()))
+            || !excluded.insert(row.label.clone())
+        {
+            return Err(why.to_string());
+        }
+        let candidates = without_failed_preparations(state, &excluded);
+        row = pick_row(cli, roster, &candidates, enrolled, unread, now)
+            .map_err(|_| why.to_string())?;
+    }
 }
 
 /// Observe the login a launch would take after rejecting known stored identity contradictions.
@@ -1515,11 +1836,30 @@ pub fn launch_observed<'a>(
     enrolled: &std::collections::BTreeSet<String>,
     program: Option<&Path>,
     now: i64,
-    home: &Path,
+    (home, sync): (&Path, Option<SyncHere<'_>>),
 ) -> Result<Option<&'a Row>, String> {
     launch_observed_with(policy, roster, state, enrolled, program, now, |picked| {
-        check_launch_login_identity(policy.0, roster, picked, home).map_err(|why| why.to_string())
+        check_launch_login_identity(policy.0, roster, picked, home, program, sync)
     })
+    .map_err(|why| why.to_string())
+}
+
+/// Why a launch [`launch_observed_with`] judged is refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LaunchRefused {
+    /// The pool's own rule, in its words.
+    Pool(String),
+    /// What the login it would take names.
+    Identity(IdentityRefusal),
+}
+
+impl std::fmt::Display for LaunchRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pool(words) => f.write_str(words),
+            Self::Identity(why) => why.fmt(f),
+        }
+    }
 }
 
 pub(crate) fn launch_observed_with<'a>(
@@ -1529,10 +1869,11 @@ pub(crate) fn launch_observed_with<'a>(
     enrolled: &std::collections::BTreeSet<String>,
     program: Option<&Path>,
     now: i64,
-    mut check_identity: impl FnMut(Option<&Row>) -> Result<(), String>,
-) -> Result<Option<&'a Row>, String> {
+    mut check_identity: impl FnMut(Option<&Row>) -> Result<(), IdentityRefusal>,
+) -> Result<Option<&'a Row>, LaunchRefused> {
     if policy.0 != Cli::Codex || takes_no_row(policy.0, policy.1) {
-        return launch_now(policy, roster, state, enrolled, program, now);
+        return launch_now(policy, roster, state, enrolled, program, now)
+            .map_err(LaunchRefused::Pool);
     }
     let mut excluded = std::collections::BTreeSet::new();
     let mut last_identity_error = None;
@@ -1542,7 +1883,7 @@ pub(crate) fn launch_observed_with<'a>(
             Ok(picked) => picked,
             Err(why) => {
                 if let Some(identity) = last_identity_error.take() {
-                    return Err(identity);
+                    return Err(LaunchRefused::Identity(identity));
                 }
                 if default_only_now(policy.0, roster, &candidates, enrolled, program, now)
                     .is_some_and(|rule| {
@@ -1553,9 +1894,9 @@ pub(crate) fn launch_observed_with<'a>(
                     })
                 {
                     // A wall's end can restore quota, not a contradictory default identity.
-                    check_identity(roster.row_for_login(None))?;
+                    check_identity(roster.row_for_login(None)).map_err(LaunchRefused::Identity)?;
                 }
-                return Err(why);
+                return Err(LaunchRefused::Pool(why));
             }
         };
         let why = match check_identity(picked) {
@@ -1563,12 +1904,12 @@ pub(crate) fn launch_observed_with<'a>(
             Err(why) => why,
         };
         let Some(row) = picked else {
-            return Err(why);
+            return Err(LaunchRefused::Identity(why));
         };
         if (state.pinned && state.active.as_deref() == Some(row.label.as_str()))
             || !excluded.insert(row.label.clone())
         {
-            return Err(why);
+            return Err(LaunchRefused::Identity(why));
         }
         last_identity_error = Some(why);
     }
@@ -1636,9 +1977,9 @@ fn pick_row<'a>(
 /// A launch's refusal where `cli`'s pool has no usable row.
 fn unusable(cli: Cli) -> String {
     format!(
-        "{} account pool has no usable account; inspect `aterm harness accounts --cli {}`",
+        "{} account pool has no usable account; inspect `{}`",
         cli.id(),
-        cli.id()
+        super::accounts_step::Step::Report(cli)
     )
 }
 
@@ -1767,6 +2108,18 @@ fn launch_env_using(
     cli: Cli,
     read: ReadUsage<'_>,
     program: Option<&Path>,
+    prepare: impl FnMut(&Row) -> io::Result<LoginEnv>,
+) -> Result<Option<LoginEnv>, String> {
+    launch_env_reading(seat, cli, read, program, LAUNCH_READS, prepare)
+}
+
+/// [`launch_env_using`] reading at most `reads` rows' usage ([`read_launch_rows`]).
+fn launch_env_reading(
+    seat: &Seat<'_>,
+    cli: Cli,
+    read: ReadUsage<'_>,
+    program: Option<&Path>,
+    reads: usize,
     mut prepare: impl FnMut(&Row) -> io::Result<LoginEnv>,
 ) -> Result<Option<LoginEnv>, String> {
     // The gate [`off_launch`] holds rotation off's pick to too.
@@ -1787,7 +2140,14 @@ fn launch_env_using(
     if configured_mode == Mode::Off {
         let Some(pinned) = off_pick(cli, roster, &snapshot.state, &enrolled, unread, seat.now)?
         else {
-            check_default_login_identity(cli, roster, seat.home).map_err(|why| why.to_string())?;
+            check_default_login_identity(
+                cli,
+                roster,
+                seat.home,
+                program,
+                Some(seat.sync_here(cli).here()),
+            )
+            .map_err(|why| why.to_string())?;
             return Ok(None);
         };
         // Rotation off moves nothing, and still never starts on another Mac's account: the pin's
@@ -1835,10 +2195,17 @@ fn launch_env_using(
     };
     if lone_default(roster, pinned) {
         default_execution(cli, roster, &snapshot.state)?;
-        check_default_login_identity(cli, roster, seat.home).map_err(|why| why.to_string())?;
+        check_default_login_identity(
+            cli,
+            roster,
+            seat.home,
+            program,
+            Some(seat.sync_here(cli).here()),
+        )
+        .map_err(|why| why.to_string())?;
         return Ok(None);
     }
-    read_launch_rows(seat, cli, &mut snapshot, &enrolled, unread, read)?;
+    read_launch_rows(seat, cli, &mut snapshot, &enrolled, unread, read, reads)?;
     let mut state = snapshot.state.clone();
     if let Some(why) = unread
         && let Some(pinned) = pinned_own(roster, &state)
@@ -1946,12 +2313,19 @@ pub fn launch_opening(seat: &Seat<'_>, cli: Cli, program: Option<&Path>) -> Opti
 /// launch carried) is now limited, signed out, not signed in here, or held by another Mac's
 /// account claim (or unclaimed where this Mac cannot record its claim on a row that is not its
 /// home): the serving row's ([`launch_env_for`], so on a Codex program that keeps no row's login
-/// its own only the row on this machine's own login). `None` keeps the row it ran on (having
-/// claimed it where claims apply): that row still serves, it ran on no row of the bound roster (a
-/// home or credential of its own), the pool has fewer than two rows, no row the program may run
-/// serves (the launch then fails as it would have, and a conversation on this machine's own login
-/// relaunches on it), or rotation is off for `cli` ([`Seat::mode_for`]: `[harness] accounts =
-/// "off"`, or the harness or `cli` switched off), which moves no session.
+/// its own only the row on this machine's own login). Where the records say the row it ran on
+/// still serves, that row is the one the relaunch is about to start on, so its usage is read with
+/// `read` first where it is due ([`usage_due`], as a launch reads the row it starts on, and on a
+/// Codex program that keeps no row's login its own only the row on this machine's own login) and
+/// it is judged again: a limit that session met while it ran moves its relaunch though nothing
+/// recorded it yet; a read that cannot be recorded leaves the judgment to the records as they
+/// stand. That read counts against the [`LAUNCH_READS`] the serving row's pick may then make.
+/// `None` keeps the row it ran on (having claimed it where claims apply): that row still
+/// serves, it ran on no row of the bound roster (a home or credential of its own), the pool has
+/// fewer than two rows, no row the program may run serves (the launch then fails as it would
+/// have, and a conversation on this machine's own login relaunches on it), or rotation is off for
+/// `cli` ([`Seat::mode_for`]: `[harness] accounts = "off"`, or the harness or `cli` switched off),
+/// which moves no session.
 #[must_use]
 pub fn cold_launch_env(
     seat: &Seat<'_>,
@@ -1964,29 +2338,38 @@ pub fn cold_launch_env(
         return None;
     }
     seat.claim(cli, super::claims::Act::Look);
-    let snapshot = pool_snapshot(seat, cli).ok()?;
+    let mut snapshot = pool_snapshot(seat, cli).ok()?;
     if snapshot.roster.rows.len() < 2 {
         return None;
     }
     let who = accounts::ProcessLogin::of_env_for(cli, env.iter().copied());
     let ran = snapshot
         .roster
-        .row(accounts::judged_label(&snapshot.roster, &who)?)?;
+        .row(accounts::judged_label(&snapshot.roster, &who)?)?
+        .clone();
     let enrolled = accounts::enrolled_in(cli, &snapshot.roster, seat.home);
-    let cond = accounts::condition(
-        ran,
-        &snapshot.state,
-        enrolled.contains(&ran.label),
-        seat.now,
-    );
-    let usable = ran.held_by.is_none()
-        && !matches!(
-            cond,
-            accounts::Condition::Limited { .. }
-                | accounts::Condition::SignedOut
-                | accounts::Condition::NotEnrolled
-        )
-        && snapshot.state.lease_verdict(&ran.label, seat.now).is_ok();
+    let serves = |state: &accounts::State| {
+        ran.held_by.is_none()
+            && !matches!(
+                accounts::condition(&ran, state, enrolled.contains(&ran.label), seat.now),
+                accounts::Condition::Limited { .. }
+                    | accounts::Condition::SignedOut
+                    | accounts::Condition::NotEnrolled
+            )
+            && state.lease_verdict(&ran.label, seat.now).is_ok()
+    };
+    let mut usable = serves(&snapshot.state);
+    let mut reads = LAUNCH_READS;
+    if usable
+        && usage_due(seat, cli, &snapshot, &ran)
+        && (ran.dir.is_none() || default_only(cli, &snapshot.roster, program).is_none())
+    {
+        reads = reads.saturating_sub(1);
+        if let Ok((state, _)) = poll_usage(seat, cli, &snapshot, &ran, read) {
+            snapshot.state = state;
+            usable = serves(&snapshot.state);
+        }
+    }
     if usable {
         let claim = seat.claim(cli, super::claims::Act::Claim(&ran.label));
         let refused = match claim {
@@ -2002,10 +2385,12 @@ pub fn cold_launch_env(
             return None;
         }
     }
-    launch_env_for(seat, cli, read, program)
-        .ok()
-        .flatten()
-        .filter(|pick| pick.label != ran.label)
+    launch_env_reading(seat, cli, read, program, reads, |row| {
+        login_env(cli, row, seat.home)
+    })
+    .ok()
+    .flatten()
+    .filter(|pick| pick.label != ran.label)
 }
 
 /// The login a resume line for a held `cli` conversation names, from
@@ -3581,12 +3966,17 @@ fn record_session<R>(
                 events.extend(accounts::note_sample(state, &row.label, sample, seat.now));
             }
             if let Point::Wall { window, at } = &session.point {
+                let at = at.unwrap_or(seat.now);
                 events.extend(accounts::note_wall(
                     state,
                     &row.label,
                     window,
-                    None,
-                    at.unwrap_or(seat.now),
+                    session
+                        .sample
+                        .as_ref()
+                        .and_then(|sample| sample.reached_reset(window))
+                        .filter(|until| *until > at),
+                    at,
                     seat.now,
                 ));
             }

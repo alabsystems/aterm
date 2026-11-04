@@ -682,3 +682,103 @@ fn a_restore_lines_short_reply_measures_the_back_off_from_the_reply() {
         let _ = std::fs::remove_dir_all(dir);
     }
 }
+
+/// A RESTART PROMPT'S REPLY NO READ SAW RUN IS JUDGED AT THE READ THAT SHOWS IT ANSWERED: the
+/// screen closes its turn on the prompt the harness typed, so its short reply backs off from there
+/// at once. The 2026-11-03 real-Claude flow f2fix (Claude Code 2.1.317, lab stub) read `⏺ Tool call
+/// done.` under the restart prompt half a second after typing it, and the loop still waited 30 s on
+/// `the worker to take the harness-turn@v1 act` (`TurnEndTiming::take_within`) before it judged the
+/// reply. Under Cruise the screen the host types past usually closes on Cruise's own continuation,
+/// which opens with the same harness mark as the restart prompt. CONTROLS, each waiting on the
+/// worker to take the act, the hang detector for a turn no screen shows answered (past it the reply
+/// is judged all the same): a read that shows the restart prompt with no answer under it yet, and
+/// a read that still closes on that continuation, answered when the host typed and not the restart
+/// prompt's reply, the restart prompt's line not yet drawn.
+#[test]
+fn a_restart_prompts_reply_no_read_saw_run_is_judged_when_the_screen_shows_it() {
+    use crate::supervise::policy::turn_end::{TurnEndTiming, WaitKind};
+    const RESTARTED: &str = "[aterm harness] Restarted: someone asked aterm to restart Claude Code \
+        (aterm ctl restart), so this session was ended and restarted on Claude Code 2.1.317 and \
+        resumed.";
+    const TAKE: &str = "the worker to take the harness-turn@v1 act";
+    let screen = |turns: &[(&str, Option<&str>)]| {
+        let mut r = Vec::new();
+        for (prompt, answer) in turns {
+            r.push(format!("❯ {prompt}"));
+            if let Some(answer) = answer {
+                r.push(format!("⏺ {answer}"));
+                r.push(String::new());
+                r.push("✻ Churned for 0s · done 5:10 AM".to_string());
+            }
+            r.push(String::new());
+        }
+        r.extend(composer("  ⏵⏵ bypass permissions on (shift+tab to cycle)"));
+        r
+    };
+    let hi = ("hi", Some("Hi! I am the local lab stub, not a model."));
+    let carried = (
+        "[aterm harness] Continue the task.",
+        Some("Nothing is left to do here."),
+    );
+    let timing = TurnEndTiming::default();
+    #[derive(Clone, Copy, Debug)]
+    enum Read {
+        Answered,
+        Unanswered,
+        Undrawn,
+    }
+    for read in [Read::Answered, Read::Unanswered, Read::Undrawn] {
+        let mut m = Mock::new(vec![busy_screen()]);
+        let (mut s, dir) = policy_session(&mut m, "restart-reply-unseen");
+        let mut opts = hosted(30);
+        opts.policy.autopilot = Autopilot::Cruise;
+        opts.idle_host = Some(Carrier::owing(false) as Arc<dyn IdleHost>);
+        s.program = Some("claude".to_owned());
+        let point = point_at(&s, screen(&[hi, carried]), 1);
+        let first = s.turn_end_at_point(&point, None, &opts);
+        assert!(
+            matches!(first, Ok(TurnEndAction::WaitUntil { .. })),
+            "PRECONDITION ({read:?}): the first short turn's back-off: {first:?}"
+        );
+        s.test_clock()
+            .skip(timing.short_backoff + Duration::from_secs(1));
+        let typed = s.fx.mono();
+        s.turn_end.host_typed(typed, HostTurn::CarryOn);
+        s.test_clock().skip(Duration::from_secs(1));
+        let reply = s.fx.mono();
+        let rows = match read {
+            Read::Answered => screen(&[hi, carried, (RESTARTED, Some("Tool call done."))]),
+            Read::Unanswered => screen(&[hi, carried, (RESTARTED, None)]),
+            Read::Undrawn => screen(&[hi, carried]),
+        };
+        let point = point_at(&s, rows.clone(), 2);
+        let after = s.turn_end_at_point(&point, None, &opts);
+        let backs_off = |a: &Result<TurnEndAction, Fail>, from: Instant| {
+            matches!(a, Ok(TurnEndAction::WaitUntil { until, wait: WaitKind::BackOff { .. }, .. })
+                if *until >= typed + timing.short_backoff
+                    && *until <= from + timing.short_backoff)
+        };
+        if matches!(read, Read::Answered) {
+            assert!(
+                backs_off(&after, reply),
+                "the reply is judged at the read that shows it, its back-off from the reply: \
+                 {after:?}"
+            );
+        } else {
+            assert!(
+                matches!(&after, Ok(TurnEndAction::WaitUntil { why, .. }) if why == TAKE),
+                "CONTROL ({read:?}): no answer to the restart prompt shown, the worker is waited \
+                 on: {after:?}"
+            );
+            s.test_clock().skip(timing.take_within);
+            let due = s.fx.mono();
+            let point = point_at(&s, rows, 3);
+            let past = s.turn_end_at_point(&point, None, &opts);
+            assert!(
+                backs_off(&past, due),
+                "CONTROL ({read:?}): past the hang detector the point is judged: {past:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

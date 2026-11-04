@@ -5762,31 +5762,92 @@ pub(crate) fn trust_for_claude(run: &Run, dirs: &[PathBuf]) -> Result<(), Fail> 
     .map_err(|e| could_not(&format!("{}: {e}", p.display())))
 }
 
+/// One script every tab of `h` runs ([`Launcher::shared`]), its preparation done
+/// ([`launcher_with`]): Claude Code's with no debug log of its own.
 pub(crate) fn launcher(
     run: &Run,
     h: Harness,
     dirs: &[PathBuf],
     walled: bool,
 ) -> Result<PathBuf, Fail> {
-    launcher_with(run, h, dirs, (walled, false), (Vec::new(), Vec::new()))
+    launcher_with(run, h, dirs, (walled, false), (Vec::new(), Vec::new()))?.shared(run)
 }
 
-/// [`launcher`] with `envs` in the agent's environment and `args` on its line after the lab's own
-/// (W10's and W11's usage tap, [`tap::tap_args`]; a system message's chains' own retries cut
-/// short, [`sysmsg::vendor_retries`]); Claude Code on a stored login of the lab's where `stored`
-/// ([`sysmsg::login::lay_stored`]).
+/// How a forever lab launches one harness's tabs, once [`launcher_with`] did what every tab
+/// shares (the folders trusted, the settings and the login laid): one script, or Claude Code's
+/// launch, written per chain so each tab keeps a debug log of its own ([`Launcher::of_chain`]).
+pub(crate) enum Launcher {
+    /// agy's or Muse Code's one script.
+    Script(PathBuf),
+    /// Claude Code's launch, the same for every chain but its debug log.
+    Claude(crate::lab::Launch),
+}
+
+impl Launcher {
+    /// The one script every tab runs alike, `forever-<harness>.sh` (Claude Code's with no debug
+    /// log), for a launch that is no chain's own start (a switch's, autopilot-captures').
+    /// # Errors
+    /// Claude Code's script could not be written (a COULD NOT RUN).
+    pub(crate) fn shared(&self, run: &Run) -> Result<PathBuf, Fail> {
+        match self {
+            Self::Script(p) => Ok(p.clone()),
+            Self::Claude(l) => put_script(run, "forever-claude.sh", &crate::lab::launcher(run, l)),
+        }
+    }
+
+    /// The script `chain`'s tab runs: Claude Code's its own, `forever-claude-<chain>.sh`, its
+    /// `--debug-file` the chain's ([`crate::stats::chain_debug_log`]), else the one script.
+    /// # Errors
+    /// Claude Code's script could not be written (a COULD NOT RUN).
+    pub(crate) fn of_chain(&self, run: &Run, chain: Chain) -> Result<PathBuf, Fail> {
+        match self {
+            Self::Script(p) => Ok(p.clone()),
+            Self::Claude(l) => {
+                let mut l = l.clone();
+                l.args.splice(0..0, chain_debug_args(run, chain));
+                put_script(
+                    run,
+                    &format!("forever-claude-{}.sh", chain.name()),
+                    &crate::lab::launcher(run, &l),
+                )
+            }
+        }
+    }
+}
+
+/// `--debug-file <chain's log>` ([`crate::stats::chain_debug_log`]) for Claude Code's line.
+fn chain_debug_args(run: &Run, chain: Chain) -> [String; 2] {
+    [
+        "--debug-file".to_string(),
+        crate::stats::chain_debug_log(run, chain.name())
+            .to_string_lossy()
+            .into_owned(),
+    ]
+}
+
+/// `text` as the run's launch script `name`: its path.
+fn put_script(run: &Run, name: &str, text: &str) -> Result<PathBuf, Fail> {
+    let script = run.run.join(name);
+    crate::sys::put(&script, 0o755, &crate::sys::PutSrc::Bytes(text.as_bytes()))
+        .map_err(|e| could_not(&format!("{}: {e}", script.display())))?;
+    Ok(script)
+}
+
+/// [`launcher`]'s [`Launcher`], with `envs` in the agent's environment and `args` on its line
+/// after the lab's own (W10's and W11's usage tap, [`tap::tap_args`]; a system message's chains'
+/// own retries cut short, [`sysmsg::vendor_retries`]); Claude Code on a stored login of the lab's
+/// where `stored` ([`sysmsg::login::lay_stored`]).
 fn launcher_with(
     run: &Run,
     h: Harness,
     dirs: &[PathBuf],
     (walled, stored): (bool, bool),
     (envs, args): (Vec<String>, Vec<String>),
-) -> Result<PathBuf, Fail> {
+) -> Result<Launcher, Fail> {
     let put = |p: &Path, mode: u32, text: &str| {
         crate::sys::put(p, mode, &crate::sys::PutSrc::Bytes(text.as_bytes()))
             .map_err(|e| could_not(&format!("{}: {e}", p.display())))
     };
-    let script = run.run.join(format!("forever-{}.sh", h.name()));
     let text = match h {
         Harness::Claude => {
             trust_for_claude(run, dirs)?;
@@ -5796,14 +5857,13 @@ fn launcher_with(
             if stored {
                 sysmsg::login::lay_stored(run)?;
             }
-            let l = crate::lab::Launch {
+            return Ok(Launcher::Claude(crate::lab::Launch {
                 subscriber: walled,
                 stub_route_alone: stored,
                 envs,
                 args,
                 ..crate::lab::Launch::default()
-            };
-            crate::lab::launcher(run, &l)
+            }));
         }
         Harness::Agy => {
             crate::agy::seed(run, &crate::agy::Launch::default())?;
@@ -5821,8 +5881,11 @@ fn launcher_with(
             crate::muse::launcher(run, &envs, &args)
         }
     };
-    put(&script, 0o755, &text)?;
-    Ok(script)
+    Ok(Launcher::Script(put_script(
+        run,
+        &format!("forever-{}.sh", h.name()),
+        &text,
+    )?))
 }
 
 fn agy_trusted(dirs: &[PathBuf]) -> Vec<String> {
@@ -5863,6 +5926,7 @@ fn scroll_launcher(
             &crate::lab::Launch {
                 envs: vec![SCROLL_CLAUDE_ENV.to_string()],
                 subscriber: walled,
+                args: chain_debug_args(run, Chain::TallScroll).to_vec(),
                 ..crate::lab::Launch::default()
             },
         ),
@@ -6134,6 +6198,8 @@ pub(crate) struct Started {
     pub(crate) held: Option<Input>,
     /// The last `status` read's input.
     pub(crate) last: Input,
+    /// The program's capture, where a look took the tab's one ([`input_hold::Holds::due`]).
+    pub(crate) capture: Option<input_hold::Capture>,
 }
 
 /// What one look at a starting tab's program stands at: what stands on its screen (`stand`) and
@@ -6162,23 +6228,36 @@ fn start_look(
 /// started beside more of itself, left even its terminal's replies unread 12 to 102 s while its
 /// composer stood drawn (rv1-l2), and so the lab's first prompt and Land's first act behind it. A
 /// hang detector over the screen and the input together ([`composer_wait`], [`COMPOSER_HANG`]): a
-/// minute in which the program neither drew nor read anything ends it.
+/// minute in which the program neither drew nor read anything ends it. A look that finds the
+/// input unread past the run's threshold captures the program, once per tab, `label` naming its
+/// files ([`input_hold`]); the wait goes on while the capture runs, and ends with it.
 ///
 /// # Errors
 /// The run was interrupted.
-pub(crate) fn started_composer(door: &Door<'_>, sid: &str, agent: &str) -> Result<Started, Fail> {
+pub(crate) fn started_composer(
+    door: &Door<'_>,
+    sid: &str,
+    agent: &str,
+    (holds, label): (&mut input_hold::Holds, &str),
+) -> Result<Started, Fail> {
     let from = now_ms();
     let mut held: Option<Input> = None;
     let mut last = Input::default();
+    let mut taking: Option<input_hold::Taking> = None;
     let wait = composer_wait(
         || {
             let text = on(door, sid, &["text"]);
-            let input = Input::of(&on(door, sid, &["status"]));
+            let status = on(door, sid, &["status"]);
+            let input = Input::of(&status);
             if input.unread() {
                 held = Some(input.clone());
             }
             last.clone_from(&input);
             let stand = start_look(agent, &text, &input, cell_on(door, sid));
+            let ready = matches!(&stand, Stand::Composer(row) if row.is_empty());
+            if holds.due(sid, &input, ready) {
+                taking = Some(holds.take(door, sid, label, &input, &status));
+            }
             ((text, input.word, input.bytes), stand)
         },
         COMPOSER_HANG,
@@ -6187,38 +6266,51 @@ pub(crate) fn started_composer(door: &Door<'_>, sid: &str, agent: &str) -> Resul
             stop::sleep(Duration::from_millis(100))?;
             Ok(Instant::now())
         },
-    )?;
+    );
+    let ms = now_ms() - from;
+    let capture = taking.map(input_hold::Taking::finish);
     Ok(Started {
-        wait,
-        ms: now_ms() - from,
+        wait: wait?,
+        ms,
         held,
         last,
+        capture,
     })
 }
 
 /// Why a tab's start failed ([`started_composer`]; `None`: it did not), for `agent`: a hang over
-/// input the program left unread says so.
+/// input the program left unread says so, and the capture of the program names its files.
 pub(crate) fn start_failed(s: &Started, agent: &str) -> Option<String> {
-    match &s.wait {
+    let why = match &s.wait {
         ComposerWait::Hung if s.last.unread() => Some(format!(
             "{agent} drew and read nothing for {} s while it started, its input unread ({})",
             COMPOSER_HANG.as_secs(),
             s.last.said()
         )),
         w => w.why(agent),
-    }
+    }?;
+    Some(format!("{why}{}", captured(s)))
 }
 
-/// [`Started`] for the run's report: how long the start took, and the input it left unread.
+/// [`Started`] for the run's report: how long the start took, the input it left unread, and the
+/// capture of the program, where a look took one.
 pub(crate) fn started_line(s: &Started) -> String {
     format!(
-        "{}{}",
+        "{}{}{}",
         crate::restore::since(0, s.ms),
         s.held.as_ref().map_or_else(
             || ", its input read at every look".to_string(),
             |i| format!(", its input unread meanwhile (last: {})", i.said())
-        )
+        ),
+        captured(s)
     )
+}
+
+/// `; <the capture's words>` ([`input_hold::Capture::said`]), or nothing where none was taken.
+fn captured(s: &Started) -> String {
+    s.capture
+        .as_ref()
+        .map_or_else(String::new, |c| format!("; {}", c.said()))
 }
 
 /// Types `text` as `agent`'s turn in tab `sid` ([`crate::composer_turn::turn`]: only into its
@@ -8455,7 +8547,7 @@ fn run_check(
     } else {
         (Vec::new(), Vec::new())
     };
-    let script = launcher_with(&run, h, &dirs, (walled, stored), extra)?;
+    let launch = launcher_with(&run, h, &dirs, (walled, stored), extra)?;
     if tap_wall {
         crate::verbs::write_headers(
             &run.w,
@@ -8483,6 +8575,10 @@ fn run_check(
         chains.iter().map(|c| c.rules().len()).sum::<usize>()
     );
     let door = Door::new(&run)?;
+    let mut holds = input_hold::Holds::of(&run)?;
+    if let Some(said) = holds.said(ready_gate) {
+        println!("  holds     {said}");
+    }
     let unread = surfaces::unread_why(surfaces_on, chains);
     let mut desk = if let Some(why) = unread {
         println!("  windows   not read ({why}): the window's wants are named skips");
@@ -8520,10 +8616,10 @@ fn run_check(
             String::new()
         };
         let script = match &scroll_script {
-            Some(own) if chain == Chain::TallScroll => own,
-            _ => &script,
+            Some(own) if chain == Chain::TallScroll => own.clone(),
+            _ => launch.of_chain(&run, chain)?,
         };
-        let launched = launch_tab(&door, &sid, chain, script)?;
+        let launched = launch_tab(&door, &sid, chain, &script)?;
         println!(
             "  tab       {} @{sid} in {}: {}{titled}, launched",
             chain.name(),
@@ -8533,7 +8629,7 @@ fn run_check(
         // THE LAUNCHES ARE STAGGERED (slice at1): the next tab's program starts only once this
         // one's has finished starting, so no program starts beside another still starting.
         if ready_gate {
-            let started = started_composer(&door, &sid, h.name())?;
+            let started = started_composer(&door, &sid, h.name(), (&mut holds, chain.name()))?;
             if let Some(why) = start_failed(&started, h.name()) {
                 for l in tail_rows(&door, &sid, 12) {
                     println!("    | {l}");
@@ -8661,14 +8757,15 @@ fn run_check(
         }
         // No clock starts and no tab is prompted over input its program has not read.
         if ready_gate {
-            let ready = started_composer(&door, &tab.sid, h.name())?;
+            let ready =
+                started_composer(&door, &tab.sid, h.name(), (&mut holds, tab.chain.name()))?;
             if let Some(why) = start_failed(&ready, h.name()) {
                 for l in tail_rows(&door, &tab.sid, 12) {
                     println!("    | {l}");
                 }
                 return Err(could_not(&format!("{why}, in {}", tab.chain.name())));
             }
-            if ready.held.is_some() {
+            if ready.held.is_some() || ready.capture.is_some() {
                 println!(
                     "  ready     {} @{}: before its prompt, {}",
                     tab.chain.name(),
@@ -9576,6 +9673,9 @@ pub mod receipt;
 
 #[path = "forever_checked.rs"]
 pub mod checked;
+
+#[path = "forever_input_hold.rs"]
+pub mod input_hold;
 
 #[cfg(test)]
 #[path = "forever_tests.rs"]

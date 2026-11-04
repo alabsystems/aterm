@@ -678,10 +678,7 @@ mod tests {
     /// If a second download replaces the part file, the first neither renames nor removes it.
     #[test]
     fn a_part_file_another_download_replaced_is_left_to_it() {
-        let root = aterm_tempfile::Builder::new()
-            .prefix("agh-part-race-")
-            .tempdir()
-            .expect("a scratch directory");
+        let root = crate::test_fixtures::scratch_dir("part-race");
         let dest = root.path().join("asset.bin");
         let mut first = Part::create(&dest).expect("the first part file");
         first
@@ -715,10 +712,7 @@ mod tests {
     /// A part file dropped on an error is removed when it is still this download's.
     #[test]
     fn a_dropped_part_file_is_removed() {
-        let root = aterm_tempfile::Builder::new()
-            .prefix("agh-part-drop-")
-            .tempdir()
-            .expect("a scratch directory");
+        let root = crate::test_fixtures::scratch_dir("part-drop");
         let dest = root.path().join("asset.bin");
         drop(Part::create(&dest).expect("a part file"));
         assert!(!part_path(&dest).exists());
@@ -729,10 +723,7 @@ mod tests {
     /// or treating a dangling symlink as absent.
     #[test]
     fn file_digest_and_refuse_non_file_reject_live_and_dangling_symlinks() {
-        let root = aterm_tempfile::Builder::new()
-            .prefix("agh-dest-symlink-")
-            .tempdir()
-            .expect("a scratch directory");
+        let root = crate::test_fixtures::scratch_dir("dest-symlink");
         let target = root.path().join("target.bin");
         std::fs::write(&target, b"payload").expect("write target");
         let live_link = root.path().join("live.bin");

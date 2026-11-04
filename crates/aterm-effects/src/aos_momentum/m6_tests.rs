@@ -44,10 +44,24 @@ impl Spread for Threads {
     }
 }
 
-/// The scale every test draws: 8 plans of each train pool, 12 pools of 8 plans of each other
-/// set, and 6 grid plans.
+/// The scale every test draws: 6 plans of each train pool (above [`JUDGED`], so `evidence`'s
+/// explored rest is not empty), 5 pools of 6 plans of each other set (one pool above [`JUDGED`],
+/// so a loop that reads K for P still shows in the counts these tests hold), and 3 grid plans.
+///
+/// A prefix of v1's sets: the pools drawn are the same plans at any scale, and every look, report
+/// and ledger loop treats each pool alike, so pools and plans past the prefix add no path through
+/// those loops. The verdict differs: `sign_test` needs n >= 10 at `LOOK_LEVEL` (620) and n >= 6 at
+/// `REPORT_LEVEL` (60), so at 5 pools no unforced look admits and no criterion shows.
+/// `a_look_is_decided_at_the_look_level` and `a_reports_criterion_is_decided_at_the_report_level`
+/// hold the two levels on chosen wins, `the_pinned_chain_reproduces_on_the_v1_sets` the train side
+/// and the grid in full and `m6_policy_tests` every v1 pool's fill. Not implied: a defect that
+/// shows only at pool index 5 and up or plan index 6 and up of a practice or report set (a loop
+/// capped at [`LOOKS`], say).
 fn scaled() -> Sets {
-    Sets::scaled(8, 12, 8, 6)
+    const TRAIN_PLANS: usize = 6;
+    const PRACTICE_POOLS: usize = 5;
+    const { assert!(TRAIN_PLANS > JUDGED && PRACTICE_POOLS > JUDGED) };
+    Sets::scaled(TRAIN_PLANS, PRACTICE_POOLS, 6, 3)
 }
 
 /// The scaled sets and their chain, labelled once on the shared evaluator.
@@ -1206,7 +1220,7 @@ fn a_token_is_minted_only_after_its_line() {
         union.as_slice(),
         "the list is the tops' union"
     );
-    assert_eq!(look.tops().len(), 12, "every pool of the scaled set");
+    assert_eq!(look.tops().len(), 5, "every pool of the scaled set");
     for (pool, tx, ta) in look.tops() {
         let plans = &f.sets.pools(pool.set).expect("drawn")[pool.pool as usize];
         assert_eq!(
@@ -1399,7 +1413,7 @@ fn an_admission_is_bound_to_its_own_ledger() {
     narrow
         .open(Digest([1; 32]), BUILD, Digest([2; 32]), false)
         .expect("an open");
-    let fewer = Sets::scaled(8, 12, 7, 6);
+    let fewer = Sets::scaled(6, 5, 5, 3);
     let short = run_look(
         &labeller,
         narrow
@@ -1501,57 +1515,98 @@ fn a_scaled_practice_session_reads_no_held_out_item() {
     );
 }
 
+/// Each ranked arm folds its ranker's top K of each report pool, on the session whose Mf is the
+/// chain's last member and on the one whose Mf is its first. Those two rows differ on these 5
+/// pools, so an Mf that folds any one fixed member fails on one of the two sessions.
 #[test]
 fn each_arm_folds_its_rankers_top_k() {
     if refused_off_the_pinned_target() {
         return;
     }
-    let (_, s) = natural();
     let f = fixture();
-    let report = s.a.report.as_ref().expect("A's report");
     let set = SetId {
         tag: SetTag::PracticeReport,
         index: 0,
     };
     let pools = f.sets.pools(set).expect("practice-report 0");
-    let mf = f
-        .chain
-        .iter()
-        .find(|v| v.id() == s.a.mf)
-        .expect("Mf is a member");
-    let rankers = [
-        (Arm::U, Ranker::Model(f.chain[0].state())),
-        (Arm::W1, Ranker::W1),
-        (Arm::W2, Ranker::W2),
-        (Arm::C, Ranker::Model(f.chain[1].state())),
-        (Arm::Mf, Ranker::Model(mf.state())),
-        (Arm::Ctl, Ranker::Control),
-    ];
-    assert_eq!(report.folded.len(), rankers.len());
-    for ((arm, folded), (want, ranker)) in report.folded.iter().zip(&rankers) {
-        assert_eq!(arm, want);
-        assert_eq!(folded.len(), pools.len());
-        for (p, (ids, plans)) in folded.iter().zip(&pools).enumerate() {
-            let pool = PoolId {
-                set,
-                pool: u32::try_from(p).expect("small"),
-            };
-            let top = ranker.top_k(&pool, plans).expect("4");
-            assert_eq!(*ids, top.map(|x| x.digest()), "{arm:?} pool {p}");
-            if let Some(winner) = report.arm(*arm)[p].plan() {
-                assert!(
-                    top.contains(&winner),
-                    "{arm:?} pool {p} folded its own top_k"
-                );
+    for (s, mf, not_this_row) in [
+        (all_admitted(), &f.chain[4], Arm::U),
+        (all_refused(), &f.chain[0], Arm::C),
+    ] {
+        assert_eq!(s.a.mf, mf.id(), "the looks' forced verdicts");
+        let report = s.a.report.as_ref().expect("A's report");
+        let rankers = [
+            (Arm::U, Ranker::Model(f.chain[0].state())),
+            (Arm::W1, Ranker::W1),
+            (Arm::W2, Ranker::W2),
+            (Arm::C, Ranker::Model(f.chain[1].state())),
+            (Arm::Mf, Ranker::Model(mf.state())),
+            (Arm::Ctl, Ranker::Control),
+        ];
+        assert_eq!(report.folded.len(), rankers.len());
+        for ((arm, folded), (want, ranker)) in report.folded.iter().zip(&rankers) {
+            assert_eq!(arm, want);
+            assert_eq!(folded.len(), pools.len());
+            for (p, (ids, plans)) in folded.iter().zip(&pools).enumerate() {
+                let pool = PoolId {
+                    set,
+                    pool: u32::try_from(p).expect("small"),
+                };
+                let top = ranker.top_k(&pool, plans).expect("4");
+                assert_eq!(*ids, top.map(|x| x.digest()), "{arm:?} pool {p}");
+                if let Some(winner) = report.arm(*arm)[p].plan() {
+                    assert!(
+                        top.contains(&winner),
+                        "{arm:?} pool {p} folded its own top_k"
+                    );
+                }
             }
+            assert_eq!(report.arm(*arm).len(), pools.len());
         }
-        assert_eq!(report.arm(*arm).len(), pools.len());
+        assert_eq!(report.arm(Arm::O).len(), pools.len());
+        let row = |arm| report.folded.iter().find(|(a, _)| *a == arm);
+        assert_ne!(
+            row(Arm::Mf).map(|r| &r.1),
+            row(not_this_row).map(|r| &r.1),
+            "Mf's row is not {not_this_row:?}'s"
+        );
+        for against in [Arm::U, Arm::W2, Arm::W1] {
+            let c = Comparison::of(report.arm(Arm::Mf), report.arm(against));
+            assert_eq!(report.criterion(against), (c, c.shows()), "{against:?}");
+        }
     }
-    assert_eq!(report.arm(Arm::O).len(), pools.len());
-    for against in [Arm::U, Arm::W2, Arm::W1] {
-        let c = Comparison::of(report.arm(Arm::Mf), report.arm(against));
-        assert_eq!(report.criterion(against), (c, c.shows()), "{against:?}");
+}
+
+/// A report's criterion is decided at the report level: Mf's outcome in a pool it wins, run as 6
+/// pools, wins 6 of 6, which shows and would not admit a look. The scaled sets' 5 pools cannot tell
+/// the levels apart.
+#[test]
+fn a_reports_criterion_is_decided_at_the_report_level() {
+    if refused_off_the_pinned_target() {
+        return;
     }
+    let report = all_admitted().a.report.as_ref().expect("A's report");
+    let mf = report.arm(Arm::Mf);
+    let (against, won) = [Arm::U, Arm::W2, Arm::W1, Arm::C, Arm::Ctl]
+        .into_iter()
+        .find_map(|against| {
+            let other = report.arm(against);
+            (0..mf.len())
+                .find(|&p| {
+                    let one = Comparison::of(&mf[p..=p], &other[p..=p]);
+                    one.wins == 1 && one.gain.0 >= one.against.0 && one.gain.1 >= one.against.1
+                })
+                .map(|p| (against, p))
+        })
+        .expect("Mf wins a pool at no lower gain");
+    let six = report
+        .clone()
+        .rearmed(Arm::Mf, vec![mf[won]; 6])
+        .rearmed(against, vec![report.arm(against)[won]; 6]);
+    let (c, shown) = six.criterion(against);
+    assert_eq!((c.wins, c.losses), (6, 0));
+    assert_eq!(c.admits(), Err(ModelRefusal::Losses), "would admit no look");
+    assert_eq!(shown, Ok(()), "6 of 6 at the report level");
 }
 
 #[test]
@@ -1708,7 +1763,7 @@ fn a_look_runs_only_through_the_ledger_list() {
         .begin_look(1, x, a, &f.chain, &f.sets)
         .expect("look 1 begins");
     let figures = run_look(&Labeller::new(evaluator(), &Threads), look).expect("its figures");
-    assert_eq!(figures.pools().len(), 12);
+    assert_eq!(figures.pools().len(), 5);
     assert_eq!((figures.candidate(), figures.comparator()), (x, a));
     assert_eq!(figures.bit(), figures.verdict().is_ok());
     assert_eq!(
@@ -1727,6 +1782,51 @@ fn a_look_runs_only_through_the_ledger_list() {
         assert!(
             bytes.windows(32).any(|w| w == id.0),
             "the figures file names {id:?}"
+        );
+    }
+}
+
+/// A look is decided at the look level, on the fold a run look takes: the tops of a pool the look
+/// wins, run as 6 pools, win 6 of 6, which shows at the report level and does not admit, and run
+/// as 10, win 10 of 10, which does both. The scaled sets' 5 pools cannot tell the levels apart.
+#[test]
+fn a_look_is_decided_at_the_look_level() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
+    let f = fixture();
+    let labeller = Labeller::new(evaluator(), &Threads);
+    let (x, a) = look_pair(1, &[], &pin().ids).expect("look 1");
+    let look_1 = || {
+        let root = root();
+        let mut ledger =
+            Ledger::practice(MemLog::of(&root, Pair::Practice(0)), 0, pin()).expect("a ledger");
+        ledger
+            .open(Digest([1; 32]), BUILD, Digest([2; 32]), false)
+            .expect("an open");
+        ledger
+            .begin_look(1, x, a, &f.chain, &f.sets)
+            .expect("look 1 begins")
+    };
+    let look = look_1();
+    let tops = look.tops().clone();
+    let figures = run_look(&labeller, look).expect("its figures");
+    let won = figures
+        .pools()
+        .iter()
+        .position(|(ox, oa)| ox.key() < oa.key())
+        .expect("look 1 wins a pool");
+    for (wins, verdict) in [(6_u32, Err(ModelRefusal::Losses)), (10, Ok(()))] {
+        let pools = usize::try_from(wins).expect("small");
+        let look = look_1().retopped(vec![tops[won]; pools]);
+        let figures = run_look(&labeller, look).expect("its figures");
+        let comparison = figures.comparison();
+        assert_eq!((comparison.wins, comparison.losses), (wins, 0));
+        assert_eq!(comparison.shows(), Ok(()), "{wins} of {wins} shows");
+        assert_eq!(
+            figures.verdict(),
+            verdict,
+            "{wins} of {wins} at the look level"
         );
     }
 }
@@ -3122,6 +3222,6 @@ fn the_pools_judged_are_k_per_arm() {
     }
     let s = all_admitted();
     let figures = s.a.figures.first().expect("look 1's figures");
-    assert_eq!(figures.pools().len(), 12);
+    assert_eq!(figures.pools().len(), 5);
     let _: fn(&PoolId) -> u32 = |p| p.pool;
 }

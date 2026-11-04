@@ -14,12 +14,6 @@ use aterm_db::{
 use aterm_secrets::client::Paths;
 use std::path::PathBuf;
 
-/// Whether this process may publish a Mac's facts: a release build outside a build tool's tests.
-/// The callers already hold the runtime off under `ATERM_STATE_HOME` and `CI`.
-fn publishes() -> bool {
-    !cfg!(debug_assertions) && std::env::var_os("CARGO_MANIFEST_DIR").is_none()
-}
-
 /// Whether a pass's result is worth a line a shipped build keeps: its log filter stops at `Info`.
 /// A pass that wrote or had nothing to do stays at debug, and `aterm db alab check` answers why at
 /// any time.
@@ -50,7 +44,7 @@ fn log_pass(pass: &aterm_db::Result<Registered>) {
 
 /// The repair-round hook for one Commons runtime: inert where this process does not publish.
 pub(crate) fn reports(paths: Paths, config: PathBuf) -> impl Fn(RepairRound) + Send + 'static {
-    let registrar = publishes()
+    let registrar = super::alab_view::holds()
         .then(|| Registrar::start(paths.clone(), config, probe, log_pass).ok())
         .flatten();
     move |round: RepairRound| {
@@ -165,14 +159,6 @@ fn probe() -> Option<Probe> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A test build never publishes, so no hook of this file can reach a live registry from a
-    /// test binary, whatever its environment says.
-    /// NEGATIVE CONTROL: with `publishes` answering `true`, this fails.
-    #[test]
-    fn a_test_build_publishes_nothing() {
-        assert!(!publishes());
-    }
 
     /// What a shipped build logs: only a pass the owner would want to hear of passes its filter.
     /// NEGATIVE CONTROL: with `speaks` always false, the first assertion fails.

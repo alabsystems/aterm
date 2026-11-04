@@ -233,7 +233,8 @@ fn live(path: &Path) -> Option<Waiting> {
     };
     #[cfg(not(any(unix, windows)))]
     let identity = None;
-    let mut head = Vec::new();
+    let cap = usize::try_from(metadata.len().min(RECORD).saturating_add(1)).unwrap_or(0);
+    let mut head = Vec::with_capacity(cap);
     (&mut file).take(RECORD).read_to_end(&mut head).ok()?;
     match RecordLock::try_lock(file, RECORD) {
         Err(std::fs::TryLockError::WouldBlock) => {

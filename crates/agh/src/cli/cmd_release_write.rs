@@ -385,7 +385,13 @@ fn read_notes(file: &str) -> Result<String> {
     if !meta.is_file() {
         return Err(invalid("not a regular file".to_string()));
     }
-    let mut bytes = Vec::new();
+    if meta.len() > NOTES_FILE_BYTES_MAX {
+        return Err(invalid(format!(
+            "over {NOTES_FILE_BYTES_MAX} bytes; GitHub takes at most {} characters of notes",
+            crate::github::releases::NOTES_MAX
+        )));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
     opened
         .take(NOTES_FILE_BYTES_MAX.saturating_add(1))
         .read_to_end(&mut bytes)

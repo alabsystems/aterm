@@ -139,7 +139,7 @@ fn an_agent_never_starts_a_clis_own_sign_in() {
         let done = Rig::new(&[(marker, "1")]).sign_in(
             &runner,
             &store,
-            &facts(&CODEX, b.pkg.agents_dir().join("codex")),
+            &facts(&CODEX, b.twin("codex")),
             &row(&CODEX, State::SignedOut),
             &[],
         );
@@ -160,7 +160,7 @@ fn under_an_agent_aterms_own_renewals_run_and_claudes_adoption_does_not() {
     let store = Store::at(&b.state);
     for marker in AGENT_MARKERS {
         let rig = Rig::new(&[(marker, "1")]);
-        let mut renewing = facts(&CLAUDE, b.pkg.agents_dir().join("claude"));
+        let mut renewing = facts(&CLAUDE, b.twin("claude"));
         renewing.accounts = Some(listed_view(true, None));
         let runner = FakeRunner::quiet();
         let done = rig.sign_in(
@@ -181,7 +181,7 @@ fn under_an_agent_aterms_own_renewals_run_and_claudes_adoption_does_not() {
             "{marker}"
         );
 
-        let mut pooled = facts(&KIMI, b.pkg.agents_dir().join("kimi"));
+        let mut pooled = facts(&KIMI, b.twin("kimi"));
         pooled.pool = Some(crate::ai::facts::CliAccounts {
             roster: PathBuf::from("/home/me/.config/aterm/accounts-kimi.toml"),
             next: Some("kimi-one".to_string()),
@@ -201,7 +201,7 @@ fn under_an_agent_aterms_own_renewals_run_and_claudes_adoption_does_not() {
         let done = rig.sign_in(
             &runner,
             &store,
-            &facts(&CLAUDE, b.pkg.agents_dir().join("claude")),
+            &facts(&CLAUDE, b.twin("claude")),
             &row(&CLAUDE, State::SignedOut),
             &["me@example.com"],
         );
@@ -217,7 +217,7 @@ fn under_an_agent_aterms_own_renewals_run_and_claudes_adoption_does_not() {
 fn codexs_login_runs_only_when_codex_is_signed_out_because_it_revokes_first() {
     let b = machine(&["codex"]);
     let store = Store::at(&b.state);
-    let shim = b.pkg.agents_dir().join("codex");
+    let shim = b.twin("codex");
     let rig = Rig::new(&[]);
     for state in [
         State::Ok,
@@ -316,7 +316,7 @@ fn a_status_read_drops_what_follows_its_prefix() {
 fn claude_signs_in_only_through_accounts_v2s_renewal() {
     let b = machine(&["claude"]);
     let store = Store::at(&b.state);
-    let shim = b.pkg.agents_dir().join("claude");
+    let shim = b.twin("claude");
     let rig = Rig::new(&[]);
     let runner = FakeRunner::quiet();
     let done = rig.sign_in(
@@ -345,6 +345,7 @@ fn claude_signs_in_only_through_accounts_v2s_renewal() {
     assert!(calls.iter().all(|c| c.program != "claude"));
     let mut f = facts(&CLAUDE, shim.clone());
     f.accounts = Some(ClaudeAccounts {
+        pool_picks: false,
         label: "m7".into(),
         store: None,
         roster: None,
@@ -394,6 +395,7 @@ fn claude_signs_in_only_through_accounts_v2s_renewal() {
 
 fn listed_view(renews: bool, refused: Option<&str>) -> ClaudeAccounts {
     ClaudeAccounts {
+        pool_picks: false,
         store: None,
         roster: None,
         label: "work".into(),
@@ -422,7 +424,7 @@ fn listed_view(renews: bool, refused: Option<&str>) -> ClaudeAccounts {
 fn claude_never_adopts_over_a_listed_row_or_a_refused_roster() {
     let b = machine(&["claude"]);
     let store = Store::at(&b.state);
-    let shim = b.pkg.agents_dir().join("claude");
+    let shim = b.twin("claude");
     let rig = Rig::new(&[]);
     for (view, says) in [
         (listed_view(false, None), "with no email"),
@@ -485,7 +487,7 @@ fn a_failed_adopt_stops_before_the_renewal() {
     let done = Rig::new(&[]).sign_in(
         &runner,
         &store,
-        &facts(&CLAUDE, b.pkg.agents_dir().join("claude")),
+        &facts(&CLAUDE, b.twin("claude")),
         &row(&CLAUDE, State::SignedOut),
         &["me@example.com"],
     );
@@ -509,7 +511,7 @@ fn a_sign_in_under_another_home_records_nothing() {
     });
     let other = b.dir.path().join("identity-codex");
     let rig = Rig::new(&[("CODEX_HOME", other.to_str().expect("utf8"))]);
-    let mut explicit = facts(&CODEX, b.pkg.agents_dir().join("codex"));
+    let mut explicit = facts(&CODEX, b.twin("codex"));
     explicit.home_var = Some(other.display().to_string());
     explicit.home = Ok(other);
     let done = rig.sign_in(
@@ -527,7 +529,7 @@ fn a_sign_in_under_another_home_records_nothing() {
     let done = Rig::new(&[]).sign_in(
         &runner,
         &store,
-        &facts(&CODEX, b.pkg.agents_dir().join("codex")),
+        &facts(&CODEX, b.twin("codex")),
         &row(&CODEX, State::SignedOut),
         &[],
     );
@@ -553,7 +555,7 @@ fn codex_sign_in_health_belongs_to_its_observed_backend() {
                         .note("codex", How::Login, Outcome::Worked, 10)
                         .unwrap();
                     let legacy = store.load().unwrap().of("codex");
-                    let mut f = facts(&CODEX, b.pkg.agents_dir().join("codex"));
+                    let mut f = facts(&CODEX, b.twin("codex"));
                     let home = b.home.join(".codex");
                     std::fs::create_dir_all(&home).unwrap();
                     let config = home.join("config.toml");
@@ -643,7 +645,7 @@ fn codex_sign_in_health_belongs_to_its_observed_backend() {
 fn an_unknown_codex_backend_cannot_start_a_sign_in() {
     let b = machine(&["codex"]);
     let store = Store::at(&b.state);
-    let mut f = facts(&CODEX, b.pkg.agents_dir().join("codex"));
+    let mut f = facts(&CODEX, b.twin("codex"));
     let home = b.home.join(".codex");
     std::fs::create_dir_all(&home).unwrap();
     std::fs::write(
@@ -671,7 +673,7 @@ fn a_file_roster_cannot_redirect_or_hold_a_hidden_backend_sign_in() {
         for refused in [false, true] {
             let b = machine(&["codex"]);
             let store = Store::at(&b.state);
-            let mut f = facts(&CODEX, b.pkg.agents_dir().join("codex"));
+            let mut f = facts(&CODEX, b.twin("codex"));
             let home = b.home.join(".codex");
             std::fs::create_dir_all(&home).unwrap();
             std::fs::write(
@@ -756,7 +758,7 @@ fn a_login_status_cannot_replace_a_newer_health_observation() {
             }
             0
         });
-        let f = facts(&CODEX, b.pkg.agents_dir().join("codex"));
+        let f = facts(&CODEX, b.twin("codex"));
         assert_eq!(
             Rig::new(&[]).sign_in(&runner, &store, &f, &row(&CODEX, State::SignedOut), &[]),
             Done::SignedIn(Some("chatgpt"))
@@ -785,7 +787,7 @@ fn explicit_codex_login_refuses_unknown_or_changed_storage() {
             },
         )
         .unwrap();
-        let mut f = facts(&CODEX, b.pkg.agents_dir().join("codex"));
+        let mut f = facts(&CODEX, b.twin("codex"));
         f.home_var = Some(explicit.display().to_string());
         f.home = Ok(explicit.clone());
         let runner = FakeRunner::quiet().exiting(move |_| {
@@ -811,7 +813,7 @@ fn claude_under_a_home_of_its_own_is_never_signed_in_here() {
     let store = Store::at(&b.state);
     let runner = FakeRunner::quiet();
     let rig = Rig::new(&[("CLAUDE_CONFIG_DIR", "/me/.config/claude")]);
-    let mut f = facts(&CLAUDE, b.pkg.agents_dir().join("claude"));
+    let mut f = facts(&CLAUDE, b.twin("claude"));
     f.home_var = Some("/me/.config/claude".to_string());
     let done = rig.sign_in(
         &runner,
@@ -831,10 +833,11 @@ fn claude_under_a_home_of_its_own_is_never_signed_in_here() {
 fn claude_limited_with_next_sign_in_renews_the_successor_account() {
     let b = machine(&["claude"]);
     let store = Store::at(&b.state);
-    let shim = b.pkg.agents_dir().join("claude");
+    let shim = b.twin("claude");
     let rig = Rig::new(&[]);
     let mut f = facts(&CLAUDE, shim);
     f.accounts = Some(ClaudeAccounts {
+        pool_picks: false,
         label: "m27-3".into(),
         store: None,
         roster: None,
@@ -883,7 +886,7 @@ fn a_cli_with_its_own_roster_signs_in_through_its_renewal_and_one_without_runs_i
     use crate::ai::connector::KIMI;
     let b = machine(&["kimi"]);
     let store = Store::at(&b.state);
-    let shim = b.pkg.agents_dir().join("kimi");
+    let shim = b.twin("kimi");
     let rig = Rig::new(&[]);
     let mut pooled = facts(&KIMI, shim.clone());
     pooled.pool = Some(crate::ai::facts::CliAccounts {
@@ -954,7 +957,7 @@ fn a_codex_default_row_on_a_build_that_ignores_codex_auth_path_signs_in_by_codex
     use crate::harness::accounts::{self, Cli};
     use crate::harness::codex_app_login::Usage;
     let b = machine(&["codex"]);
-    let launcher = b.pkg.agents_dir().join("codex");
+    let launcher = b.twin("codex");
     let lay = |reads: bool| {
         let exe = crate::harness::codex_alab::lay_package(
             &b.dir
@@ -1179,7 +1182,7 @@ fn a_managed_default_login_records_failure_without_overwriting_a_newer_sign_in()
             .unwrap(),
         )
         .unwrap();
-        let mut f = facts(&CODEX, b.pkg.agents_dir().join("codex"));
+        let mut f = facts(&CODEX, b.twin("codex"));
         f.home = Ok(b.home.join(".codex"));
         f.pool = Some(CliAccounts {
             store: Some(account_store.clone()),
@@ -1277,7 +1280,7 @@ fn unbound_default_login(
         .unwrap(),
     )
     .unwrap();
-    let mut f = facts(&CODEX, b.pkg.agents_dir().join("codex"));
+    let mut f = facts(&CODEX, b.twin("codex"));
     f.home = Ok(b.home.join(".codex"));
     f.pool = Some(CliAccounts {
         store: Some(store.clone()),
@@ -1415,7 +1418,7 @@ fn a_codex_pool_that_serves_the_default_row_alone_signs_in_nothing_while_it_serv
     let b = machine(&["codex"]);
     let store = Store::at(&b.state);
     let rig = Rig::new(&[]);
-    let mut pooled = facts(&CODEX, b.pkg.agents_dir().join("codex"));
+    let mut pooled = facts(&CODEX, b.twin("codex"));
     pooled.pool = Some(crate::ai::facts::CliAccounts {
         roster: PathBuf::from("/home/me/.config/aterm/accounts-codex.toml"),
         next: None,
@@ -1454,7 +1457,7 @@ fn a_held_signed_out_default_row_on_a_build_that_ignores_codex_auth_path_signs_i
     use crate::harness::accounts::{self, Cli};
     use crate::harness::codex_alab::DefaultRow;
     let b = machine(&["codex"]);
-    let launcher = b.pkg.agents_dir().join("codex");
+    let launcher = b.twin("codex");
     let exe = crate::harness::codex_alab::lay_package(&b.dir.path().join("store/old"), false);
     std::fs::write(&launcher, crate::harness::codex_alab::twin_text(&exe)).expect("launcher");
     let config = b.dir.path().join("config");
@@ -1552,7 +1555,7 @@ fn grok_signs_in_on_this_terminal_or_through_its_pool_and_never_for_an_agent() {
     let grok = crate::ai::connector::connector("grok").expect("Grok Build is a connection");
     let b = machine(&["grok"]);
     let store = Store::at(&b.state);
-    let shim = b.pkg.agents_dir().join("grok");
+    let shim = b.twin("grok");
     for marker in AGENT_MARKERS {
         let runner = FakeRunner::quiet();
         let done = Rig::new(&[(marker, "1")]).sign_in(
@@ -1681,7 +1684,7 @@ fn kimi_signs_in_over_ssh_with_its_own_login_and_no_opener_on_its_path() {
     let kimi = crate::ai::connector::connector("kimi").expect("Kimi Code is a connection");
     let b = machine(&["kimi"]);
     let store = Store::at(&b.state);
-    let shim = b.pkg.agents_dir().join("kimi");
+    let shim = b.twin("kimi");
     let ssh = ("SSH_CONNECTION", "10.0.0.2 52000 10.0.0.3 22");
     for (rig, over_ssh) in [(Rig::new(&[ssh]), true), (Rig::new(&[]), false)] {
         let runner = FakeRunner::quiet();
@@ -1744,7 +1747,7 @@ fn one_terminal_call(
     let done = rig.sign_in(
         &runner,
         store,
-        &facts(c, b.pkg.agents_dir().join(c.id)),
+        &facts(c, b.twin(c.id)),
         &row(c, State::SignedOut),
         &[],
     );
@@ -1775,7 +1778,7 @@ fn sign_in_over_ssh_opens_no_browser_on_this_machines_desk() {
     ] {
         let b = machine(&[c.id]);
         let store = Store::at(&b.state);
-        let shim = b.pkg.agents_dir().join(c.id);
+        let shim = b.twin(c.id);
         let (done, calls) = one_terminal_call(&Rig::new(&[ssh]), c, &b, &store);
         assert!(
             matches!(done, Done::NotChecked | Done::SignedOut),
@@ -1853,7 +1856,7 @@ type EditView<'a> = &'a dyn Fn(&mut ClaudeAccounts);
 fn with_nobody_here_aterm_starts_only_a_sign_in_that_runs_unattended() {
     let b = machine(&["claude"]);
     let store = Store::at(&b.state);
-    let shim = b.pkg.agents_dir().join("claude");
+    let shim = b.twin("claude");
     let with = |edit: &dyn Fn(&mut ClaudeAccounts)| {
         let mut f = facts(&CLAUDE, shim.clone());
         let mut view = listed_view(true, None);
@@ -1935,7 +1938,7 @@ fn with_nobody_here_a_pools_renewal_waits_on_a_bot_check_or_a_persons_step() {
     let b = machine(&["kimi"]);
     let store = Store::at(&b.state);
     let hold = crate::harness::accounts_sync::PERSON_BACKOFF_SECS;
-    let mut pooled = facts(&KIMI, b.pkg.agents_dir().join("kimi"));
+    let mut pooled = facts(&KIMI, b.twin("kimi"));
     let pool = crate::ai::facts::CliAccounts {
         roster: PathBuf::from("/home/me/.config/aterm/accounts-kimi.toml"),
         next: Some("kimi-one".to_string()),

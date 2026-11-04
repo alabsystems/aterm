@@ -387,6 +387,10 @@ fn a_frame_that_failed_after_its_wait_does_not_stall_the_next_present() {
         );
         window.pump();
     };
+    // DWM gives each shown present's frame back as it retires, which must happen: every acquire
+    // but the control's waits the one-minute hang detector, so a loaded desktop slows a frame
+    // rather than counting it as timed out.
+    let _frames_come_back = super::d3d11_window::AcquireWait::set(60_000);
     for n in 0..3 {
         present(&mut gpu, &mut surf, &format!("present {n}"));
     }
@@ -416,7 +420,11 @@ fn a_frame_that_failed_after_its_wait_does_not_stall_the_next_present() {
         chain.take_frame_unheld_for_test(60_000),
         "the lost frame is the chain's one"
     );
-    present(&mut gpu, &mut surf, "the present after the lost frame");
+    {
+        // No present gives the lost frame back: this one wait is the product's, which runs out.
+        let _lost = super::d3d11_window::AcquireWait::set(super::d3d11_window::ACQUIRE_TIMEOUT_MS);
+        present(&mut gpu, &mut surf, "the present after the lost frame");
+    }
     assert_eq!(timed_out(&surf), 1, "its wait timed out, and it showed");
     for n in 0..3 {
         present(&mut gpu, &mut surf, &format!("present {n} after that"));

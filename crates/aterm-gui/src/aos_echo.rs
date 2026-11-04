@@ -246,7 +246,8 @@ pub(crate) fn next_site(aos: &AosWindow) -> Option<(u16, u16)> {
 /// Where a typed key's instant goes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum KeyRoute {
-    /// Logged at its press: the tty or an open prompt of aterm's shell echoes it.
+    /// Logged at its press: the tty or an open prompt of aterm's shell echoes it, or it carries no
+    /// text.
     Record,
     /// Held for its echo ([`admit_key`] opened or extended the hold).
     Hold,
@@ -291,8 +292,9 @@ pub(crate) fn typed_echo_cells(
 }
 
 /// Routes a typed key whose privacy verdict is `verdict` ([`super::key_privacy`]): a no-echo key
-/// or Secure Keyboard Entry is private; a key aterm sees echoed is recorded at its press unless
-/// keys are held, which it then joins; a raw key is held while the recording runs, the press was
+/// or Secure Keyboard Entry is private; a key aterm sees echoed, or one that carries no text, is
+/// recorded at its press unless keys are held, which it then joins (a key with no text has no
+/// cells, so it cannot, and is refused); a raw key is held while the recording runs, the press was
 /// on the live screen (no deferred wrap, no scrolled-back viewport), it has cells, none of the
 /// columns its echo would take already shows its glyph ([`PressRow`]), and it fits the open hold
 /// (its session, coordinates and screen, at most [`HOLD_CAP`] columns). Opening a hold asks the

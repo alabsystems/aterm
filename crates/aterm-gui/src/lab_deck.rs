@@ -4,7 +4,8 @@
 //! The Stats deck's lab account rows (`docs/DESIGN-alab-lab-model-2026-11-01.md` §8, step 11):
 //! one cell per account on the Network State band's Shared State line, and one row per account
 //! in its lens. Each row is the account's lab label (never an address), who last used it and on
-//! which Mac, its quota left with the age of the reading that says so, and where it is signed in.
+//! which Mac, its quota left with the age of the reading that says so, and its retained sign-in
+//! records with their ages.
 //!
 //! The rows are projected from the same `LabView` ([`alab_roster::current`]) and journal
 //! ([`alab_seen::current`]) the accounts panel reads, on a thread of their own ([`Feed`]): the
@@ -170,10 +171,10 @@ fn binding(seen: &AccountSeen) -> Option<&alab_seen::WindowSeen> {
     })
 }
 
-/// "62% of 5h left, read 12 min ago on m3 (statusline)".
+/// "62% of 5h left, read on m3, about 12 min ago (its clock) (statusline)".
 fn left_line(w: &alab_seen::WindowSeen, now: i64) -> String {
     let read = w.read.as_ref().map_or_else(String::new, |(t, by, src)| {
-        format!(", read {} ago on {by} ({src})", alab_seen::age(now - *t))
+        format!(", {}", alab_seen::read_words(*t, by, src, now))
     });
     if let Some(until) = w.wall_until {
         let until = until.map_or_else(String::new, |u| {
@@ -189,16 +190,6 @@ fn left_line(w: &alab_seen::WindowSeen, now: i64) -> String {
         ),
         _ => format!("{} unknown{read}", w.window),
     }
-}
-
-fn signed_in_words(seen: &AccountSeen) -> Option<String> {
-    (!seen.signed_in.is_empty()).then(|| {
-        seen.signed_in
-            .iter()
-            .map(|s| format!("{} ({})", s.on, s.state))
-            .collect::<Vec<_>>()
-            .join(", ")
-    })
 }
 
 /// One account's row. `read`: whether the journal has been read at all, so a row with nothing
@@ -230,7 +221,7 @@ fn row_of(
         .as_ref()
         .map(|last| alab_seen::when(&last.by, last.t, now));
     let left = bind.map(|w| left_line(w, now));
-    let on = signed_in_words(seen);
+    let on = alab_seen::signed_in_words(&seen.signed_in, now);
     let mut facts = vec![(
         "Account".into(),
         if here {
@@ -269,10 +260,10 @@ fn row_of(
         ));
     }
     facts.push((
-        "Signed in on".into(),
+        "Sign-in records".into(),
         on.clone().unwrap_or_else(|| {
             if read {
-                "No sign-in word in the lab journal"
+                "No sign-in record in the lab journal"
             } else {
                 unread
             }
@@ -297,15 +288,11 @@ fn row_of(
         summary.push("preferred here".to_string());
     }
     summary.push(left.unwrap_or_else(|| "quota unknown".into()));
-    if let Some(last) = &seen.last_use {
-        summary.push(format!(
-            "last used by {} {} ago",
-            last.by,
-            alab_seen::age(now - last.t)
-        ));
+    if let Some(last) = last {
+        summary.push(format!("last used by {last}"));
     }
     if let Some(on) = on {
-        summary.push(format!("signed in on {on}"));
+        summary.push(format!("sign-in records: {on}"));
     }
     DeckAccount {
         id: id_of(&account.pk),
@@ -380,7 +367,8 @@ pub(crate) fn project(lab: Option<&Lab>, seen: Option<&Seen>, now: i64) -> LabDe
 }
 
 /// Fixed rows for the feed's dev seam (`ATERM_DEV_LAB_DECK_FIXTURE`): three accounts, one preferred here, one at its limit and
-/// one with no reading, with labels that name no machine and no address.
+/// one with no reading, with labels that name no machine and no address. The second account's
+/// reading and last use are ahead of the local clock.
 fn fixture(now: i64) -> LabDeck {
     use aterm_agent::harness::accounts::Cli;
     use aterm_agent::harness::alab_seen::{LastUse, SignedIn, WindowSeen};
@@ -444,19 +432,21 @@ fn fixture(now: i64) -> LabDeck {
             history: Vec::new(),
         },
     );
+    let mut second_window = window(1000, true);
+    second_window.read = Some((now + 120, "m2".into(), "statusline".into()));
     seen.accounts.insert(
         "ac-1b2c3d4e5f60718293a4b5".into(),
         AccountSeen {
             last_use: Some(LastUse {
                 by: "m2".into(),
-                t: now - 3_600,
+                t: now + 300,
             }),
             signed_in: vec![SignedIn {
                 on: "m2".into(),
                 state: "in".into(),
                 t: now - 7_200,
             }],
-            windows: vec![window(1000, true)],
+            windows: vec![second_window],
             history: Vec::new(),
         },
     );

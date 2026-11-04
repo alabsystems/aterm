@@ -2471,6 +2471,13 @@ impl Look {
     pub(super) fn into_token(self) -> LookToken {
         self.token
     }
+
+    /// It with `tops` for its tops, each plan of its token's list (tests: a verdict on a chosen
+    /// count of wins).
+    pub(super) fn retopped(mut self, tops: Tops) -> Look {
+        self.tops = tops;
+        self
+    }
 }
 
 /// A look replayed: its `replay` line is durable and its token minted.
@@ -3274,6 +3281,15 @@ impl Report {
     pub fn criterion(&self, against: Arm) -> (Comparison, Result<(), ModelRefusal>) {
         let c = Comparison::of(self.arm(Arm::Mf), self.arm(against));
         (c, c.shows())
+    }
+
+    /// It with `outcomes` for the arm's (tests: a criterion on a chosen count of wins).
+    #[cfg(test)]
+    pub(super) fn rearmed(mut self, arm: Arm, outcomes: Vec<PoolOutcome>) -> Report {
+        if let Some((_, held)) = self.arms.iter_mut().find(|(a, _)| *a == arm) {
+            *held = outcomes;
+        }
+        self
     }
 
     /// The report file's text.

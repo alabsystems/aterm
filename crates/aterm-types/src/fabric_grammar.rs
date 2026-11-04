@@ -5,6 +5,8 @@
 //! pure string predicates for principals, topics, kinds, verdicts, and `via=`
 //! chains, shared by `aterm-link`, `aterm-gui`, and `aterm-gui-fabric`.
 
+use astream_wire::WakeClass;
+
 /// Principal class prefixes for `<src>` segments (§3.2): session, node, human, agent.
 pub const PRINCIPAL_CLASSES: [&str; 4] = ["s-", "n-", "h-", "a-"];
 
@@ -43,28 +45,36 @@ pub fn is_topic(t: &str) -> bool {
         && cs.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
 }
 
-/// Closed set of `in` record kinds (§4.2) accepted by `deliver` and `await inbox`.
-pub const KINDS: [&str; 9] = [
-    "ask",
-    "answer",
-    "task",
-    "report",
-    "note",
-    "control",
-    "ack",
-    "expired",
-    "undeliverable",
-];
+/// Closed set of `in` record kinds (§4.2) accepted by `deliver` and `await inbox`: astream's
+/// [`WakeClass::ALL`] spelled, highest priority first (`control` ..= `note`).
+pub const KINDS: [&str; WakeClass::ALL.len()] = {
+    let [a, b, c, d, e, f, g, h, i] = WakeClass::ALL;
+    [
+        a.as_str(),
+        b.as_str(),
+        c.as_str(),
+        d.as_str(),
+        e.as_str(),
+        f.as_str(),
+        g.as_str(),
+        h.as_str(),
+        i.as_str(),
+    ]
+};
 
-/// Whether `k` is one of [`KINDS`].
+/// Whether `k` is one of [`KINDS`]: a word astream's [`WakeClass::parse`] reads.
 #[inline]
 #[must_use]
-pub fn is_kind(k: &str) -> bool {
-    KINDS.contains(&k)
+pub const fn is_kind(k: &str) -> bool {
+    WakeClass::parse(k).is_some()
 }
 
 /// Kinds that settle an `ask`/`task` with `dl=` when carrying `re=<off>` (R8).
-pub const ANSWER_KINDS: [&str; 3] = ["answer", "report", "ack"];
+pub const ANSWER_KINDS: [&str; 3] = [
+    WakeClass::Answer.as_str(),
+    WakeClass::Report.as_str(),
+    WakeClass::Ack.as_str(),
+];
 
 /// Receipt verdicts accepted by `inbox seen <id> <verdict>` and `deliver` (`verdict=`).
 pub const VERDICTS: [&str; 3] = ["handled", "refused", "deferred"];

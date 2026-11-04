@@ -76,6 +76,12 @@ fn panicking_host_hooked(
     until("the carried worker's snapshot kept", || {
         kept_of(&host, |k| k.snapshot.is_some()).unwrap_or(false)
     });
+    // The worker keeps that snapshot as it attaches, before its loop's first run (its read waits
+    // `INERT_POINT_READ` here, half a second live): a test that counts its runs, or the policy it
+    // ran under, needs that run to have come.
+    until("the carried worker's loop runs", || {
+        a.runs.load(Ordering::SeqCst) >= 1
+    });
     host.shared
         .kept
         .lock()

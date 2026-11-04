@@ -541,7 +541,10 @@ pub(crate) fn process_name(pid: i32) -> Option<String> {
 #[cfg(target_os = "linux")]
 fn platform_session_root(pid: i32) -> Option<SessionRoot> {
     let comm = process_name(pid)?;
-    let children = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")).ok()?;
+    let children = aterm_uds::process::read_proc_text(std::path::Path::new(&format!(
+        "/proc/{pid}/task/{pid}/children"
+    )))
+    .ok()?;
     Some(SessionRoot {
         comm,
         children: children

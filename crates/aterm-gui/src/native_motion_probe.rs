@@ -294,6 +294,7 @@ fn page_cases(frames: usize) -> Vec<MotionCost> {
                 width: (region.width as f32 / 2.0).ceil() as u32,
                 height: (region.height as f32 / 2.0).ceil() as u32,
             });
+            cache.native_pointer_style_only = false;
         }
         let started = Instant::now();
         assert!(app.prepare_native_input_scratch(wid));

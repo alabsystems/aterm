@@ -25,8 +25,7 @@ pub fn verify_binary(path: &OsStr, arch: &str, digest: &str, size: u64) -> Verdi
         "Linux artifact size/type mismatch",
     )?;
     // Opened by the spelling it was given, as the embedded verifier opened it.
-    let mut file = open_file(std::path::Path::new(path))?;
-    let opened = file.metadata().map_err(|e| bare_os_error(&e))?;
+    let (mut file, opened) = open_file(std::path::Path::new(path))?;
     require(
         opened.file_type().is_file()
             && opened.len() == size
@@ -34,7 +33,7 @@ pub fn verify_binary(path: &OsStr, arch: &str, digest: &str, size: u64) -> Verdi
             && opened.ino() == meta.ino(),
         "Linux artifact size/type mismatch",
     )?;
-    let mut header = Vec::with_capacity(64);
+    let mut header = Vec::with_capacity(65);
     (&mut file)
         .take(64)
         .read_to_end(&mut header)

@@ -11,7 +11,7 @@
 //! and it is a choice:
 //!
 //! - 58 is in neither: xterm's `CASE_SGR` has no `case 58`, and T.416 13.1.8 names 38 and 48. Every
-//!   58 answer extends the rule for 38 and 48 to it, and on the fold 58 is only consumed.
+//!   58 answer extends the rule for 38 and 48 to it, onto the underline's colour.
 //! - All-semicolon CMY and CMYK (`;3;c;m;y`) are not in T.416, and xterm runs their values as
 //!   codes. Here they change nothing.
 //! - A sub-parameter after an all-semicolon colour (`;5;9:4`) is not in T.416, and xterm runs it
@@ -27,6 +27,7 @@
 use super::caps::Caps;
 use super::engines::{Astream, Aterm, Ink, Paint};
 use super::generator;
+use astream_term::screen::Underline;
 use std::collections::BTreeMap;
 
 /// What a spelling names.
@@ -124,10 +125,12 @@ const CUT_SHORT: &[&str] = &[
     "",
 ];
 
-/// The pen every case starts from, so that "nothing changed" shows.
-const PEN: &str = "\x1b[33;44m";
+/// The pen every case starts from, so that "nothing changed" shows: palette 3 on palette 4,
+/// its underline coloured palette 5 (a colour rides the pen with no underline drawn).
+const PEN: &str = "\x1b[33;44;58;5;5m";
 const FG: Paint = Paint::Indexed(3);
 const BG: Paint = Paint::Indexed(4);
+const UL: Paint = Paint::Indexed(5);
 
 /// The ink of the first cell after the pen, then `sgr`, then a glyph, read off each engine fed
 /// whole and a byte at a time: the parsers have a fast path and a slow one.
@@ -155,17 +158,28 @@ fn drawn(sgr: &str) -> [(&'static str, Ink); 4] {
     ]
 }
 
-/// The ink `named` on `code` leaves. The fold has no underline colour and the oracle's ink none
-/// either, so on 58 this says only that nothing else moved; `every_58_spelling_…` reads the colour.
-fn written(code: u16, named: Named) -> Ink {
-    let paint = |kept: Paint| match named {
+/// What `named` on `code` makes of `kept`, the colour that code had.
+fn painted(named: Named, kept: Paint) -> Paint {
+    match named {
         Rgb(r, g, b) => Paint::Rgb(r, g, b),
         Palette(n) => Paint::Indexed(n),
         Nothing => kept,
+    }
+}
+
+/// The ink `named` on `code` leaves, from [`PEN`].
+fn written(code: u16, named: Named) -> Ink {
+    let paint = |c: u16, kept: Paint| {
+        if code == c {
+            painted(named, kept)
+        } else {
+            kept
+        }
     };
     Ink {
-        fg: if code == 38 { paint(FG) } else { FG },
-        bg: if code == 48 { paint(BG) } else { BG },
+        fg: paint(38, FG),
+        bg: paint(48, BG),
+        ul: paint(58, UL),
         ..Ink::PLAIN
     }
 }
@@ -197,43 +211,9 @@ fn every_spelling_draws_its_written_answer_on_both_engines() {
     );
 }
 
-/// 58 on aterm, the one engine that keeps it: over an underline already coloured (1, 2, 3), which
-/// a spelling that names nothing leaves, drawn fed whole and a byte at a time.
-#[test]
-fn every_58_spelling_sets_aterms_underline_colour_to_its_written_answer() {
-    const BEFORE: [u8; 3] = [1, 2, 3];
-    let mut wrong = Vec::new();
-    for &(tail, named) in SPELLINGS {
-        for after in ["", ";1"] {
-            let bytes = format!("\x1b[4;58:2::1:2:3m\x1b[58{tail}{after}mX").into_bytes();
-            for chunk in [bytes.len(), 1] {
-                let mut t = Aterm::new(4, 1);
-                for piece in bytes.chunks(chunk) {
-                    t.feed(piece);
-                }
-                let want = match named {
-                    Rgb(r, g, b) => [r, g, b],
-                    Palette(n) => t.palette(n),
-                    Nothing => BEFORE,
-                };
-                let got = t.underline_colour(0, 0);
-                if got != Some(want) {
-                    wrong.push(format!("58{tail}{after}: {got:?}, not {want:?}"));
-                }
-            }
-        }
-    }
-    assert!(
-        wrong.is_empty(),
-        "{} wrong:\n{}",
-        wrong.len(),
-        wrong.join("\n")
-    );
-}
-
 /// Sub-parameters on a code that takes none are ignored with it, a trailing colon's empty one too
 /// (xterm's "unexpected subparameter in SGR", Ghostty's and Alacritty's unknown), on both engines;
-/// `4:n` is the one that takes one, and `4:` is `4:0`.
+/// `4:n` is the one that takes one, its first element the style, and `4:` is `4:0`.
 #[test]
 fn a_group_on_a_code_that_takes_none_is_ignored_whole() {
     let reversed = |underline| Ink {
@@ -242,17 +222,17 @@ fn a_group_on_a_code_that_takes_none_is_ignored_whole() {
         ..written(0, Nothing)
     };
     for (sgr, want) in [
-        ("7;1:4", reversed(false)),
-        ("7;3:4:9", reversed(false)),
-        ("7;0:1", reversed(false)),
-        ("7;22:9", reversed(false)),
-        ("7;1:", reversed(false)),
-        ("7;0:", reversed(false)),
-        ("7;22:", reversed(false)),
-        ("7;1:;4", reversed(true)),
-        ("7;4:3:9", reversed(true)),
-        ("7;4;4:", reversed(false)),
-        ("7;4;4:;1", reversed(false).bold()),
+        ("7;1:4", reversed(Underline::None)),
+        ("7;3:4:9", reversed(Underline::None)),
+        ("7;0:1", reversed(Underline::None)),
+        ("7;22:9", reversed(Underline::None)),
+        ("7;1:", reversed(Underline::None)),
+        ("7;0:", reversed(Underline::None)),
+        ("7;22:", reversed(Underline::None)),
+        ("7;1:;4", reversed(Underline::Single)),
+        ("7;4:3:9", reversed(Underline::Curly)),
+        ("7;4;4:", reversed(Underline::None)),
+        ("7;4;4:;1", reversed(Underline::None).bold()),
     ] {
         for (engine, got) in drawn(sgr) {
             assert_eq!(got, want, "{sgr} on {engine}");
@@ -299,23 +279,19 @@ fn a_colour_the_parameter_cap_cuts_is_never_misread() {
                 for piece in bytes.as_bytes().chunks(chunk) {
                     t.feed(piece);
                 }
+                let before = Paint::Rgb(1, 2, 3);
                 let want = Ink {
                     reverse: true,
-                    underline: true,
+                    underline: Underline::Single,
+                    ul: if code == 58 {
+                        painted(named, before)
+                    } else {
+                        before
+                    },
                     ..written(code, named)
                 };
                 let got = t.snap().cells[0].ink;
                 assert_eq!(got, want, "{lead} parameters, then {code}{tail}");
-                let underline = match (code, named) {
-                    (58, Rgb(r, g, b)) => [r, g, b],
-                    (58, Palette(n)) => t.palette(n),
-                    _ => [1, 2, 3],
-                };
-                assert_eq!(
-                    t.underline_colour(0, 0),
-                    Some(underline),
-                    "{lead} parameters, then {code}{tail}: the underline colour"
-                );
             }
         }
     }

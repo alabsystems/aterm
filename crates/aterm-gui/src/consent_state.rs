@@ -633,20 +633,6 @@ impl DebuggerRow {
     pub(crate) const fn self_hardened(&self) -> SelfHardening {
         self.self_hardened
     }
-
-    /// Time since the probe completed (`None` while pending, refused, or inert).
-    pub(crate) fn probe_age(&self) -> Option<Duration> {
-        self.probe_age_ms
-            .map(|ms| Duration::from_millis(u64::try_from(ms).unwrap_or(u64::MAX)))
-    }
-
-    /// Time since a read that brought no reading ended: `-status` timed out, did not start, or
-    /// answered what the classifier does not claim (`None` for a reading, and for a row
-    /// [`Self::probe_age`] gives no age).
-    pub(crate) fn unread_age(&self) -> Option<Duration> {
-        self.probe_age()
-            .filter(|_| self.probe.mode == consent::DebuggerMode::Unknown)
-    }
 }
 
 fn completed_debugger_age_ms(label: DebuggerProbeLabel, age: Duration) -> Option<u128> {
@@ -1090,66 +1076,6 @@ impl ConsentState {
     pub(crate) fn fda_slot_idle_for_test(&self) -> bool {
         let slot = self.shared.fda.slot.lock_or_recover();
         !slot.in_flight && slot.entry.is_none()
-    }
-
-    /// Publish a completed debugger result on a test instance, read as just taken until
-    /// [`aterm_spec::wait::MUST_HAPPEN`] has passed. The debugger step ages a reading by the
-    /// wall clock against [`crate::debugger_access::ASK_PROBE_FRESH`] while its test moves the
-    /// step's own clock: stamped now, the looks after it would have five seconds to spend it, a
-    /// latency budget that a look's durable write, queued behind every other test's under load,
-    /// outruns.
-    #[cfg(all(test, target_os = "macos"))]
-    pub(crate) fn publish_debugger_for_test(
-        &mut self,
-        probe: DebuggerProbe,
-        self_hardened: SelfHardening,
-    ) {
-        let at = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
-        self.publish_debugger_at_for_test(probe, self_hardened, at);
-    }
-
-    /// Publish a completed debugger result aged by `age` on a test instance.
-    #[cfg(all(test, target_os = "macos"))]
-    pub(crate) fn publish_debugger_aged_for_test(
-        &mut self,
-        probe: DebuggerProbe,
-        self_hardened: SelfHardening,
-        age: Duration,
-    ) {
-        let at = Instant::now()
-            .checked_sub(age)
-            .expect("a monotonic clock that far back");
-        self.publish_debugger_at_for_test(probe, self_hardened, at);
-    }
-
-    #[cfg(all(test, target_os = "macos"))]
-    fn publish_debugger_at_for_test(
-        &mut self,
-        probe: DebuggerProbe,
-        self_hardened: SelfHardening,
-        at: Instant,
-    ) {
-        self.probes.live = true;
-        let _ = self.shared.hardening.set(self_hardened);
-        self.shared.debugger.seed_for_test(
-            DebuggerEntry {
-                probe,
-                self_hardened,
-            },
-            at,
-        );
-    }
-
-    /// Whether no debugger worker is in flight and no entry is cached.
-    #[cfg(all(test, target_os = "macos"))]
-    pub(crate) fn debugger_slot_idle_for_test(&self) -> bool {
-        let slot = self.shared.debugger.slot.lock_or_recover();
-        !slot.in_flight && slot.entry.is_none()
-    }
-
-    /// A debugger worker is out.
-    pub(crate) fn debugger_in_flight(&self) -> bool {
-        self.shared.debugger.slot.lock_or_recover().in_flight
     }
 
     /// Mutable reference to probe functions for tests.

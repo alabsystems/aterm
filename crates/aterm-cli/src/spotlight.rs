@@ -405,7 +405,11 @@ fn manifest_text(path: &Path) -> Option<String> {
     if !metadata.is_file() || metadata.len() > LIMIT {
         return None;
     }
-    let mut text = String::new();
+    let mut text = String::with_capacity(
+        usize::try_from(metadata.len())
+            .unwrap_or(0)
+            .saturating_add(1),
+    );
     file.take(LIMIT + 1).read_to_string(&mut text).ok()?;
     (text.len() as u64 <= LIMIT).then_some(text)
 }

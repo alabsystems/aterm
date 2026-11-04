@@ -706,7 +706,12 @@ fn read_retained(path: &Path) -> Result<Option<(std::fs::File, Vec<u8>)>, &'stat
             return Err("journal-permissions");
         }
     }
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.len())
+            .unwrap_or(0)
+            .min(MAX_RECORD)
+            .saturating_add(1),
+    );
     std::io::Read::by_ref(&mut file)
         .take((MAX_RECORD + 1) as u64)
         .read_to_end(&mut bytes)

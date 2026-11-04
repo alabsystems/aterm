@@ -520,7 +520,7 @@ fn survey(root: &Path) -> Result<Option<(Vec<&'static str>, bool)>, String> {
 }
 
 fn read_bytes(root: &Path, name: &str) -> Result<Option<Vec<u8>>, String> {
-    match std::fs::read(root.join(name)) {
+    match crate::macos_doctor::read_record_bytes(&root.join(name)) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(format!("{name}: {error}")),
@@ -611,7 +611,8 @@ fn plan_from(bytes: &[u8]) -> Result<(Plan, bool), String> {
 /// cannot hold one, a copy flushed before its name is published.
 pub(super) fn keep_aside(root: &Path, name: &str) -> Result<String, String> {
     let path = root.join(name);
-    let bytes = std::fs::read(&path).map_err(|error| format!("{name}: {error}"))?;
+    let bytes = crate::macos_doctor::read_record_bytes(&path)
+        .map_err(|error| format!("{name}: {error}"))?;
     for n in 1..=99_u32 {
         let aside = if n == 1 {
             format!("{name}.unreadable")
@@ -619,7 +620,7 @@ pub(super) fn keep_aside(root: &Path, name: &str) -> Result<String, String> {
             format!("{name}.unreadable.{n}")
         };
         let target = root.join(&aside);
-        match std::fs::read(&target) {
+        match crate::macos_doctor::read_record_bytes(&target) {
             Ok(kept) if kept == bytes => return Ok(aside),
             Ok(_) => continue,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}

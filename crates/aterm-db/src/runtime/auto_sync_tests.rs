@@ -702,6 +702,115 @@ fn automatic_runtime_discovers_tables_catches_up_late_devices_and_transfers_loca
 }
 
 #[test]
+fn an_application_created_after_both_runtimes_start_is_discovered_and_writable_on_both() {
+    use crate::catalog::{Descriptor, Directory};
+    use crate::table::Session;
+
+    let lab = crate::table::tests::Lab::new(&[Role::Writer; 2]);
+    let observers = aterm_tempfile::Builder::new()
+        .prefix("commons-late-table-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let reservation = Multicast::bind(
+        Ipv4Addr::LOCALHOST,
+        Ipv4Addr::new(239, 255, 31, 84),
+        0,
+        LinkScope::Loopback,
+    )
+    .unwrap();
+    let (owner, owner_progress) = start(&lab, observers.path(), 0, reservation.port());
+    let (receiver, receiver_progress) = start(&lab, observers.path(), 1, reservation.port());
+    for runtime in [&owner, &receiver] {
+        wait_network(
+            &runtime.network_observation(),
+            "runtime before publication",
+            |state| state.visibility == Visibility::Active && state.observer.is_some(),
+        );
+    }
+
+    // This application's identity is first created after both owners are active.
+    // The receiver has neither a table handle nor a pre-created replica.
+    let bootstrap = lab.bootstrap(0);
+    let descriptor =
+        Descriptor::fresh(bootstrap.trust(), "late-application", "records", 1).unwrap();
+    let scope = descriptor.scope;
+    let payloads: [&[u8]; 2] = [b"created-after-startup", b"written-by-the-discovering-peer"];
+    {
+        let peer = lab.bootstrap(1);
+        let session =
+            Session::observe_until(&peer, Instant::now() + Duration::from_secs(60)).unwrap();
+        assert!(
+            Directory::new(&lab.paths[1], peer.trust())
+                .observe_table_if_exists(&session, scope)
+                .unwrap()
+                .is_none()
+        );
+    }
+    let first = {
+        let session =
+            Session::open_until(&bootstrap, Instant::now() + Duration::from_secs(60)).unwrap();
+        let directory = Directory::new(&lab.paths[0], bootstrap.trust());
+        directory.publish(&session, &descriptor).unwrap();
+        directory
+            .open_store(&session, scope)
+            .unwrap()
+            .commit_catalog(&session, payloads[0])
+            .unwrap()
+            .id
+    };
+    receiver_progress.wait_for(
+        scope.digest(),
+        1,
+        "running peer discovered the new application",
+    );
+    let second = {
+        let peer = lab.bootstrap(1);
+        let session = Session::open_until(&peer, Instant::now() + Duration::from_secs(60)).unwrap();
+        // Opening the already discovered store performs no declaration or peer sync.
+        Directory::new(&lab.paths[1], peer.trust())
+            .open_store(&session, scope)
+            .unwrap()
+            .commit_catalog(&session, payloads[1])
+            .unwrap()
+            .id
+    };
+    owner_progress.wait_for(
+        scope.digest(),
+        2,
+        "new application carries a reverse-direction write",
+    );
+    receiver.stop();
+    owner.stop();
+
+    // Independent reads after shutdown authenticate the exact operations and values.
+    let expected = BTreeMap::from([
+        (first, payloads[0].to_vec()),
+        (second, payloads[1].to_vec()),
+    ]);
+    for paths in &lab.paths {
+        let bootstrap = Bootstrap::cached(paths).unwrap().unwrap();
+        let session = Session::observe(&bootstrap).unwrap();
+        let directory = Directory::new(paths, bootstrap.trust());
+        let catalog = directory.snapshot_existing(&session).unwrap();
+        assert!(
+            catalog.entries[&scope.digest()]
+                .declarations
+                .iter()
+                .any(|entry| entry.descriptor == descriptor)
+        );
+        let actual: BTreeMap<_, _> = directory
+            .observe_table(&session, scope)
+            .unwrap()
+            .catalog(&session)
+            .unwrap()
+            .iter()
+            .map(|record| (record.header().id, record.payload().to_vec()))
+            .collect();
+        assert_eq!(actual, expected);
+    }
+}
+
+#[test]
 fn windowless_background_runtime_replicates_yields_to_window_and_resumes_with_negative_control() {
     use std::sync::atomic::{AtomicBool, Ordering};
 

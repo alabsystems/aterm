@@ -1541,7 +1541,7 @@ pub fn read_brewfile(path: Option<&Path>) -> Result<String, String> {
         return read_stdin_brewfile();
     }
     let p = path.map_or_else(|| std::path::PathBuf::from("Brewfile"), Path::to_path_buf);
-    std::fs::read_to_string(&p).map_err(|e| {
+    crate::metadata_io::read_bounded_regular_utf8(&p, 4 * 1024 * 1024).map_err(|e| {
         // brew's `Brewfile.read` maps any ENOENT here.
         if e.kind() == std::io::ErrorKind::NotFound {
             "Error: No Brewfile found".to_string()

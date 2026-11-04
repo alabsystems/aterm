@@ -41,16 +41,11 @@ mod default_identity;
 #[path = "cli_signin_epoch_tests.rs"]
 mod signin_epoch;
 
-/// Whether a sign-in of `cli`'s row runs here: one into an overlay home (`Seam::Overlay`, Kimi's)
-/// runs only on Unix, where aterm links one (`signin`'s
-/// `a_sign_in_that_needs_an_overlay_runs_nothing_where_aterm_makes_no_links` holds the refusal).
-fn signs_in_here(cli: Cli) -> bool {
-    cfg!(unix)
-        || !matches!(
-            cli.accounts().seam,
-            crate::ai::connector::Seam::Overlay { .. }
-        )
-}
+#[cfg(unix)]
+#[path = "cli_pool_kimi_tests.rs"]
+mod kimi_native_profiles;
+
+use crate::harness::accounts_overlay::{self, links_here};
 
 fn tmp_dir(tag: &str) -> Tmp {
     aterm_tempfile::Builder::new()
@@ -1989,6 +1984,10 @@ struct RefreshCtl {
     already_gone: bool,
     timeout_at: Option<usize>,
     empty_usage: bool,
+    /// The panel's five-hour window reads this share used (36 where `None`).
+    session_pct: Option<u32>,
+    /// The panel's monthly window reads this share used (13 where `None`).
+    monthly_pct: Option<u32>,
 }
 
 impl Ctl for RefreshCtl {
@@ -2023,12 +2022,22 @@ impl Ctl for RefreshCtl {
             1 => "OK s-quota".to_owned(),
             9 => "OK schema=1 sid=s-quota program=kimi".to_owned(),
             10 if self.empty_usage => text_json(&rows(&["Plan: monthly", "Usage not read yet"])),
-            10 => text_json(&rows(&[
-                "   ╭ Usage ─────────────────────────────────────────╮",
-                "   │   5h limit    ███████░░░  36% used  resets in 25m │",
-                "   │   Monthly limit  ███░░░░  13% used  resets in 26d 20h 27m │",
-                "   ╰─────────────────────────────────────────────────╯",
-            ])),
+            10 => {
+                let session = format!(
+                    "   │   5h limit    ███████░░░  {}% used  resets in 25m │",
+                    self.session_pct.unwrap_or(36)
+                );
+                let monthly = format!(
+                    "   │   Monthly limit  ███░░░░  {}% used  resets in 26d 20h 27m │",
+                    self.monthly_pct.unwrap_or(13)
+                );
+                text_json(&rows(&[
+                    "   ╭ Usage ─────────────────────────────────────────╮",
+                    session.as_str(),
+                    monthly.as_str(),
+                    "   ╰─────────────────────────────────────────────────╯",
+                ]))
+            }
             13 => panic!("the quota tab was used after it closed"),
             _ if args.get(1) == Some(&"await") => format!("OK {} 1", args[2]),
             _ => "OK".to_owned(),
@@ -2113,7 +2122,7 @@ fn a_kimi_limits_read_persists_the_month_and_session() {
         "   ╰─────────────────────────────────────────────────╯",
     ]);
     let view = limits_view(Program::Kimi.reader(), &rows, env.now, 0, &|_, _| None);
-    record_limits_usage(&env, "@s-worker", Cli::Kimi, &view, &|_| Some(0)).unwrap();
+    record_limits_usage(&env, "@s-worker", Cli::Kimi, &view, &|_| Some(0), None).unwrap();
     let store = env.accounts_store_for(Cli::Kimi).unwrap();
     let (state, _) = store.load(env.now).unwrap();
     let account = state.account("kimi-m22");
@@ -2269,6 +2278,76 @@ fn kimi_refresh_uses_a_quota_only_tab_and_always_closes_it() {
     let store = env.accounts_store_for(Cli::Kimi).unwrap();
     let (state, _) = store.load(env.now).unwrap();
     assert!(state.account("kimi-m22").windows.contains_key("monthly"));
+    assert!(
+        state.account("kimi-m22").walls.is_empty(),
+        "no window is full: no wall"
+    );
+}
+
+/// A REFRESH WHOSE PANEL READS A WINDOW FULL WALLS THE ROW IT LAUNCHED KIMI UNDER until the
+/// window's reset, the five-hour window's or the monthly one weeks away, so a launch passes that
+/// row over. CONTROL: at 99% nothing is walled, and a `harness limits` read of a tab at 100%,
+/// whose login aterm did not launch it under, records its sample alone.
+#[test]
+fn a_kimi_refresh_at_a_full_window_walls_the_row_it_launched() {
+    let walled = |session: u32, monthly: u32| {
+        let tmp = tmp_dir("kimi-refresh-full");
+        let env = env_at(&tmp);
+        let roster = accounts::append_row("", "kimi-m22", Class::Preferred, None).unwrap();
+        std::fs::write(env.accounts_roster_for(Cli::Kimi).unwrap(), roster).unwrap();
+        let mut ctl = RefreshCtl {
+            session_pct: Some(session),
+            monthly_pct: Some(monthly),
+            ..RefreshCtl::default()
+        };
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_kimi_refresh_with(&mut ctl, &env, true, &mut out, &mut err);
+        assert_eq!(code, ExitCode::SUCCESS, "{}", String::from_utf8_lossy(&err));
+        let store = env.accounts_store_for(Cli::Kimi).unwrap();
+        let (state, _) = store.load(env.now).unwrap();
+        let account = state.account("kimi-m22");
+        assert_eq!(account.sample.as_ref().unwrap().session_pct, Some(session));
+        account.limited_until(env.now).map(|until| until - env.now)
+    };
+    assert_eq!(
+        walled(100, 13),
+        Some(25 * 60 + accounts::RESET_GRACE_S),
+        "walled until the five-hour window's reset"
+    );
+    assert_eq!(
+        walled(36, 100),
+        Some(((26 * 24 + 20) * 60 + 27) * 60 + accounts::RESET_GRACE_S),
+        "walled until the monthly window's reset, past the week's believed horizon"
+    );
+    assert_eq!(
+        walled(99, 99),
+        None,
+        "CONTROL: a window not full walls nothing"
+    );
+
+    let tmp = tmp_dir("kimi-limits-full");
+    let env = env_at(&tmp);
+    let roster = accounts::append_row("", "kimi-m22", Class::Preferred, None).unwrap();
+    std::fs::write(env.accounts_roster_for(Cli::Kimi).unwrap(), roster).unwrap();
+    let rows = rows(&[
+        "   ╭ Usage ─────────────────────────────────────────╮",
+        "   │   5h limit    ██████████  100% used  resets in 25m │",
+        "   ╰─────────────────────────────────────────────────╯",
+    ]);
+    let view = limits_view(Program::Kimi.reader(), &rows, env.now, 0, &|_, _| None);
+    record_limits_usage(&env, "@s-worker", Cli::Kimi, &view, &|_| Some(0), None).unwrap();
+    let (state, _) = env
+        .accounts_store_for(Cli::Kimi)
+        .unwrap()
+        .load(env.now)
+        .unwrap();
+    let account = state.account("kimi-m22");
+    assert_eq!(account.sample.as_ref().unwrap().session_pct, Some(100));
+    assert!(
+        account.walls.is_empty(),
+        "CONTROL: a tab's login aterm cannot name is walled by no reading"
+    );
 }
 
 #[test]

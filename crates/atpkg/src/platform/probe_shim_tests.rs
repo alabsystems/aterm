@@ -248,6 +248,43 @@ fn grok_snapshots_live_ready_development_and_symlink_handoffs_with_vendor_fallba
 }
 
 #[test]
+fn kimi_snapshot_hands_a_managed_launch_to_live_kimi_alab() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(scratch.path()).unwrap();
+    let prefix = root.join("pkg");
+    let vendor = prefix.join("store/kimi/1/bin/kimi");
+    image(&vendor);
+    let wrapper = prefix.join("agents/kimi");
+    let body = sh_shim_content_twin(
+        &vendor,
+        &crate::shim_env::ShimEnv::NONE,
+        None,
+        &full("kimi", &prefix, None),
+    );
+    text(&wrapper, &body);
+    let forwarder = bridge(&root);
+    assert_eq!(
+        mains(&probe_shim(&wrapper, &body, &forwarder).unwrap()),
+        std::slice::from_ref(&vendor),
+        "an absent harness falls back to the vendor"
+    );
+
+    let harness = prefix.join("store/kimi-alab/7/bin/kimi-alab");
+    image(&harness);
+    std::fs::write(prefix.join("store/kimi-alab/7.ready"), b"ok\n").unwrap();
+    let shim = prefix.join("bin/kimi-alab");
+    text(
+        &shim,
+        &sh_shim_content_twin(&harness, &crate::shim_env::ShimEnv::NONE, None, ""),
+    );
+    let captured = probe_shim(&wrapper, &body, &forwarder).unwrap();
+    let selected = mains(&captured);
+    assert!(selected.contains(&vendor) && selected.contains(&harness));
+    assert!(captured.body.contains("${ATERM_NO_HARNESS-}"));
+    assert!(captured.body.contains("'run' '--' \"$@\""));
+}
+
+#[test]
 fn managed_entry_selection_is_bound_with_its_own_argv0_and_fallback_metadata() {
     let scratch = aterm_tempfile::tempdir().unwrap();
     let root = std::fs::canonicalize(scratch.path()).unwrap();

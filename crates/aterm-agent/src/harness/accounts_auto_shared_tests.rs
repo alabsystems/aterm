@@ -1040,6 +1040,12 @@ fn observe_recovery(case: i64) -> (i64, i64, i64) {
     let bed = Bed::new(None);
     bed.approval.generation.store(1, Ordering::SeqCst);
     if case == 15 || case == 16 {
+        bed.store
+            .transact_pool_logins_within(&[], &bed.roster, NOW, &mut None, |_, _, logins| {
+                accounts::admit_workflow(logins, "shared")?;
+                Ok(Vec::new())
+            })
+            .unwrap();
         let before = bed.store.load_logins(NOW).unwrap().0;
         let signin = bed.store.signin_now().unwrap().unwrap();
         bed.upkeep(Some(&bed.factory()), &inline, true);
@@ -1388,6 +1394,10 @@ fn a_shared_policy_stop_is_deferred_without_a_failure_or_retry_wait() {
     }
 }
 
+/// Unix only, where aterm links the opener an unattended renewal's page is handed to
+/// (`cli::opener_link`); off Unix the sign-in ladder's
+/// `an_unattended_run_is_handed_nothing_where_aterm_links_no_opener` holds what runs.
+#[cfg(unix)]
 #[test]
 fn upkeep_renews_a_pinned_row_once_per_new_root_generation_without_a_terminal() {
     let bed = Bed::new(None);
@@ -1587,6 +1597,8 @@ fn automatic_shared_renewal_refuses_a_profile_that_contradicts_the_successful_st
     );
 }
 
+// For the unattended-renewal tests alone, which run only where aterm links the opener (Unix).
+#[cfg(unix)]
 fn observed_upkeep(bed: &Bed) -> (Arc<Mutex<AutoRenewGuard>>, Vec<String>) {
     let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
     let lines = Arc::new(Mutex::new(Vec::new()));
@@ -2425,6 +2437,10 @@ fn shared_progress_with_live_discovery_and_persistent_guard_conforms() {
     }
 }
 
+/// Unix only, where aterm links the opener an unattended renewal's page is handed to
+/// (`cli::opener_link`); off Unix the sign-in ladder's
+/// `an_unattended_run_is_handed_nothing_where_aterm_links_no_opener` holds what runs.
+#[cfg(unix)]
 #[test]
 fn changed_shared_policy_during_provider_or_failed_status_is_deferred() {
     for during_status in [false, true] {
@@ -2509,6 +2525,8 @@ fn changed_shared_policy_during_provider_or_failed_status_is_deferred() {
         }
     }
 }
+// For the unattended-renewal tests alone, which run only where aterm links the opener (Unix).
+#[cfg(unix)]
 fn observe_disposition(before: bool, after: bool, provider: bool, replay: bool) -> [i64; 4] {
     let bed = Bed::new(None);
     bed.provider.stop.store(!after, Ordering::SeqCst);
@@ -2582,6 +2600,8 @@ fn observe_disposition(before: bool, after: bool, provider: bool, replay: bool) 
     ]
 }
 
+// For the unattended-renewal tests alone, which run only where aterm links the opener (Unix).
+#[cfg(unix)]
 pub(crate) fn disposition_transition(
     state: &aterm_spec::interp::State,
     action: &str,
@@ -2615,6 +2635,10 @@ pub(crate) fn disposition_transition(
     next
 }
 
+/// Unix only, where aterm links the opener an unattended renewal's page is handed to
+/// (`cli::opener_link`); off Unix the sign-in ladder's
+/// `an_unattended_run_is_handed_nothing_where_aterm_links_no_opener` holds what runs.
+#[cfg(unix)]
 #[test]
 fn shared_dispositions_conform_and_failure_on_policy_refusal_is_detected() {
     let model = aterm_models_harness::shared_disposition_model();

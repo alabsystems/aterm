@@ -16,10 +16,14 @@ use super::arena::{self, Halt};
 use super::workspace_root;
 use crate::perf::driver::CargoDriver;
 
-/// THE BENCHES' OWN TABLE of arms, mounted from the fabric bench (std-only): the cargo profile
+/// THE BENCHES' OWN TABLE of arms, mounted from the fabric bench: the cargo profile
 /// each builds with, where its binaries land, and the opt-level it promises.
 #[path = "../../../aterm/tests/fabric_bench/profile.rs"]
 pub(crate) mod bench_profile;
+
+/// The paths a build stamp is of, as aterm's build script asks git of them.
+#[path = "../../../aterm/stamp_paths.rs"]
+mod stamp_paths;
 
 pub(crate) mod flags;
 pub(crate) mod units;
@@ -286,6 +290,10 @@ fn git_facts(
     GIT_FACTS.into_iter().zip(values).collect()
 }
 
+/// The three facts as aterm's build script reads them of the work tree `dir` is in. The dirty
+/// test asks of the paths the stamp is of ([`stamp_paths::PATHSPEC`]), so the entries a lane
+/// writes into the measured ledger between the runs of one set leave the stamp, and so the
+/// next run's build, as they were.
 fn probe_git_facts(dir: &Path) -> [String; 3] {
     let git = |args: &[&str]| {
         arena::stdout_of(
@@ -296,7 +304,7 @@ fn probe_git_facts(dir: &Path) -> [String; 3] {
         .filter(|s| !s.is_empty())
     };
     let short = git(&["rev-parse", "--short=12", "HEAD"]).unwrap_or_else(|| "unknown".into());
-    let dirty = git(&["status", "--porcelain"]).is_some();
+    let dirty = git(&[&["status", "--porcelain"][..], &stamp_paths::PATHSPEC].concat()).is_some();
     let commit = if short != "unknown" && dirty {
         format!("{short}-dirty")
     } else {
@@ -361,32 +369,47 @@ fn built_binary(messages: &str, name: &str) -> Result<PathBuf, String> {
 
 /// Cargo's exact executable artifact, matched by both target name and target kind.
 pub(crate) fn built_executable(messages: &str, name: &str, kind: &str) -> Result<PathBuf, String> {
+    let mut selected: Option<PathBuf> = None;
     for line in messages.lines() {
-        let Ok(message) = aterm_json::from_str::<aterm_json::Value>(line) else {
+        let Ok(wire) = aterm_json::from_str::<crate::compiler_message::UnitMessage>(line) else {
             continue;
+        };
+        let message = match wire {
+            crate::compiler_message::UnitMessage::Unit(value) => value,
+            crate::compiler_message::UnitMessage::Other => continue,
+            crate::compiler_message::UnitMessage::Ambiguous(_) => {
+                return Err("compiler reported ambiguous message fields".into());
+            }
         };
         if message.get("reason").and_then(aterm_json::Value::as_str) != Some("compiler-artifact") {
             continue;
         }
+        let Some(path) = message
+            .get("executable")
+            .and_then(aterm_json::Value::as_str)
+        else {
+            continue;
+        };
+        let kinds = crate::compiler_message::artifact_target_kinds(&message)?;
         let target = message.get("target");
         let named = target
             .and_then(|t| t.get("name"))
             .and_then(aterm_json::Value::as_str)
             == Some(name);
-        let bin = target
-            .and_then(|t| t.get("kind"))
-            .and_then(aterm_json::Value::as_array)
-            .is_some_and(|kinds| kinds.iter().any(|k| k.as_str() == Some(kind)));
-        if named
-            && bin
-            && let Some(path) = message
-                .get("executable")
-                .and_then(aterm_json::Value::as_str)
-        {
-            return Ok(PathBuf::from(path));
+        let bin = kinds.contains(&kind);
+        if named && bin {
+            if selected
+                .as_ref()
+                .is_some_and(|prior| prior.as_os_str() != std::ffi::OsStr::new(path))
+            {
+                return Err(format!(
+                    "compiler reported conflicting executables for `{name}`"
+                ));
+            }
+            selected.get_or_insert_with(|| PathBuf::from(path));
         }
     }
-    Err(format!("cargo reported no `{name}` binary"))
+    selected.ok_or_else(|| format!("cargo reported no `{name}` binary"))
 }
 
 /// Why a bench's report is not of `built` (`identity`): the aterm it says it launched, and that
@@ -579,6 +602,77 @@ mod tests {
         }
     }
 
+    /// D10b's set (2026-11-04-fabric-1001 to -1004): run 1's entry, written into the ledger and
+    /// not yet committed, stamped run 2's build `-dirty`, so run 2 ran a rebuild. The lane's
+    /// own output, a new entry and an edit to the ledger's README, leaves the three facts as
+    /// they were, asked from the top or from a package's folder (where a build script runs);
+    /// the negative controls, an edited source file, a new one and a file beside the ledger
+    /// that only shares its name's start, each mark the stamp dirty.
+    #[test]
+    fn a_ledger_entry_leaves_the_stamp_and_a_source_change_dirties_it() {
+        let scratch = aterm_tempfile::tempdir().expect("tempdir");
+        let top = scratch.path();
+        let package = top.join("crates/a");
+        let git = |args: &[&str]| {
+            let out = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"))
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .current_dir(top)
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        let write = |path: &str, text: &str| {
+            let path = top.join(path);
+            std::fs::create_dir_all(path.parent().expect("a parent")).expect("dir");
+            std::fs::write(path, text).expect("write");
+        };
+        write("crates/a/src/lib.rs", "pub fn a() {}\n");
+        write("docs/measured/fabric/README.md", "# fabric\n");
+        git(&["init", "-q"]);
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "base"]);
+        let clean = probe_git_facts(&package);
+        assert!(
+            clean[0].len() == 12 && clean[0].bytes().all(|b| b.is_ascii_hexdigit()),
+            "a committed tree's stamp is its commit alone: {clean:?}"
+        );
+
+        write("docs/measured/fabric/2026-11-04-fabric-1001.json", "{}\n");
+        write("docs/measured/fabric/2026-11-04-fabric-1001.md", "# 1001\n");
+        write(
+            "docs/measured/fabric/README.md",
+            "# fabric\n\nD10b's set.\n",
+        );
+        assert_eq!(
+            probe_git_facts(&package),
+            clean,
+            "the ledger's entries changed the stamp"
+        );
+        assert_eq!(probe_git_facts(top), clean, "asked from the top");
+
+        let dirty = [
+            format!("{}-dirty", clean[0]),
+            clean[1].clone(),
+            clean[2].clone(),
+        ];
+        let controls: [(&str, &str, bool); 3] = [
+            ("crates/a/src/lib.rs", "pub fn a() -> u8 { 1 }\n", true),
+            ("crates/a/src/new.rs", "pub fn b() {}\n", false),
+            ("docs/measured.md", "beside the ledger\n", false),
+        ];
+        for (path, text, tracked) in controls {
+            write(path, text);
+            assert_eq!(probe_git_facts(&package), dirty, "{path} changed");
+            if tracked {
+                git(&["checkout", "-q", "--", path]);
+            } else {
+                std::fs::remove_file(top.join(path)).expect("remove");
+            }
+            assert_eq!(probe_git_facts(&package), clean, "{path} restored");
+        }
+    }
+
     #[test]
     fn the_built_aterm_is_the_binary_cargo_reports() {
         let messages = [
@@ -617,6 +711,98 @@ mod tests {
             built_executable(&library_tests, "aterm_db", "lib"),
             Ok(PathBuf::from("/cache/deps/aterm_db-test"))
         );
+    }
+
+    #[test]
+    fn conflicting_artifacts_do_not_select_a_measurement_executable() {
+        let artifact = |name: &str, kind: &str, path: &str| {
+            format!(
+                r#"{{"reason":"compiler-artifact","target":{{"kind":["{kind}"],"name":"{name}"}},"executable":"{path}"}}"#
+            )
+        };
+        let first = artifact("x", "bin", "/first");
+        let second = artifact("x", "bin", "/second");
+        for positive in [
+            first.clone(),
+            format!("{first}\n{first}"),
+            format!(
+                "{}\n{first}\n{}",
+                artifact("other", "bin", "/other"),
+                artifact("x", "example", "/example")
+            ),
+        ] {
+            assert_eq!(
+                built_executable(&positive, "x", "bin").unwrap(),
+                PathBuf::from("/first")
+            );
+        }
+        for conflicting in [format!("{first}\n{second}"), format!("{second}\n{first}")] {
+            assert!(built_executable(&conflicting, "x", "bin").is_err());
+        }
+    }
+
+    #[test]
+    fn mixed_type_target_kinds_do_not_select_measurement_executables() {
+        let valid = r#"{"reason":"compiler-artifact","target":{"kind":["lib"],"name":"x"},"profile":{"test":true},"executable":"/built/x"}"#;
+        for kinds in [r#"["lib"]"#, r#"["rlib","lib"]"#] {
+            let positive = valid.replace(r#"["lib"]"#, kinds);
+            assert_eq!(
+                built_executable(&positive, "x", "lib").unwrap(),
+                PathBuf::from("/built/x")
+            );
+        }
+        for kinds in [r#"["lib",7]"#, r#"[null,"lib"]"#, r#"["lib",{}]"#] {
+            let malformed = valid.replace(r#"["lib"]"#, kinds);
+            for wire in [
+                malformed.clone(),
+                format!("{valid}\n{malformed}"),
+                format!("{malformed}\n{valid}"),
+            ] {
+                assert!(built_executable(&wire, "x", "lib").is_err(), "{kinds}");
+            }
+        }
+    }
+
+    #[test]
+    fn ambiguous_compiler_artifacts_do_not_select_measurement_executables() {
+        let valid = r#"{"reason":"compiler-artifact","target":{"kind":["lib"],"name":"x"},"profile":{"test":true},"executable":"/built/x"}"#;
+        assert_eq!(
+            built_executable(valid, "x", "lib").unwrap(),
+            PathBuf::from("/built/x")
+        );
+        for message in include_str!("../testdata/ambiguous-compiler-artifacts.jsonl").lines() {
+            for wire in [format!("{valid}\n{message}"), format!("{message}\n{valid}")] {
+                assert!(built_executable(&wire, "x", "lib").is_err(), "{message}");
+            }
+        }
+    }
+
+    #[test]
+    fn another_build_detects_changed_bytes_with_identical_file_metadata() {
+        let world = aterm_tempfile::tempdir().unwrap();
+        let path = world.path().join("data-only-not-executed");
+        std::fs::write(&path, b"original").unwrap();
+        assert!(bench_profile::identity(&world.path().join("missing")).is_err());
+        assert!(bench_profile::identity(world.path()).is_err());
+        let before = std::fs::metadata(&path).unwrap();
+        let identity = bench_profile::identity(&path).unwrap();
+        assert_eq!(bench_profile::identity(&path).unwrap(), identity);
+        std::fs::write(&path, b"replaced").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(before.modified().unwrap()))
+            .unwrap();
+        let after = std::fs::metadata(&path).unwrap();
+        assert_eq!(before.len(), after.len());
+        assert_eq!(before.modified().unwrap(), after.modified().unwrap());
+        let changed = bench_profile::identity(&path).unwrap();
+        let report = aterm_json::json!({
+            "aterm_binary": path.to_str().unwrap(),
+            "aterm_binary_identity": { "start": changed, "end": changed },
+        });
+        assert!(another_build(&report, &path, &identity).is_some());
     }
 
     #[test]

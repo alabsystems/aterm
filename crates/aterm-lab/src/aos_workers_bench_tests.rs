@@ -527,6 +527,15 @@ fn gate0_holds_for_one_clean_commit_on_a_debug_lab_and_fails_otherwise() {
     assert!(!gate0(Some("aterm-lab_0.128.0+gunknown"), LAB, true).is_empty());
     let unknown = LabFacts { debug: None, ..LAB };
     assert!(gate0(Some(BUILD), unknown, true)[0].contains("profile is unknown"));
+    let release = LabFacts {
+        debug: Some(false),
+        ..LAB
+    };
+    assert_eq!(
+        gate0(Some(BUILD), release, true),
+        ["the lab is not a debug build"],
+        "a release lab, its build clean and unchanged: the profile is the one reason"
+    );
     let changed = LabFacts {
         unchanged: Some(false),
         ..LAB
@@ -547,6 +556,42 @@ fn gate0_holds_for_one_clean_commit_on_a_debug_lab_and_fails_otherwise() {
     });
     let ev = evaluate_clean(&runs, 1, LAB, true);
     assert!(void_reasons(&ev).iter().any(|w| w.starts_with("gate 0:")));
+    let ev = evaluate_clean(&session(1, |_| {}), 1, release, true);
+    assert!(
+        void_reasons(&ev).iter().any(|w| w.starts_with("gate 0:")),
+        "a clean session on a release lab is void"
+    );
+}
+
+#[test]
+fn the_lab_is_the_runners_profile_only_where_it_is_the_runner() {
+    assert_eq!(
+        lab_debug(Some(true), false),
+        Some(false),
+        "a release runner that is the lab"
+    );
+    assert_eq!(
+        lab_debug(Some(true), true),
+        Some(true),
+        "a debug runner that is the lab"
+    );
+    assert_eq!(
+        lab_debug(Some(false), false),
+        None,
+        "a lab that is another binary"
+    );
+    assert_eq!(
+        lab_debug(Some(false), true),
+        None,
+        "a lab that is another binary"
+    );
+    for runner_debug in [false, true] {
+        assert_eq!(
+            lab_debug(None, runner_debug),
+            None,
+            "a lab that was not compared (runner debug {runner_debug})"
+        );
+    }
 }
 
 // --- Gate 1.

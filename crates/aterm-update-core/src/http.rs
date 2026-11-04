@@ -2542,7 +2542,8 @@ mod tests {
     #[test]
     fn the_vendor_lane_refuses_before_spawning() {
         const URL: &str = "https://downloads.claude.ai/claude-code-releases/latest";
-        let dest = std::env::temp_dir().join("aterm-vendor-refused-never-written");
+        let dir = crate::test_scratch_dir("vendor-refused");
+        let dest = dir.path().join("never-written");
         let refused = |result: Result<(), HttpError>, needle: &str| match result {
             Err(HttpError::VendorRefused(m)) => assert!(m.contains(needle), "{m}"),
             other => panic!("{needle}: {other:?}"),
@@ -2943,7 +2944,7 @@ mod tests {
         probe_a_stopped_transfer_if_asked();
         use std::os::unix::fs::PermissionsExt as _;
         const HANG_DETECTOR: std::time::Duration = std::time::Duration::from_secs(60);
-        let dir = aterm_tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch_dir("stop-dl");
         let wrapper = dir.path().join("curl");
         std::fs::write(
             &wrapper,
@@ -3189,7 +3190,7 @@ mod tests {
             current,
             thread: Some(thread),
         };
-        let dir = aterm_tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch_dir("resume-dl");
         if let Some(stale) = stale {
             std::fs::write(dir.path().join("a-1.bin"), stale).unwrap();
         }
@@ -3405,14 +3406,14 @@ mod tests {
             download_resume_args_https_only("60", "600", "/s/claude.part", Some("40"), quick);
         assert_eq!(resumed.len(), pinned.len() + 2);
         assert_eq!(&resumed[resumed.len() - 2..], ["--continue-at", "40"]);
-        let dir = std::env::temp_dir().join(format!("aterm-vendor-lane-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let err = download_to_resumable_https_only("http://example.invalid/x", &dir.join("x"), 10)
+        let dir = crate::test_scratch_dir("vendor-lane");
+        let err =
+            download_to_resumable_https_only("http://example.invalid/x", &dir.path().join("x"), 10)
+                .unwrap_err();
+        assert!(err.contains("non-https"), "{err}");
+        let err = download_to_resumable("ftp://example.invalid/x", &dir.path().join("x"), 10)
             .unwrap_err();
         assert!(err.contains("non-https"), "{err}");
-        let err = download_to_resumable("ftp://example.invalid/x", &dir.join("x"), 10).unwrap_err();
-        assert!(err.contains("non-https"), "{err}");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

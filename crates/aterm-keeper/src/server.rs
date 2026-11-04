@@ -941,9 +941,8 @@ mod tests {
     #[test]
     fn a_lab_desks_marker_is_read_as_any_marker_is() {
         use std::os::unix::ffi::OsStrExt as _;
-        let dir = std::env::temp_dir().join(format!("akk-unit-{}-lab-marker", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("the scratch log dir");
+        let scratch = crate::test_scratch_dir("lab-marker");
+        let dir = scratch.path();
         let pid = 4242;
         let m = MarkerRef {
             nanos: 7,
@@ -987,16 +986,13 @@ mod tests {
             };
             assert_eq!(read_marker(pid, &bad), MarkerEvidence::Unknown);
         }
-
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn a_status_limit_inside_a_multibyte_character_keeps_valid_utf8() {
-        let dir = std::env::temp_dir().join(format!("akk-unit-{}-status-utf8", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let scratch = crate::test_scratch_dir("status-utf8");
         let mut server = Server::bind(ServeConfig {
-            socket: dir.join("k.sock"),
+            socket: scratch.path().join("k.sock"),
             identity: Identity::same_uid(),
             relaunch: Relauncher::Unavailable,
             version: "test".into(),
@@ -1013,15 +1009,13 @@ mod tests {
         assert!(text.starts_with(&prefix));
         assert!(Frame::Status { text }.encode().is_ok());
         drop(server);
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn a_failed_write_ends_the_writing_never_the_reading() {
-        let dir = std::env::temp_dir().join(format!("akk-unit-{}-unwritable", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let scratch = crate::test_scratch_dir("unwritable");
         let mut server = Server::bind(ServeConfig {
-            socket: dir.join("k.sock"),
+            socket: scratch.path().join("k.sock"),
             identity: Identity::same_uid(),
             relaunch: Relauncher::Unavailable,
             version: "test".into(),
@@ -1099,7 +1093,6 @@ mod tests {
         assert!(server.holds(rdev), "and its descriptor kept");
         assert!(server.conns.is_empty(), "the EOF dropped the connection");
         drop(server);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn a_pty_master() -> (OwnedFd, Rdev) {
@@ -1162,11 +1155,9 @@ mod tests {
 
     fn offer_to_a_second_window(fail_dup: bool) -> OfferSeen {
         let me = std::process::id();
-        let dir =
-            std::env::temp_dir().join(format!("akk-unit-{me}-undupable-{}", u8::from(fail_dup)));
-        let _ = std::fs::remove_dir_all(&dir);
+        let scratch = crate::test_scratch_dir(&format!("undup-{}", u8::from(fail_dup)));
         let mut server = Server::bind(ServeConfig {
-            socket: dir.join("k.sock"),
+            socket: scratch.path().join("k.sock"),
             identity: Identity::same_uid(),
             relaunch: Relauncher::Unavailable,
             version: "test".into(),
@@ -1260,7 +1251,6 @@ mod tests {
             ..seen
         };
         drop(server);
-        let _ = std::fs::remove_dir_all(&dir);
         seen
     }
 
@@ -1352,10 +1342,9 @@ mod tests {
     fn the_loop_holds_exactly_the_regions_the_core_keeps() {
         use aterm_uds::shm::{PAGE, Region};
         let len = 7 * PAGE;
-        let dir = std::env::temp_dir().join(format!("akk-unit-{}-regions", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let scratch = crate::test_scratch_dir("regions");
         let mut server = Server::bind(ServeConfig {
-            socket: dir.join("k.sock"),
+            socket: scratch.path().join("k.sock"),
             identity: Identity::same_uid(),
             relaunch: Relauncher::Unavailable,
             version: "test".into(),
@@ -1438,7 +1427,6 @@ mod tests {
         );
         drop(client);
         drop(server);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// How the dials of [`dials_whose_checks_need_each_other`] ended.
@@ -1458,10 +1446,9 @@ mod tests {
         use std::sync::{Arc, Condvar, Mutex, PoisonError};
         static SCRIPTED: aterm_uds::deadline::Gate =
             aterm_uds::deadline::Gate::new("akk-unit-scripted-check");
-        let dir = std::env::temp_dir().join(format!("akk-unit-{}-dials-{max}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let scratch = crate::test_scratch_dir(&format!("dials-{max}"));
         let mut server = Server::bind(ServeConfig {
-            socket: dir.join("k.sock"),
+            socket: scratch.path().join("k.sock"),
             identity: Identity::same_uid(),
             relaunch: Relauncher::Unavailable,
             version: "test".into(),
@@ -1540,7 +1527,6 @@ mod tests {
             unanswered,
         };
         drop(server);
-        let _ = std::fs::remove_dir_all(&dir);
         ended
     }
 
@@ -1550,10 +1536,9 @@ mod tests {
         use std::sync::{Mutex, PoisonError, mpsc};
         static SCRIPTED: aterm_uds::deadline::Gate =
             aterm_uds::deadline::Gate::new("akk-unit-scripted-serve");
-        let dir = std::env::temp_dir().join(format!("akk-unit-{}-serve", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let scratch = crate::test_scratch_dir("serve");
         let mut server = Server::bind(ServeConfig {
-            socket: dir.join("k.sock"),
+            socket: scratch.path().join("k.sock"),
             identity: Identity::same_uid(),
             relaunch: Relauncher::Unavailable,
             version: "test".into(),
@@ -1617,7 +1602,6 @@ mod tests {
         );
         assert_eq!(server.poll_wait(TICK_MS), TICK_MS, "no check runs");
         drop((window, dial, server));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1653,10 +1637,9 @@ mod tests {
         use std::sync::{Mutex, PoisonError, mpsc};
         static SCRIPTED: aterm_uds::deadline::Gate =
             aterm_uds::deadline::Gate::new("akk-unit-scripted-behind");
-        let dir = std::env::temp_dir().join(format!("akk-unit-{}-behind", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let scratch = crate::test_scratch_dir("behind");
         let mut server = Server::bind(ServeConfig {
-            socket: dir.join("k.sock"),
+            socket: scratch.path().join("k.sock"),
             identity: Identity::same_uid(),
             relaunch: Relauncher::Unavailable,
             version: "test".into(),
@@ -1706,16 +1689,12 @@ mod tests {
         }
         assert_eq!(server.refused_dials, 0, "none turned away");
         drop((slow, fast, server));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn bind_refuses_non_socket_and_symlink_paths_without_unlinking_them() {
         use std::os::unix::fs::PermissionsExt as _;
-        let scratch = aterm_tempfile::Builder::new()
-            .prefix("akk-bind-nonsock-")
-            .tempdir()
-            .expect("exclusive fixture");
+        let scratch = crate::test_scratch_dir("bind-nonsock");
         std::fs::set_permissions(scratch.path(), std::fs::Permissions::from_mode(0o700))
             .expect("0700");
 
